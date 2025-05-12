@@ -1,4 +1,4 @@
-# KV fast fusion\
+# KV fast fusion
 kv cache fast fusion example
 
 **Download vLLM and apply patch**\
