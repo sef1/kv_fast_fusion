@@ -1,7 +1,7 @@
-# KV fast fusion
+# KV fast fusion\
 kv cache fast fusion example
 
-**Download vLLM and apply patch**
+**Download vLLM and apply patch**\
 git clone https://github.com/vllm-project/vllm.git \
 cd vllm \
 git checkout e4ca6e3a99816920df80a1e0a72cd3658d9d134b \
