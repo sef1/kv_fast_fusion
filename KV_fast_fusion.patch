@@ -45,35 +45,12 @@ index 1c0271811..ec712ef1e 100644
 +    #### replace the default excute_model with compressed excute_model  ###
 +    replace_excute_model_with_compressed_excute_model()
      asyncio.run(run_server(args))
-diff --git a/vllm/entrypoints/chat_utils.py b/vllm/entrypoints/chat_utils.py
-index 38fe98572..1cfd5818e 100644
---- a/vllm/entrypoints/chat_utils.py
-+++ b/vllm/entrypoints/chat_utils.py
-@@ -14,6 +14,18 @@ import jinja2.nodes
- import transformers.utils.chat_template_utils as hf_chat_utils
- # yapf conflicts with isort for this block
- # yapf: disable
-+
-+import sys
-+import os
-+
-+# Store the current path to your local directory
-+local_dir = os.path.abspath('vllm/entrypoints')
-+
-+# Remove the local directory from sys.path if it exists
-+if local_dir in sys.path:
-+    sys.path.remove(local_dir)
-+
-+
- from openai.types.chat import (ChatCompletionAssistantMessageParam,
-                                ChatCompletionContentPartImageParam,
-                                ChatCompletionContentPartInputAudioParam)
 diff --git a/vllm/entrypoints/vllm_patch.py b/vllm/entrypoints/vllm_patch.py
 new file mode 100644
-index 000000000..0dc3e0e64
+index 000000000..6d42f6066
 --- /dev/null
 +++ b/vllm/entrypoints/vllm_patch.py
-@@ -0,0 +1,528 @@
+@@ -0,0 +1,527 @@
 +import torch
 +import os
 +from vllm.sequence import ExecuteModelRequest
@@ -601,5 +578,3 @@ index 000000000..0dc3e0e64
 +def replace_excute_model_with_compressed_excute_model():
 +    logger.info("use compressed_excute_model")
 +    LocalOrDistributedWorkerBase.execute_model = execute_model
-+
-\ No newline at end of file
