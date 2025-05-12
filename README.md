@@ -7,7 +7,7 @@ cd vllm \
 git checkout e4ca6e3a99816920df80a1e0a72cd3658d9d134b \
 VLLM_USE_PRECOMPILED=1 pip install --editable .\
 
-wget https://anonymous.4open.science/api/repo/kv_fast_fusion-7A7D/file/KV_fast_fusion.patch\
+wget https://anonymous.4open.science/api/repo/kv_fast_fusion-7A7D/file/KV_fast_fusion.patch \
 git apply KV_fast_fusion.patch
 
 **Start api server with:**\
