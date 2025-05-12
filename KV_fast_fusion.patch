@@ -64,7 +64,7 @@ index 38fe98572..1cfd5818e 100644
 +if local_dir in sys.path:
 +    sys.path.remove(local_dir)
 +
-+    
++
  from openai.types.chat import (ChatCompletionAssistantMessageParam,
                                 ChatCompletionContentPartImageParam,
                                 ChatCompletionContentPartInputAudioParam)
@@ -91,7 +91,7 @@ index 000000000..0dc3e0e64
 +
 +BLOCK_SIZE = 16
 +CHUNK_SIZE = 512
-+THRESHOLD = 0.66 
++THRESHOLD = 0.66
 +
 +def _apply_rotary_emb(
 +    x: torch.Tensor,
@@ -151,45 +151,45 @@ index 000000000..0dc3e0e64
 +
 +@torch.inference_mode()
 +def fast_fusion(kv_cache, block_tables, thr, is_prefill, num_last_chunks_to_compress=2, remove_position = True, rotary_emb = None, seq_lens = None):
-+   
++
 +    def fuse_all_above_thr(x, b_idx=None, thr=thr):
 +        """
 +        Recursively processes input tensor `x` to filter and combine elements based on a threshold `thr`.
 +        Args:
-+            x (torch.Tensor): A 3D tensor of shape (B, N, D), where B is the batch size, 
++            x (torch.Tensor): A 3D tensor of shape (B, N, D), where B is the batch size,
 +                N is the number of elements per batch, and D is the feature dimension.
 +            b_idx (torch.Tensor, optional): A tensor containing batch indices. Defaults to None.
 +            thr (float): The threshold value used for filtering and combining elements.
 +        Returns:
 +            tuple: A tuple containing:
-+                - combined_x (torch.Tensor): The processed and normalized tensor after combining elements 
++                - combined_x (torch.Tensor): The processed and normalized tensor after combining elements
 +                  based on the threshold.
-+                - reverse_idx (list): A list of tensors representing the reverse mapping of indices 
++                - reverse_idx (list): A list of tensors representing the reverse mapping of indices
 +                  after processing.
-+                - fl_chain (list): A list of tuples containing intermediate results for debugging or 
++                - fl_chain (list): A list of tuples containing intermediate results for debugging or
 +                  further processing. Each tuple contains:
 +                    - b_idx (torch.Tensor): The batch indices.
 +                    - torch.Tensor: A tensor of shape (2, M) representing matched indices.
 +                    - list: Indices of unmatched elements in the left tensor.
 +                    - list: Indices of unmatched elements in the right tensor.
-+                - shifts (list): A list of integers representing the cumulative shifts applied to indices 
++                - shifts (list): A list of integers representing the cumulative shifts applied to indices
 +                  during processing.
 +        Notes:
-+            - The function operates recursively, splitting the input tensor `x` into two halves and 
++            - The function operates recursively, splitting the input tensor `x` into two halves and
 +              processing them independently before merging the results.
-+            - The merging step involves filtering elements based on the threshold `thr` and combining 
++            - The merging step involves filtering elements based on the threshold `thr` and combining
 +              matched elements using their mean.
 +            - Unmatched elements from both halves are retained and concatenated with the combined results.
-+            - The function also tracks index mappings and shifts for reconstructing the original structure 
++            - The function also tracks index mappings and shifts for reconstructing the original structure
 +              if needed.
 +        """
 +
 +        B, _, _ = x.shape
-+        
-+        if B == 1:            
-+            nz_blocks = x.shape[1] if is_prefill else (seq_lens[b_idx]//BLOCK_SIZE).item()            
++
++        if B == 1:
++            nz_blocks = x.shape[1] if is_prefill else (seq_lens[b_idx]//BLOCK_SIZE).item()
 +            return F.normalize(x[:,:nz_blocks], dim=-1), [idx__[:nz_blocks]], [], [nz_blocks]
-+                
++
 +        xl, _idx_l, fl_chain, shifts_l = fuse_all_above_thr(x[:B//2],  b_idx[:B//2], thr=thr)
 +        xr, _idx_r, fr_chain, shifts_r = fuse_all_above_thr(x[B//2:],  b_idx[B//2:], thr=thr)
 +
@@ -197,18 +197,18 @@ index 000000000..0dc3e0e64
 +        nr = xr.shape[1]
 +        idx_l = idx__[:nl]
 +        idx_r = idx__[:nr]
-+               
++
 +        idx_ll, idx_rr = (xl @ xr.mT > thr).nonzero(as_tuple=True)[1:]
 +        l_idx, c= torch.unique(idx_ll, return_counts=True)
 +        r_idx = idx_rr.split(tuple(c.tolist()))
-+        
++
 +        idx_ul = list(set(idx_l.tolist()) - set(idx_ll.tolist()))
 +        idx_ur = list(set(idx_r.tolist()) - set(idx_rr.tolist()))
-+        
++
 +        n_c = len(l_idx)
 +        n_ul = len(idx_ul)
-+        n_ur = len(idx_ur)        
-+        
++        n_ur = len(idx_ur)
++
 +        combined_tensors = [torch.cat([xl[:,l_idx[i]].unsqueeze(1),xr[:,r_idx[i]]] , dim=1).mean(1, keepdim=True) for i in range(n_c)]
 +        if combined_tensors != []:
 +            combined_x = F.normalize(torch.cat(combined_tensors, dim=1), dim = -1)
@@ -217,19 +217,19 @@ index 000000000..0dc3e0e64
 +            combined_x = torch.cat([xl[:,idx_ul], xr[:,idx_ur]], dim=1)
 +
 +        reverse_idx = torch.empty(nl+nr, device=x.device, dtype=torch.int)
-+        
++
 +        reverse_idx[l_idx.tolist()] = idx__[:n_c]
 +        for i in range(n_c):
 +            reverse_idx[(r_idx[i]+nl).tolist()] = idx__[:n_c][i]
 +
 +        reverse_idx[idx_ul] = idx__[n_c:n_c + n_ul]#torch.arange(n_c, n_c + n_ul, device=idx_.device, dtype=torch.int)
 +        reverse_idx[list(map(lambda x: x + nl, idx_ur))] = idx__[n_c+ n_ul:n_c + n_ul+ n_ur]#torch.arange(n_c + n_ul, n_c + n_ul + n_ur, device=idx_.device, dtype=torch.int)
-+                
++
 +        max_length = max(len(_idx_l), len(_idx_r))
 +        if len(_idx_l) < max_length:
 +            shifts_l += [shifts_l[-1]]*(max_length - len(_idx_l))
 +            _idx_l += [torch.tensor([], device=xl.device, dtype=torch.int) for _ in range(max_length - len(_idx_l))]
-+        
++
 +        chain = [torch.cat([_idx_l[i], _idx_r[i]+shifts_l[i]], dim=0) for i in range(max_length)]
 +        reverse_idx = [reverse_idx]
 +        reverse_idx +=chain
@@ -238,9 +238,9 @@ index 000000000..0dc3e0e64
 +        # print(b_idx)
 +        shifts = list(map(lambda x,y: x + y, shifts_l, shifts_r))
 +        shifts = [n_c+n_ul+n_ur] + shifts
-+        
-+        return combined_x, reverse_idx, fl_chain, shifts        
-+    
++
++        return combined_x, reverse_idx, fl_chain, shifts
++
 +    def fuse_values_with_above_thr_idx(v, fwd_idx, b_idx):
 +        """
 +        Recursively combines and normalizes tensor blocks based on forward indices.
@@ -267,25 +267,25 @@ index 000000000..0dc3e0e64
 +              blocks or only a subset based on sequence lengths.
 +            - The function uses `torch.nn.functional.normalize` for normalization.
 +        """
-+        i = 0                     
++        i = 0
 +        def recurssive_combining(v, b_idx):
 +            nonlocal i
 +            B,_,_ = v.shape
-+            if B == 1:                 
++            if B == 1:
 +                nz_blocks = v.shape[1] if is_prefill else (seq_lens[b_idx]//BLOCK_SIZE).item()
 +                return F.normalize(v[:, :nz_blocks], dim=-1)
 +                # return F.normalize(v, dim=-1)
 +
 +            vl = recurssive_combining(v[:B//2], b_idx[:B//2])
 +            vr = recurssive_combining(v[B//2:], b_idx[B//2:])
-+            
++
 +            _, idx_, idx_ul, idx_ur = fwd_idx[i]
 +            idx_ll, idx_rr = idx_.mT
 +            l_idx, c= torch.unique(idx_ll, return_counts=True)
 +            r_idx = idx_rr.split(tuple(c.tolist()))
 +
 +            # combined_v = F.normalize((vl[:,idx_[:,0] ]+vr[:,idx_[:,1]])*0.5, dim=-1)
-+            # combined_v = torch.cat([combined_v, vl[:,idx_ul], vr[:,idx_ur]], dim=1)            
++            # combined_v = torch.cat([combined_v, vl[:,idx_ul], vr[:,idx_ur]], dim=1)
 +            combined_tensors = [torch.cat([vl[:,l_idx[i]].unsqueeze(1),vr[:,r_idx[i]]] , dim=1).mean(1, keepdim=True) for i in range(len(l_idx))]
 +            if combined_tensors != []:
 +                combined_v = F.normalize(torch.cat(combined_tensors, dim=1), dim = -1)
@@ -295,66 +295,66 @@ index 000000000..0dc3e0e64
 +
 +            i+=1
 +
-+            return combined_v                       
++            return combined_v
 +
 +        vv = recurssive_combining(v, b_idx)
 +
-+        return vv     
-+            
++        return vv
++
 +    def restore_cache(x, idx, shape):
 +        """
-+        Restores a cache tensor by reshaping and reordering its elements based on the provided indices. 
++        Restores a cache tensor by reshaping and reordering its elements based on the provided indices.
 +        This decompresses the KV cache tensor, enabling compression ratio evaluation and accuracy analysis.
 +
 +        Args:
-+            x (torch.Tensor): The input tensor to be restored. It is expected to have a shape 
++            x (torch.Tensor): The input tensor to be restored. It is expected to have a shape
 +                compatible with the indices and the target shape.
-+            idx (list of lists): A list of index lists used to reorder the elements of the tensor. 
++            idx (list of lists): A list of index lists used to reorder the elements of the tensor.
 +                Each inner list specifies the indices for reordering at a particular step.
-+            shape (tuple): The target shape of the restored tensor. The third dimension of the shape 
++            shape (tuple): The target shape of the restored tensor. The third dimension of the shape
 +                is used to define the size of the last dimension of the output tensor.
 +
 +        Returns:
-+            torch.Tensor: A tensor with the restored shape and reordered elements based on the 
++            torch.Tensor: A tensor with the restored shape and reordered elements based on the
 +            provided indices.
 +
 +        Note:
-+            - The function assumes that the input tensor `x` and the indices in `idx` are compatible 
++            - The function assumes that the input tensor `x` and the indices in `idx` are compatible
 +              with the target shape.
 +            - The device and data type of the output tensor match those of the input tensor `x`.
 +        """
 +        xx = torch.empty((1, len(idx[-2]), shape[2]), dtype=x.dtype, device=x.device)
-+        xx[:,:x.shape[1] ] = x 
++        xx[:,:x.shape[1] ] = x
 +        for idx_ in idx[:-1]:
-+            xx[:, :len(idx_)] = xx[:, idx_]    
++            xx[:, :len(idx_)] = xx[:, idx_]
 +
 +        return xx
-+    
++
 +    def update_block_table(block_table, fwd_idx, b_idx):
 +        """
 +        Updates the block table by recursively combining blocks based on the provided forward index.
 +        Args:
-+            block_table (torch.Tensor): A tensor representing the block table. 
-+                It is expected to have a shape where the first dimension represents 
++            block_table (torch.Tensor): A tensor representing the block table.
++                It is expected to have a shape where the first dimension represents
 +                the number of blocks (B).
 +            fwd_idx (list): A list of forward indices used to map and combine blocks.
-+                Each element in the list is expected to be a tuple containing indices 
++                Each element in the list is expected to be a tuple containing indices
 +                for combining blocks.
-+            b_idx (torch.Tensor): A tensor representing the block indices. It is used 
++            b_idx (torch.Tensor): A tensor representing the block indices. It is used
 +                to determine the sequence lengths for each block.
 +        Returns:
-+            torch.Tensor: A tensor representing the updated block table after recursive 
++            torch.Tensor: A tensor representing the updated block table after recursive
 +            combination of blocks. The resulting tensor is squeezed along the first dimension.
 +        Notes:
-+            - The function uses a nested recursive helper function `blocks_recurssive_combining` 
++            - The function uses a nested recursive helper function `blocks_recurssive_combining`
 +              to perform the block combination.
-+            - The variable `i` is used as a nonlocal counter to track the current forward index 
++            - The variable `i` is used as a nonlocal counter to track the current forward index
 +              during the recursive process.
-+            - The sequence lengths for each block are assumed to be divisible by a constant 
++            - The sequence lengths for each block are assumed to be divisible by a constant
 +              `BLOCK_SIZE`, which is used to calculate the number of non-zero blocks.
 +            - The function modifies the `br` tensor in-place during the recursive combination.
 +        """
-+        i = 0                     
++        i = 0
 +        def blocks_recurssive_combining(bt, b_idx):
 +            nonlocal i
 +            B,_, = bt.shape
@@ -365,52 +365,52 @@ index 000000000..0dc3e0e64
 +
 +            bl = blocks_recurssive_combining(bt[:B//2], b_idx[:B//2])
 +            br = blocks_recurssive_combining(bt[B//2:], b_idx[B//2:])
-+           
++
 +            idx_ = fwd_idx[i][1]
 +            br.view(1,-1)[:,idx_[:,1]] = bl.view(1,-1)[:, idx_[:,0]]
-+            
++
 +            i+=1
 +
 +            return torch.cat([bl,br], dim=-1)
 +        bt = blocks_recurssive_combining(block_table, b_idx)
 +        return bt.squeeze(0)
-+    
-+    
++
++
 +    device = kv_cache[0].device
 +    L = len(kv_cache)
 +    B, num_blocks = block_tables.shape
-+    
-+    
++
++
 +    b_idx = torch.arange(B,device=device).tolist()
 +    idx__ = torch.arange(B*num_blocks, dtype=torch.int, device=device)
 +    mask = idx__[:num_blocks].repeat(B,1) < (seq_lens//BLOCK_SIZE).unsqueeze(-1)
 +    kv_shape =kv_cache[0][0, block_tables[mask]].shape
-+    blocks, block_sz, num_head, head_size =  kv_shape    
++    blocks, block_sz, num_head, head_size =  kv_shape
 +    block_tables_ = {}
-+    
++
 +    compressed_ = []
 +    total_ = []
 +    cos_sin = rotary_emb.cos_sin_cache.index_select(0, torch.arange(block_tables.shape[1]*block_sz, device=device))
 +    cos, sin = cos_sin.chunk(2, dim=-1)
-+    
++
 +    for l in range(2,L-2): # 2 warmup layers and 2 final layers
-+        
++
 +        if remove_position:
 +            kv_cache[l][0, block_tables] = _apply_inv_rotary_emb(kv_cache[l][0, block_tables].view(B,-1, num_head, head_size), cos, sin, rotary_emb.is_neox_style).view(B, -1, block_sz, num_head, head_size)
-+            
++
 +        kk = kv_cache[l][0, block_tables]
-+         
++
 +        if is_prefill:
 +            kk = kk[mask]
 +            chunks = (blocks*block_sz)//CHUNK_SIZE
-+        
++
 +            kk_cat = kk.view(chunks,blocks//chunks, -1)[:-num_last_chunks_to_compress]
 +            kk = kk.view(chunks,blocks//chunks, -1)[-num_last_chunks_to_compress:]
 +            k_norms = kk.norm(2,-1)
 +        else:
 +            kk = kk.view(B,num_blocks, -1)
 +            k_norms = kk[mask].norm(2,-1)
-+        
++
 +        _k, _idx, fwd_idx, _  = fuse_all_above_thr(kk, b_idx, thr)
 +
 +        kk = restore_cache(_k, _idx, kk.shape)
@@ -425,25 +425,25 @@ index 000000000..0dc3e0e64
 +
 +        if remove_position:
 +            kv_cache[l][0, block_tables] = _apply_rotary_emb(kv_cache[l][0, block_tables].view(B,-1, num_head, head_size), cos, sin, rotary_emb.is_neox_style).view(B, -1, block_sz, num_head, head_size)
-+            
++
 +        del _k, k_norms, kk
 +
-+        vv = kv_cache[l][1, block_tables]   
++        vv = kv_cache[l][1, block_tables]
 +
 +        if is_prefill:
 +            vv = vv[mask]
 +            chunks = (blocks*block_sz)//CHUNK_SIZE
-+        
++
 +            vv_cat = vv.view(chunks,blocks//chunks, -1)[:-num_last_chunks_to_compress]
 +            vv = vv.view(chunks,blocks//chunks, -1)[-num_last_chunks_to_compress:]
 +            v_norms = vv.norm(2,-1)
 +        else:
 +            vv = vv.view(B,num_blocks, -1)
 +            v_norms = vv[mask].norm(2,-1)
-+        
-+        _v = fuse_values_with_above_thr_idx(vv,fwd_idx, b_idx)  
-+       
-+        vv = restore_cache(_v, _idx, vv.shape) 
++
++        _v = fuse_values_with_above_thr_idx(vv,fwd_idx, b_idx)
++
++        vv = restore_cache(_v, _idx, vv.shape)
 +        if is_prefill:
 +            vv =vv.view(num_last_chunks_to_compress,blocks//chunks, -1)
 +            vv*= v_norms.unsqueeze(-1)
@@ -451,28 +451,28 @@ index 000000000..0dc3e0e64
 +            kv_cache[l][1, block_tables[mask]] = (vv).view(kv_shape)
 +        else:
 +            kv_cache[l][1, block_tables[mask]] = (vv * v_norms.unsqueeze(-1)).view(kv_shape)
-+        
++
 +        bt_clone = block_tables.clone()
 +        bt_clone[mask] = update_block_table(block_tables, fwd_idx, b_idx)
-+        block_tables_[l] = bt_clone 
-+        
++        block_tables_[l] = bt_clone
++
 +        compressed_ += [_v.shape[1]]
 +        if is_prefill:
 +            total_ += [num_last_chunks_to_compress*CHUNK_SIZE/BLOCK_SIZE]
 +        else:
 +            total_ +=[blocks]
 +        del _v, v_norms, vv
-+    
++
 +    _total =  torch.tensor(total_)
 +    _compressed = torch.tensor(compressed_)
-+    return _total.sum().item()/_compressed.sum().item(), _total, _compressed    
++    return _total.sum().item()/_compressed.sum().item(), _total, _compressed
 +
 +
 +def execute_model(
 +    self,
 +    execute_model_req: Optional[ExecuteModelRequest] = None,
 +) -> Optional[List[SamplerOutput]]:
-+    
++
 +    start_time = time.perf_counter()
 +
 +    inputs = self.prepare_input(execute_model_req)
@@ -498,13 +498,13 @@ index 000000000..0dc3e0e64
 +                and self.observability_config.collect_model_execute_time):
 +            orig_model_execute_time = intermediate_tensors.tensors.get(
 +                "model_execute_time", torch.tensor(0)).item()
-+    
-+    # Batch Fast Fusion # 
-+    if hasattr(self, 'previous_is_prompt'):        
-+        if not model_input.is_prompt and self.previous_is_prompt:                
++
++    # Batch Fast Fusion #
++    if hasattr(self, 'previous_is_prompt'):
++        if not model_input.is_prompt and self.previous_is_prompt:
 +            # if we are here, it means that we start decoing phase.
-+                
-+            bs = model_input.attn_metadata.block_tables.shape[0]          
++
++            bs = model_input.attn_metadata.block_tables.shape[0]
 +            logger.info("dealing with batch size %s ", bs)
 +            if bs > 1:
 +                block_tables = model_input.attn_metadata.block_tables
@@ -512,17 +512,17 @@ index 000000000..0dc3e0e64
 +                num_last_chunks_to_compress = 8
 +                remove_position = False
 +                m = self.model_runner.__dict__['model']
-+                rotary_emb = m.model.layers[0].self_attn.rotary_emb 
-+                # call 
-+                cr, total, num_comp = fast_fusion(self.kv_cache[worker_input.virtual_engine], model_input.attn_metadata.block_tables,  THRESHOLD, model_input.is_prompt, num_last_chunks_to_compress, remove_position, rotary_emb, seq_lens=seq_lens) 
++                rotary_emb = m.model.layers[0].self_attn.rotary_emb
++                # call
++                cr, total, num_comp = fast_fusion(self.kv_cache[worker_input.virtual_engine], model_input.attn_metadata.block_tables,  THRESHOLD, model_input.is_prompt, num_last_chunks_to_compress, remove_position, rotary_emb, seq_lens=seq_lens)
 +                logger.info(f"compression {cr} | per layer compression {total/num_comp}")
 +                logger.info(f"total blocks per layer {total}| blocks per layer after compression {num_comp}")
 +                if not os.path.exists(f"compression_res"):
 +                    os.makedirs(f"compression_res")
 +                with open(f"compression_res/{bs}_batchsz_thr_{THRESHOLD}.jsonl", "a", encoding="utf-8") as f:
 +                    json.dump({"cr": cr, "per_layer": str((total/num_comp).tolist()), "num_comp_": str((num_comp).tolist())}, f, ensure_ascii=False)
-+                    f.write('\n')              
-+ 
++                    f.write('\n')
++
 +    # Execute the model with fused KV cache blocks #
 +    output = self.model_runner.execute_model(
 +        model_input=model_input,
@@ -541,21 +541,21 @@ index 000000000..0dc3e0e64
 +        if model_input.is_prompt:
 +            #If we are here, it means that we start prefill phase.
 +            seq_lens = torch.tensor(model_input.__dict__['seq_lens'], device=model_input.attn_metadata.block_tables.device)
-+            
++
 +            if hasattr(self, 'old_seq_len'):
 +                self.num_chunks_per_compress = 4 # the frequency of compression
 +                num_last_chunks_to_compress = 4  #number of chunks to compress
 +                if seq_lens.item() - self.old_seq_len == self.num_chunks_per_compress*CHUNK_SIZE:
 +                    m = self.model_runner.__dict__['model']
-+                    rotary_emb = m.model.layers[0].self_attn.rotary_emb 
++                    rotary_emb = m.model.layers[0].self_attn.rotary_emb
 +                    remove_position = False
-+                    cr, total, num_comp = fast_fusion(self.kv_cache[worker_input.virtual_engine], model_input.attn_metadata.block_tables,  THRESHOLD, model_input.is_prompt, num_last_chunks_to_compress, remove_position, rotary_emb, seq_lens=seq_lens) 
++                    cr, total, num_comp = fast_fusion(self.kv_cache[worker_input.virtual_engine], model_input.attn_metadata.block_tables,  THRESHOLD, model_input.is_prompt, num_last_chunks_to_compress, remove_position, rotary_emb, seq_lens=seq_lens)
 +                    self.total_ += total
 +                    self.num_comp_ += num_comp
-+                    self.old_seq_len = seq_lens.item() 
-+            else: 
++                    self.old_seq_len = seq_lens.item()
++            else:
 +                self.old_seq_len = 0
-+                comopressed_layers_ = len(self.kv_cache[worker_input.virtual_engine]) - 4 # we have 2 warmup layers and 2 final layers 
++                comopressed_layers_ = len(self.kv_cache[worker_input.virtual_engine]) - 4 # we have 2 warmup layers and 2 final layers
 +                self.total_ = torch.zeros(comopressed_layers_)
 +                self.num_comp_ = torch.zeros(comopressed_layers_)
 +        else: # for the last prefill step
@@ -570,12 +570,12 @@ index 000000000..0dc3e0e64
 +                    f.write('\n')
 +                    #analyze the compression ratio by:
 +                    #data = pd.read_json("compression_res/4_chunks.jsonl", lines = True)
-+            comopressed_layers_ = len(self.kv_cache[worker_input.virtual_engine]) - 4 # we have 2 warmup layers and 2 final layers 
++            comopressed_layers_ = len(self.kv_cache[worker_input.virtual_engine]) - 4 # we have 2 warmup layers and 2 final layers
 +            self.total_ = torch.zeros(comopressed_layers_)
 +            self.num_comp_ = torch.zeros(comopressed_layers_)
-+           
-+    
-+    
++
++
++
 +
 +    model_execute_time = time.perf_counter() - start_time
 +    if not get_pp_group().is_last_rank:
@@ -598,8 +598,8 @@ index 000000000..0dc3e0e64
 +    return output
 +
 +
-+def replace_excute_model_with_compressed_excute_model():    
++def replace_excute_model_with_compressed_excute_model():
 +    logger.info("use compressed_excute_model")
 +    LocalOrDistributedWorkerBase.execute_model = execute_model
-+    
++
 \ No newline at end of file
