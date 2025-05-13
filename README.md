@@ -13,13 +13,18 @@ wget https://anonymous.4open.science/api/repo/kv_fast_fusion-7A7D/file/KV_fast_f
 git apply KV_fast_fusion.patch
 ```
 **For CFF**
+```shell
 export BATCH_SIZE=1
-
+```
 **for BFF**
+```shell
 export BATCH_SIZE=256
-
+```
 **In one terminal - Start vLLM api server with:**\
+```shell
 VLLM_USE_V1=0 python -I vllm/entrypoints/api_server.py --host 127.0.0.1 --model NousResearch/Hermes-3-Llama-3.1-8B --port 10001 --log-level info --enforce-eager --max_num_seqs $BATCH_SIZE --block-size 16 --max_num_batched_tokens 512
-  
+  ```
 **In another terminal - Run vLLM random benchmark:**\
+```shell
 python benchmarks/benchmark_serving.py --host 127.0.0.1 --port 10001 --model NousResearch/Hermes-3-Llama-3.1-8B --backend deepspeed-mii --dataset-name random --num-prompts 256 --random-input-len 32768 --random-output-len 256 --request-rate 100 --random-range-ratio 0.5
+```
