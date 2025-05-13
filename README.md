@@ -1,6 +1,6 @@
 # KV fast fusion
 kv cache fast fusion installation guide and running example. \
-Install in an environment with python3.12. \
+Install in an environment with python3.12. 
 
 **Download vLLM and apply patch**
 ```shell
@@ -17,8 +17,9 @@ export BATCH_SIZE=1
 
 **for BFF**
 export BATCH_SIZE=256
-**Start api server with:**\
-VLLM_WORKER_MULTIPROC_METHOD=spawn VLLM_USE_V1=0 python -I vllm/entrypoints/api_server.py --host 127.0.0.1 --model NousResearch/Hermes-3-Llama-3.1-8B --port 10000 --log-level info --enforce-eager --max_num_seqs 1 --block-size 16 --max_num_batched_tokens 512
+
+**In one terminal - Start vLLM api server with:**\
+VLLM_USE_V1=0 python -I vllm/entrypoints/api_server.py --host 127.0.0.1 --model NousResearch/Hermes-3-Llama-3.1-8B --port 10001 --log-level info --enforce-eager --max_num_seqs $BATCH_SIZE --block-size 16 --max_num_batched_tokens 512
   
-**Run random benchmark:**\
-python benchmarks/benchmark_serving.py --host 127.0.0.1 --port 10000 --model  NousResearch/Hermes-3-Llama-3.1-8B --backend deepspeed-mii --dataset-name random --num-prompts 256 --random-input-len 32768 --random-output-len 256 --request-rate 100 --random-range-ratio 0.5
+**In another terminal - Run vLLM random benchmark:**\
+python benchmarks/benchmark_serving.py --host 127.0.0.1 --port 10001 --model NousResearch/Hermes-3-Llama-3.1-8B --backend deepspeed-mii --dataset-name random --num-prompts 256 --random-input-len 32768 --random-output-len 256 --request-rate 100 --random-range-ratio 0.5
