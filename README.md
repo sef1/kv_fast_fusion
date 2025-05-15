@@ -14,15 +14,15 @@ git apply KV_fast_fusion.patch
 ```
 **For CFF**
 ```shell
-export BATCH_SIZE=1
+export MAX_NUM_SEQ=1
 ```
 **for BFF**
 ```shell
-export BATCH_SIZE=256
+export MAX_NUM_SEQ=256
 ```
 **In one terminal - Start vLLM api server with:**\
 ```shell
-VLLM_USE_V1=0 python -I vllm/entrypoints/api_server.py --host 127.0.0.1 --model NousResearch/Hermes-3-Llama-3.1-8B --port 10001 --log-level info --enforce-eager --max_num_seqs $BATCH_SIZE --block-size 16 --max_num_batched_tokens 512
+VLLM_USE_V1=0 python -I vllm/entrypoints/api_server.py --host 127.0.0.1 --model NousResearch/Hermes-3-Llama-3.1-8B --port 10001 --log-level info --enforce-eager --max_num_seqs $MAX_NUM_SEQ --block-size 16 --max_num_batched_tokens 512 --thr 0.7 --num_chunks_to_compress 32
   ```
 **In another terminal - Run vLLM random benchmark:**\
 ```shell
