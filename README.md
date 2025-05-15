@@ -12,13 +12,13 @@ VLLM_USE_PRECOMPILED=1 pip install --editable .
 wget https://anonymous.4open.science/api/repo/kv_fast_fusion-7A7D/file/KV_fast_fusion.patch 
 git apply KV_fast_fusion.patch
 ```
-**For CFF**
-```shell
-export MAX_NUM_SEQ=1
-```
 **for BFF**
 ```shell
 export MAX_NUM_SEQ=256
+```
+**For CFF**
+```shell
+export MAX_NUM_SEQ=1
 ```
 **In one terminal - Start vLLM api server with:**\
 ```shell
