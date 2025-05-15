@@ -26,5 +26,5 @@ VLLM_USE_V1=0 python -I vllm/entrypoints/api_server.py --host 127.0.0.1 --model 
   ```
 **In another terminal - Run vLLM random benchmark:**\
 ```shell
-python benchmarks/benchmark_serving.py --host 127.0.0.1 --port 10001 --model NousResearch/Hermes-3-Llama-3.1-8B --backend deepspeed-mii --dataset-name random --num-prompts 256 --random-input-len 32768 --random-output-len 256 --request-rate 100 --random-range-ratio 0.5
+python benchmarks/benchmark_serving.py --host 127.0.0.1 --port 10001 --model NousResearch/Hermes-3-Llama-3.1-8B --backend deepspeed-mii --dataset-name random --num-prompts 256 --random-input-len 1024 --random-output-len 1024 --request-rate 100 --random-range-ratio 0.5
 ```
