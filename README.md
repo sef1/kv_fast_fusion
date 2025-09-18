@@ -1,6 +1,6 @@
 # KV Fast Fusion: Installation & Quickstart Guide
 
-This guide walks you through installing and running **KV Fast Fusion**, a context-sharing optimization for vLLM that enables efficient key-value cache compression using Block Fast Fusion (BFF) and Chunk Fast Fusion (CFF).
+This guide walks you through installing and running **Joint Encoding of KV Blocks**, a blocks-sharing optimization for vLLM that enables efficient key-value cache compression using Batch Fast Fusion (BFF) and Chunks Fast Fusion (CFF).
 
 ---
 
