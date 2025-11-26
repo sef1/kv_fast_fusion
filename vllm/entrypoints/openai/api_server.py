@@ -1850,7 +1850,11 @@ if __name__ == "__main__":
     parser = FlexibleArgumentParser(
         description="vLLM OpenAI-Compatible RESTful API server.")
     parser = make_arg_parser(parser)
+    parser.add_argument("--thr", type=float, default=0.75)
+    parser.add_argument("--num-chunks-to-compress", type=int, default=4)
     args = parser.parse_args()
+    
     validate_parsed_serve_args(args)
 
+    # replace_excute_model_with_compressed_excute_model(args)
     uvloop.run(run_server(args))

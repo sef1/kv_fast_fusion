@@ -3,8 +3,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Optional, Any
 
 if TYPE_CHECKING:
     import numpy as np
@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
     from vllm.v1.request import Request
+
 
 
 @dataclass
@@ -110,8 +111,7 @@ class CachedRequestData:
 
 
 @dataclass
-class SchedulerOutput:
-
+class SchedulerOutput:   
     # list of the requests that are scheduled for the first time.
     # We cache the request's data in each worker process, so that we don't
     # need to re-send it every scheduling step.
@@ -146,12 +146,14 @@ class SchedulerOutput:
     # list of (req_id, encoder_input_index) tuples.
     # Used to free the encoder cache.
     free_encoder_input_ids: list[tuple[str, int]]
-
+    
     # Dict of request ids to their index within the batch
     # for filling the next token bitmask
     structured_output_request_ids: dict[str, int]
     # the bitmask for the whole batch
     grammar_bitmask: Optional[npt.NDArray[np.int32]]
-
+    
     # KV Cache Connector metadata.
     kv_connector_metadata: Optional[KVConnectorMetadata] = None
+    
+    

@@ -28,6 +28,10 @@ from vllm.usage.usage_lib import UsageContext
 from vllm.utils import FlexibleArgumentParser, random_uuid, set_ulimit
 from vllm.version import __version__ as VLLM_VERSION
 
+from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+from vllm.entrypoints.kv_fast_fusion import replace_excute_model_with_compressed_excute_model
+import inspect
+
 logger = init_logger("vllm.entrypoints.api_server")
 
 app = FastAPI()
@@ -39,6 +43,11 @@ async def health() -> Response:
     """Health check."""
     return Response(status_code=200)
 
+
+@app.post("/v1/completions")
+async def completions(request: Request) -> Response:
+    request_dict = await request.json()
+    return await _generate(request_dict, raw_request=request)
 
 @app.post("/generate")
 async def generate(request: Request) -> Response:
@@ -57,7 +66,11 @@ async def generate(request: Request) -> Response:
 async def _generate(request_dict: dict, raw_request: Request) -> Response:
     prompt = request_dict.pop("prompt")
     stream = request_dict.pop("stream", False)
-    sampling_params = SamplingParams(**request_dict)
+    params = inspect.signature(SamplingParams).parameters
+    partial_request_dict = {k: v for k, v in request_dict.items() if k in params.keys()}
+    partial_request_dict['top_k'] = 1
+    sampling_params = SamplingParams(**partial_request_dict)
+
     request_id = random_uuid()
 
     assert engine is not None
@@ -146,6 +159,7 @@ async def run_server(args: Namespace,
 
 
 if __name__ == "__main__":
+    
     parser = FlexibleArgumentParser()
     parser.add_argument("--host", type=str, default=None)
     parser.add_argument("--port", type=parser.check_port, default=8000)
@@ -172,7 +186,16 @@ if __name__ == "__main__":
         default=None,
         help="FastAPI root_path when app is behind a path based routing proxy")
     parser.add_argument("--log-level", type=str, default="debug")
+    parser.add_argument("--thr", type=float, default=0.75)
+    parser.add_argument("--num-chunks-to-compress", type=int, default=4)
     parser = AsyncEngineArgs.add_cli_args(parser)
     args = parser.parse_args()
+    #### replace the default excute_model with compressed excute_model  ###
+    import os
+    use_v1  = (os.environ.get('VLLM_USE_V1') == '1')
+    # if not use_v1:
+    replace_excute_model_with_compressed_excute_model(args, use_v1)
+    # else:
+    #     modify the init of GPUModelRunner to use compressed excute_model
 
     asyncio.run(run_server(args))

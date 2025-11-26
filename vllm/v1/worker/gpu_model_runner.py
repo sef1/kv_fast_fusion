@@ -95,6 +95,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         vllm_config: VllmConfig,
         device: torch.device,
     ):
+        ############### sefi
+        from vllm.entrypoints.kv_fast_fusion import execute_model_v1
+        from types import MethodType
+        self.execute_model = MethodType(execute_model_v1, self)
+        ###################
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config

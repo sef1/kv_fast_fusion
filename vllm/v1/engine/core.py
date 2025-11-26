@@ -51,6 +51,8 @@ logger = init_logger(__name__)
 POLLING_TIMEOUT_S = 2.5
 HANDSHAKE_TIMEOUT_MINS = 5
 
+from copy import deepcopy
+
 _R = TypeVar('_R')  # Return type for collective_rpc
 
 
@@ -65,8 +67,8 @@ class EngineCore:
 
         # plugins need to be loaded at the engine/scheduler level too
         from vllm.plugins import load_general_plugins
-        load_general_plugins()
-
+        load_general_plugins()        
+        # kv_cache_config.kv_cache_groups
         self.vllm_config = vllm_config
         logger.info("Initializing a V1 LLM engine (v%s) with config: %s",
                     VLLM_VERSION, vllm_config)
@@ -83,7 +85,7 @@ class EngineCore:
 
         # Setup KV Caches and update CacheConfig after profiling.
         num_gpu_blocks, num_cpu_blocks, kv_cache_config = \
-            self._initialize_kv_caches(vllm_config)
+            self._initialize_kv_caches(vllm_config)       
 
         vllm_config.cache_config.num_gpu_blocks = num_gpu_blocks
         vllm_config.cache_config.num_cpu_blocks = num_cpu_blocks
@@ -170,6 +172,20 @@ class EngineCore:
             for kv_cache_spec_one_worker, available_gpu_memory_one_worker in
             zip(kv_cache_specs, available_gpu_memory)
         ]
+
+         ### sefi - fast fusion setup                      
+        if True: #vllm_config.kv_transfer_config.kv_role != "kv_producer":
+           fused_layers_names = deepcopy(kv_cache_configs[0].kv_cache_groups[0].layer_names[2:-2])
+           warmup_layers_names = deepcopy(kv_cache_configs[0].kv_cache_groups[0].layer_names[0:2] + kv_cache_configs[0].kv_cache_groups[0].layer_names[-2:])
+           tmp_config = [deepcopy(kv_cache_configs[0].kv_cache_groups[0]) for _ in range(len(fused_layers_names)+1)]
+           tmp_config[0].layer_names = warmup_layers_names
+           for idx, layer_name in enumerate(fused_layers_names):
+               tmp_config[idx+1].layer_names = [layer_name]
+               
+           kv_cache_configs[0].kv_cache_groups = tmp_config
+           vllm_config.cache_config.enable_prefix_caching = False
+           vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = False  
+        ### sefi  end
 
         # Since we use a shared centralized controller, we need the
         # `kv_cache_config` to be consistent across all workers to make sure
