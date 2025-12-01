@@ -292,17 +292,13 @@ class BlockPool:
                 priority.
         """
         # Materialize the iterable to allow multiple passes.
+        seen = {}
         blocks_list = list(ordered_blocks)
         for block in blocks_list:
             block.ref_cnt -= 1
+            seen[block.block_id] = block
 
-        # Deduplicate blocks while preserving order  #sefi
-        seen_blocks = set()  
-        unique_blocks = []  
-        for block in blocks_list:  
-            if block.block_id not in seen_blocks:  
-                seen_blocks.add(block.block_id)  
-                unique_blocks.append(block)  
+        unique_blocks = list(seen.values())
         ######
         self.free_block_queue.append_n([
             block for block in unique_blocks
