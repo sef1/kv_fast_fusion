@@ -12,6 +12,7 @@ from vllm.v1.core.kv_cache_utils import (BlockHash, BlockHashWithGroupId,
                                          generate_block_hash_extra_keys,
                                          hash_block_tokens)
 from vllm.v1.request import Request
+import threading
 
 logger = init_logger(__name__)
 
@@ -68,6 +69,7 @@ class BlockPool:
 
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue: list[KVCacheEvent] = []
+        self._queue_lock = threading.Lock() #sefi
 
     def get_cached_block(
             self, block_hash: BlockHash,
@@ -224,6 +226,9 @@ class BlockPool:
                 block.ref_cnt += 1
         else:
             for block in ret:
+                if block.ref_cnt != 0:
+                    raise RuntimeError(
+                        "Block with non-zero ref_cnt found in free queue")
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
         return ret
@@ -290,8 +295,17 @@ class BlockPool:
         blocks_list = list(ordered_blocks)
         for block in blocks_list:
             block.ref_cnt -= 1
+
+        # Deduplicate blocks while preserving order  #sefi
+        seen_blocks = set()  
+        unique_blocks = []  
+        for block in blocks_list:  
+            if block.block_id not in seen_blocks:  
+                seen_blocks.add(block.block_id)  
+                unique_blocks.append(block)  
+        ######
         self.free_block_queue.append_n([
-            block for block in blocks_list
+            block for block in unique_blocks
             if block.ref_cnt == 0 and not block.is_null
         ])
 

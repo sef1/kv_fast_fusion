@@ -107,7 +107,7 @@ class ModelRunnerOutput:
     # NEW FIELDS for block merging info  sefi
     blocks_count: dict[int, dict[int, int]] #= field(default_factory=dict)  
     blocks_to_free: dict[int, int] #= field(default_factory=list) 
-    updated_block_table: dict[str, dict[int, dict[int, int]]] #= field(default_factory=dict) # sefi block_table
+    updated_block_table: dict[str, dict[int, list[int]]] # = field(default=None) #dict[str, dict[int, dict[int, int]]] #= field(default_factory=dict) # sefi block_table    
 
     # [req_ids]
     finished_sending: Optional[set[str]] = None

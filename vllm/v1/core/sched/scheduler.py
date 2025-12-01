@@ -36,8 +36,9 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from copy import deepcopy
 logger = init_logger(__name__)
+from vllm.v1.core.block_pool import KVCacheBlock
 
-
+from collections import Counter
 class Scheduler(SchedulerInterface):
 
     def __init__(
@@ -761,10 +762,585 @@ class Scheduler(SchedulerInterface):
                 f"Queue corruption detected at {location}: "  
                 f"counter={queue.num_free_blocks}, actual={len(actual_free)}"  
             )  
+            logger.error(f"Queue corrupted at {location}")
             # Log which blocks are in the queue  
-            logger.error(f"Blocks in queue: {[b.block_id for b in actual_free]}")  
-            raise AssertionError(f"Queue corrupted at {location}")
+            # logger.error(f"Blocks in queue: {[b.block_id for b in actual_free]}")  
+            # raise AssertionError(f"Queue corrupted at {location}")
         
+    
+    def _handle_block_merging_simple(  
+    self,   
+    request_blocks: dict[str, dict[int, list[int]]]  
+) -> None:  
+        """  
+        Handle block merging using direct block lists from GPU model runner.  
+        
+        Args:  
+            request_blocks: Maps req_id -> group_idx -> [block_id_1, block_id_2, ...]  
+        """  
+        if not request_blocks:  
+            return  
+            
+        before_free = self.kv_cache_manager.coordinator.block_pool.get_num_free_blocks()  
+        
+        # Store original states for rollback  
+        original_states: dict[str, dict[int, list[KVCacheBlock]]] = {}  
+        
+        # Global tracking across all groups  
+        blocks_to_touch: dict[int, KVCacheBlock] = {} 
+        blocks_to_free: dict[int, KVCacheBlock] = {} 
+        
+        try:  
+            # Phase 1: Update block assignments and track changes  
+            for req_id, group_blocks in request_blocks.items():  
+                if req_id not in self.requests:  
+                    continue
+                if not group_blocks:
+                    continue
+                    
+                original_states[req_id] = {}  
+                
+                for group_idx, new_block_ids in group_blocks.items():  
+                    if group_idx == 0:  
+                        continue  
+                        
+                    manager = self.kv_cache_manager.coordinator.single_type_managers[group_idx]  
+                    req_blocks = manager.req_to_blocks.get(req_id, [])  
+                    
+                    # Store original state for rollback  
+                    original_states[req_id][group_idx] = req_blocks.copy()  
+                    
+                    # Get old and new block sets  
+                    old_block_ids = {block.block_id for block in req_blocks   
+                                if not block.is_null and block.block_id != -1}  
+                    new_block_set = set(new_block_ids)  
+                    
+                    # Determine which blocks to touch and free  
+                    blocks_to_add = new_block_set - old_block_ids  
+                    blocks_to_remove = old_block_ids - new_block_set  
+                    
+                    # Collect block objects  
+                    for block_id in blocks_to_add:  
+                        if block_id >= 0:  # Skip null blocks  
+                            block = self.kv_cache_manager.coordinator.block_pool.blocks[block_id]  
+                            if not block.is_null:  
+                                blocks_to_touch[block_id] = block
+                    
+                    for block in req_blocks:  
+                        if (not block.is_null and   
+                            block.block_id != -1 and   
+                            block.block_id in blocks_to_remove):  
+                            blocks_to_free[block.block_id] = block
+                    
+                    # Update request's block list  
+                    new_req_blocks = []  
+                    for block_id in new_block_ids:  
+                        if block_id == -1:  
+                            # Add null block  
+                            new_req_blocks.append(manager.block_pool.null_block)  
+                        else:  
+                            block = self.kv_cache_manager.coordinator.block_pool.blocks[block_id]  
+                            if block.is_null:  
+                                raise ValueError(f"Cannot map to null block {block_id}")  
+                            new_req_blocks.append(block)  
+                    
+                    manager.req_to_blocks[req_id] = new_req_blocks  
+            
+            # Phase 2: Apply reference changes atomically  
+            if blocks_to_touch:  
+                self.kv_cache_manager.coordinator.block_pool.touch((list(blocks_to_touch.values()),))  
+            if blocks_to_free:  
+                self.kv_cache_manager.coordinator.block_pool.free_blocks(list(blocks_to_free.values()))  
+            
+            after_free = self.kv_cache_manager.coordinator.block_pool.get_num_free_blocks()  
+            logger.info(f"Block merging freed {after_free - before_free} blocks")  
+            
+        except Exception as e:  
+            # Rollback on failure  
+            logger.error(f"Block merging failed, rolling back: {e}")  
+            for req_id, groups_state in original_states.items():  
+                for group_idx, original_blocks in groups_state.items():  
+                    manager = self.kv_cache_manager.coordinator.single_type_managers[group_idx]  
+                    manager.req_to_blocks[req_id] = original_blocks  
+            raise e
+#     def _handle_block_merging(  
+#     self,   
+#     block_merge_mapping: dict[str, dict[int, dict[int, int]]]  
+# ) -> None:  
+#         """  
+#         Handle block merging with full atomicity and corner case handling.  
+        
+#         Args:  
+#             block_merge_mapping: Maps req_id -> group_idx -> old_block_id -> new_block_id  
+#         """  
+#         if not block_merge_mapping:  
+#             return  
+            
+#         before_free = self.kv_cache_manager.coordinator.block_pool.get_num_free_blocks()  
+        
+#         # Store original states for rollback  
+#         original_states: dict[str, dict[int, list[KVCacheBlock]]] = {}  
+        
+        
+        
+#         try:  
+#             # Phase 1: Prepare all changes without applying them  
+#             for req_id, group_mappings in block_merge_mapping.items():  
+#                 if req_id not in self.requests:  
+#                     continue  
+                    
+#                 original_states[req_id] = {}  
+                
+#                 for group_idx in range(1, self.kv_cache_manager.num_kv_cache_groups):  
+#                     if group_idx not in group_mappings:  
+#                         continue  
+
+#                     # Global tracking across all groups to handle duplicates properly  
+#                     global_blocks_to_touch: dict[int, KVCacheBlock] = {}  
+#                     global_blocks_to_free: dict[int, KVCacheBlock] = {}  
+#                     global_final_block_ids: set[int] = set()  
+                                    
+#                     manager = self.kv_cache_manager.coordinator.single_type_managers[group_idx]  
+#                     req_blocks = manager.req_to_blocks.get(req_id, [])  
+                    
+#                     # Store original state  
+#                     original_states[req_id][group_idx] = req_blocks.copy()  
+                    
+#                     current_block_ids = {  
+#                         block.block_id for block in req_blocks  
+#                         if not block.is_null and block.block_id != -1  
+#                     }  
+                    
+#                     new_req_blocks = []  
+                    
+#                     for block in req_blocks:  
+#                         if block.is_null or block.block_id == -1:  
+#                             new_req_blocks.append(block)  
+#                             continue  
+                            
+#                         if block.block_id in group_mappings[group_idx]:  
+#                             new_block_id = group_mappings[group_idx][block.block_id]  
+                            
+#                             # # Validate new block exists and is not null  
+#                             if (new_block_id >= len(self.kv_cache_manager.coordinator.block_pool.blocks) or  
+#                                 new_block_id < 0):  
+#                                 raise ValueError(  
+#                                     f"Invalid block_id {new_block_id} for request {req_id} group {group_idx}"  
+#                                 )  
+                            
+#                             new_block = self.kv_cache_manager.coordinator.block_pool.blocks[new_block_id]  
+                            
+#                             # Critical: Validate new block is not null  
+#                             if new_block.is_null:  
+#                                 raise ValueError(  
+#                                     f"Cannot map to null block {new_block_id} for request {req_id} group {group_idx}"  
+#                                 )  
+                            
+#                             new_req_blocks.append(new_block)  
+                            
+#                             # Track globally to handle duplicates across groups  
+#                             if new_block.block_id not in current_block_ids:  
+#                                 global_blocks_to_touch[new_block.block_id] = new_block  
+                            
+#                             global_blocks_to_free[block.block_id] = block  
+#                         else:  
+#                             new_req_blocks.append(block)  
+                    
+#                     # # Collect final block IDs globally  
+#                     for block in new_req_blocks:  
+#                         if not block.is_null and block.block_id != -1:  
+#                             global_final_block_ids.add(block.block_id)  
+                    
+#                     # Store new blocks but don't apply yet  
+#                     manager.req_to_blocks[req_id] = new_req_blocks  
+            
+#             # Phase 2: Validate we have enough free blocks if needed  
+#             # This addresses corner case 4 (block pool exhaustion)  
+#                     blocks_to_free_final = {  
+#                         block_id: block for block_id, block in global_blocks_to_free.items()  
+#                         if block_id not in global_blocks_to_touch.keys() and block_id not in global_final_block_ids   
+#                         }  
+                                
+#                     # Phase 3: Apply all changes atomically  
+#                     if global_blocks_to_touch:  
+#                         self.kv_cache_manager.coordinator.block_pool.touch(  
+#                         (list(global_blocks_to_touch.values()),)  
+#                         ) 
+#                     if blocks_to_free_final:  
+#                         blocks_to_free_objs = list(blocks_to_free_final.values())  
+#                         self.kv_cache_manager.coordinator.block_pool.free_blocks(blocks_to_free_objs) 
+                   
+            
+#             after_free = self.kv_cache_manager.coordinator.block_pool.get_num_free_blocks()  
+#             logger.info(f"Block merging freed {after_free - before_free} blocks")  
+            
+#         except Exception as e:  
+#             # Rollback all req_to_blocks mappings  
+#             logger.error(f"Block merging failed, rolling back: {e}")  
+#             for req_id, groups_state in original_states.items():  
+#                 for group_idx, original_blocks in groups_state.items():  
+#                     manager = self.kv_cache_manager.coordinator.single_type_managers[group_idx]  
+#                     manager.req_to_blocks[req_id] = original_blocks  
+            
+#             raise e  
+    def _validate_free_queue_integrity(self):  
+        """Validate the free queue linked list is not corrupted."""  
+        queue = self.kv_cache_manager.coordinator.block_pool.free_block_queue  
+        
+        if queue.num_free_blocks == 0:  
+            # Empty queue should have head pointing to tail  
+            if (queue.fake_free_list_head.next_free_block is not queue.fake_free_list_tail or  
+                queue.fake_free_list_tail.prev_free_block is not queue.fake_free_list_head):  
+                raise RuntimeError("Empty free queue has inconsistent pointers")  
+            return  
+        
+        # Walk the list and check for broken links  
+        curr = queue.fake_free_list_head.next_free_block  
+        actual_count = 0  
+        seen_blocks = set()  
+        
+        while curr is not queue.fake_free_list_tail:  
+            if curr is None:  
+                # Found broken link - this is the corruption  
+                # raise RuntimeError(  
+                #     f"Free queue corrupted: found None link at position {actual_count}"  
+                # )  
+                logger.error(  
+                f"Free queue corrupted: found None link at position {actual_count}"  
+            )  
+            elif curr.block_id in seen_blocks:  
+                logger.error(  
+                    f"Free queue corrupted: block {curr.block_id} appears twice"  
+                )  
+            else:
+                seen_blocks.add(curr.block_id)  
+                actual_count += 1  
+                curr = curr.next_free_block  
+            
+        if actual_count != queue.num_free_blocks:  
+            # Log details for debugging  
+            logger.error(  
+                f"Free queue count mismatch: expected {queue.num_free_blocks}, "  
+                f"found {actual_count}. Missing blocks: "  
+            )  
+            # raise RuntimeError(  
+            #     f"Free queue count mismatch: expected {queue.num_free_blocks}, "  
+            #     f"found {actual_count}"  
+            # )
+    
+    def _handle_block_merging_with_counts(  
+        self,   
+        request_blocks: dict[str, dict[int, list[int]]]   ,      
+    ) -> None:  
+        """Apply reference changes using pre-calculated counts."""  
+        if not request_blocks:  
+            return  
+            
+        before_free = self.kv_cache_manager.coordinator.block_pool.get_num_free_blocks()  
+        
+        old_block_ids_cnt = []
+        new_block_ids_cnt = []
+        self._validate_queue_consistency("ll")   
+        # with self.kv_cache_manager.coordinator.block_pool._queue_lock:
+        # try:          
+            # Update block assignments  
+            
+        for req_id, group_blocks in request_blocks.items():  
+            if req_id not in self.requests:  
+                continue
+            if not group_blocks:
+                continue
+
+            # request = self.requests[req_id]
+            # if request.is_finished():
+            #     continue
+            
+            for group_idx, new_block_ids in group_blocks.items():  
+                if group_idx == 0:  
+                    continue  
+                    
+                manager = self.kv_cache_manager.coordinator.single_type_managers[group_idx]  
+                req_blocks = manager.req_to_blocks.get(req_id, [])  
+                # original_states[req_id][group_idx] = req_blocks.copy()  
+                
+                old_block_ids_cnt += list(b.block_id for b in req_blocks if not b.is_null and b.block_id != -1)
+                # Build new block list  
+                new_req_blocks = []  
+                # update_hash = False
+                for  block_id in new_block_ids:    
+                    # if block_id == -1:    
+                    #     new_req_blocks.append(manager.block_pool.null_block)    
+                    # else:    
+                    #     block = self.kv_cache_manager.coordinator.block_pool.blocks[block_id]    
+                    #     if block.is_null:    
+                    #         raise ValueError(f"Cannot map to null block {block_id}")    
+                    block = self.kv_cache_manager.coordinator.block_pool.blocks[block_id]    
+                    new_req_blocks.append(block)
+                    # if block._block_hash is not None:  
+                    #     update_hash = True                     
+
+                    # req_blocks[i] = block                        
+                manager.req_to_blocks.update({req_id: new_req_blocks}) #new_req_blocks
+                # if update_hash:    
+                #         # Use new_req_blocks, not req_blocks  
+                #             num_cached = sum(1 for b in new_req_blocks if b._block_hash is not None)    
+                #             manager.num_cached_block[req_id] = num_cached
+                # self.kv_cache_manager.coordinator.single_type_managers[group_idx].req_to_blocks[req_id] = new_req_blocks
+                new_block_ids_cnt+= list(b.block_id for b in new_req_blocks if not b.is_null and b.block_id != -1)
+                
+        
+        # Apply reference count changes 
+        old_cnt = Counter(old_block_ids_cnt)
+        new_cnt = Counter(new_block_ids_cnt)
+
+        block_ref_changes = {}
+        all_keys = set(old_cnt.keys()).union(set(new_cnt.keys()))
+
+        for key in all_keys:
+            block_ref_changes[key] = new_cnt[key] - old_cnt[key]
+
+        blocks_to_touch = []  
+        blocks_to_free = []  
+        
+        for block_id, ref_change in block_ref_changes.items():  
+            if ref_change > 0:  
+                # Touch block ref_change times  
+                block = self.kv_cache_manager.coordinator.block_pool.blocks[block_id]  
+                # if block_id == -1:  
+                #     continue
+                # if (block.ref_cnt == 0 and not block.is_null 
+                #             ):    
+                #             self.kv_cache_manager.coordinator.block_pool.free_block_queue.remove(block) 
+                blocks_to_touch.extend([block] * ref_change)  
+                # for _ in range(ref_change):  
+                #     blocks_to_touch.append(block)  
+                # block.ref_cnt += ref_change
+            elif ref_change < 0:  
+                # Free block |ref_change| times  
+                block = self.kv_cache_manager.coordinator.block_pool.blocks[block_id]  
+                # if block.block_id == -1:  
+                #     continue
+                if (block.prev_free_block is not None):  
+                    # Block is already in free queue, don't free again  
+                        logger.warning(f"Block {block_id} already in free queue, skipping free")  
+                        continue  
+
+                blocks_to_free.extend([block] * abs(ref_change)) 
+                # block.ref_cnt += ref_change  # Subtract references  
+                # if block.ref_cnt < 0:  
+                #     raise ValueError(f"Block {block_id} has negative ref_cnt: {block.ref_cnt}")  
+                # if block.ref_cnt == 0 and not block.is_null: 
+
+                #     if (block.prev_free_block is not None and   
+                #     block.next_free_block is not None):  
+                #     # Block is already in free queue, don't free again  
+                #         logger.warning(f"Block {block_id} already in free queue, skipping free")  
+                #         continue  
+                # #     # block.ref_cnt = 1
+                # #     # self.kv_cache_manager.coordinator.block_pool.free_block_queue.append_n([block])  
+                    # blocks_to_free.append(block)  
+        
+        # Apply pool operations  
+        if blocks_to_touch:  
+            self.kv_cache_manager.coordinator.block_pool.touch((blocks_to_touch,))  
+        if blocks_to_free:
+            # for block in blocks_to_free:  
+            #     if (block.prev_free_block is not None or   
+            #         block.next_free_block is not None):  
+            #         raise RuntimeError(f"Block {block.block_id} already in free queue")  
+                
+            blocks_to_free.reverse()  
+            # self.kv_cache_manager.coordinator.block_pool.free_block_queue.append_n(blocks_to_free)  
+            
+            self.kv_cache_manager.coordinator.block_pool.free_blocks(blocks_to_free) 
+
+        # Validate queue after operations 
+        self._validate_queue_consistency("l1l") 
+        # self._validate_free_queue_integrity()
+        
+        after_free = self.kv_cache_manager.coordinator.block_pool.get_num_free_blocks()  
+        logger.info(f"Block merging freed {after_free - before_free} blocks")  
+        
+        # except Exception as e:  
+        #     # Rollback  
+        #     logger.error(f"Block merging failed, rolling back: {e}")  
+        #     for req_id, groups_state in original_states.items():  
+        #         for group_idx, original_blocks in groups_state.items():  
+        #             manager = self.kv_cache_manager.coordinator.single_type_managers[group_idx]  
+        #             manager.req_to_blocks[req_id] = original_blocks  
+        #     raise e
+
+    # def _handle_block_merging_with_counts(  
+    #     self,   
+    #     request_blocks: dict[str, dict[int, list[int]]],      
+    #     req_id,
+    #     old_block_ids_cnt,
+    #     new_block_ids_cnt
+    # ) -> None:  
+    #     """Apply reference changes using pre-calculated counts."""  
+    #     if not request_blocks:  
+    #         return  
+            
+        
+        
+        
+    #     # old_block_ids_cnt = []
+    #     # new_block_ids_cnt = []
+    #     self._validate_queue_consistency("ll")   
+    #     # with self.kv_cache_manager.coordinator.block_pool._queue_lock:
+    #     # try:  
+    #         # Update block assignments
+
+    #     if req_id not in request_blocks.keys():  
+    #         return
+    #     # for req_id, group_blocks in request_blocks.items():  
+    #     #     if req_id not in self.requests:  
+    #     #         continue
+        
+    #     group_blocks = request_blocks[req_id]
+    #     if not group_blocks:
+    #         return
+            
+    #     for group_idx, new_block_ids in group_blocks.items():  
+    #         if group_idx == 0:  
+    #             continue  
+                
+    #         manager = self.kv_cache_manager.coordinator.single_type_managers[group_idx]  
+    #         req_blocks = manager.req_to_blocks.get(req_id, [])  
+    #         # original_states[req_id][group_idx] = req_blocks.copy()  
+            
+    #         old_block_ids_cnt += list(set(b.block_id for b in req_blocks if not b.is_null and b.block_id != -1))
+    #         # Build new block list  
+    #         new_req_blocks = []  
+    #         for block_id in new_block_ids:    
+    #             if block_id == -1:    
+    #                 new_req_blocks.append(manager.block_pool.null_block)    
+    #             else:    
+    #                 block = self.kv_cache_manager.coordinator.block_pool.blocks[block_id]    
+    #                 if block.is_null:    
+    #                     raise ValueError(f"Cannot map to null block {block_id}")    
+    #                 new_req_blocks.append(block)
+                    
+    #         # manager.req_to_blocks[req_id] = new_req_blocks
+    #         self.kv_cache_manager.coordinator.single_type_managers[group_idx].req_to_blocks[req_id] = new_req_blocks
+    #         new_block_ids_cnt+= list(set(b.block_id for b in new_req_blocks if not b.is_null and b.block_id != -1))
+            
+    
+       
+        
+    #     # except Exception as e:  
+    #     #     # Rollback  
+    #     #     logger.error(f"Block merging failed, rolling back: {e}")  
+    #     #     for req_id, groups_state in original_states.items():  
+    #     #         for group_idx, original_blocks in groups_state.items():  
+    #     #             manager = self.kv_cache_manager.coordinator.single_type_managers[group_idx]  
+    #     #             manager.req_to_blocks[req_id] = original_blocks  
+    #     #     raise e
+
+    def _handle_counts(self, old_block_ids_cnt, new_block_ids_cnt):
+         # Apply reference count changes 
+        if not new_block_ids_cnt:
+            return
+        before_free = self.kv_cache_manager.coordinator.block_pool.get_num_free_blocks()  
+        old_cnt = Counter(old_block_ids_cnt)
+        new_cnt = Counter(new_block_ids_cnt)
+
+        block_ref_changes = {}
+        all_keys = set(old_cnt.keys()).union(set(new_cnt.keys()))
+
+        for key in all_keys:
+            block_ref_changes[key] = new_cnt[key] - old_cnt[key]
+
+        blocks_to_touch = []  
+        blocks_to_free = []  
+        
+        for block_id, ref_change in block_ref_changes.items():  
+            if ref_change > 0:  
+                # Touch block ref_change times  
+                block = self.kv_cache_manager.coordinator.block_pool.blocks[block_id]  
+                if block_id == -1:  
+                    continue
+                # if (block.ref_cnt == 0 and not block.is_null 
+                #             ):    
+                #             self.kv_cache_manager.coordinator.block_pool.free_block_queue.remove(block) 
+                blocks_to_touch.extend([block] * ref_change)  
+                # for _ in range(ref_change):  
+                #     blocks_to_touch.append(block)  
+                # block.ref_cnt += ref_change
+            elif ref_change < 0:  
+                # Free block |ref_change| times  
+                block = self.kv_cache_manager.coordinator.block_pool.blocks[block_id]  
+                if block.block_id == -1:  
+                    continue
+                if (block.prev_free_block is not None and   
+                    block.next_free_block is not None):  
+                    # Block is already in free queue, don't free again  
+                        logger.warning(f"Block {block_id} already in free queue, skipping free")  
+                        continue  
+
+                blocks_to_free.extend([block] * abs(ref_change)) 
+                # block.ref_cnt += ref_change  # Subtract references  
+                # if block.ref_cnt < 0:  
+                #     raise ValueError(f"Block {block_id} has negative ref_cnt: {block.ref_cnt}")  
+                # if block.ref_cnt == 0 and not block.is_null: 
+
+                #     if (block.prev_free_block is not None and   
+                #     block.next_free_block is not None):  
+                #     # Block is already in free queue, don't free again  
+                #         logger.warning(f"Block {block_id} already in free queue, skipping free")  
+                #         continue  
+                # #     # block.ref_cnt = 1
+                # #     # self.kv_cache_manager.coordinator.block_pool.free_block_queue.append_n([block])  
+                    # blocks_to_free.append(block)  
+        
+        # Apply pool operations  
+        if blocks_to_touch:  
+            self.kv_cache_manager.coordinator.block_pool.touch((blocks_to_touch,))  
+        if blocks_to_free:
+            # for block in blocks_to_free:  
+            #     if (block.prev_free_block is not None or   
+            #         block.next_free_block is not None):  
+            #         raise RuntimeError(f"Block {block.block_id} already in free queue")  
+                
+            blocks_to_free.reverse()  
+            # self.kv_cache_manager.coordinator.block_pool.free_block_queue.append_n(blocks_to_free)  
+            
+            self.kv_cache_manager.coordinator.block_pool.free_blocks(blocks_to_free) 
+
+        # Validate queue after operations 
+        self._validate_queue_consistency("l1l") 
+        # self._validate_free_queue_integrity()
+        
+        after_free = self.kv_cache_manager.coordinator.block_pool.get_num_free_blocks()  
+        logger.info(f"Block merging freed {after_free - before_free} blocks")  
+    
+
+    def _validate_block_merge_mapping(  
+        self,  
+        block_merge_mapping: dict[str, dict[int, dict[int, int]]]  
+    ) -> None:  
+        """Validate the block merge mapping is consistent."""  
+        for req_id, group_mappings in block_merge_mapping.items():  
+            if req_id not in self.requests:  
+                continue  
+                
+            for group_idx, mappings in group_mappings.items():  
+                if group_idx >= self.kv_cache_manager.num_kv_cache_groups:  
+                    raise ValueError(f"Invalid group_idx {group_idx}")  
+                    
+                manager = self.kv_cache_manager.coordinator.single_type_managers[group_idx]  
+                req_blocks = manager.req_to_blocks.get(req_id, [])  
+                req_block_ids = {b.block_id for b in req_blocks if not b.is_null}  
+                
+                for old_block_id, new_block_id in mappings.items():  
+                    if old_block_id not in req_block_ids:  
+                        logger.warning(  
+                            f"Block {old_block_id} not found in request {req_id} group {group_idx}"  
+                        )  
+                    
+                    # Validate new block ID range  
+                    if new_block_id < 0 or new_block_id >= len(self.kv_cache_manager.coordinator.block_pool.blocks):  
+                        raise ValueError(f"Invalid new_block_id {new_block_id} in mapping")
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
@@ -783,6 +1359,31 @@ class Scheduler(SchedulerInterface):
         blocks_to_free = model_runner_output.blocks_to_free  
 
         block_merge_mapping = model_runner_output.updated_block_table  # Your similarity merging creates this  
+        # old_block_ids_cnt = []
+        # new_block_ids_cnt = []
+        if block_merge_mapping:
+            # for req_id in block_merge_mapping.keys():
+            #     stopped = False
+            #     request = self.requests[req_id]  
+            #     req_index = model_runner_output.req_id_to_index[req_id]
+            #     generated_token_ids = sampled_token_ids[
+            #     req_index] if sampled_token_ids else []
+            #     new_token_ids = generated_token_ids
+            #     if new_token_ids:
+            #         new_token_ids, stopped = self._update_request_with_output(
+            #         request, new_token_ids)
+            #     pooler_output = None
+            #     if pooler_outputs:
+            #         pooler_output = pooler_outputs[req_index]
+            #         stopped = check_stop(request, self.max_model_len,
+            #                          pooler_output)
+            #     if stopped:
+            #         block_merge_mapping.pop(req_id)
+
+               # Check which requests will be stopped BEFORE updating block tables  
+            
+            self._handle_block_merging_with_counts(block_merge_mapping)
+
         if False:
             before_free = self.kv_cache_manager.coordinator.block_pool.get_num_free_blocks()  
             blocks_already_freed = set()
@@ -820,17 +1421,21 @@ class Scheduler(SchedulerInterface):
                 
             blocks_to_free_objs = []    
             blocks_already_freed = set()  
-            for req_id, request in self.requests.items():  
+            for req_id, request in self.requests.items(): 
+                if req_id not in block_merge_mapping.keys():  
+                    continue
                 for group_idx in range(1, self.kv_cache_manager.num_kv_cache_groups):  
+                    if group_idx not in block_merge_mapping[req_id]:  
+                        continue
                     manager = self.kv_cache_manager.coordinator.single_type_managers[group_idx]  
                     req_blocks = manager.req_to_blocks.get(req_id, [])  
                     
                     # Track which blocks to remove  
                     blocks_to_remove_indices = []  
                     
-                    for i, block in enumerate(req_blocks):  
-                        if block.block_id in block_merge_mapping[req_id][group_idx-1].keys():  
-                            new_block_id = block_merge_mapping[req_id][group_idx-1][block.block_id]  
+                    for i, block in enumerate(set(req_blocks)):  
+                        if block.block_id in block_merge_mapping[req_id][group_idx].keys():  
+                            new_block_id = block_merge_mapping[req_id][group_idx][block.block_id]  
                             new_block = self.kv_cache_manager.coordinator.block_pool.blocks[new_block_id]  
                             
                             # Handle new block  
@@ -857,27 +1462,44 @@ class Scheduler(SchedulerInterface):
                         # Recalculate the number of cached blocks  
                         num_cached = sum(1 for b in req_blocks if b._block_hash is not None)  
                         manager.num_cached_block[req_id] = num_cached
+            
+             # Free all old blocks at once  
+            if blocks_to_free_objs:  
+                blocks_to_free_objs.reverse()  # Free in reverse order for proper eviction  
+                self.kv_cache_manager.coordinator.block_pool.free_blocks(blocks_to_free_objs)  
+                
+                after_free = self.kv_cache_manager.coordinator.block_pool.get_num_free_blocks()  
+                logger.info(f"Block merging freed {after_free - before_free} blocks")  
+            
+            self._validate_queue_consistency("line 945")          
 
-        # if block_merge_mapping:  
+        if False:  
             assert self.kv_cache_manager.coordinator.block_pool.free_block_queue.fake_free_list_head.next_free_block is not None  
             before_free = self.kv_cache_manager.coordinator.block_pool.get_num_free_blocks()  
             
             blocks_to_free_objs = []  
-            blocks_already_processed = set()  # Track blocks we've already handled  
+            
             blocks_removed_from_queue = set()  # Track blocks removed from free queue  
             
             self._validate_queue_consistency("line 867")  
             
             for req_id, group_mappings in block_merge_mapping.items():  
                 if req_id not in self.requests:  
-                    continue  
+                    continue 
+
+                blocks_already_processed = set()  # Track blocks we've already handled   
                 
-                for group_idx in range(1, self.kv_cache_manager.num_kv_cache_groups):  
+                for group_idx in range(1, self.kv_cache_manager.num_kv_cache_groups): 
+                    if group_idx not in group_mappings:  
+                        continue   
                     manager = self.kv_cache_manager.coordinator.single_type_managers[group_idx]  
                     req_blocks = manager.req_to_blocks.get(req_id, [])  
                     
                     new_req_blocks = []  
-                    for block in req_blocks:  
+                    for block in req_blocks:
+                        if block.is_null or block.block_id == -1:  
+                            new_req_blocks.append(block)  
+                            continue    
                         if block.block_id in group_mappings[group_idx]:  
                             new_block_id = group_mappings[group_idx][block.block_id]  
                             new_block = self.kv_cache_manager.coordinator.block_pool.blocks[new_block_id]  
@@ -890,15 +1512,16 @@ class Scheduler(SchedulerInterface):
                                     self.kv_cache_manager.coordinator.block_pool.free_block_queue.remove(new_block)  
                                     blocks_removed_from_queue.add(new_block.block_id)  
                             # Increment ref_cnt for the new block  
-                            new_block.ref_cnt += 1  
-                                # blocks_already_processed.add(new_block.block_id)  
+                            if new_block.block_id not in blocks_already_processed:
+                                new_block.ref_cnt += 1  
+                                blocks_already_processed.add(new_block.block_id)  
                             
                             # Handle the OLD block (being replaced)  
-                            # if block.block_id not in blocks_already_processed:  
-                            # if block.ref_cnt > 1:  
-                            #     block.ref_cnt -= 1
-                            if block.ref_cnt == 1:
-                                blocks_to_free_objs.append(block)  
+                            if block.block_id not in blocks_already_processed:  
+                                if block.ref_cnt > 1:  
+                                    block.ref_cnt -= 1
+                                elif block.ref_cnt == 1:
+                                    blocks_to_free_objs.append(block)  
                                 blocks_already_processed.add(block.block_id)  
                             
                             new_req_blocks.append(new_block)  
@@ -1024,9 +1647,7 @@ class Scheduler(SchedulerInterface):
         if False: ##  
             assert self.kv_cache_manager.coordinator.block_pool.free_block_queue.fake_free_list_head.next_free_block is not None      
             before_free = self.kv_cache_manager.coordinator.block_pool.get_num_free_blocks()     
-            
-            blocks_to_free_objs = []      
-            blocks_already_freed = set()  # Tracks blocks already added to free list  
+           
             # blocks_already_incremented = set()  # NEW: Track blocks whose ref_cnt we've incremented  
         
             self._validate_queue_consistency("line 867")  
@@ -1034,7 +1655,10 @@ class Scheduler(SchedulerInterface):
             for req_id, group_mappings in block_merge_mapping.items():  
                 if req_id not in self.requests:  
                     continue  
-                    
+
+                blocks_to_free_all = {}      
+                blocks_to_touch_all = {}  # NEW: Track blocks to touch    
+
                 for group_idx in range(1, self.kv_cache_manager.num_kv_cache_groups):  
                     if group_idx not in group_mappings:  
                         continue  
@@ -1043,11 +1667,11 @@ class Scheduler(SchedulerInterface):
                     req_blocks = manager.req_to_blocks.get(req_id, [])  
                     
                     # Track all old blocks before updating  
-                    old_block_ids = {block.block_id for block in req_blocks   
+                    current_block_ids = {block.block_id for block in req_blocks   
                                     if not block.is_null and block.block_id != -1}  
                     
                     new_req_blocks = []  
-                    new_block_ids = set()  
+                    # new_block_ids = set()  
                     
                     for block in req_blocks:  
                         if block.is_null or block.block_id == -1:  
@@ -1058,54 +1682,72 @@ class Scheduler(SchedulerInterface):
                             new_block_id = group_mappings[group_idx][block.block_id]  
                             new_block = self.kv_cache_manager.coordinator.block_pool.blocks[new_block_id]  
                             new_req_blocks.append(new_block)  
-                            new_block_ids.add(new_block_id)  
+                            # new_block_ids.add(new_block_id)  
                             
                             # Remove from free queue if needed  
-                            if new_block.prev_free_block is not None:  
-                                self.kv_cache_manager.coordinator.block_pool.free_block_queue.remove(new_block)  
-                            new_block.ref_cnt += 1  
+                            # if new_block.prev_free_block is not None:  
+                            #     self.kv_cache_manager.coordinator.block_pool.free_block_queue.remove(new_block)  
+                            # new_block.ref_cnt += 1  
+                            if new_block.block_id not in current_block_ids:
+                                blocks_to_touch_all[new_block.block_id] = new_block
+
+                            blocks_to_free_all[block.block_id] = block
+                        
                         else:  
                             new_req_blocks.append(block)  
-                            new_block_ids.add(block.block_id)  
+                            # new_block_ids.add(block.block_id)  
                     
                     # Update the request's block list  
-                    manager.req_to_blocks[req_id] = new_req_blocks  
+                    manager.req_to_blocks[req_id] = new_req_blocks
+
+                if blocks_to_touch_all:    
+                    self.kv_cache_manager.coordinator.block_pool.touch((list(blocks_to_touch_all.values()),)) 
+                if blocks_to_free_all:    
+                        # Consider reversing if blocks are from same request chain  
+                    blocks_to_free_objs = list(blocks_to_free_all.values())
+                        # blocks_to_free_objs.reverse()    
+                    self.kv_cache_manager.coordinator.block_pool.free_blocks(blocks_to_free_objs) 
                     
                     # Free blocks that are no longer referenced  
-                    blocks_to_check = old_block_ids - new_block_ids  
-                    for block_id in blocks_to_check:  
-                        block = self.kv_cache_manager.coordinator.block_pool.blocks[block_id]  
-                        if block.ref_cnt > 1:  
-                            block.ref_cnt -= 1  
-                        elif block.ref_cnt == 1:  
-                            blocks_to_free_objs.append(block)
+                    # blocks_to_check = old_block_ids - new_block_ids  
+                    # for block_id in blocks_to_check:  
+                    #     block = self.kv_cache_manager.coordinator.block_pool.blocks[block_id]  
+                    #     if block.ref_cnt > 1:  
+                    #         block.ref_cnt -= 1  
+                    #     elif block.ref_cnt == 1:  
+                    #         blocks_to_free_objs.append(block)
                         
+            
+              
+
             # Free all blocks at once      
-            if blocks_to_free_objs:    
-                # Consider reversing if blocks are from same request chain  
-                # blocks_to_free_objs.reverse()    
-                self.kv_cache_manager.coordinator.block_pool.free_blocks(blocks_to_free_objs)    
+               
                 
                 after_free = self.kv_cache_manager.coordinator.block_pool.get_num_free_blocks()      
                 logger.info(f"Block merging freed {after_free - before_free} blocks")  
             
             self._validate_queue_consistency("line 945")
 
-        if block_merge_mapping:    
-            assert self.kv_cache_manager.coordinator.block_pool.free_block_queue.fake_free_list_head.next_free_block is not None        
-            before_free = self.kv_cache_manager.coordinator.block_pool.get_num_free_blocks()       
+        if False:    
+            assert self.kv_cache_manager.coordinator.block_pool.free_block_queue.fake_free_list_head.next_free_block is not None          
+            before_free = self.kv_cache_manager.coordinator.block_pool.get_num_free_blocks()         
             
-            blocks_to_free_objs = []        
-            blocks_already_freed = set()    
+            blocks_to_free_objs = []         
             
-            self._validate_queue_consistency("line 867")    
+            # Track all blocks that will lose references across ALL requests  
+            blocks_losing_refs = {}  # block_id -> count of how many requests stop using it  
             
-            for req_id, group_mappings in block_merge_mapping.items():    
-                if req_id not in self.requests:    
+            for req_id, group_mappings in block_merge_mapping.items():  
+                if req_id not in self.requests:      
                     continue  
                 
-                # Check if this request is about to finish  
                 request = self.requests[req_id]  
+                
+                # Skip preempted requests  
+                if request.status == RequestStatus.PREEMPTED:    
+                    continue  
+                
+                # Skip stopping requests (as before)  
                 is_stopping = False  
                 
                 # Determine if request will stop after this batch  
@@ -1121,24 +1763,295 @@ class Scheduler(SchedulerInterface):
                             is_stopping = True  
                         elif request.num_tokens >= self.max_model_len:  
                             is_stopping = True  
-                
-                # Skip processing for stopping requests  
-                if is_stopping:  
+                            
+                if is_stopping:    
                     continue  
                     
+                for group_idx in range(1, self.kv_cache_manager.num_kv_cache_groups):  
+                    if group_idx not in group_mappings:      
+                        continue  
+                        
+                    manager = self.kv_cache_manager.coordinator.single_type_managers[group_idx]      
+                    req_blocks = manager.req_to_blocks.get(req_id, [])      
+                    
+                    new_req_blocks = []      
+                    unique_blocks_for_req = set()  
+                    
+                    for block in req_blocks:      
+                        if block.is_null or block.block_id == -1:      
+                            new_req_blocks.append(block)      
+                            continue  
+                            
+                        if block.block_id in group_mappings[group_idx]:      
+                            new_block_id = group_mappings[group_idx][block.block_id]      
+                            new_block = self.kv_cache_manager.coordinator.block_pool.blocks[new_block_id]      
+                            new_req_blocks.append(new_block)      
+                            
+                            # Increment ref_cnt for new blocks (once per request)  
+                            if new_block.block_id not in unique_blocks_for_req:  
+                                if new_block.prev_free_block is not None:      
+                                    self.kv_cache_manager.coordinator.block_pool.free_block_queue.remove(new_block)      
+                                new_block.ref_cnt += 1      
+                                unique_blocks_for_req.add(new_block.block_id)  
+                            
+                            # Track old blocks that will lose this request's reference  
+                            if block.block_id not in unique_blocks_for_req:  
+                                blocks_losing_refs[block.block_id] = blocks_losing_refs.get(block.block_id, 0) + 1  
+                                unique_blocks_for_req.add(block.block_id)  
+                        else:      
+                            new_req_blocks.append(block)      
+                    
+                    manager.req_to_blocks[req_id] = new_req_blocks      
+            
+            # Now free blocks that lost ALL their references  
+            for block_id, lost_refs in blocks_losing_refs.items():  
+                # Only free if this block was actually referenced by the requests being processed  
+                # AND we're tracking it as losing references  
+                block = self.kv_cache_manager.coordinator.block_pool.blocks[block_id]  
+                blocks_to_free_objs.append(block)  
+            
+            # Free all blocks at once          
+            if blocks_to_free_objs:        
+                self.kv_cache_manager.coordinator.block_pool.free_blocks(blocks_to_free_objs)        
+                
+                after_free = self.kv_cache_manager.coordinator.block_pool.get_num_free_blocks()          
+                logger.info(f"Block merging freed {after_free - before_free} blocks")
+
+        if False:  
+            before_free = self.kv_cache_manager.coordinator.block_pool.get_num_free_blocks()  
+            
+            # Track blocks to touch and blocks that might need freeing  
+            blocks_to_touch_all = []  
+            blocks_to_free_all = []  
+            
+            for req_id, group_mappings in  block_merge_mapping.items():  
+                if req_id not in self.requests:  
+                    continue
+               
+                blocks_to_touch = {}
+                blocks_to_free = {} 
+                    
+                request = self.requests[req_id]  
+
+                # Skip preempted requests  
+                if request.status == RequestStatus.PREEMPTED:    
+                    continue  
+                
+                # Skip stopping requests (as before)  
+                is_stopping = False  
+                
+                # Determine if request will stop after this batch  
+                if hasattr(request, 'output_token_ids') and request.output_token_ids:  
+                    last_token_id = request.output_token_ids[-1]  
+                    sampling_params = request.sampling_params  
+                    if sampling_params:  
+                        if not sampling_params.ignore_eos and last_token_id == request.eos_token_id:  
+                            is_stopping = True  
+                        elif last_token_id in (sampling_params.stop_token_ids or ()):  
+                            is_stopping = True  
+                        elif request.num_output_tokens >= request.max_tokens:  
+                            is_stopping = True  
+                        elif request.num_tokens >= self.max_model_len:  
+                            is_stopping = True  
+                            
+                if is_stopping:    
+                    continue   
+                
+                
+
+                for group_idx in range(1, self.kv_cache_manager.num_kv_cache_groups):  
+                    if group_idx not in group_mappings:  
+                        continue  
+                        
+                    manager = self.kv_cache_manager.coordinator.single_type_managers[group_idx]  
+                    req_blocks = manager.req_to_blocks.get(req_id, [])  
+                    current_block_ids = {block.block_id for block in req_blocks}  
+
+                    new_req_blocks = []  
+                    # old_blocks_used = set()  
+                    
+                    for block in req_blocks:  
+                        if block.is_null or block.block_id == -1:  
+                            new_req_blocks.append(block)  
+                            continue  
+                            
+                        if block.block_id in group_mappings[group_idx]:  
+                            new_block_id = group_mappings[group_idx][block.block_id]  
+                            new_block = self.kv_cache_manager.coordinator.block_pool.blocks[new_block_id]  
+                            new_req_blocks.append(new_block) 
+
+                            
+                            # Track new blocks to touch 
+                            if new_block.block_id not in current_block_ids: 
+                                blocks_to_touch[new_block_id]=new_block  
+                            
+                            blocks_to_free[block.block_id]=block
+                            
+                        else:  
+                            new_req_blocks.append(block)  
+                    
+                    manager.req_to_blocks[req_id] = new_req_blocks
+
+                blocks_to_touch_all += list(blocks_to_touch.values())  #[b for b in blocks_to_touch]
+                blocks_to_free_all +=  list(blocks_to_free.values()) #list(b for b in blocks_to_free.values() if b) #[b for b in blocks_to_free]
+            
+            # Touch all new blocks at once (more efficient)  
+            if blocks_to_touch_all:  
+                self.kv_cache_manager.coordinator.block_pool.touch((blocks_to_touch_all,))  
+          
+            # Free blocks through the block pool (handles ref_cnt properly)  
+            if blocks_to_free_all:
+                final_free = []
+                for b in blocks_to_free_all:
+                    if b.ref_cnt < 1 or b.is_null:
+                        continue
+                    if b in blocks_to_touch_all:
+                        continue
+
+                    final_free.append(b)   
+
+                if not all(b.ref_cnt ==1 for b in final_free):
+                    logger.error("Blocks to free have ref_cnt > 1") 
+                self.kv_cache_manager.coordinator.block_pool.free_blocks(final_free)  
+                
+                after_free = self.kv_cache_manager.coordinator.block_pool.get_num_free_blocks()  
+                logger.info(f"Block merging freed {after_free - before_free} blocks")        
+        
+        if False:    
+            before_free = self.kv_cache_manager.coordinator.block_pool.get_num_free_blocks()    
+            
+            # Use dicts to track unique blocks by block_id  
+            blocks_to_touch_all = {}  # {block_id: KVCacheBlock}  
+            blocks_to_free_all = {}   # {block_id: KVCacheBlock}  
+            
+            for req_id, group_mappings in block_merge_mapping.items():    
+                if req_id not in self.requests:    
+                    continue  
+                
+                request = self.requests[req_id]    
+        
+                # Skip preempted or stopping requests  
+                if request.status == RequestStatus.PREEMPTED:  
+                    continue  
+                    
+                is_stopping = False  
+                if hasattr(request, 'output_token_ids') and request.output_token_ids:  
+                    last_token_id = request.output_token_ids[-1]  
+                    sampling_params = request.sampling_params  
+                    if sampling_params:  
+                        if not sampling_params.ignore_eos and last_token_id == request.eos_token_id:  
+                            is_stopping = True  
+                        elif last_token_id in (sampling_params.stop_token_ids or ()):  
+                            is_stopping = True  
+                        elif request.num_output_tokens >= request.max_tokens:  
+                            is_stopping = True  
+                        elif request.num_tokens >= self.max_model_len:  
+                            is_stopping = True  
+                            
+                if is_stopping:  
+                    continue     
+                
                 for group_idx in range(1, self.kv_cache_manager.num_kv_cache_groups):    
                     if group_idx not in group_mappings:    
                         continue    
                         
                     manager = self.kv_cache_manager.coordinator.single_type_managers[group_idx]    
                     req_blocks = manager.req_to_blocks.get(req_id, [])    
-                    
-                    # Track all old blocks before updating    
-                    old_block_ids = {block.block_id for block in req_blocks     
-                                    if not block.is_null and block.block_id != -1}    
-                    
+                    current_block_ids = {block.block_id for block in req_blocks}    
+        
                     new_req_blocks = []    
-                    new_block_ids = set()    
+                    
+                    for block in req_blocks:    
+                        if block.is_null or block.block_id == -1:    
+                            new_req_blocks.append(block)    
+                            continue    
+                            
+                        if block.block_id in group_mappings[group_idx]:    
+                            new_block_id = group_mappings[group_idx][block.block_id]    
+                            new_block = self.kv_cache_manager.coordinator.block_pool.blocks[new_block_id]    
+                            new_req_blocks.append(new_block)    
+        
+                            # Track new blocks to touch (only if not already in request)    
+                            if new_block.block_id not in current_block_ids:    
+                                blocks_to_touch_all[new_block.block_id] = new_block    
+                            
+                            # ALWAYS track old blocks for freeing when they're replaced  
+                            blocks_to_free_all[block.block_id] = block  
+                            
+                        else:    
+                            new_req_blocks.append(block)    
+                    
+                    manager.req_to_blocks[req_id] = new_req_blocks  
+            
+            # Touch all new blocks at once    
+            if blocks_to_touch_all:    
+                self.kv_cache_manager.coordinator.block_pool.touch((list(blocks_to_touch_all.values()),))    
+            
+            # Free blocks through the block pool    
+            if blocks_to_free_all:  
+                # Convert to list and filter out blocks that were just touched  
+                final_free = [b for b in blocks_to_free_all.values()   
+                            if b.block_id not in blocks_to_touch_all]  
+                
+                # Additional safety check: only free blocks with ref_cnt > 0  
+                final_free = [b for b in final_free if b.ref_cnt > 0 and not b.is_null]  
+                
+                if final_free:  
+                    self.kv_cache_manager.coordinator.block_pool.free_blocks(final_free)    
+                    
+                    after_free = self.kv_cache_manager.coordinator.block_pool.get_num_free_blocks()    
+                    logger.info(f"Block merging freed {after_free - before_free} blocks")
+       
+        if False:    
+            before_free = self.kv_cache_manager.coordinator.block_pool.get_num_free_blocks()    
+            
+            blocks_to_touch_all = {}  # {block_id: KVCacheBlock}  
+            blocks_to_free_all = {}   # {block_id: KVCacheBlock}  
+            
+            for req_id, group_mappings in block_merge_mapping.items():    
+                if req_id not in self.requests:    
+                    continue  
+                
+                request = self.requests[req_id]    
+        
+                # Skip all special request states  
+                if request.status in [  
+                    RequestStatus.PREEMPTED,  
+                    RequestStatus.FINISHED_ABORTED,  
+                    # RequestStatus.WAITING_FOR_REMOTE_KV  
+                ]:  
+                    continue  
+                    
+                is_stopping = False  
+                if hasattr(request, 'output_token_ids') and request.output_token_ids:  
+                    last_token_id = request.output_token_ids[-1]  
+                    sampling_params = request.sampling_params  
+                    if sampling_params:  
+                        if not sampling_params.ignore_eos and last_token_id == request.eos_token_id:  
+                            is_stopping = True  
+                        elif last_token_id in (sampling_params.stop_token_ids or ()):  
+                            is_stopping = True  
+                        elif request.num_output_tokens >= request.max_tokens:  
+                            is_stopping = True  
+                        elif request.num_tokens >= self.max_model_len:  
+                            is_stopping = True  
+                            
+                            
+                if is_stopping:  
+                    continue     
+                
+                # Track ALL block IDs in the final list for this request  
+                final_block_ids = set()  
+                
+                for group_idx in range(1, self.kv_cache_manager.num_kv_cache_groups):    
+                    if group_idx not in group_mappings:    
+                        continue    
+                        
+                    manager = self.kv_cache_manager.coordinator.single_type_managers[group_idx]    
+                    req_blocks = manager.req_to_blocks.get(req_id, [])    
+                    current_block_ids = {block.block_id for block in req_blocks}    
+        
+                    new_req_blocks = []    
                     
                     for block in req_blocks:    
                         if block.is_null or block.block_id == -1:    
@@ -1149,103 +2062,120 @@ class Scheduler(SchedulerInterface):
                             new_block_id = group_mappings[group_idx][block.block_id]    
                             new_block = self.kv_cache_manager.coordinator.block_pool.blocks[new_block_id]    
                             new_req_blocks.append(new_block)    
-                            new_block_ids.add(new_block_id)    
+        
+                            # Track new blocks to touch (only if not already in request)    
+                            if new_block_id not in current_block_ids:    
+                                blocks_to_touch_all[new_block_id] = new_block    
                             
-                            # Remove from free queue if needed    
-                            if new_block.prev_free_block is not None:    
-                                self.kv_cache_manager.coordinator.block_pool.free_block_queue.remove(new_block)    
-                            new_block.ref_cnt += 1    
+                            # Track old blocks for potential freeing  
+                            blocks_to_free_all[block.block_id] = block  
+                            
+                        else:    
+                            new_req_blocks.append(block)  
+                    
+                    # Collect all block IDs that remain in the final list  
+                    for block in new_req_blocks:  
+                        if not block.is_null and block.block_id != -1:  
+                            final_block_ids.add(block.block_id)  
+                    
+                    manager.req_to_blocks[req_id] = new_req_blocks  
+                
+                # Remove blocks that are still in the final list from freeing  
+                blocks_to_free_final = {  
+                    block_id: block for block_id, block in blocks_to_free_all.items()  
+                    if block_id not in final_block_ids  
+                }  
+            
+            # Touch all new blocks at once    
+            if blocks_to_touch_all:    
+                self.kv_cache_manager.coordinator.block_pool.touch((list(blocks_to_touch_all.values()),))    
+            
+            # Free blocks through the block pool    
+            if blocks_to_free_final:  
+                final_free = list(blocks_to_free_final.values())  
+                
+                # Additional safety check: only free blocks with ref_cnt > 0  
+                final_free = [b for b in final_free if b.ref_cnt > 0 and not b.is_null]  
+                
+                if final_free:  
+                    self.kv_cache_manager.coordinator.block_pool.free_blocks(final_free)    
+                    
+                    after_free = self.kv_cache_manager.coordinator.block_pool.get_num_free_blocks()    
+                    logger.info(f"Block merging freed {after_free - before_free} blocks")       
+            ################## end sefi #######
+
+        if False:    
+            assert self.kv_cache_manager.coordinator.block_pool.free_block_queue.fake_free_list_head.next_free_block is not None        
+            before_free = self.kv_cache_manager.coordinator.block_pool.get_num_free_blocks()       
+            
+            self._validate_queue_consistency("line 867")    
+            
+            for req_id, group_mappings in block_merge_mapping.items():    
+                if req_id not in self.requests:    
+                    continue    
+                       
+                
+                for group_idx in range(1, self.kv_cache_manager.num_kv_cache_groups):    
+                    if group_idx not in group_mappings:    
+                        continue
+
+                    blocks_to_free_all = {}        
+                    blocks_to_touch_all = {}      
+                    final_block_ids = set()  # Track blocks that remain in final list      
+                        
+                    manager = self.kv_cache_manager.coordinator.single_type_managers[group_idx]    
+                    req_blocks = manager.req_to_blocks.get(req_id, [])    
+                    
+                    current_block_ids = {block.block_id for block in req_blocks     
+                                    if not block.is_null and block.block_id != -1}    
+                    
+                    new_req_blocks = []    
+                    
+                    for block in req_blocks:    
+                        if block.is_null or block.block_id == -1:    
+                            new_req_blocks.append(block)    
+                            continue    
+                            
+                        if block.block_id in group_mappings[group_idx]:    
+                            new_block_id = group_mappings[group_idx][block.block_id]    
+                            new_block = self.kv_cache_manager.coordinator.block_pool.blocks[new_block_id]    
+                            new_req_blocks.append(new_block)    
+                            
+                            if new_block.block_id not in current_block_ids:  
+                                blocks_to_touch_all[new_block.block_id] = new_block  
+                            
+                            blocks_to_free_all[block.block_id] = block  
+                            
                         else:    
                             new_req_blocks.append(block)    
-                            new_block_ids.add(block.block_id)    
                     
-                    # Update the request's block list    
-                    manager.req_to_blocks[req_id] = new_req_blocks    
+                    # Collect block IDs that remain in this group's final list  
+                    for block in new_req_blocks:  
+                        if not block.is_null and block.block_id != -1:  
+                            final_block_ids.add(block.block_id)  
                     
-                    # Free blocks that are no longer referenced    
-                    blocks_to_check = old_block_ids - new_block_ids    
-                    for block_id in blocks_to_check:    
-                        block = self.kv_cache_manager.coordinator.block_pool.blocks[block_id]    
-                        if block.ref_cnt > 1:    
-                            block.ref_cnt -= 1    
-                        elif block.ref_cnt == 1:    
-                            blocks_to_free_objs.append(block)  
-                            
-            # Free all blocks at once        
-            if blocks_to_free_objs:      
-                self.kv_cache_manager.coordinator.block_pool.free_blocks(blocks_to_free_objs)      
-                
-                after_free = self.kv_cache_manager.coordinator.block_pool.get_num_free_blocks()        
-                logger.info(f"Block merging freed {after_free - before_free} blocks")    
+                    manager.req_to_blocks[req_id] = new_req_blocks  
+                    
+                # Only free blocks that are NOT in the final list  
+                    blocks_to_free_final = {  
+                        block_id: block for block_id, block in blocks_to_free_all.items()  
+                        if block_id not in final_block_ids  
+                    }  
+                    
+                    if blocks_to_touch_all:      
+                        self.kv_cache_manager.coordinator.block_pool.touch((list(blocks_to_touch_all.values()),))   
+                    if blocks_to_free_final:      
+                        blocks_to_free_objs = list(blocks_to_free_final.values())  
+                        self.kv_cache_manager.coordinator.block_pool.free_blocks(blocks_to_free_objs)   
+            
+            after_free = self.kv_cache_manager.coordinator.block_pool.get_num_free_blocks()        
+            logger.info(f"Block merging freed {after_free - before_free} blocks")    
             
             self._validate_queue_consistency("line 945")
-        
-        #                 if block.block_id in blocks_to_free:  
-        #                     # Replace old block with new merged block                              
-        #                     new_block_id = block_merge_mapping[req_id][group_idx-1][i].item()  
-        #                     new_block = self.kv_cache_manager.coordinator.block_pool.blocks[new_block_id]  
-        #                     # block.block_id = new_block_id
-                            
-        #                     # Decrement old block's ref_cnt  
-        #                     self.kv_cache_manager.coordinator.block_pool.blocks[block.block_id].ref_cnt -= 1
-        #                     # block.ref_cnt -= 1  
-                            
-        # #                     # # Increment new block's ref_cnt  
-        #                     if new_block_id in blocks_count.keys():  
-        #                         new_block.ref_cnt = blocks_count[new_block_id]
-        #                     # new_block.ref_cnt += 1  # Set to count or 1 if not in count
-        #                     # new_block.prev_free_block = block.prev_free_block
-        # #                     new_block.next_free_block = block.next_free_block
-                            
-        # #                     # Update the request's block list  
-        #                     req_blocks[i] = new_block  
-            
-        #     blocks_to_free_objs = [  
-        #         self.kv_cache_manager.coordinator.block_pool.blocks[block_id]  
-        #         for block_id in blocks_to_free if self.kv_cache_manager.coordinator.block_pool.blocks[block_id].ref_cnt <= 1 
-        #         ]
-            
-        #     self.kv_cache_manager.coordinator.block_pool.free_blocks(blocks_to_free_objs)
-        
-        # Update ref_cnt based on blocks_count  
-        # if blocks_count:  
-        #     for block_id, count in blocks_count.items():  
-        #         block = self.kv_cache_manager.coordinator.block_pool.blocks[block_id]  
-        #         # if block.ref_cnt == 1:
-        #         block.ref_cnt = count 
-        #         # else:  
-        #         #     block.ref_cnt += count 
-        
-        # # Free blocks  
-        # if blocks_to_free:  
-        #     blocks_to_free_objs = []  
-                
-        #     for block_id in blocks_to_free:
-        #         # if self.kv_cache_manager.coordinator.block_pool.blocks[block_id].ref_cnt <= 1:
-        #         if block_id not in blocks_count.keys(): 
-        #             # self.kv_cache_manager.coordinator.block_pool.blocks[block_id].ref_cnt -= 1                  
-        #             self.kv_cache_manager.coordinator.block_pool.blocks[block_id].ref_cnt = 1
-        #             # if self.kv_cache_manager.coordinator.block_pool.blocks[block_id].ref_cnt <= 1:
-        #             blocks_to_free_objs.append(
-        #                 self.kv_cache_manager.coordinator.block_pool.blocks[block_id]
-        #             )
-        #         else: # block_id in blocks_count.keys():
-        #             # self.kv_cache_manager.coordinator.block_pool.blocks[block_id].ref_cnt = blocks_count[block_id] ### what does it means
-        #             raise RuntimeError("block appear in both blocks_count and blocks_to_free")
-        #         # else:
-        #         #     self.kv_cache_manager.coordinator.block_pool.blocks[block_id].ref_cnt = 1
-            
 
-        # #     for block in blocks_to_free_objs:
-        # #         block.ref_cnt = 1
-        #     # counts = [block.ref_cnt for block in blocks_to_free_objs]
-        #     # if sum(counts) != len(blocks_to_free_objs):
-        #     #     logger.warning(f"Trying to free blocks with ref_cnt > 1: {counts}")
-            
-        #     self.kv_cache_manager.coordinator.block_pool.free_blocks(blocks_to_free_objs)  
-
-        ################## end sefi #######
-
+        # old_block_ids_cnt = []
+        # new_block_ids_cnt = []
+        
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: Optional[SpecDecodingStats] = None
 
@@ -1308,7 +2238,13 @@ class Scheduler(SchedulerInterface):
                     stopped_running_reqs.add(request)
                 else:
                     stopped_preempted_reqs.add(request)
+            # else:
+            #     if block_merge_mapping:
+                    
+            #         self._handle_block_merging_with_counts(block_merge_mapping, req_id, old_block_ids_cnt, new_block_ids_cnt)
 
+
+            # self._handle_counts( old_block_ids_cnt, new_block_ids_cnt) # sefi         
             # Extract sample logprobs if needed.
             if request.sampling_params is not None \
                 and request.sampling_params.logprobs is not None and logprobs:
@@ -1361,7 +2297,8 @@ class Scheduler(SchedulerInterface):
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
-
+              
+       
         # Remove the stopped requests from the running and waiting queues.
         if stopped_running_reqs:
             self.running = [
@@ -1394,11 +2331,13 @@ class Scheduler(SchedulerInterface):
                         finished_requests=finished_set)
             finished_req_ids.clear()
 
+        
         if engine_core_outputs:
             # Return stats to only one of the front-ends.
             next(iter(engine_core_outputs.values())).scheduler_stats = (
                 self.make_stats(spec_decoding_stats))
 
+        # self._handle_counts(old_block_ids_cnt, new_block_ids_cnt)
         return engine_core_outputs
 
     def _update_request_with_output(

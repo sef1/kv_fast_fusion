@@ -558,6 +558,42 @@ def execute_model_v0(
     # output is List[SamplerOutput]
     return output
 
+
+
+def _update_block_tables_after_compression(  
+    self,   
+    new_requests: list[str],  
+    block_tables_: list[torch.Tensor]  
+) -> dict[str, dict[int, list[int]]]:  
+    """Return final block lists instead of mappings."""  
+    request_blocks = {}  
+    for req_id in new_requests:  
+        req_idx = self.input_batch.req_id_to_index[req_id]  
+        req_state = self.requests[req_id]  
+        
+        for group_idx in range(len(self.input_batch.block_table.block_tables)):  
+            if group_idx == 0:  
+                continue  
+                
+            block_table_obj = self.input_batch.block_table.block_tables[group_idx]  
+            new_table = block_tables_[group_idx - 1][req_idx]  
+            num_blocks = block_table_obj.num_blocks_per_row[req_idx]    #sefi tset
+            # Update state and block table  
+            
+            final_blocks = new_table[:num_blocks].tolist()
+            if all(block_table_obj.block_table_np[req_idx, :num_blocks] == final_blocks) :
+                continue
+            if req_id not in request_blocks.keys():
+                request_blocks[req_id] = {}
+            req_state.block_ids[group_idx][:num_blocks] = final_blocks[:num_blocks]  
+            block_table_obj.block_table_np[req_idx, :num_blocks] = new_table[:num_blocks].cpu().numpy()  
+            # block_table_obj.num_blocks_per_row[req_idx] = num_blocks  
+            
+            # Store final block list  
+            request_blocks[req_id][group_idx] = final_blocks  
+  
+    return request_blocks
+
 @torch.inference_mode()
 def execute_model_v1(
         self,
@@ -868,77 +904,109 @@ def execute_model_v1(
                 self.fused_requests.append(new_requests)
                 compressed_layers = total / num_comp > 1
                 if cr > 1:  
-                    for req_id in new_requests:    
-                        req_idx = self.input_batch.req_id_to_index[req_id]   
-                           
-                        req_state = self.requests[req_id]      
+                    updated_block_tables = _update_block_tables_after_compression(self, new_requests, block_tables_)
+                    # request_blocks = {}  
+                    # for req_id in new_requests:  
+                    #     req_idx = self.input_batch.req_id_to_index[req_id]  
+                    #     req_state = self.requests[req_id]  
                         
-                        # Process ALL KV cache groups (not just starting from 4)  
-                        for group_idx in range(len(self.input_batch.block_table.block_tables)):  
-                            # Skip group 0 if it's not used for KV cache  
-                            if group_idx == 0:  
-                                continue  
+                    #     for group_idx in range(len(self.input_batch.block_table.block_tables)):  
+                    #         if group_idx == 0:  
+                    #             continue  
                                 
-                            block_table_obj = self.input_batch.block_table.block_tables[group_idx]    
+                    #         block_table_obj = self.input_batch.block_table.block_tables[group_idx]  
+                    #         new_table = block_tables_[group_idx - 1][req_idx]  
+                    #         # nz_idx = new_table.nonzero(as_tuple=True)[0]  
+                    #         num_blocks = block_table_obj.num_blocks_per_row[req_idx] #len(nz_idx)  
+                    #         # Update state and block table  
+                    #         final_blocks = new_table[:num_blocks].tolist()
+                    #         if all(block_table_obj.block_table_np[req_idx, :num_blocks] == final_blocks) :
+                    #             continue
+                    #         if req_id not in request_blocks.keys():
+                    #             request_blocks[req_id] = {}
+                    #         req_state.block_ids[group_idx][:] = final_blocks  
+                    #         block_table_obj.block_table_np[req_idx, :num_blocks] = new_table[:num_blocks].cpu().numpy()  
+                    #         # block_table_obj.num_blocks_per_row[req_idx] = num_blocks  
                             
-                            # Get old and new tables  
-                            old_table = block_table_obj.block_table_np[req_idx]  # Use .np for numpy array  
-                            new_table = block_tables_[group_idx - 1][req_idx]  # Adjust index since we skip group 0  
-                            nz_idx = new_table.nonzero(as_tuple=True)[0]    
-                            
-                            # Update CachedRequestState    
-                            req_state.block_ids[group_idx][:] = new_table[nz_idx].tolist()    
-                            
-                            # Update the block table's numpy array (THIS is the critical update)  
-                            num_blocks = len(nz_idx)    
-                            
-                            # Track mapping for scheduler    
+                    #         # Store final block list  
+                    #         request_blocks[req_id][group_idx] = final_blocks  
+                    
+                    # updated_block_tables = request_blocks
+                                    # for req_id in new_requests:    
+                    #     req_idx = self.input_batch.req_id_to_index[req_id]   
+                           
+                    #     req_state = self.requests[req_id]      
+                        
+                    #     # Process ALL KV cache groups (not just starting from 4)  
+                    #     for group_idx in range(len(self.input_batch.block_table.block_tables)):  
+                    #         # Skip group 0 if it's not used for KV cache  
+                    #         if group_idx == 0:  
+                    #             continue  
                                 
-                            for o, n in zip(old_table[:num_blocks], new_table[nz_idx].cpu().numpy()):    
-                                if o != n:
-                                    if updated_block_tables.get(req_id) is None:    
-                                        updated_block_tables[req_id] = {} 
-                                    if updated_block_tables[req_id].get(group_idx) is None:    
-                                        updated_block_tables[req_id][group_idx] = {}    
-                                    updated_block_tables[req_id][group_idx][int(o)] = int(n)
+                    #         block_table_obj = self.input_batch.block_table.block_tables[group_idx]    
+                            
+                    #         # Get old and new tables  
+                    #         old_table = block_table_obj.block_table_np[req_idx]  # Use .np for numpy array  
+                    #         new_table = block_tables_[group_idx - 1][req_idx]  # Adjust index since we skip group 0  
+                    #         nz_idx = new_table.nonzero(as_tuple=True)[0]    
+                            
+                    #         # Update CachedRequestState    
+                    #         req_state.block_ids[group_idx][:] = new_table[nz_idx].tolist()    
+                            
+                    #         # Update the block table's numpy array (THIS is the critical update)  
+                    #         num_blocks = len(nz_idx)    
+                            
+                    #         # Track mapping for scheduler    
+                    #         if updated_block_tables.get(req_id) is None:    
+                    #                 updated_block_tables[req_id] = {}     
+                    #         if updated_block_tables[req_id].get(group_idx) is None:    
+                    #                 updated_block_tables[req_id][group_idx] = {}  
+                    #         updated_block_tables[req_id][group_idx][tuple(old_table[:num_blocks].tolist())] = new_table[nz_idx].cpu().numpy()    
+                    #         # for o, n in zip(old_table[:num_blocks], new_table[nz_idx].cpu().numpy()):    
+                    #         #     if o != n:
+                    #         #         if updated_block_tables.get(req_id) is None:    
+                    #         #             updated_block_tables[req_id] = {} 
+                    #         #         if updated_block_tables[req_id].get(group_idx) is None:    
+                    #         #             updated_block_tables[req_id][group_idx] = {}    
+                    #         #         updated_block_tables[req_id][group_idx][int(o)] = int(n)
 
-                            block_table_obj.block_table_np[req_idx, :num_blocks] = new_table[nz_idx].cpu().numpy()  
-                            block_table_obj.num_blocks_per_row[req_idx] = num_blocks
-                            # block_table_obj.block_table_cpu[req_idx, :num_blocks] = new_table[nz_idx].cpu()    
-                            # block_table_obj.block_table_gpu[req_idx, :num_blocks] = new_table[nz_idx].cuda()
+                    #         block_table_obj.block_table_np[req_idx, :num_blocks] = new_table[nz_idx].cpu().numpy()  
+                    #         block_table_obj.num_blocks_per_row[req_idx] = num_blocks
+                    #         # block_table_obj.block_table_cpu[req_idx, :num_blocks] = new_table[nz_idx].cpu()    
+                    #         # block_table_obj.block_table_gpu[req_idx, :num_blocks] = new_table[nz_idx].cuda()
                                         
                                         
-                                        # for req_id in (new_requests):  
-                                        #     req_idx = self.input_batch.req_id_to_index[req_id]  
-                                        #     if updated_block_tables.get(req_id) is None:  
-                                        #         updated_block_tables[req_id] = {}  
-                                        #     req_state = self.requests[req_id]    
+                    #                     # for req_id in (new_requests):  
+                    #                     #     req_idx = self.input_batch.req_id_to_index[req_id]  
+                    #                     #     if updated_block_tables.get(req_id) is None:  
+                    #                     #         updated_block_tables[req_id] = {}  
+                    #                     #     req_state = self.requests[req_id]    
                                             
-                                        #     for group_idx in range(len(block_tables[4:])):  
-                                        #         # Get the BlockTable object for this group  
-                                        #         block_table_obj = self.input_batch.block_table.block_tables[group_idx+1]  
+                    #                     #     for group_idx in range(len(block_tables[4:])):  
+                    #                     #         # Get the BlockTable object for this group  
+                    #                     #         block_table_obj = self.input_batch.block_table.block_tables[group_idx+1]  
                                                 
-                                        #         old_table = block_table_obj.block_table_cpu[req_idx]  # or .np if you need numpy  
-                                        #         new_table = block_tables_[group_idx][req_idx]  
-                                        #         nz_idx = block_tables_[group_idx][req_idx].nonzero(as_tuple=True)[0]  
+                    #                     #         old_table = block_table_obj.block_table_cpu[req_idx]  # or .np if you need numpy  
+                    #                     #         new_table = block_tables_[group_idx][req_idx]  
+                    #                     #         nz_idx = block_tables_[group_idx][req_idx].nonzero(as_tuple=True)[0]  
                                                 
-                                        #         # Update CachedRequestState  
-                                        #         req_state.block_ids[group_idx+1][:] = new_table[nz_idx].tolist()  
+                    #                     #         # Update CachedRequestState  
+                    #                     #         req_state.block_ids[group_idx+1][:] = new_table[nz_idx].tolist()  
                                                 
-                                        #         # Update the block table's numpy array  
-                                        #         num_blocks = len(nz_idx)  
-                                        #         # block_table_obj.block_table.np[req_idx, :num_blocks] = new_table[nz_idx].cpu().numpy()                              
+                    #                     #         # Update the block table's numpy array  
+                    #                     #         num_blocks = len(nz_idx)  
+                    #                     #         # block_table_obj.block_table.np[req_idx, :num_blocks] = new_table[nz_idx].cpu().numpy()                              
                                                 
-                                        #         # Track mapping for scheduler  
-                                        #         if updated_block_tables[req_id].get(group_idx) is None:  
-                                        #             updated_block_tables[req_id][group_idx] = {}  
-                                        #         for o, n in zip(old_table[:num_blocks], new_table[nz_idx]):  
-                                        #             if o.item() != n.item():  
-                                        #                 updated_block_tables[req_id][group_idx][o.item()] = n.item()
+                    #                     #         # Track mapping for scheduler  
+                    #                     #         if updated_block_tables[req_id].get(group_idx) is None:  
+                    #                     #             updated_block_tables[req_id][group_idx] = {}  
+                    #                     #         for o, n in zip(old_table[:num_blocks], new_table[nz_idx]):  
+                    #                     #             if o.item() != n.item():  
+                    #                     #                 updated_block_tables[req_id][group_idx][o.item()] = n.item()
                                                 
-                                        #         block_table_obj.block_table_cpu[req_idx, :num_blocks] = new_table[nz_idx].cpu()
-                                        #         block_table_obj.np[req_idx, :num_blocks] = new_table[nz_idx].cpu().numpy()
-                                        #         block_table_obj.num_blocks_per_row[req_idx] = num_blocks  
+                    #                     #         block_table_obj.block_table_cpu[req_idx, :num_blocks] = new_table[nz_idx].cpu()
+                    #                     #         block_table_obj.np[req_idx, :num_blocks] = new_table[nz_idx].cpu().numpy()
+                    #                     #         block_table_obj.num_blocks_per_row[req_idx] = num_blocks  
                                                 
                                     
         #     # if cr > 1:
