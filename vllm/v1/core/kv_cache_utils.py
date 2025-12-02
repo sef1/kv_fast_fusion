@@ -293,10 +293,10 @@ class FreeKVCacheBlockQueue:
         # Pop n blocks from the head of the list
         ret = []
         for _ in range(n):
-            if curr_block is None:
-                # curr_block = self.fake_free_list_head.next_free_block
-                raise RuntimeError("num_free_blocks is out of sync with the "
-                                   "free list")
+            # if curr_block is None:
+            #     # curr_block = self.fake_free_list_head.next_free_block
+            #     raise RuntimeError("num_free_blocks is out of sync with the "
+            #                        "free list")
             assert curr_block is not None
             ret.append(curr_block)
             last_block = curr_block

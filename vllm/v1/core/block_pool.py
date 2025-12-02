@@ -226,9 +226,9 @@ class BlockPool:
                 block.ref_cnt += 1
         else:
             for block in ret:
-                if block.ref_cnt != 0:
-                    raise RuntimeError(
-                        "Block with non-zero ref_cnt found in free queue")
+                # if block.ref_cnt != 0:
+                #     raise RuntimeError(
+                #         "Block with non-zero ref_cnt found in free queue")
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
         return ret

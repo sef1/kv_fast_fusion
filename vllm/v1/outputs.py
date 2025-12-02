@@ -105,8 +105,8 @@ class ModelRunnerOutput:
     pooler_output: list[Optional[torch.Tensor]]
 
     # NEW FIELDS for block merging info  sefi
-    blocks_count: dict[int, dict[int, int]] #= field(default_factory=dict)  
-    blocks_to_free: dict[int, int] #= field(default_factory=list) 
+    # blocks_count: dict[int, dict[int, int]] #= field(default_factory=dict)  
+    # blocks_to_free: dict[int, int] #= field(default_factory=list) 
     updated_block_table: dict[str, dict[int, list[int]]] # = field(default=None) #dict[str, dict[int, dict[int, int]]] #= field(default_factory=dict) # sefi block_table    
 
     # [req_ids]
@@ -124,8 +124,8 @@ EMPTY_MODEL_RUNNER_OUTPUT = ModelRunnerOutput(req_ids=[],
                                               logprobs=None,
                                               prompt_logprobs_dict={},
                                               pooler_output=[],
-                                              blocks_count={}, # sefi
-                                              blocks_to_free={}, #sefi
+                                            #   blocks_count={}, # sefi
+                                            #   blocks_to_free={}, #sefi
                                               updated_block_table={}, # sefi
                                               finished_sending=None,
                                               finished_recving=None,
