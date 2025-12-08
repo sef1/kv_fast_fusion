@@ -951,10 +951,10 @@ class Scheduler(SchedulerInterface):
             if ref_change > 0:  
                 blocks_to_touch.extend([block] * ref_change)  
             elif ref_change < 0:  
-                if block.prev_free_block is not None:  # Check if already in free queue
-                    logger.warning(f"Block {block_id} already in free queue, skipping free")  
-                else:
-                    blocks_to_free.extend([block] * abs(ref_change)) 
+                # if block.prev_free_block is not None:  # Check if already in free queue
+                #     logger.warning(f"Block {block_id} already in free queue, skipping free")  
+                # else:
+                blocks_to_free.extend([block] * abs(ref_change)) 
 
         # Apply batch operations if necessary
         if blocks_to_touch:

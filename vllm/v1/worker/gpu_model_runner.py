@@ -96,9 +96,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         device: torch.device,
     ):
         ############### sefi
-        from vllm.entrypoints.kv_fast_fusion import execute_model_v1
+        from vllm.entrypoints.kv_fast_fusion import execute_model_v1, BlockCompressionHook, _update_block_tables_after_compression
         from types import MethodType
         self.execute_model = MethodType(execute_model_v1, self)
+        self._update_block_tables_after_compression =MethodType(_update_block_tables_after_compression, self)
+        self.compression_hook = None  
+        if True:  
+            self.compression_hook = BlockCompressionHook(vllm_config)  
         ###################
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
