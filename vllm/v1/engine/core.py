@@ -66,7 +66,7 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.version import __version__ as VLLM_VERSION
-
+from copy import deepcopy
 logger = init_logger(__name__)
 
 POLLING_TIMEOUT_S = 2.5
@@ -253,6 +253,47 @@ class EngineCore:
         kv_cache_configs = get_kv_cache_configs(
             vllm_config, kv_cache_specs, available_gpu_memory
         )
+
+        ###########sefi start: modify kv cache config for kv fast fusion ###########
+        if False: #vllm_config.kv_transfer_config.kv_role != "kv_producer":  
+            # Get original layers and spec  
+            original_layers = deepcopy(kv_cache_configs[0].kv_cache_groups[0].layer_names)  
+            original_spec = kv_cache_configs[0].kv_cache_groups[0].kv_cache_spec  
+            
+            # Split into warmup (sliding window) and fused (full attention) layers  
+            warmup_layers_names = original_layers[0:2] + original_layers[-2:]  
+            fused_layers_names = original_layers[2:-2]  
+            
+            # Create new configs with two attention types  
+            tmp_config = []  
+            
+            # Group 0: Warmup layers with sliding window attention  
+            from vllm.v1.kv_cache_interface import SlidingWindowSpec  
+            warmup_group = deepcopy(kv_cache_configs[0].kv_cache_groups[0])  
+            warmup_group.layer_names = warmup_layers_names  
+            warmup_group.kv_cache_spec = SlidingWindowSpec(  
+                block_size=original_spec.block_size,  
+                num_kv_heads=original_spec.num_kv_heads,  
+                head_size=original_spec.head_size,  
+                dtype=original_spec.dtype,  
+                sliding_window=8192,  # Adjust based on your model's requirements  
+                use_mla=False,  # Required parameter - set based on your model  
+            )  
+            tmp_config.append(warmup_group)
+
+            tmp_config.extend([deepcopy(kv_cache_configs[0].kv_cache_groups[0]) for _ in range(len(fused_layers_names))])
+            # full_attention_group = deepcopy(kv_cache_configs[0].kv_cache_groups[0]) 
+            for idx, layer_name in enumerate(fused_layers_names):
+               tmp_config[idx+1].layer_names = [layer_name] 
+            # full_attention_group.layer_names = fused_layers_names  
+            # Keep the original FullAttentionSpec  
+            # tmp_config.append(full_attention_group)  
+            
+            kv_cache_configs[0].kv_cache_groups = tmp_config  
+            # vllm_config.cache_config.enable_prefix_caching = True  # Required for HybridKVCacheCoordinator  
+            # vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = False
+        ### sefi  end
+
 
         # If auto-fit reduced max_model_len, sync the new value to workers.
         # This is needed because workers were spawned before memory profiling

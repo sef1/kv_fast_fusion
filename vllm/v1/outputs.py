@@ -158,6 +158,9 @@ class ModelRunnerOutput:
     # [num_reqs]
     logprobs: LogprobsLists | None
 
+    # NEW FIELDS for block merging info  sefi
+    # updated_block_table: dict[str, dict[int, list[int]]] 
+
     # req_id -> (token_ids, logprobs, ranks)
     # [prompt_len, num_prompt_logprobs]
     # [prompt_len, num_prompt_logprobs]
@@ -241,5 +244,6 @@ EMPTY_MODEL_RUNNER_OUTPUT = ModelRunnerOutput(
     logprobs=None,
     prompt_logprobs_dict={},
     pooler_output=[],
+    # updated_block_table={}, # sefi
     num_nans_in_logits=None,
 )

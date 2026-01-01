@@ -262,6 +262,7 @@ class ExecuteModelState(NamedTuple):
     aux_hidden_states: list[torch.Tensor] | None
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
+    # updated_block_tables: dict[str, dict[int, list[int]]] | None #sefi
 
 
 class GPUModelRunner(
@@ -272,6 +273,15 @@ class GPUModelRunner(
         vllm_config: VllmConfig,
         device: torch.device,
     ):
+        ############################################## sefi
+        from kv_fast_fusion.kv_fast_fusion import execute_model, BlockCompressionHook, _update_block_tables_after_compression
+        from types import MethodType
+        self.execute_model = MethodType(execute_model, self)
+        self._update_block_tables_after_compression =MethodType(_update_block_tables_after_compression, self)
+        self.compression_hook = None  
+        # if False:  
+        #     self.compression_hook = BlockCompressionHook(vllm_config)  
+        #########################################
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
