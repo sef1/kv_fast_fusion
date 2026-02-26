@@ -274,6 +274,21 @@ class Attention(nn.Module):
             else:
                 torch.ops.vllm.unified_attention_with_output(
                     query, key, value, output, self.layer_name)
+                
+                ##sefi
+                 # Start compression for this layer immediately
+                forward_context: ForwardContext = get_forward_context()  
+                attn_metadata = forward_context.attn_metadata
+                if isinstance(attn_metadata, dict):
+                    attn_metadata = attn_metadata[self.layer_name]
+                self_kv_cache = self.kv_cache[forward_context.virtual_engine]
+                if forward_context.compression_hook is not None: #hasattr(forward_context, 'compression_hook'):  
+                    forward_context.compression_hook.start_layer_compression(  
+                        self.layer_name,  
+                        self_kv_cache,  
+                        attn_metadata  
+                        )
+                ####
             return output.view(-1, hidden_size)
         else:
             if self.use_direct_call:

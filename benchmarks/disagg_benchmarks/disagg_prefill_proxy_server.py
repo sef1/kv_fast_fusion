@@ -36,13 +36,17 @@ async def handle_request():
 
         # finish prefill
         async for _ in forward_request(
-            "http://localhost:8100/v1/completions", prefill_request
+            # "http://localhost:8100/v1/completions",
+            'http://10.10.10.174:8100/v1/completions',
+              prefill_request
         ):
             continue
 
         # return decode
         generator = forward_request(
-            "http://localhost:8200/v1/completions", original_request_data
+            # "http://localhost:8200/v1/completions",
+            'http://10.10.10.174:8200/v1/completions',
+             original_request_data,
         )
         response = await make_response(generator)
         response.timeout = None
@@ -60,4 +64,5 @@ async def handle_request():
 
 
 if __name__ == "__main__":
-    app.run(port=8000)
+    # app.run(port=8000)
+    app.run(host="10.10.10.174", port=8000)

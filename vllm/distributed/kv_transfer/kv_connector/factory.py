@@ -103,6 +103,12 @@ KVConnectorFactory.register_connector(
     "LMCacheConnector")
 
 KVConnectorFactory.register_connector(
+    "P2pNcclConnectorFF",
+    "vllm.distributed.kv_transfer.kv_connector.v1.p2p.p2p_nccl_connector_fast_fustion",
+    "P2pNcclConnectorFF")
+
+
+KVConnectorFactory.register_connector(
     "MooncakeStoreConnector",
     "vllm.distributed.kv_transfer.kv_connector.mooncake_store_connector",
     "MooncakeStoreConnector")

@@ -190,7 +190,7 @@ async def async_request_openai_chat_completions(
             "max_completion_tokens":
             request_func_input.output_len,
             "stream":
-            True,
+            True, 
             "stream_options": {
                 "include_usage": True,
             },
@@ -201,7 +201,7 @@ async def async_request_openai_chat_completions(
             payload.update(request_func_input.extra_body)
         headers = {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
+            # "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
         }
 
         output = RequestFuncOutput()
@@ -215,45 +215,71 @@ async def async_request_openai_chat_completions(
             async with session.post(url=api_url, json=payload,
                                     headers=headers) as response:
                 if response.status == 200:
-                    async for chunk_bytes in response.content:
-                        chunk_bytes = chunk_bytes.strip()
-                        if not chunk_bytes:
-                            continue
-                        chunk_bytes = chunk_bytes.decode("utf-8")
-                        # NOTE: SSE comments (often used as pings) start with
-                        # a colon. These are not JSON data payload and should
-                        # be skipped.
-                        if chunk_bytes.startswith(":"):
-                            continue
+                    if payload.get("stream", False): 
+                        async for chunk_bytes in response.content:
+                            chunk_bytes = chunk_bytes.strip()
+                            if not chunk_bytes:
+                                continue
+                            chunk_bytes = chunk_bytes.decode("utf-8")
+                            # NOTE: SSE comments (often used as pings) start with
+                            # a colon. These are not JSON data payload and should
+                            # be skipped.
+                            if chunk_bytes.startswith(":"):
+                                continue
 
-                        chunk = chunk_bytes.removeprefix("data: ")
+                            chunk = chunk_bytes.removeprefix("data: ")
 
-                        if chunk != "[DONE]":
-                            timestamp = time.perf_counter()
-                            data = json.loads(chunk)
+                            if chunk != "[DONE]":
+                                timestamp = time.perf_counter()
+                                data = json.loads(chunk)
 
-                            if choices := data.get("choices"):
-                                content = choices[0]["delta"].get("content")
-                                # First token
-                                if ttft == 0.0:
-                                    ttft = timestamp - st
-                                    output.ttft = ttft
+                                if choices := data.get("choices"):
+                                    content = choices[0]["delta"].get("content")
+                                    # First token
+                                    if ttft == 0.0:
+                                        ttft = timestamp - st
+                                        output.ttft = ttft
 
-                                # Decoding phase
-                                else:
-                                    output.itl.append(timestamp -
-                                                      most_recent_timestamp)
+                                    # Decoding phase
+                                    else:
+                                        output.itl.append(timestamp -
+                                                        most_recent_timestamp)
 
-                                generated_text += content or ""
-                            elif usage := data.get("usage"):
-                                output.output_tokens = usage.get(
-                                    "completion_tokens")
+                                    generated_text += content or ""
+                                elif usage := data.get("usage"):
+                                    output.output_tokens = usage.get(
+                                        "completion_tokens")
 
-                            most_recent_timestamp = timestamp
+                                most_recent_timestamp = timestamp
 
-                    output.generated_text = generated_text
-                    output.success = True
-                    output.latency = most_recent_timestamp - st
+                        output.generated_text = generated_text
+                        output.success = True
+                        output.latency = most_recent_timestamp - st
+                    else:
+                        data = await response.json()  
+                        if choices := data.get("choices"):  
+                            choice = choices[0]  
+                            message = choice.get("message", {})  
+                            
+                            # Extract tool calls if present  
+                            if message.get("tool_calls"):  
+                                # Convert tool calls to string format for generated_text  
+                                tool_call_descriptions = []  
+                                for tc in message["tool_calls"]:  
+                                    if "name" in tc['function'].keys() and "arguments" in tc['function'].keys():  
+                                        tool_call_descriptions.append(  
+                                            f"{tc['function']['name']}({tc['function']['arguments']})"  
+                                        )  
+                                generated_text = f"[tool_calls: {', '.join(tool_call_descriptions)}]"  
+                            else:  
+                                generated_text = message.get("content", "")  
+                            
+                            output.generated_text = generated_text  
+                            output.success = True  
+                            output.latency = time.perf_counter() - st  
+                            
+                            if usage := data.get("usage"):  
+                                output.output_tokens = usage.get("completion_tokens")
                 else:
                     output.error = response.reason or ""
                     output.success = False

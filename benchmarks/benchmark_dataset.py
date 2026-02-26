@@ -534,7 +534,121 @@ class CustomDataset(BenchmarkDataset):
 
         return sampled_requests
 
-
+#-------------------------------------------------------------------------------
+# Sefi Custom Dataset Implementation
+#-------------------------------------------------------------------------------
+class CustomConversationDataset(BenchmarkDataset):  
+    """  
+    Dataset for loading conversation data from HuggingFace datasets.  
+    Loads prompt-completion pairs and generates sample requests.  
+    """  
+  
+    def __init__(  
+        self,  
+        dataset_subset: Optional[str],  
+        dataset_split: str,  
+        input_key: str,  
+        output_key: str,  
+        min_input_len: int = 256,  
+        max_input_len: int = 8192,  
+        max_total_len: int = 128*1024,  
+        **kwargs,  
+    ) -> None:  
+        self.dataset_subset = dataset_subset  
+        self.dataset_split = dataset_split  
+        self.input_key = input_key  
+        self.output_key = output_key  
+        self.min_input_len = min_input_len  
+        self.max_input_len = max_input_len  
+        self.max_total_len = max_total_len  
+        super().__init__(**kwargs) 
+        self.load_data() 
+  
+    def load_data(self) -> None:  
+        if not self.dataset_path:  
+            raise ValueError("dataset_path must be provided.")  
+          
+        from datasets import load_dataset  
+        dataset = load_dataset(  
+            self.dataset_path,  
+            name=self.dataset_subset,  
+            split=self.dataset_split,  
+            streaming=False  
+        )  
+          
+        # Validate required columns  
+        if self.input_key not in dataset.features or self.output_key not in dataset.features:  
+            raise ValueError(  
+                f"Dataset must have '{self.input_key}' and '{self.output_key}' columns."  
+            )  
+          
+        # Filter and store data  
+        self.data = dataset.filter(lambda x: len(x[self.input_key]) >= 2)  
+  
+    def sample(  
+        self,  
+        tokenizer,  
+        num_requests: int,  
+        fixed_output_len: int | None = None,  
+        output_len: int | None = None,  
+        request_id_prefix: str = "",  
+        no_oversample: bool = False,  
+        **kwargs,  
+    ) -> list[SampleRequest]:  
+        if output_len is None:  
+            output_len = 128  # Default output length  
+          
+        sampled_requests = []  
+          
+        for i, item in enumerate(self.data):  
+            if len(sampled_requests) >= num_requests:  
+                break  
+              
+            # Extract prompt and completion  
+            prompt = item[self.input_key]  
+            completion = item[self.output_key]  
+              
+            if completion is None:  
+                continue  
+            if isinstance(completion, list):  
+                completion = completion[0]  
+              
+            # Tokenize  
+            prompt_token_ids = tokenizer(prompt).input_ids  
+            completion_token_ids = tokenizer(completion).input_ids  
+            prompt_len = len(prompt_token_ids)  
+            output_len_actual = len(completion_token_ids) if fixed_output_len is None else fixed_output_len  
+              
+            # Filter by length constraints  
+            if prompt_len < self.min_input_len:  
+                continue  
+            if prompt_len > self.max_input_len:  
+                continue  
+            if prompt_len + output_len_actual > self.max_total_len:  
+                continue  
+              
+            # Apply chat template  
+            prompt_formatted = tokenizer.apply_chat_template(  
+                [{"role": "user", "content": prompt}],  
+                add_generation_prompt=True,  
+                tokenize=False,  
+            )  
+              
+            sampled_requests.append(  
+                SampleRequest(  
+                    prompt=prompt_formatted,  
+                    prompt_len=prompt_len,  
+                    expected_output_len=output_len_actual,  
+                    # request_id=request_id_prefix + str(i),  
+                )  
+            )  
+          
+        self.maybe_oversample_requests(  
+            sampled_requests, num_requests  
+        )  
+          
+        return sampled_requests
+#
 # -----------------------------------------------------------------------------
 # Sonnet Dataset Implementation
 # -----------------------------------------------------------------------------

@@ -221,8 +221,8 @@ class EngineCore:
             # tmp_config.append(full_attention_group)  
             
             kv_cache_configs[0].kv_cache_groups = tmp_config  
-            vllm_config.cache_config.enable_prefix_caching = False  # Required for HybridKVCacheCoordinator  
-            vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = False
+            # vllm_config.cache_config.enable_prefix_caching = True  # Required for HybridKVCacheCoordinator  
+            # vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = False
         ### sefi  end
 
         # Since we use a shared centralized controller, we need the

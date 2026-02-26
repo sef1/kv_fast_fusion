@@ -39,6 +39,9 @@ import numpy as np
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 
+from typing import Any, AsyncGenerator, Collection, Dict, List, Optional, Tuple
+from datasets import load_dataset
+
 from backend_request_func import (
     ASYNC_REQUEST_FUNCS,
     OPENAI_COMPATIBLE_BACKENDS,
@@ -61,6 +64,7 @@ from benchmark_dataset import (
     ASRDataset,
     BurstGPTDataset,
     ConversationDataset,
+    CustomConversationDataset,
     CustomDataset,
     HuggingFaceDataset,
     InstructCoderDataset,
@@ -75,8 +79,15 @@ from benchmark_dataset import (
 from benchmark_utils import convert_to_pytorch_benchmark_format, write_to_json
 from vllm.benchmarks.serve import get_request
 
-MILLISECONDS_TO_SECONDS_CONVERSION = 1000
+import prompts
+import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
+
+MILLISECONDS_TO_SECONDS_CONVERSION = 1000
+MAX_NUMBER_OF_BLOCKS_INPUT = 64
+MIN_NUMBER_OF_BLOCKS_INPUT = 2
+MAX_NUMBER_OF_BLOCKS_OUTPUT = 64
 
 @dataclass
 class BenchmarkMetrics:
@@ -651,6 +662,19 @@ def main(args: argparse.Namespace):
             output_len=args.custom_output_len,
             skip_chat_template=args.custom_skip_chat_template,
         )
+    elif args.dataset_name == "conversations":
+        dataset = CustomConversationDataset(
+            dataset_path=args.dataset_path,
+            dataset_subset=args.hf_subset,            
+            dataset_split=args.hf_split,
+            input_key=args.input_key,
+            output_key=args.output_key           
+        )
+        input_requests = dataset.sample(
+                num_requests=args.num_prompts,
+                tokenizer=tokenizer,
+                fixed_output_len=args.hf_output_len,
+            )
 
     elif args.dataset_name == "sonnet":
         dataset = SonnetDataset(dataset_path=args.dataset_path)
@@ -737,6 +761,109 @@ def main(args: argparse.Namespace):
             tokenizer=tokenizer,
             output_len=args.hf_output_len,
         )
+    elif args.dataset_name == "n8n":
+        print("Using n8n webhook dataset...")
+
+        webhook_url = args.dataset_path
+        num = args.num_prompts
+        
+        # Load prompts from prompts.py
+        agent_prompts = {
+            "code_agent": prompts.code_agent_prompts,
+            "summarization_agent": prompts.summary_agent_prompts,
+            "problem_agent": prompts.problem_solving_agent_prompts
+        }
+
+        def generate_payload(iteration):
+            return {
+                "iteration": iteration,
+                "agents": {
+                    "code_agent": {
+                        "prompt": agent_prompts["code_agent"][iteration % len(agent_prompts["code_agent"])]
+                    },
+                    "summarization_agent": {
+                        "prompt": agent_prompts["summarization_agent"][iteration % len(agent_prompts["summarization_agent"])]
+                    },
+                    "problem_agent": {
+                        "prompt": agent_prompts["problem_agent"][iteration % len(agent_prompts["problem_agent"])]
+                    }
+                }
+            }
+
+        def trigger_webhook(payload):
+            try:
+                r = requests.get(webhook_url, json=payload)
+                r.raise_for_status()
+                return r.json()
+            except Exception as e:
+                return {"error": str(e), "payload": payload}
+
+        print(f"Triggering n8n for {num} requests...")
+
+        input_requests = []
+        with ThreadPoolExecutor(max_workers=min(32, num)) as ex:
+            futures = [
+                ex.submit(trigger_webhook, generate_payload(i + 1))
+                for i in range(num)
+            ]
+            for future in tqdm(as_completed(futures)):
+                result = future.result()
+
+                # Wrap n8n JSON as SampleRequest so benchmark() can accept it
+                sr = SampleRequest(
+                    prompt=json.dumps(result),
+                    prompt_len=len(json.dumps(result)),
+                    expected_output_len=256,
+                    multi_modal_data=None
+                )
+                input_requests.append(sr)
+
+        print("n8n dataset construction complete.")
+
+        # Save raw n8n results
+        save_path = "n8n_stress_test_results.json"
+        try:
+            with open(save_path, "w") as f:
+                json.dump([json.loads(r.prompt) for r in input_requests], f, indent=2)
+            print(f"Saved n8n stress test results to {save_path}")
+        except Exception as e:
+            print(f"Failed to save n8n results: {e}")
+    
+    # elif args.dataset_name == "n8n":
+    #     print("Using n8n webhook dataset...")
+    #     agent_prompts = {
+    #         "code_agent": prompts.code_agent_prompts,
+    #         "summarization_agent": prompts.summary_agent_prompts,
+    #         "problem_agent": prompts.problem_solving_agent_prompts
+    #     }
+    #     from prompts import N8nAgentDataset, async_request_n8n
+    #     dataset = N8nAgentDataset(agent_prompts=agent_prompts)
+    #     input_requests = dataset.sample(
+    #         num_requests=args.num_prompts
+    #     )
+    #     # webhook_url = args.dataset_path
+    #     # num = args.num_prompts
+        
+    #     api_url = f"http://{args.host}:{args.port}/webhook/ai-stress-test"
+    #     # request["prompt"] is a JSON string containing our payload
+    #     # payload = json.loads(request["prompt"])
+
+    #     # tasks.append(async_request_n8n(
+    #     # payload=json.loads(req["prompt"]),
+    #     # host=args.host,
+    #     # port=args.port,
+    #     # timeout=args.request_timeout,
+    #     # ))
+
+    #     # Save raw n8n results
+    #     save_path = "n8n_stress_test_results.json"
+    #     try:
+    #         with open(save_path, "w") as f:
+    #             json.dump([json.loads(r.prompt) for r in input_requests], f, indent=2)
+    #         print(f"Saved n8n stress test results to {save_path}")
+    #     except Exception as e:
+    #         print(f"Failed to save n8n results: {e}")
+
 
     else:
         # For datasets that follow a similar structure, use a mapping.
@@ -930,9 +1057,12 @@ def create_argument_parser():
         "--dataset-name",
         type=str,
         default="sharegpt",
-        choices=["sharegpt", "burstgpt", "sonnet", "random", "hf", "custom"],
+        choices=["sharegpt", "burstgpt", "sonnet", "random", "hf", "custom", "n8n", "conversations"],
         help="Name of the dataset to benchmark on.",
     )
+    
+    parser.add_argument("--block-size", type=int, choices=[16, 32,64,128], default=16)
+
     parser.add_argument(
         "--dataset-path",
         type=str,
@@ -1116,6 +1246,19 @@ def create_argument_parser():
         "--custom-skip-chat-template",
         action="store_true",
         help="Skip applying chat template to prompt, used only for custom dataset.",
+    )
+
+    conversation_group = parser.add_argument_group("conversations dataset options")
+    conversation_group.add_argument("--input-key",
+                          type=str,                          
+                          default=None,
+                          help="input key in dataset for conversatinos.")
+    
+    conversation_group.add_argument(
+        "--output-key", 
+        type=str,       
+        default="output",        
+        help="output key in dataset for conversatinos",
     )
 
     sonnet_group = parser.add_argument_group("sonnet dataset options")
