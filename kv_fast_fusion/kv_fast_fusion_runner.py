@@ -1448,17 +1448,6 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 
-# @staticmethod
-# def set_hook_register(    
-#     hook: BlockCompressionHookSync | BlockCompressionHook | None,
-# ) -> None:
-#    GPUModelRunner.hook_register = hook
-
-# @staticmethod
-# def get_hook_register(    
-# ) -> BlockCompressionHookSync | BlockCompressionHook | None:
-#     return GPUModelRunner.hook_register
-
 @torch.inference_mode()
 def execute_model(
     self,
