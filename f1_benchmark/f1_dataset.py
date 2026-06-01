@@ -15,7 +15,7 @@ class CustomConversationDataset(HuggingFaceDataset):
         self,  
         input_key: str = "problem",  
         output_key: str = "generated_solution",  
-        min_input_len: int = 256,  
+        min_input_len: int = 257,  
         max_input_len: int = 8192,  
         max_total_len: int = 128 * 1024,  
         **kwargs,  

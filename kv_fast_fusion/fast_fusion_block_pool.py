@@ -8,10 +8,15 @@ def patched_free_blocks(self, ordered_blocks):
         seen[block.block_id] = block  
   
     unique_blocks = list(seen.values())  
-    self.free_block_queue.append_n([  
-        block for block in unique_blocks  
-        if block.ref_cnt == 0 and not block.is_null  
-    ])  
+    # self.free_block_queue.append_n([  
+    #     block for block in unique_blocks  
+    #     if block.ref_cnt == 0 and not block.is_null  
+    # ])  
+    for block in unique_blocks:
+        if block.ref_cnt == 0 and not block.is_null:
+            self.free_block_queue.append(block)
+            self._maybe_evict_cached_block(block) 
+
   
 #   def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
 #         """Free a list of blocks. The blocks should be ordered by their

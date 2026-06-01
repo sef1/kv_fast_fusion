@@ -789,8 +789,7 @@ class BlockCompressionHookSync(CompressionHook):
         thr = self.thr
         block_table = attention_metadata.block_table[self.req_idx]
         B, num_blocks = block_table.shape
-        if B <=1:
-            return
+        
         seq_lens = attention_metadata.seq_lens[self.req_idx]
         num_last_chunks_to_compress = 4
         is_chunks_fusion = False
@@ -933,7 +932,258 @@ class BlockCompressionHookSync(CompressionHook):
         # logger.info(f"Compression ratio: {compression_ratio}")
 
         # return _total.sum().item()/_compressed.sum().item(), _total, _compressed, bt_clone, slot_maps    
-    
+
+class BlockCompressionHookSyncOptimized(CompressionHook):  
+    """Synchronous version using optimized recursive methods from async worker"""  
+      
+    def __init__(self, vllm_config):  
+        self.vllm_config = vllm_config  
+        self.warmup_layers = 2  
+        self.thr = 0.5  
+        self._block_size = BLOCK_SIZE  
+        self.max_layer_idx = (vllm_config.model_config.get_num_layers(  
+                vllm_config.parallel_config) - self.warmup_layers) 
+          
+        # Pre-allocate buffers for efficiency  
+        self.norms_k = {}  
+        self.norms_v = {}  
+        self.fused_requests = {}
+      
+    def start_layer_compression(self, layer_name, kv_cache, attn_metadata):  
+        """Run optimized compression synchronously"""  
+        layer_idx = int(layer_name.split('.')[2])  
+          
+        if layer_idx < self.warmup_layers or layer_idx >= self.max_layer_idx:  
+            return  
+          
+        # Run compression directly  
+        self.layer_fast_fusion_optimized(layer_name, kv_cache, attn_metadata) 
+      
+    def wait_for_layer_compression(self, layer_name):  
+        """No-op for sync version"""  
+        pass
+      
+    def wait_for_all_compressions(self):  
+        """No-op for sync version"""  
+        pass
+      
+    def layer_fast_fusion_optimized(self, layer_name, kv_layer, attention_metadata):  
+        """Optimized fusion method adapted from AsyncCompressionWorker"""  
+          
+        def fuse_all_above_thr(x, b_idx, thr=self.thr):  
+            """Recursive fusion with optimized indexing"""  
+            B, _, _ = x.shape  
+              
+            if B == 1:              
+                nz_blocks = self.nz_blocks[b_idx[0]]  
+                return F.normalize(x[:, :nz_blocks], dim=-1, eps=1e-7), [self.idx__[:nz_blocks]], [], [nz_blocks]  
+                  
+            xl, _idx_l, fl_chain, shifts_l = fuse_all_above_thr(x[:B//2], b_idx[:B//2], thr=thr)  
+            xr, _idx_r, fr_chain, shifts_r = fuse_all_above_thr(x[B//2:], b_idx[B//2:], thr=thr)  
+  
+            nl = xl.shape[1]  
+            nr = xr.shape[1]  
+            idx_l = self.idx__[:nl]  
+            idx_r = self.idx__[:nr]  
+                  
+            idx_ll, idx_rr = (xl @ xr.mT > thr).nonzero(as_tuple=True)[-2:]  
+            l_idx, c = torch.unique(idx_ll, return_counts=True)  
+            r_idx = idx_rr.split(tuple(c.tolist()))  
+              
+            idx_ul = list(set(idx_l.tolist()) - set(idx_ll.tolist()))  
+            idx_ur = list(set(idx_r.tolist()) - set(idx_rr.tolist()))  
+              
+            n_c = len(l_idx)  
+            n_ul = len(idx_ul)  
+            n_ur = len(idx_ur)          
+              
+            combined_tensors = [torch.cat([xl[:,l_idx[i]].unsqueeze(1),xr[:,r_idx[i]]], dim=1).mean(1, keepdim=True) for i in range(n_c)]  
+            if combined_tensors:  
+                combined_x = F.normalize(torch.cat(combined_tensors, dim=1), dim=-1, eps=1e-7)  
+                combined_x = torch.cat([combined_x, xl[:,idx_ul], xr[:,idx_ur]], dim=1)  
+            else:  
+                combined_x = torch.cat([xl[:,idx_ul], xr[:,idx_ur]], dim=1)  
+  
+            reverse_idx = torch.empty(nl+nr, device=x.device, dtype=torch.int)  
+              
+            reverse_idx[l_idx.tolist()] = self.idx__[:n_c]  
+            for i in range(n_c):  
+                reverse_idx[(r_idx[i]+nl).tolist()] = self.idx__[:n_c][i]  
+  
+            reverse_idx[idx_ul] = self.idx__[n_c:n_c + n_ul]  
+            reverse_idx[list(map(lambda x: x + nl, idx_ur))] = self.idx__[n_c + n_ul:n_c + n_ul + n_ur]  
+                      
+            max_length = max(len(_idx_l), len(_idx_r))  
+            if len(_idx_l) < max_length:  
+                shifts_l += [shifts_l[-1]] * (max_length - len(_idx_l))  
+                _idx_l += [torch.tensor([], device=xl.device, dtype=torch.int)   
+                           for _ in range(max_length - len(_idx_l))]  
+              
+            chain = [torch.cat([_idx_l[i], _idx_r[i] + shifts_l[i]], dim=0) for i in range(max_length)]  
+            reverse_idx = [reverse_idx]  
+            reverse_idx += chain  
+            fl_chain += fr_chain  
+            fl_chain += [(b_idx, torch.stack([idx_ll, idx_rr], dim=-1), idx_ul, idx_ur)]  
+              
+            shifts = list(map(lambda x, y: x + y, shifts_l, shifts_r))  
+            shifts = [n_c + n_ul + n_ur] + shifts  
+  
+            del x, xl, xr, idx_ll, idx_rr, l_idx, r_idx, idx_ul, idx_ur, n_c, n_ul, n_ur  
+            return combined_x, reverse_idx, fl_chain, shifts  
+          
+        def fuse_values_with_above_thr_idx(v, fwd_idx, b_idx):  
+            """Optimized value fusion"""  
+            i = 0                       
+            def recursive_combining(v, b_idx):  
+                nonlocal i  
+                B, _, _ = v.shape  
+                if B == 1:                   
+                    nz_blocks = self.nz_blocks[b_idx[0]]  
+                    return F.normalize(v[:, :nz_blocks], dim=-1, eps=1e-7)  
+  
+                vl = recursive_combining(v[:B//2], b_idx[:B//2])  
+                vr = recursive_combining(v[B//2:], b_idx[B//2:])  
+                  
+                _, idx_, idx_ul, idx_ur = fwd_idx[i]  
+                idx_ll, idx_rr = idx_.mT  
+                l_idx, c = torch.unique(idx_ll, return_counts=True)  
+                r_idx = idx_rr.split(tuple(c.tolist()))  
+  
+                combined_tensors = [torch.cat([vl[:,l_idx[i]].unsqueeze(1), vr[:,r_idx[i]]], dim=1).mean(1, keepdim=True) for i in range(len(l_idx))]  
+                if combined_tensors:  
+                    combined_v = F.normalize(torch.cat(combined_tensors, dim=1), dim=-1, eps=1e-7)  
+                    combined_v = torch.cat([combined_v, vl[:,idx_ul], vr[:,idx_ur]], dim=1)  
+                else:  
+                    combined_v = torch.cat([vl[:,idx_ul], vr[:,idx_ur]], dim=1)  
+  
+                i += 1  
+                del v, vl, vr, idx_ll, idx_rr, l_idx, r_idx, idx_ul, idx_ur  
+                return combined_v                         
+  
+            vv = recursive_combining(v, b_idx)  
+            return vv       
+          
+        def restore_cache(x, idx, shape):  
+            """Optimized cache restoration"""  
+            xx = torch.empty((1, len(idx[-2]), x.shape[-1]), dtype=x.dtype, device=x.device)  
+            xx[:,:x.shape[1]] = x  
+            for idx_ in idx[:-1]:  
+                xx[:, :len(idx_)] = xx[:, idx_]  
+                  
+            del x  
+            return xx
+        
+        def update_block_table(block_table, fwd_idx, b_idx):  
+            """Optimized block table update"""  
+            i = 0                     
+            def blocks_recursive_combining(bt, b_idx):  
+                nonlocal i  
+                B, _, = bt.shape  
+                if B == 1:  
+                    nz_blocks = self.nz_blocks[b_idx[0]]  
+                    return bt[:,:nz_blocks]  
+  
+                bl = blocks_recursive_combining(bt[:B//2], b_idx[:B//2])  
+                br = blocks_recursive_combining(bt[B//2:], b_idx[B//2:])  
+              
+                idx_ = fwd_idx[i][1]  
+                br.view(1,-1)[:,idx_[:,1]] = bl.view(1,-1)[:, idx_[:,0]]  
+                  
+                i+=1  
+  
+                return torch.cat([bl,br], dim=-1)  
+            bt = blocks_recursive_combining(block_table, b_idx)  
+            return bt.squeeze(0)
+        
+        # Setup optimized state  
+        req_idx = self.req_idx#attention_metadata.req_idx_to_compress  
+        self.B = len(req_idx)  
+        self.num_blocks = attention_metadata.block_table.shape[-1]  
+        device = attention_metadata.block_table.device  
+        block_table = attention_metadata.block_table[req_idx]          
+        seq_lens = attention_metadata.seq_lens[req_idx].unsqueeze(-1)  
+        self.idx__ = torch.arange(self.num_blocks, dtype=torch.int, device=device)  
+        self.b_idx = list(range(self.B))  
+        mask = self.idx__.repeat(self.B,1) < (seq_lens[:self.B] // BLOCK_SIZE)  
+        self.nz_mask = mask.nonzero(as_tuple=True)  
+        self.nz_blocks = (seq_lens // BLOCK_SIZE).squeeze()
+        
+        thr = self.thr  
+        is_chunks_fusion = False  
+        num_last_chunks_to_compress = 4  
+                   
+        kv_shape = kv_layer[0, block_table[mask]].shape  
+        blocks, block_sz, num_head, head_size = kv_shape  
+        blocks_to_keep = CHUNK_SIZE//block_sz  
+        
+        compressed_ = []  
+        total_ = []  
+            
+        kk = kv_layer[0, block_table]  
+  
+        if is_chunks_fusion:  
+            kk = kk[mask]  
+            kk_cat = kk[:-blocks_to_keep]  
+            kk = kk[-blocks_to_keep:].view(num_last_chunks_to_compress,blocks_to_keep//num_last_chunks_to_compress, -1)  
+            k_norms = kk.norm(2,-1)  
+        else:  
+            kk = kk.view(self.B,self.num_blocks, -1)  
+            k_norms = kk[self.nz_mask].norm(2,-1)  
+            for i,k in enumerate(k_norms.split(mask.sum(-1).tolist())):  
+                if req_idx[i] not in self.norms_k:  
+                    self.norms_k[req_idx[i]] = {}  
+                self.norms_k[req_idx[i]][layer_name] = k
+        
+        _k, _idx, fwd_idx, _  = fuse_all_above_thr(kk, self.b_idx, thr)  
+  
+        kk = restore_cache(_k, _idx, kk.shape)  
+  
+        if is_chunks_fusion:  
+            kk =kk.view(num_last_chunks_to_compress,blocks_to_keep//num_last_chunks_to_compress, -1)  
+            kk = torch.cat([kk_cat,kk.view(blocks_to_keep, block_sz, num_head, head_size)], dim=0)  
+            kv_layer[0, block_table[mask]] = kk.view(kv_shape)  
+        else:  
+            kv_layer[0, block_table[mask]] = kk.view(kv_shape)  
+  
+        del _k  
+  
+        vv = kv_layer[1, block_table]   
+  
+        if is_chunks_fusion:  
+            vv = vv[mask]  
+            vv_cat = vv[:-blocks_to_keep]  
+            vv = vv[-blocks_to_keep:].view(num_last_chunks_to_compress,blocks_to_keep//num_last_chunks_to_compress, -1)  
+            v_norms = vv.norm(2,-1)  
+        else:  
+            vv = vv.view(self.B,self.num_blocks, -1)  
+            v_norms = vv[self.nz_mask].norm(2,-1)  
+            for i,v in enumerate(v_norms.split(mask.sum(-1).tolist())):  
+                if req_idx[i] not in self.norms_v:  
+                    self.norms_v[req_idx[i]] = {}  
+                self.norms_v[req_idx[i]][layer_name] = v
+            
+        _v = fuse_values_with_above_thr_idx(vv,fwd_idx, self.b_idx)  
+          
+        vv = restore_cache(_v, _idx, vv.shape)  
+  
+        if is_chunks_fusion:  
+            vv =vv.view(num_last_chunks_to_compress,blocks_to_keep//num_last_chunks_to_compress, -1)  
+            vv = torch.cat([vv_cat,vv.view(blocks_to_keep, block_sz, num_head, head_size)], dim=0)  
+            kv_layer[1, block_table[mask]] = vv.view(kv_shape)  
+        else:  
+            kv_layer[1, block_table[mask]] = vv.view(kv_shape)  
+  
+        update_block_table(block_table, fwd_idx, self.b_idx)  
+        attention_metadata.block_table[req_idx] = block_table  
+          
+        compressed_ += [_v.shape[1]]  
+        if is_chunks_fusion:  
+            total_ += [num_last_chunks_to_compress*CHUNK_SIZE/self._block_size]  
+        else:  
+            total_ +=[blocks]  
+          
+        del vv, _v, fwd_idx, _idx  
+        logger.info(f"Compression ratio in layer {layer_name}: {torch.tensor(total_).sum().item() / torch.tensor(compressed_).sum().item() if torch.tensor(compressed_).sum().item() > 0 else 0.0}")
 
 @torch.inference_mode()
 def fast_fusion(kv_cache, block_tables, thr, is_chunks_fusion, num_last_chunks_to_compress=2, remove_position = True, rotary_emb = None, seq_lens = None):
@@ -1780,6 +2030,7 @@ def execute_model(
     self.kv_connector_output = kv_connector_output
     return None
 
+
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from copy import copy
 from vllm.v1.spec_decode.eagle import EagleProposer
@@ -1985,7 +2236,7 @@ def _dummy_run(
         self,
         num_tokens: int,
         cudagraph_runtime_mode: CUDAGraphMode | None = None,
-        force_attention: bool = False,
+        force_attention: bool = True,
         uniform_decode: bool = False,
         allow_microbatching: bool = True,
         skip_eplb: bool = False,
@@ -2221,7 +2472,7 @@ def _dummy_run(
                     cudagraph_runtime_mode=cudagraph_runtime_mode,
                     batch_descriptor=batch_desc,
                     ubatch_slices=ubatch_slices_padded,
-                    compression_hook=self.compression_hook,                
+                    compression_hook=self.compression_hook, # sefi                
                 ),
             ):
                 outputs = self.model(

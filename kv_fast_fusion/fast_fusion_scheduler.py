@@ -2,14 +2,14 @@ from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from vllm.logger import init_logger
 logger = init_logger("vllm.patched_scheduler")
-
-def _handle_block_merging_with_counts(  
+from vllm.v1.core.kv_cache_utils import BlockHashWithGroupId
+def _handle_block_merging_with_counts_o(  
         self,   
         request_blocks: dict[str, dict[int, list[int]]],      
     ) -> None:  
         """Apply reference changes using pre-calculated counts."""  
-        if not request_blocks:
-            return
+        # if not request_blocks:
+        #     return
             
         before_free = self.kv_cache_manager.coordinator.block_pool.get_num_free_blocks()  
         
@@ -74,7 +74,272 @@ def _handle_block_merging_with_counts(
         
         after_free = self.kv_cache_manager.coordinator.block_pool.get_num_free_blocks()  
         logger.info(f"Block merging freed {after_free - before_free} blocks")  
- 
+
+def _handle_block_merging_with_counts____(    
+    self,     
+    request_blocks: dict[str, dict[int, list[int]]],        
+) -> None:    
+    """Apply reference changes using pre-calculated counts."""    
+    before_free = self.kv_cache_manager.coordinator.block_pool.get_num_free_blocks()    
+      
+    blocks_to_touch = []    
+    blocks_to_free = []    
+    block_pool = self.kv_cache_manager.coordinator.block_pool  
+      
+    for req_id, group_blocks in request_blocks.items():    
+        if req_id not in self.requests or not group_blocks:  
+            continue  
+          
+        request = self.requests[req_id]  
+          
+        for group_idx, new_block_ids in group_blocks.items():    
+            if group_idx == 0:    
+                continue  
+                  
+            manager = self.kv_cache_manager.coordinator.single_type_managers[group_idx]    
+            old_blocks = manager.req_to_blocks.get(req_id, [])  
+              
+            # Build new blocks and calculate ref changes in single pass  
+            new_blocks = []  
+            old_block_ids = set()  
+              
+            # Process old blocks  
+            for block in old_blocks:  
+                if not block.is_null and block.block_id != -1:  
+                    old_block_ids.add(block.block_id)  
+              
+            # Process new blocks and calculate ref changes  
+            new_block_ids_set = set()  
+            for block_id in new_block_ids:      
+                block = block_pool.blocks[block_id]      
+                new_blocks.append(block)  
+                new_block_ids_set.add(block_id)  
+                  
+                # Calculate ref change on the fly  
+                if block_id not in old_block_ids:  
+                    # New block - need to touch  
+                    if not block.is_null and block.block_id != -1:  
+                        blocks_to_touch.append(block)  
+              
+            # Find blocks to free (in old but not in new)  
+            for block_id in old_block_ids - new_block_ids_set:  
+                block = block_pool.blocks[block_id]  
+                if not block.is_null and block.block_id != -1:  
+                    blocks_to_free.append(block)  
+              
+            # Reset hashes only for blocks that changed  
+            blocks_changed = (set(old_block_ids) != new_block_ids_set)  
+            if blocks_changed:  
+                for block in new_blocks:  
+                    if not block.is_null:  
+                        block.reset_hash()  
+                  
+                # Recompute hashes only if blocks actually changed  
+                # num_full_blocks = len([b for b in new_blocks if not b.is_null])  
+                # if num_full_blocks > 0:  
+                    # manager.cache_blocks(request, num_full_blocks * manager.block_size)  
+                manager.cache_blocks(request, request.num_tokens)
+              
+            manager.req_to_blocks[req_id] = new_blocks  
+      
+    # Apply batch operations  
+    if blocks_to_touch:  
+        block_pool.touch(blocks_to_touch)  
+    if blocks_to_free:  
+        block_pool.free_blocks(blocks_to_free)  
+      
+    after_free = block_pool.get_num_free_blocks()    
+    logger.info(f"Block merging freed {after_free - before_free} blocks")
+
+def _handle_block_merging_with_counts(self, request_blocks: dict[str, dict[int, list[int]]]) -> None:  
+    """Apply reference changes using pre-calculated counts."""  
+    if not request_blocks:  
+        return  
+          
+    block_pool = self.kv_cache_manager.coordinator.block_pool  
+    before_free = block_pool.get_num_free_blocks()  
+      
+    old_ref_counts = defaultdict(int)  
+    new_ref_counts = defaultdict(int)  
+    block_cache = {}  # Cache block objects to avoid repeated lookups  
+  
+    for req_id, group_blocks in request_blocks.items():  
+        if req_id not in self.requests or not group_blocks:  
+            continue  
+          
+        for group_idx, new_block_ids in group_blocks.items():  
+            if group_idx == 0:  
+                continue  
+                  
+            manager = self.kv_cache_manager.coordinator.single_type_managers[group_idx]  
+            req_blocks = manager.req_to_blocks.get(req_id, [])  
+              
+            # Count old references and cache blocks  
+            for block in req_blocks:  
+                if not block.is_null and block.block_id != -1:  
+                    old_ref_counts[block.block_id] += 1  
+                    block_cache[block.block_id] = block  
+  
+            # Build new blocks and count new references  
+            new_req_blocks = []  
+            for block_id in new_block_ids:  
+                if block_id not in block_cache:  
+                    block_cache[block_id] = block_pool.blocks[block_id]  
+                block = block_cache[block_id]  
+                new_req_blocks.append(block)  
+                if not block.is_null and block.block_id != -1:  
+                    new_ref_counts[block.block_id] += 1  
+  
+            manager.req_to_blocks[req_id] = new_req_blocks  
+  
+    # Calculate reference changes and prepare operations  
+    blocks_to_touch = []  
+    blocks_to_free = []  
+      
+    all_keys = set(new_ref_counts) | set(old_ref_counts)  
+    for block_id in all_keys:  
+        ref_change = new_ref_counts[block_id] - old_ref_counts[block_id]  
+        if ref_change > 0:  
+            blocks_to_touch.extend([block_cache[block_id]] * ref_change)  
+        elif ref_change < 0:  
+            blocks_to_free.extend([block_cache[block_id]] * abs(ref_change))  
+  
+    # Apply batch operations  
+    if blocks_to_touch:  
+        block_pool.touch(blocks_to_touch)  
+    if blocks_to_free:  
+        block_pool.free_blocks(blocks_to_free)  
+      
+    after_free = block_pool.get_num_free_blocks()  
+    logger.info(f"Block merging freed {after_free - before_free} blocks")
+
+def _handle_block_merging_with_counts_(  
+    self,  
+    request_blocks: dict[str, dict[int, list[int]]],  
+) -> None:  
+    """Apply reference changes using pre-calculated counts and block ID hashing."""  
+    if not request_blocks:  
+        return  
+          
+    before_free = self.kv_cache_manager.coordinator.block_pool.get_num_free_blocks()  
+      
+    # Track all changes  
+    old_ref_counts = defaultdict(int)  
+    new_ref_counts = defaultdict(int)  
+    merged_requests = []  
+      
+    # First pass: update block mappings and track changes  
+    for req_id, group_blocks in request_blocks.items():  
+        if req_id not in self.requests or not group_blocks:  
+            continue  
+              
+        merged_requests.append(req_id)  
+          
+        for group_idx, new_block_ids in group_blocks.items():  
+            if group_idx == 0:  
+                continue  
+                  
+            manager = self.kv_cache_manager.coordinator.single_type_managers[group_idx]  
+            req_blocks = manager.req_to_blocks.get(req_id, [])  
+              
+            # Count old references  
+            for block in req_blocks:  
+                if not block.is_null and block.block_id != -1:  
+                    old_ref_counts[block.block_id] += 1  
+  
+            # Build new blocks and count new references  
+            new_req_blocks = []  
+            block_pool = self.kv_cache_manager.coordinator.block_pool  
+              
+            for block_id in new_block_ids:  
+                block = block_pool.blocks[block_id]  
+                new_req_blocks.append(block)  
+                if not block.is_null and block.block_id != -1:  
+                    new_ref_counts[block.block_id] += 1  
+  
+            manager.req_to_blocks[req_id] = new_req_blocks  
+      
+    # Calculate and apply reference changes  
+    block_ref_changes = {}  
+    all_keys = set(new_ref_counts) | set(old_ref_counts)  
+      
+    for key in all_keys:  
+        block_ref_changes[key] = new_ref_counts[key] - old_ref_counts[key]  
+  
+    blocks_to_touch = []  
+    blocks_to_free = []  
+      
+    for block_id, ref_change in block_ref_changes.items():  
+        block = self.kv_cache_manager.coordinator.block_pool.blocks[block_id]  
+          
+        if ref_change > 0:  
+            blocks_to_touch.extend([block] * ref_change)  
+        elif ref_change < 0:  
+            blocks_to_free.extend([block] * abs(ref_change))  
+      
+    # Apply block operations  
+    if blocks_to_touch:  
+        self.kv_cache_manager.coordinator.block_pool.touch(blocks_to_touch)  
+    if blocks_to_free:  
+        self.kv_cache_manager.coordinator.block_pool.free_blocks(blocks_to_free)  
+      
+    # Update hashes for merged blocks  
+    self._update_hashes_for_merged_blocks(request_blocks, merged_requests)  
+      
+    after_free = self.kv_cache_manager.coordinator.block_pool.get_num_free_blocks()  
+    logger.info(f"Block merging freed {after_free - before_free} blocks")  
+  
+def _update_hashes_for_merged_blocks(  
+    self,  
+    request_blocks: dict[str, dict[int, list[int]]],  
+    merged_requests: list[str]  
+) -> None:  
+    """Update block hashes using block ID-based hashing for merged blocks."""  
+    block_pool = self.kv_cache_manager.coordinator.block_pool  
+      
+    for req_id in merged_requests:  
+        request = self.requests[req_id]  
+          
+        for group_idx, new_block_ids in request_blocks[req_id].items():  
+            if group_idx == 0 or not new_block_ids:  
+                continue  
+                  
+            # Create hash from block IDs  
+            block_id_hash = _create_block_id_hash(new_block_ids, group_idx)  
+              
+            # Update all blocks in the group  
+            for i, block_id in enumerate(new_block_ids):  
+                block = block_pool.blocks[block_id]  
+                if not block.is_null:  
+                    # Reset existing hash and set new block ID-based hash  
+                    block.reset_hash()  
+                    block.block_hash = block_id_hash  
+                    block_pool.cached_block_hash_to_block.insert(  
+                        block.block_hash, block  
+                    )  
+                  
+                # Update request's block hashes  
+                from vllm.v1.core.kv_cache_utils import get_block_hash  
+                hash_value = get_block_hash(block_id_hash)  
+                  
+                if i < len(request.block_hashes):  
+                    request.block_hashes[i] = hash_value  
+                else:  
+                    request.block_hashes.append(hash_value)  
+  
+def _create_block_id_hash(block_ids: list[int], group_idx: int = 0) -> BlockHashWithGroupId:  
+    """Create a hash from block IDs."""  
+    from vllm.v1.core.kv_cache_utils import BlockHash, make_block_hash_with_group_id  
+    import hashlib  
+      
+    # Sort block IDs for consistency  
+    sorted_ids = tuple(sorted(block_ids))  
+    hash_bytes = hashlib.sha256(str(sorted_ids).encode()).digest()  
+    block_hash = BlockHash(hash_bytes)  
+      
+    # Use group_id 0 by default  
+    return make_block_hash_with_group_id(block_hash, group_idx)
+
 from vllm.v1.core.sched.output import (
     SchedulerOutput,
 )

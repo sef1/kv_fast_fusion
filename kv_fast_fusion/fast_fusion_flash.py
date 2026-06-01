@@ -1,6 +1,8 @@
 import torch
 
-from vllm.forward_context import get_forward_context
+# from vllm.forward_context import get_forward_context
+from kv_fast_fusion.kv_fast_fusion_graph_runner import BLOCK_SIZE
+
 from vllm.v1.attention.backends.flash_attn import  (
     cascade_attention,
     AttentionType,
@@ -85,19 +87,14 @@ def patched_forward(
          ### sefi
         # forward_context: ForwardContext = get_forward_context()
         sf_k = None
-        if hasattr(attn_metadata, 'sf_k'):
-                sf_k = attn_metadata.sf_k
-                sf_v = attn_metadata.sf_v
-                idx = attn_metadata.req_idx
+        if hasattr(attn_metadata, 'norms_k'):
+                idx = list(attn_metadata.norms_k.keys())
+                num_blocks = (attn_metadata.seq_lens[idx]//BLOCK_SIZE).max()
+                device = attn_metadata.block_table.device
+                sf_k = torch.stack(list(attn_metadata.norms_k.values()))[:,:num_blocks].to(device)
+                sf_v = torch.stack(list(attn_metadata.norms_k.values()))[:,:num_blocks].to(device)
                 
-                # Ensure 2D shape in-place if needed (more efficient than unsqueeze_)  
-                if sf_k.ndim == 1:  
-                    sf_k = sf_k[None, :]  # Creates view instead of copy  
-                    sf_v = sf_v[None, :]  
-                
-                # Apply scaling directly  
-                # key_cache, value_cache = kv_cache.unbind(0)  
-                
+                                               
                 # Combine unsqueeze operations and apply scaling  
                 sf_k_expanded = sf_k.view(*sf_k.shape, 1, 1, 1)  # More efficient than multiple unsqueeze  
                 sf_v_expanded = sf_v.view(*sf_v.shape, 1, 1, 1)  
@@ -140,15 +137,20 @@ def patched_forward(
                 key_cache[bt_idx] /= sf_k_expanded
                 value_cache[bt_idx] /= sf_v_expanded
 
-            forward_context = get_forward_context() 
-            compression_hook = forward_context.additional_kwargs.get('compression_hook')
+            # forward_context = get_forward_context() 
+            # compression_hook = forward_context.additional_kwargs.get('compression_hook')
             # if compression_hook is not None: # and forward_context.compression_hook is not None:
-            # # Get the attention layer and KV cache  
-            compression_hook.start_layer_compression(  
-                layer.layer_name,  
-                kv_cache,  
-                attn_metadata  
-                )    
+            # # Get the attention layer and KV cache
+            if hasattr(attn_metadata, 'compression_hook'):
+                req_idx = attn_metadata.req_idx_to_compress
+                # kv = kv_cache[:, attn_metadata.block_table[req_idx]].clone()
+
+                attn_metadata.compression_hook.start_layer_compression(  
+                    layer.layer_name,  
+                    kv_cache.clone(),
+                    attn_metadata,
+                    )    
+                
             ##
 
 
