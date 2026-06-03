@@ -19,7 +19,7 @@ BLOCK_SIZE = 128
 NUM_LAST_CHUNKS_TO_COMPRESS = 4 
 CHUNK_SIZE = 512
 
-from kv_fast_fusion.kv_fast_fusion_runner_optimized import BlockCompressionHookGraphAsync
+from kv_fast_fusion.kv_fast_fusion_runner_optimized import BlockCompressionHookGraphAsync  # kept for reference; not used by graph path
 
 class BlockCompressionHookGraph(CompressionHook):  
 
@@ -452,7 +452,238 @@ class BlockCompressionHookGraph(CompressionHook):
         logger.info(f"Compression ratio in layer {layer_name}: {torch.tensor(total_).sum().item() / torch.tensor(compressed_).sum().item() if torch.tensor(compressed_).sum().item() > 0 else 0.0}")
         return 
 
-import numpy as np       
+import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# Norm-buffer helpers (graph-mode decode scaling)
+# ---------------------------------------------------------------------------
+
+def _fill_norm_buffers(
+    self,
+    fused_reqs: list[str],
+    fused_reqs_idx: list[int],
+) -> None:
+    """Reset norm buffers to 1.0 and fill with stored norms for fused requests."""
+    if not hasattr(self, 'norms_k_buf') or self.norms_k_buf is None:
+        return
+    self.norms_k_buf.fill_(1.0)
+    self.norms_v_buf.fill_(1.0)
+    for req_id, req_idx in zip(fused_reqs, fused_reqs_idx):
+        per_layer = self.fused_requests.get(req_id)
+        if per_layer is None:
+            continue
+        for layer_name, (norms_k, norms_v) in per_layer.items():
+            layer_idx = int(layer_name.split('.')[2])
+            n = norms_k.shape[0]
+            max_blocks = self.norms_k_buf.shape[2]
+            n = min(n, max_blocks)
+            self.norms_k_buf[layer_idx, req_idx, :n].copy_(norms_k[:n].to(self.norms_k_buf.device))
+            self.norms_v_buf[layer_idx, req_idx, :n].copy_(norms_v[:n].to(self.norms_v_buf.device))
+
+
+def _run_post_forward_bff(
+    self,
+    req_to_compress: list[str],
+    req_idx_to_compress: list[int],
+    attn_metadata_dict,
+) -> None:
+    """Run BFF on every fusion layer after the forward pass (eager mode, outside graph).
+
+    Each fusion KV-cache group (kv_gid >= 1) has its own independent physical
+    block pool and its own block table stored in attn_metadata_dict[layer_name].
+    We MUST use the per-layer block table — not a shared one from the warmup group.
+    """
+    import torch.nn.functional as F
+
+    B = len(req_idx_to_compress)
+    if B < 2:
+        return
+
+    b_idx = list(range(B))
+    meta_dict = attn_metadata_dict if isinstance(attn_metadata_dict, dict) else attn_metadata_dict[0]
+
+    kv_cache_groups = self.kv_cache_config.kv_cache_groups
+    for kv_gid, kv_group in enumerate(kv_cache_groups):
+        if kv_gid == 0:
+            continue  # skip warmup (sliding-window) group
+
+        layer_names = kv_group.layer_names
+        if not layer_names:
+            continue
+        layer_name = layer_names[0]
+        layer_idx = int(layer_name.split('.')[2])
+
+        # Each fusion layer has its own block table in its own metadata object
+        if layer_name not in meta_dict:
+            continue
+        layer_meta = meta_dict[layer_name]
+
+        # Per-layer block table and seq_lens
+        block_table_layer = layer_meta.block_table[req_idx_to_compress].clone()  # [B, max_blocks]
+        seq_lens_layer = layer_meta.seq_lens[req_idx_to_compress].unsqueeze(-1)  # [B, 1]
+        num_blocks_dim = block_table_layer.shape[1]
+        device = block_table_layer.device
+
+        idx__ = torch.arange(num_blocks_dim, dtype=torch.int, device=device)
+        nz_blocks_layer = (seq_lens_layer // BLOCK_SIZE).squeeze(-1)              # [B]
+        mask = idx__.repeat(B, 1) < nz_blocks_layer.unsqueeze(-1)                # [B, max_blocks]
+        nz_mask = mask.nonzero(as_tuple=True)
+        mask_split_list = mask.sum(-1).tolist()
+
+        # Store on GPU so _fill_norm_buffers copies stay GPU-to-GPU (no PCIe transfers).
+        splits_k = torch.ones(B, num_blocks_dim, dtype=torch.bfloat16, device=device)
+        splits_v = torch.ones(B, num_blocks_dim, dtype=torch.bfloat16, device=device)
+
+        # ---- inner helpers (defined per-layer so closures capture layer locals) ----
+
+        def fuse_all_above_thr(x, b_idx_local, thr=THRESHOLD):
+            Bloc, _, _ = x.shape
+            if Bloc == 1:
+                nz = nz_blocks_layer[b_idx_local[0]]
+                return F.normalize(x[:, :nz], dim=-1, eps=1e-7), [idx__[:nz]], [], [nz]
+
+            xl, _idx_l, fl_chain, shifts_l = fuse_all_above_thr(x[:Bloc // 2], b_idx_local[:Bloc // 2], thr)
+            xr, _idx_r, fr_chain, shifts_r = fuse_all_above_thr(x[Bloc // 2:], b_idx_local[Bloc // 2:], thr)
+
+            nl, nr = xl.shape[1], xr.shape[1]
+            idx_ll, idx_rr = (xl @ xr.mT > thr).nonzero(as_tuple=True)[-2:]
+            l_idx, c = torch.unique(idx_ll, return_counts=True)
+            r_idx = idx_rr.split(tuple(c.tolist()))
+
+            idx_ul = list(set(range(nl)) - set(idx_ll.tolist()))
+            idx_ur = list(set(range(nr)) - set(idx_rr.tolist()))
+            n_c, n_ul, n_ur = len(l_idx), len(idx_ul), len(idx_ur)
+
+            combined = [torch.cat([xl[:, l_idx[i]].unsqueeze(1), xr[:, r_idx[i]]], dim=1).mean(1, keepdim=True)
+                        for i in range(n_c)]
+            if combined:
+                combined_x = F.normalize(torch.cat(combined, dim=1), dim=-1)
+                combined_x = torch.cat([combined_x, xl[:, idx_ul], xr[:, idx_ur]], dim=1)
+            else:
+                combined_x = torch.cat([xl[:, idx_ul], xr[:, idx_ur]], dim=1)
+
+            rev = torch.empty(nl + nr, device=device, dtype=torch.int)
+            rev[l_idx.tolist()] = idx__[:n_c]
+            for i in range(n_c):
+                rev[(r_idx[i] + nl).tolist()] = idx__[:n_c][i]
+            rev[idx_ul] = idx__[n_c:n_c + n_ul]
+            rev[list(map(lambda v: v + nl, idx_ur))] = idx__[n_c + n_ul:n_c + n_ul + n_ur]
+
+            max_len = max(len(_idx_l), len(_idx_r))
+            if len(_idx_l) < max_len:
+                shifts_l += [shifts_l[-1]] * (max_len - len(_idx_l))
+                _idx_l += [torch.tensor([], device=device, dtype=torch.int)] * (max_len - len(_idx_l))
+
+            chain = [torch.cat([_idx_l[i], _idx_r[i] + shifts_l[i]]) for i in range(max_len)]
+            rev = [rev] + chain
+            fl_chain = fl_chain + fr_chain + [(b_idx_local, torch.stack([idx_ll, idx_rr], dim=-1), idx_ul, idx_ur)]
+            shifts = [n_c + n_ul + n_ur] + list(map(lambda p, q: p + q, shifts_l, shifts_r))
+            return combined_x, rev, fl_chain, shifts
+
+        def fuse_values(v, fwd_idx, b_idx_local):
+            counter = [0]
+            def recurse(v, b_local):
+                Bloc = v.shape[0]
+                if Bloc == 1:
+                    nz = (seq_lens_layer[b_local] // BLOCK_SIZE).item()
+                    return F.normalize(v[:, :nz], dim=-1, eps=1e-7)
+                vl = recurse(v[:Bloc // 2], b_local[:Bloc // 2])
+                vr = recurse(v[Bloc // 2:], b_local[Bloc // 2:])
+                _, idx_, idx_ul, idx_ur = fwd_idx[counter[0]]
+                idx_ll, idx_rr = idx_.mT
+                l_idx, c = torch.unique(idx_ll, return_counts=True)
+                r_idx = idx_rr.split(tuple(c.tolist()))
+                combined = [torch.cat([vl[:, l_idx[i]].unsqueeze(1), vr[:, r_idx[i]]], dim=1).mean(1, keepdim=True)
+                            for i in range(len(l_idx))]
+                if combined:
+                    cv = F.normalize(torch.cat(combined, dim=1), dim=-1)
+                    cv = torch.cat([cv, vl[:, idx_ul], vr[:, idx_ur]], dim=1)
+                else:
+                    cv = torch.cat([vl[:, idx_ul], vr[:, idx_ur]], dim=1)
+                counter[0] += 1
+                return cv
+            return recurse(v, b_idx_local)
+
+        def restore_cache(x, rev_idx):
+            xx = torch.empty((1, len(rev_idx[-2]), x.shape[-1]), dtype=x.dtype, device=x.device)
+            xx[:, :x.shape[1]] = x
+            for idx_ in rev_idx[:-1]:
+                xx[:, :len(idx_)] = xx[:, idx_]
+            return xx
+
+        def update_block_table_inplace(bt, fwd_idx, b_idx_local):
+            """Modify bt in-place (via PyTorch view sharing) so right-branch blocks
+            point to the same IDs as their matched left-branch blocks."""
+            counter = [0]
+            def recurse(bt_sub, b_local):
+                Bloc = bt_sub.shape[0]
+                if Bloc == 1:
+                    nz = (seq_lens_layer[b_local] // BLOCK_SIZE).item()
+                    return bt_sub[:, :nz]
+                bl = recurse(bt_sub[:Bloc // 2], b_local[:Bloc // 2])
+                br = recurse(bt_sub[Bloc // 2:], b_local[Bloc // 2:])
+                idx_ = fwd_idx[counter[0]][1]
+                if idx_.numel() > 0:
+                    br.view(1, -1)[:, idx_[:, 1]] = bl.view(1, -1)[:, idx_[:, 0]]
+                counter[0] += 1
+                return torch.cat([bl, br], dim=-1)
+            recurse(bt, b_idx_local)
+            # Return value is ignored — bt was modified in-place via view sharing
+
+        # ---- KV cache read/fuse/write ----
+        kv_layer = self.kv_caches[kv_gid]  # [2, total_blocks, block_sz, heads, dim]
+        _, block_sz, num_heads, head_dim = kv_layer.shape[1:]
+        bt_safe = block_table_layer.clamp(min=0)   # map -1 padding to null block (block 0)
+
+        # flat_valid: 1D list of the N_masked valid (non-padding) block IDs.
+        # Must be computed from the ORIGINAL block table before update_block_table_inplace
+        # remaps some IDs — we write merged content to these original locations.
+        flat_valid = bt_safe[nz_mask]  # shape (N_masked,)
+
+        kk = kv_layer[0][bt_safe].view(B, num_blocks_dim, -1)  # [B, P, r]
+        k_norms = kk[nz_mask].norm(2, -1)
+        for i, k in enumerate(k_norms.split(mask_split_list)):
+            splits_k[i, :k.shape[0]] = k.cpu()
+
+        _k, rev_idx, fwd_idx, _ = fuse_all_above_thr(kk, b_idx)
+        kk_restored = restore_cache(_k, rev_idx)  # shape (1, N_masked, r)
+        # Scatter write: only to valid (non-padding) block IDs — avoids writing to null block
+        # and matches restore_cache's output size (N_masked, not B×num_blocks_dim).
+        kv_layer[0][flat_valid] = kk_restored.squeeze(0).view(-1, block_sz, num_heads, head_dim)
+
+        vv = kv_layer[1][bt_safe].view(B, num_blocks_dim, -1)
+        v_norms = vv[nz_mask].norm(2, -1)
+        for i, v in enumerate(v_norms.split(mask_split_list)):
+            splits_v[i, :v.shape[0]] = v.cpu()
+
+        _v = fuse_values(vv, fwd_idx, b_idx)
+        vv_restored = restore_cache(_v, rev_idx)  # shape (1, N_masked, r)
+        kv_layer[1][flat_valid] = vv_restored.squeeze(0).view(-1, block_sz, num_heads, head_dim)
+
+        # Update block table in-place (right-branch blocks redirect to left-branch IDs)
+        update_block_table_inplace(block_table_layer, fwd_idx, b_idx)
+        # Propagate updated block IDs back to the GPU tensor so
+        # _update_block_tables_after_compression can read them.
+        layer_meta.block_table[req_idx_to_compress] = block_table_layer
+
+        # Store norms
+        for i, req_id in enumerate(req_to_compress):
+            if req_id not in self.fused_requests:
+                self.fused_requests[req_id] = {}
+            self.fused_requests[req_id][layer_name] = (splits_k[i].clone(), splits_v[i].clone())
+
+        if hasattr(self, 'norms_k_buf') and self.norms_k_buf is not None:
+            max_blocks_buf = self.norms_k_buf.shape[2]
+            nb = min(num_blocks_dim, max_blocks_buf)
+            for i, req_idx in enumerate(req_idx_to_compress):
+                self.norms_k_buf[layer_idx, req_idx, :nb].copy_(splits_k[i, :nb].to(device))
+                self.norms_v_buf[layer_idx, req_idx, :nb].copy_(splits_v[i, :nb].to(device))
+
+        compression_ratio = num_blocks_dim / _v.shape[1] if _v.shape[1] > 0 else 0.0
+        logger.info(f"Post-forward BFF compression ratio for {layer_name}: {compression_ratio:.2f}x")
+
+
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -586,8 +817,6 @@ def _patched_build_attention_metadata(
         for_cudagraph_capture: bool = False,
         num_scheduled_tokens: dict[str, int] | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
-        req_idx_to_compress: list[int] | None = None,
-        req_ids_to_compress: list[str] | None = None,
         fused_reqs_idx: list[int] | None = None,
         fused_reqs: list[str] | None = None,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
@@ -750,28 +979,32 @@ def _patched_build_attention_metadata(
                 if builder.supports_update_block_table:
                     cached_attn_metadata[cache_key] = attn_metadata_i
 
-            
-            #sefi
-            #this is a dummy run
-            # attn_metadata_i.req_idx_to_compress = [0,1]
-            # attn_metadata_i.req_ids_to_compress = ['dummy-req1', 'dummy-req2']
-            
-            # if req_idx_to_compress is not None and len(req_idx_to_compress) > 1:
+
+            # sefi — attach static norm-buffer views for graph-compatible decode scaling
             if len(attn_group.layer_names) == 1:
                 layer_name = attn_group.layer_names[0]
-                if len(req_idx_to_compress) > 1:
-                    attn_metadata_i.req_idx_to_compress = req_idx_to_compress
-                    attn_metadata_i.req_ids_to_compress = req_ids_to_compress
-                    attn_metadata_i.compression_hook = BlockCompressionHookGraphAsync(self.vllm_config,attn_metadata_i, self.fused_requests)
-                    
-                if len(fused_reqs) > 0:
-                    attn_metadata_i.norms_k = {}
-                    attn_metadata_i.norms_v = {}
-                    for i, k in zip(fused_reqs_idx,fused_reqs):
-                        norm_k, norm_v = self.fused_requests[k][layer_name]
-                        attn_metadata_i.norms_k[i] = norm_k
-                        attn_metadata_i.norms_v[i] = norm_v   
-                
+                layer_idx = int(layer_name.split('.')[2])
+                warmup = getattr(self, '_ff_warmup_layers', 2)
+                max_layer = getattr(self, '_ff_max_layer_idx',
+                                    self.vllm_config.model_config.get_num_layers(
+                                        self.vllm_config.parallel_config) - warmup)
+                is_fusion_layer = warmup <= layer_idx < max_layer
+
+                if is_fusion_layer and hasattr(self, 'norms_k_buf') and self.norms_k_buf is not None:
+                    nr_view = num_reqs_padded if num_reqs_padded is not None else num_reqs
+                    max_blocks_buf = self.norms_k_buf.shape[2]
+                    # Store views into the persistent buffer — same storage, graph-capturable
+                    attn_metadata_i.norms_k_buf = self.norms_k_buf[layer_idx, :nr_view, :max_blocks_buf]
+                    attn_metadata_i.norms_v_buf = self.norms_v_buf[layer_idx, :nr_view, :max_blocks_buf]
+                    # Flag for patched_flash_forward: skip scaling when nothing is fused.
+                    # Do NOT force True during graph capture — the warmup dummy run uses
+                    # the maximum batch size (e.g. 256 reqs × 256 blocks) and the
+                    # gather-multiply would try to allocate ~8 GiB → OOM.
+                    # In PIECEWISE graph mode (the default) patched_flash_forward runs
+                    # eagerly every step, so this Python flag is re-evaluated at each
+                    # call and is safe to be False during warmup.
+                    attn_metadata_i.has_fused_reqs = bool(fused_reqs)
+
             
             if ubid is None:
                 assert isinstance(attn_metadata, dict)
@@ -984,20 +1217,30 @@ def execute_model(
 
             ## sefi
             self._updated_block_tables = None
-            # do_compress = all([scheduler_output.num_scheduled_tokens.get(req_id, 0) > 1 for req_id in self.input_batch.req_ids])
-            
-            req_to_compress = [  
-                req_id for req_id in self.input_batch.req_ids  
-                if (scheduler_output.num_scheduled_tokens.get(req_id, 0) > 1 and   
-                    req_id not in self.fused_requests.keys())  
+
+            # Evict entries for requests that have left the batch (prevents unbounded growth)
+            active_ids = set(self.input_batch.req_ids)
+            for rid in [k for k in self.fused_requests if k not in active_ids]:
+                del self.fused_requests[rid]
+
+            req_to_compress = [
+                req_id for req_id in self.input_batch.req_ids
+                if (scheduler_output.num_scheduled_tokens.get(req_id, 0) > 1 and
+                    req_id not in self.fused_requests)
             ]
             if len(req_to_compress) < 4:
-                req_to_compress = []     
+                req_to_compress = []
             req_idx_to_compress = [self.input_batch.req_id_to_index[r] for r in req_to_compress]
-            fused_reqs = [req_id for req_id in self.input_batch.req_ids if req_id in self.fused_requests.keys()]
+            fused_reqs = [req_id for req_id in self.input_batch.req_ids if req_id in self.fused_requests]
             fused_reqs_idx = [self.input_batch.req_id_to_index[r] for r in fused_reqs]
 
-            ## 
+            # Skip norm-buffer fill/reset when no fused requests are present AND the
+            # previous step also had none (avoids pointless fill_(1.0) every step).
+            has_fused = bool(fused_reqs)
+            if has_fused or getattr(self, '_had_fused_reqs_prev_step', False):
+                self._fill_norm_buffers(fused_reqs, fused_reqs_idx)
+            self._had_fused_reqs_prev_step = has_fused
+            ##
 
             attn_metadata, spec_decode_common_attn_metadata = (
                 self._build_attention_metadata(
@@ -1011,10 +1254,8 @@ def execute_model(
                     use_spec_decode=use_spec_decode,
                     num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
-                    req_idx_to_compress=req_idx_to_compress,
-                    req_ids_to_compress=req_to_compress,
                     fused_reqs_idx=fused_reqs_idx,
-                    fused_reqs = fused_reqs,
+                    fused_reqs=fused_reqs,
                 )
             )
 
@@ -1060,9 +1301,16 @@ def execute_model(
                 **model_kwargs,
             )
 
-            if len(req_to_compress) > 1:
-                self.compression_hook.wait_for_all_compressions()
-                self._update_block_tables_after_compression(req_to_compress)
+        # Post-forward BFF compression — OUTSIDE set_forward_context so KV cache
+        # writes don't interfere with the forward context / KV-connector state.
+        if len(req_to_compress) >= 4:
+            self._run_post_forward_bff(req_to_compress, req_idx_to_compress, attn_metadata)
+            self._update_block_tables_after_compression(req_to_compress)
+            logger.info(
+                "BFF post-forward: compressed %d requests across %d fusion layers",
+                len(req_to_compress),
+                sum(1 for g in self.kv_cache_config.kv_cache_groups[1:] if g.layer_names),
+            )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:

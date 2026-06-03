@@ -1129,10 +1129,11 @@ class BlockCompressionHookSyncOptimized(CompressionHook):
         else:  
             kk = kk.view(self.B,self.num_blocks, -1)  
             k_norms = kk[self.nz_mask].norm(2,-1)  
-            for i,k in enumerate(k_norms.split(mask.sum(-1).tolist())):  
-                if req_idx[i] not in self.norms_k:  
-                    self.norms_k[req_idx[i]] = {}  
-                self.norms_k[req_idx[i]][layer_name] = k
+            for i,k in enumerate(k_norms.split(mask.sum(-1).tolist())):
+                req_id = self.reqs[i]
+                if req_id not in self.norms_k:
+                    self.norms_k[req_id] = {}
+                self.norms_k[req_id][layer_name] = k
         
         _k, _idx, fwd_idx, _  = fuse_all_above_thr(kk, self.b_idx, thr)  
   
@@ -1157,10 +1158,11 @@ class BlockCompressionHookSyncOptimized(CompressionHook):
         else:  
             vv = vv.view(self.B,self.num_blocks, -1)  
             v_norms = vv[self.nz_mask].norm(2,-1)  
-            for i,v in enumerate(v_norms.split(mask.sum(-1).tolist())):  
-                if req_idx[i] not in self.norms_v:  
-                    self.norms_v[req_idx[i]] = {}  
-                self.norms_v[req_idx[i]][layer_name] = v
+            for i,v in enumerate(v_norms.split(mask.sum(-1).tolist())):
+                req_id = self.reqs[i]
+                if req_id not in self.norms_v:
+                    self.norms_v[req_id] = {}
+                self.norms_v[req_id][layer_name] = v
             
         _v = fuse_values_with_above_thr_idx(vv,fwd_idx, self.b_idx)  
           

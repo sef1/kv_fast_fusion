@@ -371,7 +371,10 @@ def update_from_output(
         # block_merge_mapping = model_runner_output.updated_block_table  
         block_merge_mapping = getattr(model_runner_output, "_updated_block_tables", None)
         if block_merge_mapping:
-            self._handle_block_merging_with_counts(block_merge_mapping)
+            try:
+                self._handle_block_merging_with_counts(block_merge_mapping)
+            except Exception as e:
+                logger.error("BFF block merging failed — skipping this step: %s", e, exc_info=True)
         ###
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():

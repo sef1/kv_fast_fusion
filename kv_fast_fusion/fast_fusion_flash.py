@@ -1,8 +1,6 @@
 import torch
 
 # from vllm.forward_context import get_forward_context
-from kv_fast_fusion.kv_fast_fusion_graph_runner import BLOCK_SIZE
-
 from vllm.v1.attention.backends.flash_attn import  (
     cascade_attention,
     AttentionType,
@@ -84,26 +82,22 @@ def patched_forward(
         # For decoder and cross-attention, use KV cache as before
         key_cache, value_cache = kv_cache.unbind(0)
 
-         ### sefi
-        # forward_context: ForwardContext = get_forward_context()
-        sf_k = None
-        if hasattr(attn_metadata, 'norms_k'):
-                idx = list(attn_metadata.norms_k.keys())
-                num_blocks = (attn_metadata.seq_lens[idx]//BLOCK_SIZE).max()
-                device = attn_metadata.block_table.device
-                sf_k = torch.stack(list(attn_metadata.norms_k.values()))[:,:num_blocks].to(device)
-                sf_v = torch.stack(list(attn_metadata.norms_k.values()))[:,:num_blocks].to(device)
-                
-                                               
-                # Combine unsqueeze operations and apply scaling  
-                sf_k_expanded = sf_k.view(*sf_k.shape, 1, 1, 1)  # More efficient than multiple unsqueeze  
-                sf_v_expanded = sf_v.view(*sf_v.shape, 1, 1, 1)  
-                
-                # Index and scale in one operation  
-                bt_idx = attn_metadata.block_table[idx, :sf_k.shape[1]]  
-                key_cache[bt_idx] *= sf_k_expanded  
-                value_cache[bt_idx] *= sf_v_expanded
-    
+        ### sefi — static-buffer scaling for fused requests (graph-compatible)
+        # has_fused_reqs is False in piecewise/eager mode when nothing is fused → skip
+        # entire block to avoid wasting memory bandwidth on 1.0 multiplies.
+        # During CUDA graph capture it is forced True so the op is always captured.
+        bt = None
+        sf_k_expanded = None
+        sf_v_expanded = None
+        if hasattr(attn_metadata, 'norms_k_buf') and getattr(attn_metadata, 'has_fused_reqs', True):
+            sf_k = attn_metadata.norms_k_buf   # [num_reqs_padded, max_blocks] — static shape
+            sf_v = attn_metadata.norms_v_buf   # [num_reqs_padded, max_blocks] — static shape
+            sf_k_expanded = sf_k.view(*sf_k.shape, 1, 1, 1)
+            sf_v_expanded = sf_v.view(*sf_v.shape, 1, 1, 1)
+            # clamp(-1 pad slots → 0 null block); norms_k_buf is 1.0 for padding → no-op
+            bt = attn_metadata.block_table[:sf_k.shape[0], :sf_k.shape[1]].clamp(min=0)
+            key_cache[bt] *= sf_k_expanded
+            value_cache[bt] *= sf_v_expanded
         ####
 
         # key and value may be None in the case of cross attention. They are
@@ -132,25 +126,10 @@ def patched_forward(
                 layer._v_scale,
             )
         
-         ###sefi
-            if sf_k is not None:            
-                key_cache[bt_idx] /= sf_k_expanded
-                value_cache[bt_idx] /= sf_v_expanded
-
-            # forward_context = get_forward_context() 
-            # compression_hook = forward_context.additional_kwargs.get('compression_hook')
-            # if compression_hook is not None: # and forward_context.compression_hook is not None:
-            # # Get the attention layer and KV cache
-            if hasattr(attn_metadata, 'compression_hook'):
-                req_idx = attn_metadata.req_idx_to_compress
-                # kv = kv_cache[:, attn_metadata.block_table[req_idx]].clone()
-
-                attn_metadata.compression_hook.start_layer_compression(  
-                    layer.layer_name,  
-                    kv_cache.clone(),
-                    attn_metadata,
-                    )    
-                
+            ###sefi — restore after KV write so later attention steps use original norms
+            if bt is not None:
+                key_cache[bt] /= sf_k_expanded
+                value_cache[bt] /= sf_v_expanded
             ##
 
 
