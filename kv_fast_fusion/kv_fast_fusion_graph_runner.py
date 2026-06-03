@@ -19,7 +19,6 @@ BLOCK_SIZE = 128
 NUM_LAST_CHUNKS_TO_COMPRESS = 4 
 CHUNK_SIZE = 512
 
-from kv_fast_fusion.kv_fast_fusion_runner_optimized import BlockCompressionHookGraphAsync  # kept for reference; not used by graph path
 
 class BlockCompressionHookGraph(CompressionHook):  
 
@@ -644,7 +643,7 @@ def _run_post_forward_bff(
         kk = kv_layer[0][bt_safe].view(B, num_blocks_dim, -1)  # [B, P, r]
         k_norms = kk[nz_mask].norm(2, -1)
         for i, k in enumerate(k_norms.split(mask_split_list)):
-            splits_k[i, :k.shape[0]] = k.cpu()
+            splits_k[i, :k.shape[0]] = k
 
         _k, rev_idx, fwd_idx, _ = fuse_all_above_thr(kk, b_idx)
         kk_restored = restore_cache(_k, rev_idx)  # shape (1, N_masked, r)
@@ -655,7 +654,7 @@ def _run_post_forward_bff(
         vv = kv_layer[1][bt_safe].view(B, num_blocks_dim, -1)
         v_norms = vv[nz_mask].norm(2, -1)
         for i, v in enumerate(v_norms.split(mask_split_list)):
-            splits_v[i, :v.shape[0]] = v.cpu()
+            splits_v[i, :v.shape[0]] = v
 
         _v = fuse_values(vv, fwd_idx, b_idx)
         vv_restored = restore_cache(_v, rev_idx)  # shape (1, N_masked, r)
