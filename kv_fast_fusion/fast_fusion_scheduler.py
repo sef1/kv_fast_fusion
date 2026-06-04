@@ -187,12 +187,18 @@ def _handle_block_merging_with_counts(self, request_blocks: dict[str, dict[int, 
                     block_cache[block_id] = block_pool.blocks[block_id]  
                 block = block_cache[block_id]  
                 new_req_blocks.append(block)  
-                if not block.is_null and block.block_id != -1:  
-                    new_ref_counts[block.block_id] += 1  
-  
-            manager.req_to_blocks[req_id] = new_req_blocks  
-  
-    # Calculate reference changes and prepare operations  
+                if not block.is_null and block.block_id != -1:
+                    new_ref_counts[block.block_id] += 1
+
+            manager.req_to_blocks[req_id] = new_req_blocks
+            # After merge/dedup a block may already carry a hash (it now points at a
+            # block another request cached). Mark the whole current block set as
+            # cached so cache_full_blocks won't try to re-hash it and trip
+            # `assert blk.block_hash is None`. New decode blocks (beyond this count)
+            # still get cached normally.
+            manager.num_cached_block[req_id] = len(new_req_blocks)
+
+    # Calculate reference changes and prepare operations
     blocks_to_touch = []  
     blocks_to_free = []  
       

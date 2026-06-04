@@ -19,6 +19,11 @@ BLOCK_SIZE = 128
 NUM_LAST_CHUNKS_TO_COMPRESS = 4
 CHUNK_SIZE = 512
 
+# Number of consecutive fusion layers packed into one KV cache group.
+# G=1  → one group per layer (28 groups for a 32-layer model, original behaviour).
+# G=4  → 7 groups, 4× fewer block-pool operations per step.
+BFF_GROUP_SIZE = 4
+
 # LSH deduplication constants
 NUM_LSH_BITS = 256            # total bits per fingerprint
 NUM_LSH_TABLES = 16           # independent sub-tables
@@ -570,12 +575,15 @@ class BFFCompressor:
         )
 
         # LSH fields — head_dim and lsh_proj are constant across all fusion layers.
+        # kv_caches is indexed by LAYER INDEX (not group id), so resolve the first
+        # fusion group's first layer to its layer index before indexing.
         self._head_dim = self._kv_dtype = self._lsh_proj = None
         for kv_gid2, kv_group2 in enumerate(runner.kv_cache_config.kv_cache_groups):
-            if kv_gid2 == 0:
+            if kv_gid2 == 0 or not kv_group2.layer_names:
                 continue
-            if runner.kv_caches and kv_gid2 < len(runner.kv_caches):
-                kv0 = runner.kv_caches[kv_gid2]
+            li0 = int(kv_group2.layer_names[0].split('.')[2])
+            if runner.kv_caches and li0 < len(runner.kv_caches):
+                kv0 = runner.kv_caches[li0]
                 self._head_dim = kv0.shape[-1]
                 self._lsh_proj = runner.lsh_proj[:self._head_dim]  # [head_dim, NUM_LSH_BITS]
                 self._kv_dtype = kv0.dtype
@@ -694,87 +702,137 @@ class BFFCompressor:
         recurse(bt, b_idx_local)
 
     # ------------------------------------------------------------------
-    # Per-layer compression (only genuinely layer-specific work here)
+    # Fusion-group iteration helper
     # ------------------------------------------------------------------
 
-    def _compress_layer(self, layer_name, layer_idx, layer_meta, kv_layer):
-        """Run BFF for one fusion layer. Returns (n_valid_blocks, n_unique_blocks)."""
-        _, block_sz, num_heads, head_dim = kv_layer.shape[1:]
+    def _iter_fusion_groups(self):
+        """Yield (layer_names, layer_idxs, layer_meta, kv_layers) per fusion group.
 
-        # Block-table entries differ per layer (each layer has its own block pool).
-        block_table_layer = layer_meta.block_table[self._req_idx_to_compress].clone()
-        bt_safe    = block_table_layer.clamp(min=0)
+        All layers in a KV cache group share a single block table, so a group's
+        attn metadata (and therefore its block_table) is the same object for every
+        layer in the group — we key it off layer_names[0].  Each layer still has its
+        own physical KV tensor, accessed by **layer index** (runner.kv_caches is a
+        flat list ordered by sorted layer index — see bind_kv_cache), NOT by group id.
+        """
+        runner = self._runner
+        for kv_gid, kv_group in enumerate(runner.kv_cache_config.kv_cache_groups):
+            if kv_gid == 0:                       # group 0 = warmup (sliding window)
+                continue
+            layer_names = kv_group.layer_names
+            if not layer_names:
+                continue
+            key = layer_names[0]
+            if key not in self._meta_dict:
+                continue
+            layer_meta = self._meta_dict[key]     # shared across the whole group
+            layer_idxs = [int(ln.split('.')[2]) for ln in layer_names]
+            kv_layers  = [runner.kv_caches[li] for li in layer_idxs]
+            yield layer_names, layer_idxs, layer_meta, kv_layers
+
+    # ------------------------------------------------------------------
+    # Per-group compression (joint merge across the G layers of a group)
+    # ------------------------------------------------------------------
+
+    def _compress_group(self, layer_names, layer_idxs, layer_meta, kv_layers):
+        """Run BFF jointly over all G layers of one KV cache group.
+
+        The merge decision is made once on the mean-K representation across the G
+        layers (they share a block table, so the redirect must be identical for all
+        of them); the same fusion (fwd_idx) is then replayed on every layer's own K
+        and V tensors and the shared block table is redirected once.
+
+        Returns (n_valid_blocks, n_unique_blocks) for the group.
+        """
+        runner = self._runner
+        _, block_sz, num_heads, head_dim = kv_layers[0].shape[1:]
+        P = self._num_blocks_dim
+
+        bt         = layer_meta.block_table[self._req_idx_to_compress].clone()
+        bt_safe    = bt.clamp(min=0)
         flat_valid = bt_safe[self._nz_mask]
 
-        # Reuse pre-allocated buffers — fill_(1.0) is cheaper than a new allocation.
-        self._splits_k.fill_(1.0)
-        self._splits_v.fill_(1.0)
+        # ---- joint representation: mean of K across the G layers ----
+        kk_joint = kv_layers[0][0][bt_safe].view(self.B, P, -1).clone()
+        for kv_layer in kv_layers[1:]:
+            kk_joint += kv_layer[0][bt_safe].view(self.B, P, -1)
+        if len(kv_layers) > 1:
+            kk_joint /= len(kv_layers)
 
-        # ---- K cache ----
-        kk     = kv_layer[0][bt_safe].view(self.B, self._num_blocks_dim, -1)
-        k_norms = kk[self._nz_mask].norm(2, -1)
-        for i, k in enumerate(k_norms.split(self._mask_split_list)):
-            self._splits_k[i, :k.shape[0]] = k
+        _k, rev_idx, fwd_idx, _ = self._fuse_all_above_thr(kk_joint, self._b_idx)
+        n_valid, n_unique = self._nz_mask[0].shape[0], _k.shape[1]
+        del kk_joint, _k
 
-        _k, rev_idx, fwd_idx, _ = self._fuse_all_above_thr(kk, self._b_idx)
-        kk_restored = self._restore_cache(_k, rev_idx)
-        kv_layer[0][flat_valid] = kk_restored.squeeze(0).view(-1, block_sz, num_heads, head_dim)
+        # ---- replay the joint merge on every layer's own K and V ----
+        for li, layer_name, kv_layer in zip(layer_idxs, layer_names, kv_layers):
+            self._splits_k.fill_(1.0)
+            self._splits_v.fill_(1.0)
 
-        # ---- V cache ----
-        vv     = kv_layer[1][bt_safe].view(self.B, self._num_blocks_dim, -1)
-        v_norms = vv[self._nz_mask].norm(2, -1)
-        for i, v in enumerate(v_norms.split(self._mask_split_list)):
-            self._splits_v[i, :v.shape[0]] = v
+            kk = kv_layer[0][bt_safe].view(self.B, P, -1)
+            k_norms = kk[self._nz_mask].norm(2, -1)
+            for i, k in enumerate(k_norms.split(self._mask_split_list)):
+                self._splits_k[i, :k.shape[0]] = k
+            _kl = self._fuse_values(kk, fwd_idx, self._b_idx)
+            kv_layer[0][flat_valid] = self._restore_cache(_kl, rev_idx).squeeze(0).view(
+                -1, block_sz, num_heads, head_dim)
 
-        _v = self._fuse_values(vv, fwd_idx, self._b_idx)
-        vv_restored = self._restore_cache(_v, rev_idx)
-        kv_layer[1][flat_valid] = vv_restored.squeeze(0).view(-1, block_sz, num_heads, head_dim)
+            vv = kv_layer[1][bt_safe].view(self.B, P, -1)
+            v_norms = vv[self._nz_mask].norm(2, -1)
+            for i, v in enumerate(v_norms.split(self._mask_split_list)):
+                self._splits_v[i, :v.shape[0]] = v
+            _vl = self._fuse_values(vv, fwd_idx, self._b_idx)
+            kv_layer[1][flat_valid] = self._restore_cache(_vl, rev_idx).squeeze(0).view(
+                -1, block_sz, num_heads, head_dim)
 
-        # ---- Block-table redirect and write-back ----
-        self._update_block_table_inplace(block_table_layer, fwd_idx, self._b_idx)
-        layer_meta.block_table[self._req_idx_to_compress] = block_table_layer
+            # Persist per-layer norms for decode scaling.
+            for i, req_id in enumerate(self._req_to_compress):
+                if req_id not in runner.fused_requests:
+                    runner.fused_requests[req_id] = {}
+                runner.fused_requests[req_id][layer_name] = (
+                    self._splits_k[i].clone(), self._splits_v[i].clone()
+                )
+            if runner.norms_k_buf is not None:
+                nb = min(P, runner.norms_k_buf.shape[2])
+                for i, req_idx in enumerate(self._req_idx_to_compress):
+                    runner.norms_k_buf[li, req_idx, :nb].copy_(self._splits_k[i, :nb])
+                    runner.norms_v_buf[li, req_idx, :nb].copy_(self._splits_v[i, :nb])
 
-        # ---- Persist norms for decode scaling ----
-        runner = self._runner
-        for i, req_id in enumerate(self._req_to_compress):
-            if req_id not in runner.fused_requests:
-                runner.fused_requests[req_id] = {}
-            runner.fused_requests[req_id][layer_name] = (
-                self._splits_k[i].clone(), self._splits_v[i].clone()
-            )
+        # ---- redirect the shared block table once for the whole group ----
+        self._update_block_table_inplace(bt, fwd_idx, self._b_idx)
+        layer_meta.block_table[self._req_idx_to_compress] = bt
 
-        if runner.norms_k_buf is not None:
-            nb = min(self._num_blocks_dim, runner.norms_k_buf.shape[2])
-            for i, req_idx in enumerate(self._req_idx_to_compress):
-                runner.norms_k_buf[layer_idx, req_idx, :nb].copy_(self._splits_k[i, :nb])
-                runner.norms_v_buf[layer_idx, req_idx, :nb].copy_(self._splits_v[i, :nb])
-
-        return self._nz_mask[0].shape[0], _v.shape[1]
+        return n_valid, n_unique
 
     # ------------------------------------------------------------------
     # LSH deduplication path (< 4 concurrent prefills)
     # ------------------------------------------------------------------
 
-    def _lsh_dedup_layer(self, layer_name, layer_idx, layer_meta, kv_layer):
-        """LSH dedup + normalisation for one fusion layer."""
-        runner      = self._runner
-        head_dim    = self._head_dim
-        lsh_proj    = self._lsh_proj
-        kv_dtype    = self._kv_dtype
+    def _lsh_dedup_group(self, layer_names, layer_idxs, layer_meta, kv_layers):
+        """LSH dedup + normalisation for one fusion group (G layers, shared table).
 
-        if layer_name not in runner.lsh_registry:
-            runner.lsh_registry[layer_name] = [dict() for _ in range(NUM_LSH_TABLES)]
-            runner.lsh_mean_k[layer_name]   = {}
-        registry_tables = runner.lsh_registry[layer_name]
-        mean_k_store    = runner.lsh_mean_k[layer_name]
+        The match decision uses the mean-K fingerprint averaged across all G layers
+        (richer fingerprint, identical redirect for the whole group).  A matched
+        block redirects the shared block table once; the unmatched blocks are then
+        normalised independently in every layer's own tensor, with per-layer norms
+        stored for decode scaling.
+        """
+        runner   = self._runner
+        head_dim = self._head_dim
+        lsh_proj = self._lsh_proj
+        kv_dtype = self._kv_dtype
+        G        = len(kv_layers)
 
-        # Block table IS layer-specific; reuse pre-allocated norm buffers.
+        # One registry per group, keyed by the group's first layer name.
+        gkey = layer_names[0]
+        if gkey not in runner.lsh_registry:
+            runner.lsh_registry[gkey] = [dict() for _ in range(NUM_LSH_TABLES)]
+            runner.lsh_mean_k[gkey]   = {}
+        registry_tables = runner.lsh_registry[gkey]
+        mean_k_store    = runner.lsh_mean_k[gkey]
+
         block_table = layer_meta.block_table[self._req_idx_to_compress].clone()
-        self._splits_k.fill_(1.0)
-        self._splits_v.fill_(1.0)
 
         for i, req_id in enumerate(self._req_to_compress):
-            nz_blocks = int(self._nz_blocks[i])   # precomputed, no per-layer division
+            nz_blocks = int(self._nz_blocks[i])
             if nz_blocks == 0:
                 continue
 
@@ -786,13 +844,12 @@ class BFFCompressor:
             if N == 0:
                 continue
 
-            # ---- Batched GPU: norms + mean-K + LSH fingerprints ----
-            block_ks = kv_layer[0, valid_bids]   # [N, blk_sz, kv_heads, head_dim]
-            block_vs = kv_layer[1, valid_bids]
-            norms_k  = block_ks.float().view(N, -1).norm(dim=1)
-            norms_v  = block_vs.float().view(N, -1).norm(dim=1)
-
-            block_means      = block_ks.float().view(N, -1, head_dim).mean(dim=1)
+            # ---- joint mean-K fingerprint across the G layers ----
+            block_means = kv_layers[0][0, valid_bids].float().view(N, -1, head_dim).mean(dim=1)
+            for kv_layer in kv_layers[1:]:
+                block_means += kv_layer[0, valid_bids].float().view(N, -1, head_dim).mean(dim=1)
+            if G > 1:
+                block_means /= G
             block_means_norm = F.normalize(block_means, dim=1).to(torch.float16)
 
             proj_all       = (block_means_norm @ lsh_proj).sign()
@@ -800,19 +857,14 @@ class BFFCompressor:
             proj_bytes     = proj_bits.view(N, NUM_LSH_TABLES, LSH_BITS_PER_TABLE)
             sub_hashes_all = (proj_bytes * _LSH_POWERS).sum(dim=2).tolist()
 
-            # Write norms into pre-allocated buffers (GPU→GPU, no alloc)
-            self._splits_k[i, valid_pos] = norms_k.clamp(min=1e-6).to(self._splits_k.dtype)
-            self._splits_v[i, valid_pos] = norms_v.clamp(min=1e-6).to(self._splits_v.dtype)
-
             valid_bids_list = valid_bids.tolist()
             valid_pos_list  = valid_pos.tolist()
 
-            # ---- Registry lookup (CPU loop; GPU matmul batched per block) ----
+            # ---- Registry lookup → decide matched vs to-register (joint) ----
             to_register = []
             for k, (bid, pos) in enumerate(zip(valid_bids_list, valid_pos_list)):
-                sub_hashes = sub_hashes_all[k]
                 candidates = set()
-                for t, h in enumerate(sub_hashes):
+                for t, h in enumerate(sub_hashes_all[k]):
                     candidates.update(registry_tables[t].get(h, []))
                 candidates.discard(bid)
 
@@ -827,82 +879,85 @@ class BFFCompressor:
                             matched_bid = cid_list[best_idx.item()]
 
                 if matched_bid is not None:
-                    block_table[i, pos] = matched_bid
+                    block_table[i, pos] = matched_bid       # redirect shared table
                 else:
-                    to_register.append((k, bid, block_means_norm[k], sub_hashes))
+                    to_register.append((k, bid, block_means_norm[k], sub_hashes_all[k]))
 
-            # ---- Batched GPU normalisation for unmatched blocks ----
-            if to_register and len(mean_k_store) < MAX_REGISTRY_PER_LAYER:
-                local_idxs         = [t[0] for t in to_register]
-                unmatched_bids_gpu = valid_bids[local_idxs]
-                norms_k_sub        = norms_k[local_idxs].view(-1, 1, 1, 1).clamp(min=1e-6)
-                norms_v_sub        = norms_v[local_idxs].view(-1, 1, 1, 1).clamp(min=1e-6)
-                kv_layer[0, unmatched_bids_gpu] = (block_ks[local_idxs] / norms_k_sub).to(kv_dtype)
-                kv_layer[1, unmatched_bids_gpu] = (block_vs[local_idxs] / norms_v_sub).to(kv_dtype)
+            # ---- per-layer norms + normalise unmatched blocks in each layer ----
+            local_idxs = [t[0] for t in to_register]
+            for li, layer_name, kv_layer in zip(layer_idxs, layer_names, kv_layers):
+                self._splits_k.fill_(1.0)
+                self._splits_v.fill_(1.0)
 
-                for _, bid, mean_k, sub_hashes in to_register:
-                    if len(mean_k_store) >= MAX_REGISTRY_PER_LAYER:
-                        break
-                    mean_k_store[bid] = mean_k
-                    for t, h in enumerate(sub_hashes):
-                        registry_tables[t].setdefault(h, []).append(bid)
+                block_ks = kv_layer[0, valid_bids]
+                block_vs = kv_layer[1, valid_bids]
+                norms_k  = block_ks.float().view(N, -1).norm(dim=1)
+                norms_v  = block_vs.float().view(N, -1).norm(dim=1)
+                self._splits_k[i, valid_pos] = norms_k.clamp(min=1e-6).to(self._splits_k.dtype)
+                self._splits_v[i, valid_pos] = norms_v.clamp(min=1e-6).to(self._splits_v.dtype)
 
-            n_redir = nz_blocks - len(to_register)
+                if local_idxs:
+                    unmatched_bids_gpu = valid_bids[local_idxs]
+                    norms_k_sub = norms_k[local_idxs].view(-1, 1, 1, 1).clamp(min=1e-6)
+                    norms_v_sub = norms_v[local_idxs].view(-1, 1, 1, 1).clamp(min=1e-6)
+                    kv_layer[0, unmatched_bids_gpu] = (block_ks[local_idxs] / norms_k_sub).to(kv_dtype)
+                    kv_layer[1, unmatched_bids_gpu] = (block_vs[local_idxs] / norms_v_sub).to(kv_dtype)
+
+                if req_id not in runner.fused_requests:
+                    runner.fused_requests[req_id] = {}
+                runner.fused_requests[req_id][layer_name] = (
+                    self._splits_k[i].clone(), self._splits_v[i].clone()
+                )
+                if runner.norms_k_buf is not None:
+                    nb = min(self._num_blocks_dim, runner.norms_k_buf.shape[2])
+                    runner.norms_k_buf[li, self._req_idx_to_compress[i], :nb].copy_(self._splits_k[i, :nb])
+                    runner.norms_v_buf[li, self._req_idx_to_compress[i], :nb].copy_(self._splits_v[i, :nb])
+
+            # ---- register the unmatched blocks once (joint fingerprint) ----
+            for _, bid, mean_k, sub_hashes in to_register:
+                if len(mean_k_store) >= MAX_REGISTRY_PER_LAYER:
+                    break
+                mean_k_store[bid] = mean_k
+                for t, h in enumerate(sub_hashes):
+                    registry_tables[t].setdefault(h, []).append(bid)
+
+            n_redir = N - len(to_register)
             logger.info(
-                "LSH dedup %s req=%s: %d/%d blocks redirected",
-                layer_name, req_id, n_redir, nz_blocks,
+                "LSH dedup group[%s] req=%s: %d/%d blocks redirected",
+                gkey, req_id, n_redir, N,
             )
 
-            if req_id not in runner.fused_requests:
-                runner.fused_requests[req_id] = {}
-            runner.fused_requests[req_id][layer_name] = (
-                self._splits_k[i].clone(), self._splits_v[i].clone()
-            )
-
-        # Update norms_k_buf so patched_forward can scale this step's decode.
-        if runner.norms_k_buf is not None:
-            nb = min(self._num_blocks_dim, runner.norms_k_buf.shape[2])
-            for i, req_idx in enumerate(self._req_idx_to_compress):
-                runner.norms_k_buf[layer_idx, req_idx, :nb].copy_(self._splits_k[i, :nb])
-                runner.norms_v_buf[layer_idx, req_idx, :nb].copy_(self._splits_v[i, :nb])
-
-        # Write redirected block IDs back to the attention-metadata GPU buffer.
+        # Write redirected block IDs back to the shared block table.
         layer_meta.block_table[self._req_idx_to_compress] = block_table
 
     def run_lsh(self):
-        """Run LSH dedup + registration across all fusion layers."""
+        """Run LSH dedup + registration across all fusion groups."""
         if self._num_blocks_dim == 0 or self._lsh_proj is None:
             return
-        runner = self._runner
-        for kv_gid, kv_group in enumerate(runner.kv_cache_config.kv_cache_groups):
-            if kv_gid == 0:
-                continue
-            layer_names = kv_group.layer_names
-            if not layer_names:
-                continue
-            layer_name = layer_names[0]
-            if layer_name not in self._meta_dict:
-                continue
-            layer_idx  = int(layer_name.split('.')[2])
-            layer_meta = self._meta_dict[layer_name]
-            kv_layer   = runner.kv_caches[kv_gid]
-            self._lsh_dedup_layer(layer_name, layer_idx, layer_meta, kv_layer)
+        for layer_names, layer_idxs, layer_meta, kv_layers in self._iter_fusion_groups():
+            self._lsh_dedup_group(layer_names, layer_idxs, layer_meta, kv_layers)
 
-    def _lsh_register_layer(self, layer_name, layer_meta, kv_layer):
-        """Register BFF-merged (already normalised) blocks for one fusion layer."""
-        runner      = self._runner
-        head_dim    = self._head_dim
-        lsh_proj    = self._lsh_proj
+    def _lsh_register_group(self, layer_names, layer_idxs, layer_meta, kv_layers):
+        """Register BFF-merged (already normalised) blocks for one fusion group.
 
-        if layer_name not in runner.lsh_registry:
-            runner.lsh_registry[layer_name] = [dict() for _ in range(NUM_LSH_TABLES)]
-            runner.lsh_mean_k[layer_name]   = {}
-        registry_tables = runner.lsh_registry[layer_name]
-        mean_k_store    = runner.lsh_mean_k[layer_name]
+        The fingerprint is the mean-K averaged across the G layers — identical to
+        the lookup fingerprint used in _lsh_dedup_group so a later request can match.
+        """
+        runner   = self._runner
+        head_dim = self._head_dim
+        lsh_proj = self._lsh_proj
+        G        = len(kv_layers)
+
+        gkey = layer_names[0]
+        if gkey not in runner.lsh_registry:
+            runner.lsh_registry[gkey] = [dict() for _ in range(NUM_LSH_TABLES)]
+            runner.lsh_mean_k[gkey]   = {}
+        registry_tables = runner.lsh_registry[gkey]
+        mean_k_store    = runner.lsh_mean_k[gkey]
 
         for i, req_id in enumerate(self._req_to_compress):
             req_idx   = self._req_idx_to_compress[i]
-            nz_blocks = int(self._nz_blocks[i])   # precomputed
+            nz_blocks = int(self._nz_blocks[i])
             if nz_blocks == 0 or len(mean_k_store) >= MAX_REGISTRY_PER_LAYER:
                 continue
 
@@ -912,16 +967,18 @@ class BFFCompressor:
             if valid_bids.shape[0] == 0:
                 continue
 
-            bid_list = valid_bids.tolist()
-            new_bids = [b for b in bid_list if b not in mean_k_store]
+            new_bids = [b for b in valid_bids.tolist() if b not in mean_k_store]
             if not new_bids:
                 continue
 
-            new_bids_t   = torch.tensor(new_bids, dtype=torch.long, device=kv_layer.device)
-            block_ks     = kv_layer[0, new_bids_t]
-            M            = len(new_bids)
-            block_means  = block_ks.float().view(M, -1, head_dim).mean(dim=1)
-            means_norm   = F.normalize(block_means, dim=1).to(torch.float16)
+            new_bids_t  = torch.tensor(new_bids, dtype=torch.long, device=kv_layers[0].device)
+            M           = len(new_bids)
+            block_means = kv_layers[0][0, new_bids_t].float().view(M, -1, head_dim).mean(dim=1)
+            for kv_layer in kv_layers[1:]:
+                block_means += kv_layer[0, new_bids_t].float().view(M, -1, head_dim).mean(dim=1)
+            if G > 1:
+                block_means /= G
+            means_norm  = F.normalize(block_means, dim=1).to(torch.float16)
 
             proj_all       = (means_norm @ lsh_proj).sign()
             proj_bits      = (proj_all > 0).to(torch.int32).cpu()
@@ -936,22 +993,11 @@ class BFFCompressor:
                     registry_tables[t].setdefault(h, []).append(bid)
 
     def run_lsh_register(self):
-        """Register BFF blocks in the LSH registry across all fusion layers."""
+        """Register BFF blocks in the LSH registry across all fusion groups."""
         if self._num_blocks_dim == 0 or self._lsh_proj is None:
             return
-        runner = self._runner
-        for kv_gid, kv_group in enumerate(runner.kv_cache_config.kv_cache_groups):
-            if kv_gid == 0:
-                continue
-            layer_names = kv_group.layer_names
-            if not layer_names:
-                continue
-            layer_name = layer_names[0]
-            if layer_name not in self._meta_dict:
-                continue
-            layer_meta = self._meta_dict[layer_name]
-            kv_layer   = runner.kv_caches[kv_gid]
-            self._lsh_register_layer(layer_name, layer_meta, kv_layer)
+        for layer_names, layer_idxs, layer_meta, kv_layers in self._iter_fusion_groups():
+            self._lsh_register_group(layer_names, layer_idxs, layer_meta, kv_layers)
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -960,29 +1006,17 @@ class BFFCompressor:
     def run(self):
         if self._num_blocks_dim == 0:
             return
-        runner = self._runner
-        for kv_gid, kv_group in enumerate(runner.kv_cache_config.kv_cache_groups):
-            if kv_gid == 0:
-                continue
-            layer_names = kv_group.layer_names
-            if not layer_names:
-                continue
-            layer_name = layer_names[0]
-            if layer_name not in self._meta_dict:
-                continue
-            layer_idx  = int(layer_name.split('.')[2])
-            layer_meta = self._meta_dict[layer_name]
-            kv_layer   = runner.kv_caches[kv_gid]
-
-            n_valid, n_unique = self._compress_layer(layer_name, layer_idx, layer_meta, kv_layer)
+        for layer_names, layer_idxs, layer_meta, kv_layers in self._iter_fusion_groups():
+            n_valid, n_unique = self._compress_group(
+                layer_names, layer_idxs, layer_meta, kv_layers)
             self._total_valid  += n_valid
             self._total_unique += n_unique
 
             n_freed = n_valid - n_unique
             if n_freed > 0:
                 logger.info(
-                    "Post-forward BFF %s: %d valid → %d unique (%.2fx, freed %d)",
-                    layer_name, n_valid, n_unique,
+                    "Post-forward BFF group[%s] (%d layers): %d valid → %d unique (%.2fx, freed %d)",
+                    layer_names[0], len(layer_names), n_valid, n_unique,
                     n_valid / n_unique if n_unique else 1.0, n_freed,
                 )
 
@@ -990,7 +1024,7 @@ class BFFCompressor:
         overall_ratio = (self._total_valid / self._total_unique
                          if self._total_unique else 1.0)
         logger.info(
-            "BFF summary: %d reqs, %d valid → %d unique across all layers "
+            "BFF summary: %d reqs, %d valid → %d unique across all groups "
             "(%.2fx, %d freed)",
             self.B, self._total_valid, self._total_unique, overall_ratio, total_freed,
         )
@@ -1592,10 +1626,23 @@ def execute_model(
             for rid in [k for k in self.fused_requests if k not in active_ids]:
                 del self.fused_requests[rid]
 
+            # Only compress requests that FINISH their prefill this step. Compressing
+            # a mid-prefill chunk (chunked prefill) would redirect/free blocks that the
+            # next chunk's cache_full_blocks still expects to be uncached → crash.
+            def _prefill_done(req_id):
+                st = self.requests.get(req_id)
+                if st is None:
+                    return False
+                ridx   = self.input_batch.req_id_to_index[req_id]
+                n_comp = int(self.input_batch.num_computed_tokens_cpu[ridx])
+                n_sched = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+                return n_comp + n_sched >= st.num_prompt_tokens
+
             req_to_compress = [
                 req_id for req_id in self.input_batch.req_ids
                 if (scheduler_output.num_scheduled_tokens.get(req_id, 0) > 1 and
-                    req_id not in self.fused_requests)
+                    req_id not in self.fused_requests and
+                    _prefill_done(req_id))
             ]
             # Keep the full list; BFF still requires >=4, but the LSH path handles any count.
             req_idx_to_compress = [self.input_batch.req_id_to_index[r] for r in req_to_compress]
@@ -1673,7 +1720,7 @@ def execute_model(
         _n_fusion_layers = sum(
             1 for g in self.kv_cache_config.kv_cache_groups[1:] if g.layer_names
         )
-        if False: # len(req_to_compress) > 1:
+        if len(req_to_compress) > 1:
             # Full BFF: recursive merge across concurrent prefills, then register blocks.
             self._run_post_forward_bff(req_to_compress, req_idx_to_compress, attn_metadata)
             self._update_block_tables_after_compression(req_to_compress)
@@ -1682,7 +1729,7 @@ def execute_model(
                 "BFF post-forward: compressed %d requests across %d fusion layers",
                 len(req_to_compress), _n_fusion_layers,
             )
-        elif len(req_to_compress) >= 1:
+        elif False: #len(req_to_compress) >= 1:
             # LSH dedup: normalise + look up registry for each individual prefill.
             self._run_lsh_dedup_and_register(req_to_compress, req_idx_to_compress, attn_metadata)
             self._update_block_tables_after_compression(req_to_compress)

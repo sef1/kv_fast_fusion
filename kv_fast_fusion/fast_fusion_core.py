@@ -80,13 +80,19 @@ def _initialize_kv_caches(
             )  
             tmp_config.append(warmup_group)
 
-            tmp_config.extend([deepcopy(kv_cache_configs[0].kv_cache_groups[0]) for _ in range(len(fused_layers_names))])
-            # full_attention_group = deepcopy(kv_cache_configs[0].kv_cache_groups[0]) 
-            for idx, layer_name in enumerate(fused_layers_names):
-               tmp_config[idx+1].layer_names = [layer_name] 
-            # full_attention_group.layer_names = fused_layers_names  
-            # Keep the original FullAttentionSpec  
-            # tmp_config.append(full_attention_group)  
+            # Pack consecutive fusion layers into groups of BFF_GROUP_SIZE.
+            # G=1 → one group per layer (old behaviour); G>1 → fewer, larger groups.
+            from kv_fast_fusion.kv_fast_fusion_graph_runner import BFF_GROUP_SIZE
+            fused_chunks = [
+                fused_layers_names[i:i + BFF_GROUP_SIZE]
+                for i in range(0, len(fused_layers_names), BFF_GROUP_SIZE)
+            ]
+            tmp_config.extend([
+                deepcopy(kv_cache_configs[0].kv_cache_groups[0])
+                for _ in range(len(fused_chunks))
+            ])
+            for idx, chunk in enumerate(fused_chunks):
+                tmp_config[idx + 1].layer_names = chunk  # list of G layer names
             
             kv_cache_configs[0].kv_cache_groups = tmp_config  
         ### sefi  end
