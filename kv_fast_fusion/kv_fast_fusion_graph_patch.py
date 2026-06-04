@@ -34,7 +34,11 @@ from kv_fast_fusion.kv_fast_fusion_graph_runner import (
     sample_tokens,
     _fill_norm_buffers,
     _run_post_forward_bff,
+    _run_lsh_dedup_and_register,
+    _lsh_register_bff_blocks,
     BLOCK_SIZE,
+    NUM_LSH_BITS,
+    LSH_MAX_HEAD_DIM,
 )
 
 import vllm.v1.core.kv_cache_utils as kv_utils
@@ -55,8 +59,13 @@ def apply_fast_fusion_graph_patch():
             _patched_build_attention_metadata, self)
         self._fill_norm_buffers = MethodType(_fill_norm_buffers, self)
         self._run_post_forward_bff = MethodType(_run_post_forward_bff, self)
+        self._run_lsh_dedup_and_register = MethodType(_run_lsh_dedup_and_register, self)
+        self._lsh_register_bff_blocks = MethodType(_lsh_register_bff_blocks, self)
         self.fused_requests = {}
         self._updated_block_tables = None
+        # LSH registry (populated lazily, one entry per fusion layer)
+        self.lsh_registry = {}   # layer_name → list[dict[int, list[int]]] (8 tables)
+        self.lsh_mean_k   = {}   # layer_name → dict[block_id, Tensor[head_dim]]
 
         original_gpu_model_runner_init(self, *args, **kwargs)
 
@@ -74,6 +83,15 @@ def apply_fast_fusion_graph_patch():
         self.norms_v_buf = torch.ones(
             num_layers, max_reqs, max_blocks_per_req,
             dtype=torch.bfloat16, device=self.device)
+
+        # Random projection matrix for LSH (fixed seed → deterministic across restarts)
+        gen = torch.Generator(device=self.device)
+        gen.manual_seed(42)
+        self.lsh_proj = torch.randn(
+            LSH_MAX_HEAD_DIM, NUM_LSH_BITS,
+            dtype=torch.float16, device=self.device,
+            generator=gen,
+        )
 
         # Cache warmup/max-layer constants so _patched_build_attention_metadata
         # doesn't have to recompute them every call.

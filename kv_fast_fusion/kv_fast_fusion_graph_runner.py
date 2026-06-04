@@ -14,10 +14,17 @@ from typing import Any, Dict, List, Optional, Union, TYPE_CHECKING, NamedTuple
 
 from dataclasses import dataclass  
   
-THRESHOLD = 0.75
+THRESHOLD = 0.7
 BLOCK_SIZE = 128
-NUM_LAST_CHUNKS_TO_COMPRESS = 4 
+NUM_LAST_CHUNKS_TO_COMPRESS = 4
 CHUNK_SIZE = 512
+
+# LSH deduplication constants
+NUM_LSH_BITS = 256            # total bits per fingerprint
+NUM_LSH_TABLES = 16           # independent sub-tables
+LSH_BITS_PER_TABLE = 16       # bits per sub-table  (NUM_LSH_BITS // NUM_LSH_TABLES)
+MAX_REGISTRY_PER_LAYER = 8192  # max registered blocks per fusion layer (hard cap)
+LSH_MAX_HEAD_DIM = 512       # lsh_proj is pre-allocated up to this head_dim
 
 
 class BlockCompressionHookGraph(CompressionHook):  
@@ -27,7 +34,7 @@ class BlockCompressionHookGraph(CompressionHook):
         self.compression_stream = torch.cuda.Stream()
         self.max_layer_idx = (vllm_config.model_config.get_num_layers(vllm_config.parallel_config) - self.warmup_layers)
         self._block_size = BLOCK_SIZE
-        self.thr = 0.5
+        self.thr = 0.0
         self.num_blocks = attn_metadata.block_table.shape[-1]
         req_idx = attn_metadata.req_idx_to_compress
         device = attn_metadata.block_table.device
@@ -481,206 +488,569 @@ def _fill_norm_buffers(
             self.norms_v_buf[layer_idx, req_idx, :n].copy_(norms_v[:n].to(self.norms_v_buf.device))
 
 
+class BFFCompressor:
+    """Encapsulates one BFF post-forward pass across all fusion layers.
+
+    Expensive per-call-invariant state (mask, nz_mask, arange tensor, norm buffers)
+    is computed once in __init__ instead of being recreated inside the layer loop.
+    The four inner algorithms (fuse_all_above_thr, fuse_values, restore_cache,
+    update_block_table_inplace) become class methods so Python does not create and
+    garbage-collect closure objects on every iteration of the 28-layer loop.
+    """
+
+    __slots__ = (
+        '_runner', '_req_to_compress', '_req_idx_to_compress', '_meta_dict',
+        'B', '_b_idx', '_num_blocks_dim', '_device',
+        '_nz_blocks', '_idx__', '_nz_mask', '_mask_split_list',
+        '_splits_k', '_splits_v',
+        '_total_valid', '_total_unique',
+        # LSH fields — precomputed once, shared by run_lsh() and run_lsh_register()
+        '_head_dim', '_lsh_proj', '_kv_dtype',
+    )
+
+    def __init__(self, runner, req_to_compress, req_idx_to_compress, attn_metadata_dict):
+        self._runner            = runner
+        self._req_to_compress   = req_to_compress
+        self._req_idx_to_compress = req_idx_to_compress
+        self.B                  = len(req_idx_to_compress)
+        self._b_idx             = list(range(self.B))
+        self._meta_dict         = (attn_metadata_dict
+                                   if isinstance(attn_metadata_dict, dict)
+                                   else attn_metadata_dict[0])
+        self._total_valid  = 0
+        self._total_unique = 0
+
+        # Discover dimensions from the first available fusion-layer metadata.
+        # seq_lens and block-table width are identical across all fusion layers.
+        first_meta = None
+        for kv_gid, kv_group in enumerate(runner.kv_cache_config.kv_cache_groups):
+            if kv_gid == 0:
+                continue
+            for ln in kv_group.layer_names:
+                if ln in self._meta_dict:
+                    first_meta = self._meta_dict[ln]
+                    break
+            if first_meta is not None:
+                break
+
+        if first_meta is None:
+            self._num_blocks_dim  = 0
+            self._device          = torch.device('cpu')
+            self._nz_blocks       = None
+            self._idx__           = None
+            self._nz_mask         = None
+            self._mask_split_list = []
+            self._splits_k        = None
+            self._splits_v        = None
+            self._head_dim        = None
+            self._lsh_proj        = None
+            self._kv_dtype        = None
+            return
+
+        self._num_blocks_dim = first_meta.block_table.shape[1]
+        self._device         = first_meta.block_table.device
+
+        # All fusion layers present the same seq_lens — compute once.
+        seq_lens = first_meta.seq_lens[req_idx_to_compress].unsqueeze(-1)  # [B, 1]
+        self._nz_blocks = (seq_lens // BLOCK_SIZE).squeeze(-1)             # [B]
+
+        self._idx__ = torch.arange(
+            self._num_blocks_dim, dtype=torch.int, device=self._device
+        )
+        mask = self._idx__.repeat(self.B, 1) < self._nz_blocks.unsqueeze(-1)  # [B, P]
+        self._nz_mask         = mask.nonzero(as_tuple=True)
+        self._mask_split_list = mask.sum(-1).tolist()
+
+        # Pre-allocated norm buffers — reset to 1.0 before each layer, no re-alloc.
+        self._splits_k = torch.ones(
+            self.B, self._num_blocks_dim, dtype=torch.bfloat16, device=self._device
+        )
+        self._splits_v = torch.ones(
+            self.B, self._num_blocks_dim, dtype=torch.bfloat16, device=self._device
+        )
+
+        # LSH fields — head_dim and lsh_proj are constant across all fusion layers.
+        self._head_dim = self._kv_dtype = self._lsh_proj = None
+        for kv_gid2, kv_group2 in enumerate(runner.kv_cache_config.kv_cache_groups):
+            if kv_gid2 == 0:
+                continue
+            if runner.kv_caches and kv_gid2 < len(runner.kv_caches):
+                kv0 = runner.kv_caches[kv_gid2]
+                self._head_dim = kv0.shape[-1]
+                self._lsh_proj = runner.lsh_proj[:self._head_dim]  # [head_dim, NUM_LSH_BITS]
+                self._kv_dtype = kv0.dtype
+                break
+
+    # ------------------------------------------------------------------
+    # Merge algorithms — defined once as methods, not re-created per layer
+    # ------------------------------------------------------------------
+
+    def _fuse_all_above_thr(self, x, b_idx_local, thr=THRESHOLD):
+        Bloc, _, _ = x.shape
+        if Bloc == 1:
+            nz = self._nz_blocks[b_idx_local[0]]
+            return (F.normalize(x[:, :nz], dim=-1, eps=1e-7),
+                    [self._idx__[:nz]], [], [nz])
+
+        xl, _idx_l, fl_chain, shifts_l = self._fuse_all_above_thr(
+            x[:Bloc // 2], b_idx_local[:Bloc // 2], thr)
+        xr, _idx_r, fr_chain, shifts_r = self._fuse_all_above_thr(
+            x[Bloc // 2:], b_idx_local[Bloc // 2:], thr)
+
+        nl, nr = xl.shape[1], xr.shape[1]
+        idx_ll, idx_rr = (xl @ xr.mT > thr).nonzero(as_tuple=True)[-2:]
+        l_idx, c = torch.unique(idx_ll, return_counts=True)
+        r_idx    = idx_rr.split(tuple(c.tolist()))
+
+        idx_ul = list(set(range(nl)) - set(idx_ll.tolist()))
+        idx_ur = list(set(range(nr)) - set(idx_rr.tolist()))
+        n_c, n_ul, n_ur = len(l_idx), len(idx_ul), len(idx_ur)
+
+        combined = [
+            torch.cat([xl[:, l_idx[i]].unsqueeze(1), xr[:, r_idx[i]]], dim=1).mean(1, keepdim=True)
+            for i in range(n_c)
+        ]
+        if combined:
+            combined_x = F.normalize(torch.cat(combined, dim=1), dim=-1)
+            combined_x = torch.cat([combined_x, xl[:, idx_ul], xr[:, idx_ur]], dim=1)
+        else:
+            combined_x = torch.cat([xl[:, idx_ul], xr[:, idx_ur]], dim=1)
+
+        rev = torch.empty(nl + nr, device=self._device, dtype=torch.int)
+        rev[l_idx.tolist()] = self._idx__[:n_c]
+        for i in range(n_c):
+            rev[(r_idx[i] + nl).tolist()] = self._idx__[:n_c][i]
+        rev[idx_ul] = self._idx__[n_c:n_c + n_ul]
+        rev[list(map(lambda v: v + nl, idx_ur))] = self._idx__[n_c + n_ul:n_c + n_ul + n_ur]
+
+        max_len = max(len(_idx_l), len(_idx_r))
+        if len(_idx_l) < max_len:
+            shifts_l += [shifts_l[-1]] * (max_len - len(_idx_l))
+            _idx_l   += [torch.tensor([], device=self._device, dtype=torch.int)] * (
+                         max_len - len(_idx_l))
+
+        chain    = [torch.cat([_idx_l[i], _idx_r[i] + shifts_l[i]]) for i in range(max_len)]
+        rev      = [rev] + chain
+        fl_chain = (fl_chain + fr_chain +
+                    [(b_idx_local, torch.stack([idx_ll, idx_rr], dim=-1), idx_ul, idx_ur)])
+        shifts   = ([n_c + n_ul + n_ur] +
+                    list(map(lambda p, q: p + q, shifts_l, shifts_r)))
+        return combined_x, rev, fl_chain, shifts
+
+    def _fuse_values(self, v, fwd_idx, b_idx_local):
+        nz_blocks = self._nz_blocks
+        counter   = [0]
+
+        def recurse(v, b_local):
+            Bloc = v.shape[0]
+            if Bloc == 1:
+                nz = int(nz_blocks[b_local[0]])
+                return F.normalize(v[:, :nz], dim=-1, eps=1e-7)
+            vl = recurse(v[:Bloc // 2], b_local[:Bloc // 2])
+            vr = recurse(v[Bloc // 2:], b_local[Bloc // 2:])
+            _, idx_, idx_ul, idx_ur = fwd_idx[counter[0]]
+            idx_ll, idx_rr = idx_.mT
+            l_idx, c = torch.unique(idx_ll, return_counts=True)
+            r_idx    = idx_rr.split(tuple(c.tolist()))
+            combined = [
+                torch.cat([vl[:, l_idx[i]].unsqueeze(1), vr[:, r_idx[i]]], dim=1).mean(1, keepdim=True)
+                for i in range(len(l_idx))
+            ]
+            if combined:
+                cv = F.normalize(torch.cat(combined, dim=1), dim=-1)
+                cv = torch.cat([cv, vl[:, idx_ul], vr[:, idx_ur]], dim=1)
+            else:
+                cv = torch.cat([vl[:, idx_ul], vr[:, idx_ur]], dim=1)
+            counter[0] += 1
+            return cv
+
+        return recurse(v, b_idx_local)
+
+    @staticmethod
+    def _restore_cache(x, rev_idx):
+        xx = torch.empty((1, len(rev_idx[-2]), x.shape[-1]), dtype=x.dtype, device=x.device)
+        xx[:, :x.shape[1]] = x
+        for idx_ in rev_idx[:-1]:
+            xx[:, :len(idx_)] = xx[:, idx_]
+        return xx
+
+    def _update_block_table_inplace(self, bt, fwd_idx, b_idx_local):
+        """Redirect right-branch block IDs to the matched left-branch IDs in-place."""
+        nz_blocks = self._nz_blocks
+        counter   = [0]
+
+        def recurse(bt_sub, b_local):
+            Bloc = bt_sub.shape[0]
+            if Bloc == 1:
+                return bt_sub[:, :int(nz_blocks[b_local[0]])]
+            bl = recurse(bt_sub[:Bloc // 2], b_local[:Bloc // 2])
+            br = recurse(bt_sub[Bloc // 2:], b_local[Bloc // 2:])
+            idx_ = fwd_idx[counter[0]][1]
+            if idx_.numel() > 0:
+                br.view(1, -1)[:, idx_[:, 1]] = bl.view(1, -1)[:, idx_[:, 0]]
+            counter[0] += 1
+            return torch.cat([bl, br], dim=-1)
+
+        recurse(bt, b_idx_local)
+
+    # ------------------------------------------------------------------
+    # Per-layer compression (only genuinely layer-specific work here)
+    # ------------------------------------------------------------------
+
+    def _compress_layer(self, layer_name, layer_idx, layer_meta, kv_layer):
+        """Run BFF for one fusion layer. Returns (n_valid_blocks, n_unique_blocks)."""
+        _, block_sz, num_heads, head_dim = kv_layer.shape[1:]
+
+        # Block-table entries differ per layer (each layer has its own block pool).
+        block_table_layer = layer_meta.block_table[self._req_idx_to_compress].clone()
+        bt_safe    = block_table_layer.clamp(min=0)
+        flat_valid = bt_safe[self._nz_mask]
+
+        # Reuse pre-allocated buffers — fill_(1.0) is cheaper than a new allocation.
+        self._splits_k.fill_(1.0)
+        self._splits_v.fill_(1.0)
+
+        # ---- K cache ----
+        kk     = kv_layer[0][bt_safe].view(self.B, self._num_blocks_dim, -1)
+        k_norms = kk[self._nz_mask].norm(2, -1)
+        for i, k in enumerate(k_norms.split(self._mask_split_list)):
+            self._splits_k[i, :k.shape[0]] = k
+
+        _k, rev_idx, fwd_idx, _ = self._fuse_all_above_thr(kk, self._b_idx)
+        kk_restored = self._restore_cache(_k, rev_idx)
+        kv_layer[0][flat_valid] = kk_restored.squeeze(0).view(-1, block_sz, num_heads, head_dim)
+
+        # ---- V cache ----
+        vv     = kv_layer[1][bt_safe].view(self.B, self._num_blocks_dim, -1)
+        v_norms = vv[self._nz_mask].norm(2, -1)
+        for i, v in enumerate(v_norms.split(self._mask_split_list)):
+            self._splits_v[i, :v.shape[0]] = v
+
+        _v = self._fuse_values(vv, fwd_idx, self._b_idx)
+        vv_restored = self._restore_cache(_v, rev_idx)
+        kv_layer[1][flat_valid] = vv_restored.squeeze(0).view(-1, block_sz, num_heads, head_dim)
+
+        # ---- Block-table redirect and write-back ----
+        self._update_block_table_inplace(block_table_layer, fwd_idx, self._b_idx)
+        layer_meta.block_table[self._req_idx_to_compress] = block_table_layer
+
+        # ---- Persist norms for decode scaling ----
+        runner = self._runner
+        for i, req_id in enumerate(self._req_to_compress):
+            if req_id not in runner.fused_requests:
+                runner.fused_requests[req_id] = {}
+            runner.fused_requests[req_id][layer_name] = (
+                self._splits_k[i].clone(), self._splits_v[i].clone()
+            )
+
+        if runner.norms_k_buf is not None:
+            nb = min(self._num_blocks_dim, runner.norms_k_buf.shape[2])
+            for i, req_idx in enumerate(self._req_idx_to_compress):
+                runner.norms_k_buf[layer_idx, req_idx, :nb].copy_(self._splits_k[i, :nb])
+                runner.norms_v_buf[layer_idx, req_idx, :nb].copy_(self._splits_v[i, :nb])
+
+        return self._nz_mask[0].shape[0], _v.shape[1]
+
+    # ------------------------------------------------------------------
+    # LSH deduplication path (< 4 concurrent prefills)
+    # ------------------------------------------------------------------
+
+    def _lsh_dedup_layer(self, layer_name, layer_idx, layer_meta, kv_layer):
+        """LSH dedup + normalisation for one fusion layer."""
+        runner      = self._runner
+        head_dim    = self._head_dim
+        lsh_proj    = self._lsh_proj
+        kv_dtype    = self._kv_dtype
+
+        if layer_name not in runner.lsh_registry:
+            runner.lsh_registry[layer_name] = [dict() for _ in range(NUM_LSH_TABLES)]
+            runner.lsh_mean_k[layer_name]   = {}
+        registry_tables = runner.lsh_registry[layer_name]
+        mean_k_store    = runner.lsh_mean_k[layer_name]
+
+        # Block table IS layer-specific; reuse pre-allocated norm buffers.
+        block_table = layer_meta.block_table[self._req_idx_to_compress].clone()
+        self._splits_k.fill_(1.0)
+        self._splits_v.fill_(1.0)
+
+        for i, req_id in enumerate(self._req_to_compress):
+            nz_blocks = int(self._nz_blocks[i])   # precomputed, no per-layer division
+            if nz_blocks == 0:
+                continue
+
+            raw_ids    = block_table[i, :nz_blocks]
+            valid_mask = raw_ids >= 0
+            valid_bids = raw_ids[valid_mask].long()
+            valid_pos  = valid_mask.nonzero(as_tuple=True)[0]
+            N = valid_bids.shape[0]
+            if N == 0:
+                continue
+
+            # ---- Batched GPU: norms + mean-K + LSH fingerprints ----
+            block_ks = kv_layer[0, valid_bids]   # [N, blk_sz, kv_heads, head_dim]
+            block_vs = kv_layer[1, valid_bids]
+            norms_k  = block_ks.float().view(N, -1).norm(dim=1)
+            norms_v  = block_vs.float().view(N, -1).norm(dim=1)
+
+            block_means      = block_ks.float().view(N, -1, head_dim).mean(dim=1)
+            block_means_norm = F.normalize(block_means, dim=1).to(torch.float16)
+
+            proj_all       = (block_means_norm @ lsh_proj).sign()
+            proj_bits      = (proj_all > 0).to(torch.int32).cpu()
+            proj_bytes     = proj_bits.view(N, NUM_LSH_TABLES, LSH_BITS_PER_TABLE)
+            sub_hashes_all = (proj_bytes * _LSH_POWERS).sum(dim=2).tolist()
+
+            # Write norms into pre-allocated buffers (GPU→GPU, no alloc)
+            self._splits_k[i, valid_pos] = norms_k.clamp(min=1e-6).to(self._splits_k.dtype)
+            self._splits_v[i, valid_pos] = norms_v.clamp(min=1e-6).to(self._splits_v.dtype)
+
+            valid_bids_list = valid_bids.tolist()
+            valid_pos_list  = valid_pos.tolist()
+
+            # ---- Registry lookup (CPU loop; GPU matmul batched per block) ----
+            to_register = []
+            for k, (bid, pos) in enumerate(zip(valid_bids_list, valid_pos_list)):
+                sub_hashes = sub_hashes_all[k]
+                candidates = set()
+                for t, h in enumerate(sub_hashes):
+                    candidates.update(registry_tables[t].get(h, []))
+                candidates.discard(bid)
+
+                matched_bid = None
+                if candidates:
+                    cid_list = [c for c in candidates if c in mean_k_store]
+                    if cid_list:
+                        stored_stack       = torch.stack([mean_k_store[c] for c in cid_list])
+                        sims               = (block_means_norm[k].float() @ stored_stack.T.float())
+                        best_val, best_idx = sims.max(dim=0)
+                        if best_val.item() > THRESHOLD:
+                            matched_bid = cid_list[best_idx.item()]
+
+                if matched_bid is not None:
+                    block_table[i, pos] = matched_bid
+                else:
+                    to_register.append((k, bid, block_means_norm[k], sub_hashes))
+
+            # ---- Batched GPU normalisation for unmatched blocks ----
+            if to_register and len(mean_k_store) < MAX_REGISTRY_PER_LAYER:
+                local_idxs         = [t[0] for t in to_register]
+                unmatched_bids_gpu = valid_bids[local_idxs]
+                norms_k_sub        = norms_k[local_idxs].view(-1, 1, 1, 1).clamp(min=1e-6)
+                norms_v_sub        = norms_v[local_idxs].view(-1, 1, 1, 1).clamp(min=1e-6)
+                kv_layer[0, unmatched_bids_gpu] = (block_ks[local_idxs] / norms_k_sub).to(kv_dtype)
+                kv_layer[1, unmatched_bids_gpu] = (block_vs[local_idxs] / norms_v_sub).to(kv_dtype)
+
+                for _, bid, mean_k, sub_hashes in to_register:
+                    if len(mean_k_store) >= MAX_REGISTRY_PER_LAYER:
+                        break
+                    mean_k_store[bid] = mean_k
+                    for t, h in enumerate(sub_hashes):
+                        registry_tables[t].setdefault(h, []).append(bid)
+
+            n_redir = nz_blocks - len(to_register)
+            logger.info(
+                "LSH dedup %s req=%s: %d/%d blocks redirected",
+                layer_name, req_id, n_redir, nz_blocks,
+            )
+
+            if req_id not in runner.fused_requests:
+                runner.fused_requests[req_id] = {}
+            runner.fused_requests[req_id][layer_name] = (
+                self._splits_k[i].clone(), self._splits_v[i].clone()
+            )
+
+        # Update norms_k_buf so patched_forward can scale this step's decode.
+        if runner.norms_k_buf is not None:
+            nb = min(self._num_blocks_dim, runner.norms_k_buf.shape[2])
+            for i, req_idx in enumerate(self._req_idx_to_compress):
+                runner.norms_k_buf[layer_idx, req_idx, :nb].copy_(self._splits_k[i, :nb])
+                runner.norms_v_buf[layer_idx, req_idx, :nb].copy_(self._splits_v[i, :nb])
+
+        # Write redirected block IDs back to the attention-metadata GPU buffer.
+        layer_meta.block_table[self._req_idx_to_compress] = block_table
+
+    def run_lsh(self):
+        """Run LSH dedup + registration across all fusion layers."""
+        if self._num_blocks_dim == 0 or self._lsh_proj is None:
+            return
+        runner = self._runner
+        for kv_gid, kv_group in enumerate(runner.kv_cache_config.kv_cache_groups):
+            if kv_gid == 0:
+                continue
+            layer_names = kv_group.layer_names
+            if not layer_names:
+                continue
+            layer_name = layer_names[0]
+            if layer_name not in self._meta_dict:
+                continue
+            layer_idx  = int(layer_name.split('.')[2])
+            layer_meta = self._meta_dict[layer_name]
+            kv_layer   = runner.kv_caches[kv_gid]
+            self._lsh_dedup_layer(layer_name, layer_idx, layer_meta, kv_layer)
+
+    def _lsh_register_layer(self, layer_name, layer_meta, kv_layer):
+        """Register BFF-merged (already normalised) blocks for one fusion layer."""
+        runner      = self._runner
+        head_dim    = self._head_dim
+        lsh_proj    = self._lsh_proj
+
+        if layer_name not in runner.lsh_registry:
+            runner.lsh_registry[layer_name] = [dict() for _ in range(NUM_LSH_TABLES)]
+            runner.lsh_mean_k[layer_name]   = {}
+        registry_tables = runner.lsh_registry[layer_name]
+        mean_k_store    = runner.lsh_mean_k[layer_name]
+
+        for i, req_id in enumerate(self._req_to_compress):
+            req_idx   = self._req_idx_to_compress[i]
+            nz_blocks = int(self._nz_blocks[i])   # precomputed
+            if nz_blocks == 0 or len(mean_k_store) >= MAX_REGISTRY_PER_LAYER:
+                continue
+
+            raw_ids    = layer_meta.block_table[req_idx, :nz_blocks]
+            valid_mask = raw_ids >= 0
+            valid_bids = raw_ids[valid_mask].long()
+            if valid_bids.shape[0] == 0:
+                continue
+
+            bid_list = valid_bids.tolist()
+            new_bids = [b for b in bid_list if b not in mean_k_store]
+            if not new_bids:
+                continue
+
+            new_bids_t   = torch.tensor(new_bids, dtype=torch.long, device=kv_layer.device)
+            block_ks     = kv_layer[0, new_bids_t]
+            M            = len(new_bids)
+            block_means  = block_ks.float().view(M, -1, head_dim).mean(dim=1)
+            means_norm   = F.normalize(block_means, dim=1).to(torch.float16)
+
+            proj_all       = (means_norm @ lsh_proj).sign()
+            proj_bits      = (proj_all > 0).to(torch.int32).cpu()
+            proj_bytes     = proj_bits.view(M, NUM_LSH_TABLES, LSH_BITS_PER_TABLE)
+            sub_hashes_all = (proj_bytes * _LSH_POWERS).sum(dim=2).tolist()
+
+            for k, bid in enumerate(new_bids):
+                if len(mean_k_store) >= MAX_REGISTRY_PER_LAYER:
+                    break
+                mean_k_store[bid] = means_norm[k]
+                for t, h in enumerate(sub_hashes_all[k]):
+                    registry_tables[t].setdefault(h, []).append(bid)
+
+    def run_lsh_register(self):
+        """Register BFF blocks in the LSH registry across all fusion layers."""
+        if self._num_blocks_dim == 0 or self._lsh_proj is None:
+            return
+        runner = self._runner
+        for kv_gid, kv_group in enumerate(runner.kv_cache_config.kv_cache_groups):
+            if kv_gid == 0:
+                continue
+            layer_names = kv_group.layer_names
+            if not layer_names:
+                continue
+            layer_name = layer_names[0]
+            if layer_name not in self._meta_dict:
+                continue
+            layer_meta = self._meta_dict[layer_name]
+            kv_layer   = runner.kv_caches[kv_gid]
+            self._lsh_register_layer(layer_name, layer_meta, kv_layer)
+
+    # ------------------------------------------------------------------
+    # Main entry point
+    # ------------------------------------------------------------------
+
+    def run(self):
+        if self._num_blocks_dim == 0:
+            return
+        runner = self._runner
+        for kv_gid, kv_group in enumerate(runner.kv_cache_config.kv_cache_groups):
+            if kv_gid == 0:
+                continue
+            layer_names = kv_group.layer_names
+            if not layer_names:
+                continue
+            layer_name = layer_names[0]
+            if layer_name not in self._meta_dict:
+                continue
+            layer_idx  = int(layer_name.split('.')[2])
+            layer_meta = self._meta_dict[layer_name]
+            kv_layer   = runner.kv_caches[kv_gid]
+
+            n_valid, n_unique = self._compress_layer(layer_name, layer_idx, layer_meta, kv_layer)
+            self._total_valid  += n_valid
+            self._total_unique += n_unique
+
+            n_freed = n_valid - n_unique
+            if n_freed > 0:
+                logger.info(
+                    "Post-forward BFF %s: %d valid → %d unique (%.2fx, freed %d)",
+                    layer_name, n_valid, n_unique,
+                    n_valid / n_unique if n_unique else 1.0, n_freed,
+                )
+
+        total_freed  = self._total_valid - self._total_unique
+        overall_ratio = (self._total_valid / self._total_unique
+                         if self._total_unique else 1.0)
+        logger.info(
+            "BFF summary: %d reqs, %d valid → %d unique across all layers "
+            "(%.2fx, %d freed)",
+            self.B, self._total_valid, self._total_unique, overall_ratio, total_freed,
+        )
+
+
 def _run_post_forward_bff(
     self,
     req_to_compress: list[str],
     req_idx_to_compress: list[int],
     attn_metadata_dict,
 ) -> None:
-    """Run BFF on every fusion layer after the forward pass (eager mode, outside graph).
-
-    Each fusion KV-cache group (kv_gid >= 1) has its own independent physical
-    block pool and its own block table stored in attn_metadata_dict[layer_name].
-    We MUST use the per-layer block table — not a shared one from the warmup group.
-    """
-    import torch.nn.functional as F
-
-    B = len(req_idx_to_compress)
-    if B < 2:
+    """Run BFF on every fusion layer after the forward pass.  Delegates to BFFCompressor."""
+    if len(req_idx_to_compress) < 2:
         return
+    BFFCompressor(self, req_to_compress, req_idx_to_compress, attn_metadata_dict).run()
 
-    b_idx = list(range(B))
-    meta_dict = attn_metadata_dict if isinstance(attn_metadata_dict, dict) else attn_metadata_dict[0]
 
-    kv_cache_groups = self.kv_cache_config.kv_cache_groups
-    for kv_gid, kv_group in enumerate(kv_cache_groups):
-        if kv_gid == 0:
-            continue  # skip warmup (sliding-window) group
+# ---------------------------------------------------------------------------
+# LSH deduplication: per-request block normalisation + registry
+# ---------------------------------------------------------------------------
 
-        layer_names = kv_group.layer_names
-        if not layer_names:
-            continue
-        layer_name = layer_names[0]
-        layer_idx = int(layer_name.split('.')[2])
+_LSH_POWERS = torch.tensor([1 << b for b in range(LSH_BITS_PER_TABLE)], dtype=torch.int32)
 
-        # Each fusion layer has its own block table in its own metadata object
-        if layer_name not in meta_dict:
-            continue
-        layer_meta = meta_dict[layer_name]
 
-        # Per-layer block table and seq_lens
-        block_table_layer = layer_meta.block_table[req_idx_to_compress].clone()  # [B, max_blocks]
-        seq_lens_layer = layer_meta.seq_lens[req_idx_to_compress].unsqueeze(-1)  # [B, 1]
-        num_blocks_dim = block_table_layer.shape[1]
-        device = block_table_layer.device
+def _lsh_fingerprint(mean_k_norm: torch.Tensor, lsh_proj: torch.Tensor) -> list:
+    """Return 8 independent 8-bit sub-hashes for a single normalised mean-K vector.
 
-        idx__ = torch.arange(num_blocks_dim, dtype=torch.int, device=device)
-        nz_blocks_layer = (seq_lens_layer // BLOCK_SIZE).squeeze(-1)              # [B]
-        mask = idx__.repeat(B, 1) < nz_blocks_layer.unsqueeze(-1)                # [B, max_blocks]
-        nz_mask = mask.nonzero(as_tuple=True)
-        mask_split_list = mask.sum(-1).tolist()
+    Args:
+        mean_k_norm: [head_dim] float16, unit-norm.
+        lsh_proj:    [head_dim, NUM_LSH_BITS] float16 random projections.
+    Returns:
+        list of NUM_LSH_TABLES ints in [0, 255].
+    """
+    proj_bits = ((mean_k_norm @ lsh_proj).sign() > 0).to(torch.int32)  # [64]
+    packed = (proj_bits.view(NUM_LSH_TABLES, LSH_BITS_PER_TABLE) * _LSH_POWERS).sum(dim=1)
+    return packed.tolist()
 
-        # Store on GPU so _fill_norm_buffers copies stay GPU-to-GPU (no PCIe transfers).
-        splits_k = torch.ones(B, num_blocks_dim, dtype=torch.bfloat16, device=device)
-        splits_v = torch.ones(B, num_blocks_dim, dtype=torch.bfloat16, device=device)
 
-        # ---- inner helpers (defined per-layer so closures capture layer locals) ----
+def _run_lsh_dedup_and_register(
+    self,
+    req_to_process: list,
+    req_idx_to_process: list,
+    attn_metadata_dict,
+) -> None:
+    """LSH dedup + registration for every fusion layer. Delegates to BFFCompressor."""
+    if not req_to_process:
+        return
+    BFFCompressor(self, req_to_process, req_idx_to_process, attn_metadata_dict).run_lsh()
 
-        def fuse_all_above_thr(x, b_idx_local, thr=THRESHOLD):
-            Bloc, _, _ = x.shape
-            if Bloc == 1:
-                nz = nz_blocks_layer[b_idx_local[0]]
-                return F.normalize(x[:, :nz], dim=-1, eps=1e-7), [idx__[:nz]], [], [nz]
 
-            xl, _idx_l, fl_chain, shifts_l = fuse_all_above_thr(x[:Bloc // 2], b_idx_local[:Bloc // 2], thr)
-            xr, _idx_r, fr_chain, shifts_r = fuse_all_above_thr(x[Bloc // 2:], b_idx_local[Bloc // 2:], thr)
-
-            nl, nr = xl.shape[1], xr.shape[1]
-            idx_ll, idx_rr = (xl @ xr.mT > thr).nonzero(as_tuple=True)[-2:]
-            l_idx, c = torch.unique(idx_ll, return_counts=True)
-            r_idx = idx_rr.split(tuple(c.tolist()))
-
-            idx_ul = list(set(range(nl)) - set(idx_ll.tolist()))
-            idx_ur = list(set(range(nr)) - set(idx_rr.tolist()))
-            n_c, n_ul, n_ur = len(l_idx), len(idx_ul), len(idx_ur)
-
-            combined = [torch.cat([xl[:, l_idx[i]].unsqueeze(1), xr[:, r_idx[i]]], dim=1).mean(1, keepdim=True)
-                        for i in range(n_c)]
-            if combined:
-                combined_x = F.normalize(torch.cat(combined, dim=1), dim=-1)
-                combined_x = torch.cat([combined_x, xl[:, idx_ul], xr[:, idx_ur]], dim=1)
-            else:
-                combined_x = torch.cat([xl[:, idx_ul], xr[:, idx_ur]], dim=1)
-
-            rev = torch.empty(nl + nr, device=device, dtype=torch.int)
-            rev[l_idx.tolist()] = idx__[:n_c]
-            for i in range(n_c):
-                rev[(r_idx[i] + nl).tolist()] = idx__[:n_c][i]
-            rev[idx_ul] = idx__[n_c:n_c + n_ul]
-            rev[list(map(lambda v: v + nl, idx_ur))] = idx__[n_c + n_ul:n_c + n_ul + n_ur]
-
-            max_len = max(len(_idx_l), len(_idx_r))
-            if len(_idx_l) < max_len:
-                shifts_l += [shifts_l[-1]] * (max_len - len(_idx_l))
-                _idx_l += [torch.tensor([], device=device, dtype=torch.int)] * (max_len - len(_idx_l))
-
-            chain = [torch.cat([_idx_l[i], _idx_r[i] + shifts_l[i]]) for i in range(max_len)]
-            rev = [rev] + chain
-            fl_chain = fl_chain + fr_chain + [(b_idx_local, torch.stack([idx_ll, idx_rr], dim=-1), idx_ul, idx_ur)]
-            shifts = [n_c + n_ul + n_ur] + list(map(lambda p, q: p + q, shifts_l, shifts_r))
-            return combined_x, rev, fl_chain, shifts
-
-        def fuse_values(v, fwd_idx, b_idx_local):
-            counter = [0]
-            def recurse(v, b_local):
-                Bloc = v.shape[0]
-                if Bloc == 1:
-                    nz = (seq_lens_layer[b_local] // BLOCK_SIZE).item()
-                    return F.normalize(v[:, :nz], dim=-1, eps=1e-7)
-                vl = recurse(v[:Bloc // 2], b_local[:Bloc // 2])
-                vr = recurse(v[Bloc // 2:], b_local[Bloc // 2:])
-                _, idx_, idx_ul, idx_ur = fwd_idx[counter[0]]
-                idx_ll, idx_rr = idx_.mT
-                l_idx, c = torch.unique(idx_ll, return_counts=True)
-                r_idx = idx_rr.split(tuple(c.tolist()))
-                combined = [torch.cat([vl[:, l_idx[i]].unsqueeze(1), vr[:, r_idx[i]]], dim=1).mean(1, keepdim=True)
-                            for i in range(len(l_idx))]
-                if combined:
-                    cv = F.normalize(torch.cat(combined, dim=1), dim=-1)
-                    cv = torch.cat([cv, vl[:, idx_ul], vr[:, idx_ur]], dim=1)
-                else:
-                    cv = torch.cat([vl[:, idx_ul], vr[:, idx_ur]], dim=1)
-                counter[0] += 1
-                return cv
-            return recurse(v, b_idx_local)
-
-        def restore_cache(x, rev_idx):
-            xx = torch.empty((1, len(rev_idx[-2]), x.shape[-1]), dtype=x.dtype, device=x.device)
-            xx[:, :x.shape[1]] = x
-            for idx_ in rev_idx[:-1]:
-                xx[:, :len(idx_)] = xx[:, idx_]
-            return xx
-
-        def update_block_table_inplace(bt, fwd_idx, b_idx_local):
-            """Modify bt in-place (via PyTorch view sharing) so right-branch blocks
-            point to the same IDs as their matched left-branch blocks."""
-            counter = [0]
-            def recurse(bt_sub, b_local):
-                Bloc = bt_sub.shape[0]
-                if Bloc == 1:
-                    nz = (seq_lens_layer[b_local] // BLOCK_SIZE).item()
-                    return bt_sub[:, :nz]
-                bl = recurse(bt_sub[:Bloc // 2], b_local[:Bloc // 2])
-                br = recurse(bt_sub[Bloc // 2:], b_local[Bloc // 2:])
-                idx_ = fwd_idx[counter[0]][1]
-                if idx_.numel() > 0:
-                    br.view(1, -1)[:, idx_[:, 1]] = bl.view(1, -1)[:, idx_[:, 0]]
-                counter[0] += 1
-                return torch.cat([bl, br], dim=-1)
-            recurse(bt, b_idx_local)
-            # Return value is ignored — bt was modified in-place via view sharing
-
-        # ---- KV cache read/fuse/write ----
-        kv_layer = self.kv_caches[kv_gid]  # [2, total_blocks, block_sz, heads, dim]
-        _, block_sz, num_heads, head_dim = kv_layer.shape[1:]
-        bt_safe = block_table_layer.clamp(min=0)   # map -1 padding to null block (block 0)
-
-        # flat_valid: 1D list of the N_masked valid (non-padding) block IDs.
-        # Must be computed from the ORIGINAL block table before update_block_table_inplace
-        # remaps some IDs — we write merged content to these original locations.
-        flat_valid = bt_safe[nz_mask]  # shape (N_masked,)
-
-        kk = kv_layer[0][bt_safe].view(B, num_blocks_dim, -1)  # [B, P, r]
-        k_norms = kk[nz_mask].norm(2, -1)
-        for i, k in enumerate(k_norms.split(mask_split_list)):
-            splits_k[i, :k.shape[0]] = k
-
-        _k, rev_idx, fwd_idx, _ = fuse_all_above_thr(kk, b_idx)
-        kk_restored = restore_cache(_k, rev_idx)  # shape (1, N_masked, r)
-        # Scatter write: only to valid (non-padding) block IDs — avoids writing to null block
-        # and matches restore_cache's output size (N_masked, not B×num_blocks_dim).
-        kv_layer[0][flat_valid] = kk_restored.squeeze(0).view(-1, block_sz, num_heads, head_dim)
-
-        vv = kv_layer[1][bt_safe].view(B, num_blocks_dim, -1)
-        v_norms = vv[nz_mask].norm(2, -1)
-        for i, v in enumerate(v_norms.split(mask_split_list)):
-            splits_v[i, :v.shape[0]] = v
-
-        _v = fuse_values(vv, fwd_idx, b_idx)
-        vv_restored = restore_cache(_v, rev_idx)  # shape (1, N_masked, r)
-        kv_layer[1][flat_valid] = vv_restored.squeeze(0).view(-1, block_sz, num_heads, head_dim)
-
-        # Update block table in-place (right-branch blocks redirect to left-branch IDs)
-        update_block_table_inplace(block_table_layer, fwd_idx, b_idx)
-        # Propagate updated block IDs back to the GPU tensor so
-        # _update_block_tables_after_compression can read them.
-        layer_meta.block_table[req_idx_to_compress] = block_table_layer
-
-        # Store norms
-        for i, req_id in enumerate(req_to_compress):
-            if req_id not in self.fused_requests:
-                self.fused_requests[req_id] = {}
-            self.fused_requests[req_id][layer_name] = (splits_k[i].clone(), splits_v[i].clone())
-
-        if hasattr(self, 'norms_k_buf') and self.norms_k_buf is not None:
-            max_blocks_buf = self.norms_k_buf.shape[2]
-            nb = min(num_blocks_dim, max_blocks_buf)
-            for i, req_idx in enumerate(req_idx_to_compress):
-                self.norms_k_buf[layer_idx, req_idx, :nb].copy_(splits_k[i, :nb].to(device))
-                self.norms_v_buf[layer_idx, req_idx, :nb].copy_(splits_v[i, :nb].to(device))
-
-        compression_ratio = num_blocks_dim / _v.shape[1] if _v.shape[1] > 0 else 0.0
-        logger.info(f"Post-forward BFF compression ratio for {layer_name}: {compression_ratio:.2f}x")
+def _lsh_register_bff_blocks(
+    self,
+    req_to_compress: list,
+    req_idx_to_compress: list,
+    attn_metadata_dict,
+) -> None:
+    """Register BFF-merged blocks in the LSH registry. Delegates to BFFCompressor."""
+    if not req_to_compress:
+        return
+    BFFCompressor(self, req_to_compress, req_idx_to_compress, attn_metadata_dict).run_lsh_register()
 
 
 if TYPE_CHECKING:
@@ -1227,8 +1597,7 @@ def execute_model(
                 if (scheduler_output.num_scheduled_tokens.get(req_id, 0) > 1 and
                     req_id not in self.fused_requests)
             ]
-            if len(req_to_compress) < 4:
-                req_to_compress = []
+            # Keep the full list; BFF still requires >=4, but the LSH path handles any count.
             req_idx_to_compress = [self.input_batch.req_id_to_index[r] for r in req_to_compress]
             fused_reqs = [req_id for req_id in self.input_batch.req_ids if req_id in self.fused_requests]
             fused_reqs_idx = [self.input_batch.req_id_to_index[r] for r in fused_reqs]
@@ -1300,15 +1669,26 @@ def execute_model(
                 **model_kwargs,
             )
 
-        # Post-forward BFF compression — OUTSIDE set_forward_context so KV cache
-        # writes don't interfere with the forward context / KV-connector state.
-        if len(req_to_compress) >= 4:
+        # Post-forward block fusion / deduplication — OUTSIDE set_forward_context.
+        _n_fusion_layers = sum(
+            1 for g in self.kv_cache_config.kv_cache_groups[1:] if g.layer_names
+        )
+        if False: # len(req_to_compress) > 1:
+            # Full BFF: recursive merge across concurrent prefills, then register blocks.
             self._run_post_forward_bff(req_to_compress, req_idx_to_compress, attn_metadata)
             self._update_block_tables_after_compression(req_to_compress)
+            # self._lsh_register_bff_blocks(req_to_compress, req_idx_to_compress, attn_metadata)
             logger.info(
                 "BFF post-forward: compressed %d requests across %d fusion layers",
-                len(req_to_compress),
-                sum(1 for g in self.kv_cache_config.kv_cache_groups[1:] if g.layer_names),
+                len(req_to_compress), _n_fusion_layers,
+            )
+        elif len(req_to_compress) >= 1:
+            # LSH dedup: normalise + look up registry for each individual prefill.
+            self._run_lsh_dedup_and_register(req_to_compress, req_idx_to_compress, attn_metadata)
+            self._update_block_tables_after_compression(req_to_compress)
+            logger.info(
+                "LSH dedup post-forward: processed %d requests across %d fusion layers",
+                len(req_to_compress), _n_fusion_layers,
             )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
