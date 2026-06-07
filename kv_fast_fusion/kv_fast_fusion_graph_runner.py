@@ -920,6 +920,8 @@ class BFFCompressor:
                 mean_k_store[bid] = mean_k
                 for t, h in enumerate(sub_hashes):
                     registry_tables[t].setdefault(h, []).append(bid)
+                # Reverse index for O(1) eviction when this block is freed/recycled.
+                runner.lsh_block_owner[bid] = (gkey, sub_hashes)
 
             n_redir = N - len(to_register)
             logger.info(
@@ -991,6 +993,8 @@ class BFFCompressor:
                 mean_k_store[bid] = means_norm[k]
                 for t, h in enumerate(sub_hashes_all[k]):
                     registry_tables[t].setdefault(h, []).append(bid)
+                # Reverse index for O(1) eviction when this block is freed/recycled.
+                runner.lsh_block_owner[bid] = (gkey, sub_hashes_all[k])
 
     def run_lsh_register(self):
         """Register BFF blocks in the LSH registry across all fusion groups."""
@@ -1061,6 +1065,41 @@ def _lsh_fingerprint(mean_k_norm: torch.Tensor, lsh_proj: torch.Tensor) -> list:
     proj_bits = ((mean_k_norm @ lsh_proj).sign() > 0).to(torch.int32)  # [64]
     packed = (proj_bits.view(NUM_LSH_TABLES, LSH_BITS_PER_TABLE) * _LSH_POWERS).sum(dim=1)
     return packed.tolist()
+
+
+def evict_lsh_blocks(self, block_ids) -> None:
+    """Remove freed/recycled block IDs from the LSH dedup registry.
+
+    Called from the block-free path the moment a block's ref_cnt hits 0. Without
+    this, the registry keeps stale block IDs whose physical block has been
+    reallocated to a different request, so a later prefill can redirect to (and
+    read) another request's KV — corrupting ref counts (negative "freed N") and
+    silently corrupting attention. Eviction-on-ref0 is exactly right: a
+    redirected (shared) block stays ref_cnt>0 until all holders free it, so live
+    KV is never evicted.
+    """
+    owner = getattr(self, "lsh_block_owner", None)
+    if not owner:
+        return
+    for bid in block_ids:
+        entry = owner.pop(bid, None)
+        if entry is None:
+            continue
+        gkey, sub_hashes = entry
+        tables = self.lsh_registry.get(gkey)
+        if tables is not None:
+            for t, h in enumerate(sub_hashes):
+                bucket = tables[t].get(h)
+                if bucket:
+                    try:
+                        bucket.remove(bid)
+                    except ValueError:
+                        pass
+                    if not bucket:
+                        del tables[t][h]
+        mk = self.lsh_mean_k.get(gkey)
+        if mk is not None:
+            mk.pop(bid, None)
 
 
 def _run_lsh_dedup_and_register(
@@ -1720,7 +1759,7 @@ def execute_model(
         _n_fusion_layers = sum(
             1 for g in self.kv_cache_config.kv_cache_groups[1:] if g.layer_names
         )
-        if len(req_to_compress) > 1:
+        if False: #len(req_to_compress) > 1:
             # Full BFF: recursive merge across concurrent prefills, then register blocks.
             self._run_post_forward_bff(req_to_compress, req_idx_to_compress, attn_metadata)
             self._update_block_tables_after_compression(req_to_compress)
@@ -1729,7 +1768,7 @@ def execute_model(
                 "BFF post-forward: compressed %d requests across %d fusion layers",
                 len(req_to_compress), _n_fusion_layers,
             )
-        elif False: #len(req_to_compress) >= 1:
+        elif len(req_to_compress) >= 1:
             # LSH dedup: normalise + look up registry for each individual prefill.
             self._run_lsh_dedup_and_register(req_to_compress, req_idx_to_compress, attn_metadata)
             self._update_block_tables_after_compression(req_to_compress)

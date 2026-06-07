@@ -36,6 +36,7 @@ from kv_fast_fusion.kv_fast_fusion_graph_runner import (
     _run_post_forward_bff,
     _run_lsh_dedup_and_register,
     _lsh_register_bff_blocks,
+    evict_lsh_blocks,
     BLOCK_SIZE,
     NUM_LSH_BITS,
     LSH_MAX_HEAD_DIM,
@@ -61,11 +62,20 @@ def apply_fast_fusion_graph_patch():
         self._run_post_forward_bff = MethodType(_run_post_forward_bff, self)
         self._run_lsh_dedup_and_register = MethodType(_run_lsh_dedup_and_register, self)
         self._lsh_register_bff_blocks = MethodType(_lsh_register_bff_blocks, self)
+        self.evict_lsh_blocks = MethodType(evict_lsh_blocks, self)
         self.fused_requests = {}
         self._updated_block_tables = None
         # LSH registry (populated lazily, one entry per fusion layer)
         self.lsh_registry = {}   # layer_name → list[dict[int, list[int]]] (8 tables)
         self.lsh_mean_k   = {}   # layer_name → dict[block_id, Tensor[head_dim]]
+        # Reverse index: block_id → (gkey, sub_hashes), so the block-free path can
+        # evict freed/recycled blocks from the registry (see evict_lsh_blocks).
+        self.lsh_block_owner = {}
+        # Publish this runner so patched_free_blocks (scheduler side, same
+        # EngineCore process for TP=1) can reach the registry. TODO(TP>1): runners
+        # live in separate processes; freed IDs would need shipping via output.
+        import kv_fast_fusion.fast_fusion_block_pool as _ffbp
+        _ffbp._ACTIVE_RUNNER = self
 
         original_gpu_model_runner_init(self, *args, **kwargs)
 

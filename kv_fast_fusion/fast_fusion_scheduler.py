@@ -382,6 +382,26 @@ def update_from_output(
             except Exception as e:
                 logger.error("BFF block merging failed — skipping this step: %s", e, exc_info=True)
         ###
+        # --- BFF measurement: periodic runtime scheduling snapshot ---
+        # Separates "no free blocks" (static capacity cap) from "free blocks exist
+        # but batch stays small" (runtime / preemption). K=50 steps.
+        try:
+            _k = 50
+            self._bff_step = getattr(self, "_bff_step", 0) + 1
+            if self._bff_step % _k == 0:
+                _bp = self.kv_cache_manager.coordinator.block_pool
+                _free = _bp.get_num_free_blocks()
+                _total = getattr(_bp, "num_gpu_blocks", None) or len(getattr(_bp, "blocks", []))
+                _usage = (1.0 - _free / _total) if _total else float("nan")
+                logger.info(
+                    "BFF sched | step=%d | running=%d | waiting=%d | "
+                    "free_blocks=%d / %d | block_usage=%.1f%%",
+                    self._bff_step, len(self.running), len(self.waiting),
+                    _free, _total, _usage * 100,
+                )
+        except Exception as e:
+            logger.warning("BFF sched log failed: %s", e, exc_info=True)
+        # --- end BFF measurement ---
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
             perf_stats = self.perf_metrics.get_step_perf_stats_per_gpu(scheduler_output)
