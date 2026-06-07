@@ -475,22 +475,51 @@ def _fill_norm_buffers(
     fused_reqs: list[str],
     fused_reqs_idx: list[int],
 ) -> None:
-    """Reset norm buffers to 1.0 and fill with stored norms for fused requests."""
+    """Reset norm buffers to 1.0 and fill with stored norms for fused requests.
+
+    Vectorized: each request's per-(layer, block) norms are assembled ONCE into a dense
+    [num_layers, max_blocks] tensor (cached in `self._fused_stack`); per step we just stack
+    the active requests' tensors and do a single batched scatter into the buffer. This
+    replaces the previous O(fused_reqs × fusion_layers) Python `copy_` loop — at ~300 fused
+    requests that was ~8k tiny GPU launches per decode step (a major per-step cost)."""
     if not hasattr(self, 'norms_k_buf') or self.norms_k_buf is None:
         return
     self.norms_k_buf.fill_(1.0)
     self.norms_v_buf.fill_(1.0)
+    if not fused_reqs:
+        return
+
+    L, _, B = self.norms_k_buf.shape
+    dev = self.norms_k_buf.device
+    dt = self.norms_k_buf.dtype
+    stack = self.__dict__.setdefault('_fused_stack', {})
+
+    nk_list, nv_list, valid_idx = [], [], []
     for req_id, req_idx in zip(fused_reqs, fused_reqs_idx):
-        per_layer = self.fused_requests.get(req_id)
-        if per_layer is None:
-            continue
-        for layer_name, (norms_k, norms_v) in per_layer.items():
-            layer_idx = int(layer_name.split('.')[2])
-            n = norms_k.shape[0]
-            max_blocks = self.norms_k_buf.shape[2]
-            n = min(n, max_blocks)
-            self.norms_k_buf[layer_idx, req_idx, :n].copy_(norms_k[:n].to(self.norms_k_buf.device))
-            self.norms_v_buf[layer_idx, req_idx, :n].copy_(norms_v[:n].to(self.norms_v_buf.device))
+        st = stack.get(req_id)
+        if st is None:
+            per_layer = self.fused_requests.get(req_id)
+            if per_layer is None:
+                continue
+            # Build once (a request is compressed exactly once, so this is immutable).
+            NK = torch.ones(L, B, device=dev, dtype=dt)
+            NV = torch.ones(L, B, device=dev, dtype=dt)
+            for layer_name, (norms_k, norms_v) in per_layer.items():
+                li = int(layer_name.split('.')[2])
+                n = min(norms_k.shape[0], B)
+                NK[li, :n] = norms_k[:n].to(dev, dt)
+                NV[li, :n] = norms_v[:n].to(dev, dt)
+            st = (NK, NV)
+            stack[req_id] = st
+        nk_list.append(st[0])
+        nv_list.append(st[1])
+        valid_idx.append(req_idx)
+
+    if not valid_idx:
+        return
+    idx = torch.tensor(valid_idx, device=dev, dtype=torch.long)
+    self.norms_k_buf[:, idx, :] = torch.stack(nk_list, dim=1)  # [L, F, B]
+    self.norms_v_buf[:, idx, :] = torch.stack(nv_list, dim=1)
 
 
 class BFFCompressor:
@@ -1422,29 +1451,25 @@ def _patched_build_attention_metadata(
                     cached_attn_metadata[cache_key] = attn_metadata_i
 
 
-            # sefi — attach static norm-buffer views for graph-compatible decode scaling
-            if len(attn_group.layer_names) == 1:
-                layer_name = attn_group.layer_names[0]
-                layer_idx = int(layer_name.split('.')[2])
+            # sefi — attach norm buffers so patched_forward can apply per-(seq, block)
+            # BFF scaling IN-KERNEL. Attach to EVERY fusion group regardless of how many
+            # layers it has (BFF_GROUP_SIZE>1 groups several layers under one attn_group);
+            # patched_forward selects the per-layer slice via layer_idx. The whole
+            # [num_layers, max_reqs, max_blocks] buffer is attached (same storage →
+            # graph-capturable). Warmup (sliding-window) groups are skipped → flash path.
+            if hasattr(self, 'norms_k_buf') and self.norms_k_buf is not None:
                 warmup = getattr(self, '_ff_warmup_layers', 2)
                 max_layer = getattr(self, '_ff_max_layer_idx',
                                     self.vllm_config.model_config.get_num_layers(
                                         self.vllm_config.parallel_config) - warmup)
-                is_fusion_layer = warmup <= layer_idx < max_layer
-
-                if is_fusion_layer and hasattr(self, 'norms_k_buf') and self.norms_k_buf is not None:
-                    nr_view = num_reqs_padded if num_reqs_padded is not None else num_reqs
-                    max_blocks_buf = self.norms_k_buf.shape[2]
-                    # Store views into the persistent buffer — same storage, graph-capturable
-                    attn_metadata_i.norms_k_buf = self.norms_k_buf[layer_idx, :nr_view, :max_blocks_buf]
-                    attn_metadata_i.norms_v_buf = self.norms_v_buf[layer_idx, :nr_view, :max_blocks_buf]
-                    # Flag for patched_flash_forward: skip scaling when nothing is fused.
-                    # Do NOT force True during graph capture — the warmup dummy run uses
-                    # the maximum batch size (e.g. 256 reqs × 256 blocks) and the
-                    # gather-multiply would try to allocate ~8 GiB → OOM.
-                    # In PIECEWISE graph mode (the default) patched_flash_forward runs
-                    # eagerly every step, so this Python flag is re-evaluated at each
-                    # call and is safe to be False during warmup.
+                layer_idxs = [int(ln.split('.')[2]) for ln in attn_group.layer_names]
+                is_fusion_group = all(warmup <= li < max_layer for li in layer_idxs)
+                if is_fusion_group:
+                    attn_metadata_i.norms_k_buf_full = self.norms_k_buf
+                    attn_metadata_i.norms_v_buf_full = self.norms_v_buf
+                    # has_fused_reqs is False during CUDA-graph capture and whenever no
+                    # request in the batch is fused → patched_forward takes the flash
+                    # fast path; True → the BFF Triton kernel.
                     attn_metadata_i.has_fused_reqs = bool(fused_reqs)
 
             
@@ -1660,10 +1685,17 @@ def execute_model(
             ## sefi
             self._updated_block_tables = None
 
+            # --- BFF phase timers (host wall-clock; localizes per-step overhead) ---
+            import time as _time
+            _ff = self.__dict__.setdefault('_ff_phase', {})
+            self._ff_steps = getattr(self, '_ff_steps', 0) + 1
+            # ----------------------------------------------------------------------
+
             # Evict entries for requests that have left the batch (prevents unbounded growth)
             active_ids = set(self.input_batch.req_ids)
             for rid in [k for k in self.fused_requests if k not in active_ids]:
                 del self.fused_requests[rid]
+                self.__dict__.get('_fused_stack', {}).pop(rid, None)
 
             # Only compress requests that FINISH their prefill this step. Compressing
             # a mid-prefill chunk (chunked prefill) would redirect/free blocks that the
@@ -1691,11 +1723,14 @@ def execute_model(
             # Skip norm-buffer fill/reset when no fused requests are present AND the
             # previous step also had none (avoids pointless fill_(1.0) every step).
             has_fused = bool(fused_reqs)
+            _t0 = _time.perf_counter()
             if has_fused or getattr(self, '_had_fused_reqs_prev_step', False):
                 self._fill_norm_buffers(fused_reqs, fused_reqs_idx)
+            _ff['norm_fill'] = _ff.get('norm_fill', 0.0) + (_time.perf_counter() - _t0)
             self._had_fused_reqs_prev_step = has_fused
             ##
 
+            _t0 = _time.perf_counter()
             attn_metadata, spec_decode_common_attn_metadata = (
                 self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
@@ -1712,6 +1747,7 @@ def execute_model(
                     fused_reqs=fused_reqs,
                 )
             )
+            _ff['build_meta'] = _ff.get('build_meta', 0.0) + (_time.perf_counter() - _t0)
 
             (
                 input_ids,
@@ -1747,6 +1783,7 @@ def execute_model(
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
         ):
+            _t0 = _time.perf_counter()
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -1754,8 +1791,10 @@ def execute_model(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+            _ff['model_fwd'] = _ff.get('model_fwd', 0.0) + (_time.perf_counter() - _t0)
 
         # Post-forward block fusion / deduplication — OUTSIDE set_forward_context.
+        _t0 = _time.perf_counter()
         _n_fusion_layers = sum(
             1 for g in self.kv_cache_config.kv_cache_groups[1:] if g.layer_names
         )
@@ -1768,7 +1807,7 @@ def execute_model(
                 "BFF post-forward: compressed %d requests across %d fusion layers",
                 len(req_to_compress), _n_fusion_layers,
             )
-        elif len(req_to_compress) >= 1:
+        elif len(req_to_compress) > 1:
             # LSH dedup: normalise + look up registry for each individual prefill.
             self._run_lsh_dedup_and_register(req_to_compress, req_idx_to_compress, attn_metadata)
             self._update_block_tables_after_compression(req_to_compress)
@@ -1776,6 +1815,17 @@ def execute_model(
                 "LSH dedup post-forward: processed %d requests across %d fusion layers",
                 len(req_to_compress), _n_fusion_layers,
             )
+        _ff['post_fwd'] = _ff.get('post_fwd', 0.0) + (_time.perf_counter() - _t0)
+
+        # --- BFF phase report (avg host ms/step over the window) ---
+        _K = 100
+        if self._ff_steps % _K == 0 and _ff:
+            logger.info(
+                "BFF phase ms/step (avg/%d): %s",
+                _K, {k: round(v / _K * 1000, 2) for k, v in sorted(_ff.items())},
+            )
+            _ff.clear()
+        # -----------------------------------------------------------
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:

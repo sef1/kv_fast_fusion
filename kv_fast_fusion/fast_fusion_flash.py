@@ -82,22 +82,19 @@ def patched_forward(
         # For decoder and cross-attention, use KV cache as before
         key_cache, value_cache = kv_cache.unbind(0)
 
-        ### sefi — static-buffer scaling for fused requests (graph-compatible)
-        # has_fused_reqs is False in piecewise/eager mode when nothing is fused → skip
-        # entire block to avoid wasting memory bandwidth on 1.0 multiplies.
-        # During CUDA graph capture it is forced True so the op is always captured.
-        bt = None
-        sf_k_expanded = None
-        sf_v_expanded = None
-        if hasattr(attn_metadata, 'norms_k_buf') and getattr(attn_metadata, 'has_fused_reqs', True):
-            sf_k = attn_metadata.norms_k_buf   # [num_reqs_padded, max_blocks] — static shape
-            sf_v = attn_metadata.norms_v_buf   # [num_reqs_padded, max_blocks] — static shape
-            sf_k_expanded = sf_k.view(*sf_k.shape, 1, 1, 1)
-            sf_v_expanded = sf_v.view(*sf_v.shape, 1, 1, 1)
-            # clamp(-1 pad slots → 0 null block); norms_k_buf is 1.0 for padding → no-op
-            bt = attn_metadata.block_table[:sf_k.shape[0], :sf_k.shape[1]].clamp(min=0)
-            key_cache[bt] *= sf_k_expanded
-            value_cache[bt] *= sf_v_expanded
+        ### sefi — BFF per-(seq, block) norm scaling is applied IN-KERNEL (see
+        # fast_fusion_triton_attn.bff_unified_attention) so a shared/dedup'd physical
+        # block can be scaled differently per request with no write-back conflict.
+        # We only take the custom-kernel path for fusion layers that have at least one
+        # fused request in the batch; everything else uses the flash-attn fast path.
+        # `has_fused_reqs` is False during CUDA-graph capture and when nothing is fused.
+        bff_norms_k = None
+        bff_norms_v = None
+        if getattr(attn_metadata, 'has_fused_reqs', False) and \
+                getattr(attn_metadata, 'norms_k_buf_full', None) is not None:
+            layer_idx = int(layer.layer_name.split('.')[2])
+            bff_norms_k = attn_metadata.norms_k_buf_full[layer_idx]
+            bff_norms_v = attn_metadata.norms_v_buf_full[layer_idx]
         ####
 
         # key and value may be None in the case of cross attention. They are
@@ -125,13 +122,6 @@ def patched_forward(
                 layer._k_scale,
                 layer._v_scale,
             )
-        
-            ###sefi — restore after KV write so later attention steps use original norms
-            if bt is not None:
-                key_cache[bt] /= sf_k_expanded
-                value_cache[bt] /= sf_v_expanded
-            ##
-
 
         if self.kv_cache_dtype.startswith("fp8"):
             # queries are quantized in the attention layer
@@ -171,6 +161,35 @@ def patched_forward(
                     if self.sliding_window is not None
                     else None
                 )
+                if bff_norms_k is not None:
+                    # BFF: per-(seq, block) K/V norm scaling applied in-kernel.
+                    from kv_fast_fusion.fast_fusion_triton_attn import (
+                        bff_unified_attention,
+                    )
+                    bff_unified_attention(
+                        q=query[:num_actual_tokens],
+                        k=key_cache,
+                        v=value_cache,
+                        out=output[:num_actual_tokens],
+                        cu_seqlens_q=cu_seqlens_q,
+                        max_seqlen_q=max_seqlen_q,
+                        seqused_k=seqused_k,
+                        max_seqlen_k=max_seqlen_k,
+                        softmax_scale=self.scale,
+                        causal=attn_metadata.causal,
+                        window_size=(
+                            sliding_window_size
+                            if sliding_window_size is not None
+                            else (-1, -1)
+                        ),
+                        block_table=block_table,
+                        softcap=self.logits_soft_cap,
+                        norms_k=bff_norms_k,
+                        norms_v=bff_norms_v,
+                        alibi_slopes=self.alibi_slopes,
+                        sinks=self.sinks,
+                    )
+                    return output
                 flash_attn_varlen_func(
                     q=query[:num_actual_tokens],
                     k=key_cache,
