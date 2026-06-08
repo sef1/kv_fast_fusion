@@ -14,10 +14,20 @@ from typing import Any, Dict, List, Optional, Union, TYPE_CHECKING, NamedTuple
 
 from dataclasses import dataclass  
   
-THRESHOLD = 0.7
+THRESHOLD = float(os.environ.get("BFF_THRESHOLD", "0.7"))
 BLOCK_SIZE = 128
 NUM_LAST_CHUNKS_TO_COMPRESS = 4
 CHUNK_SIZE = 512
+
+# LSH block representation used for the fingerprint + cosine match (ROUND 6 experiment):
+#   'mean' : mean over (tokens × heads) per head_dim, averaged across the G group layers
+#            (cheap, coarse — the original).
+#   'full' : full flattened block (block_sz·heads·head_dim), averaged across G layers —
+#            matches fast-fusion's full-block cosine. Most faithful, heavy registry.
+#   'proj' : Johnson–Lindenstrauss random projection of the 'full' vector to LSH_PROJ_DIM
+#            (approximately preserves cosine; near-'full' accuracy, small registry).
+LSH_BLOCK_REPR = os.environ.get("BFF_LSH_REPR", "proj").lower()
+LSH_PROJ_DIM = int(os.environ.get("BFF_LSH_PROJ_DIM", "512"))
 
 # Number of consecutive fusion layers packed into one KV cache group.
 # G=1  → one group per layer (28 groups for a 32-layer model, original behaviour).
@@ -28,7 +38,7 @@ BFF_GROUP_SIZE = 4
 NUM_LSH_BITS = 256            # total bits per fingerprint
 NUM_LSH_TABLES = 16           # independent sub-tables
 LSH_BITS_PER_TABLE = 16       # bits per sub-table  (NUM_LSH_BITS // NUM_LSH_TABLES)
-MAX_REGISTRY_PER_LAYER = 8192  # max registered blocks per fusion layer (hard cap)
+MAX_REGISTRY_PER_LAYER = int(os.environ.get("BFF_MAX_REGISTRY", "8192"))  # max registered blocks per fusion layer (lower for 'full' repr to bound memory)
 LSH_MAX_HEAD_DIM = 512       # lsh_proj is pre-allocated up to this head_dim
 
 
@@ -513,6 +523,35 @@ def _fill_norm_buffers(
             torch.tensor(slots, dtype=torch.int32), non_blocking=True)
 
 
+def _get_simhash_matrix(runner, d_repr, device):
+    """Fixed-seed simHash projection [d_repr, NUM_LSH_BITS], cached per dim on the runner.
+    Must be deterministic across calls so a block registered earlier and a query block
+    hash consistently."""
+    cache = runner.__dict__.setdefault('_lsh_simhash_by_dim', {})
+    m = cache.get(d_repr)
+    if m is None:
+        g = torch.Generator(device=device)
+        g.manual_seed(42)
+        m = torch.randn(d_repr, NUM_LSH_BITS, dtype=torch.float16, device=device, generator=g)
+        cache[d_repr] = m
+    return m
+
+
+def _get_jl_matrix(runner, d_in, d_out, device):
+    """Fixed-seed Johnson–Lindenstrauss matrix [d_in, d_out] (cosine-preserving random
+    projection), cached on the runner."""
+    cache = runner.__dict__.setdefault('_lsh_jl_by_dim', {})
+    key = (d_in, d_out)
+    m = cache.get(key)
+    if m is None:
+        g = torch.Generator(device=device)
+        g.manual_seed(1234)
+        m = torch.randn(d_in, d_out, dtype=torch.float16, device=device, generator=g)
+        m /= (d_out ** 0.5)
+        cache[key] = m
+    return m
+
+
 class BFFCompressor:
     """Encapsulates one BFF post-forward pass across all fusion layers.
 
@@ -531,6 +570,7 @@ class BFFCompressor:
         '_total_valid', '_total_unique',
         # LSH fields — precomputed once, shared by run_lsh() and run_lsh_register()
         '_head_dim', '_lsh_proj', '_kv_dtype',
+        '_repr_mode', '_d_full', '_d_repr', '_lsh_jl',
     )
 
     def __init__(self, runner, req_to_compress, req_idx_to_compress, attn_metadata_dict):
@@ -570,6 +610,10 @@ class BFFCompressor:
             self._head_dim        = None
             self._lsh_proj        = None
             self._kv_dtype        = None
+            self._repr_mode       = LSH_BLOCK_REPR
+            self._d_full          = None
+            self._d_repr          = None
+            self._lsh_jl          = None
             return
 
         self._num_blocks_dim = first_meta.block_table.shape[1]
@@ -598,6 +642,8 @@ class BFFCompressor:
         # kv_caches is indexed by LAYER INDEX (not group id), so resolve the first
         # fusion group's first layer to its layer index before indexing.
         self._head_dim = self._kv_dtype = self._lsh_proj = None
+        self._repr_mode = LSH_BLOCK_REPR
+        self._d_full = self._d_repr = self._lsh_jl = None
         for kv_gid2, kv_group2 in enumerate(runner.kv_cache_config.kv_cache_groups):
             if kv_gid2 == 0 or not kv_group2.layer_names:
                 continue
@@ -605,8 +651,20 @@ class BFFCompressor:
             if runner.kv_caches and li0 < len(runner.kv_caches):
                 kv0 = runner.kv_caches[li0]
                 self._head_dim = kv0.shape[-1]
-                self._lsh_proj = runner.lsh_proj[:self._head_dim]  # [head_dim, NUM_LSH_BITS]
                 self._kv_dtype = kv0.dtype
+                # block representation dimension + a dim-matched simHash matrix.
+                # kv0 block is [block_sz, num_kv_heads, head_dim] → D_full flat.
+                self._d_full = kv0.shape[-3] * kv0.shape[-2] * kv0.shape[-1]
+                if self._repr_mode == 'mean':
+                    self._d_repr = self._head_dim
+                    self._lsh_proj = runner.lsh_proj[:self._head_dim]
+                elif self._repr_mode == 'proj':
+                    self._d_repr = LSH_PROJ_DIM
+                    self._lsh_jl = _get_jl_matrix(runner, self._d_full, LSH_PROJ_DIM, self._device)
+                    self._lsh_proj = _get_simhash_matrix(runner, self._d_repr, self._device)
+                else:  # 'full'
+                    self._d_repr = self._d_full
+                    self._lsh_proj = _get_simhash_matrix(runner, self._d_repr, self._device)
                 break
 
     # ------------------------------------------------------------------
@@ -826,6 +884,30 @@ class BFFCompressor:
     # LSH deduplication path (< 4 concurrent prefills)
     # ------------------------------------------------------------------
 
+    def _block_repr(self, kv_layers, valid_bids, N):
+        """Normalized per-block representation for LSH (selected by LSH_BLOCK_REPR),
+        averaged across the G layers of the group → [N, D_repr] float16.
+
+        - 'mean': mean over (tokens × heads) per head_dim  → [N, head_dim]  (coarse)
+        - 'full': full flattened block (block_sz·heads·head_dim) → fast-fusion's metric
+        - 'proj': JL projection of 'full' to LSH_PROJ_DIM (cosine-preserving, cheap)
+        """
+        head_dim = self._head_dim
+        G = len(kv_layers)
+        if self._repr_mode == 'mean':
+            rep = kv_layers[0][0, valid_bids].float().view(N, -1, head_dim).mean(dim=1)
+            for kv_layer in kv_layers[1:]:
+                rep += kv_layer[0, valid_bids].float().view(N, -1, head_dim).mean(dim=1)
+        else:
+            rep = kv_layers[0][0, valid_bids].float().view(N, -1)
+            for kv_layer in kv_layers[1:]:
+                rep += kv_layer[0, valid_bids].float().view(N, -1)
+        if G > 1:
+            rep /= G
+        if self._repr_mode == 'proj':
+            rep = rep @ self._lsh_jl.float()
+        return F.normalize(rep, dim=1).to(torch.float16)
+
     def _lsh_dedup_group(self, layer_names, layer_idxs, layer_meta, kv_layers):
         """LSH dedup + normalisation for one fusion group (G layers, shared table).
 
@@ -864,13 +946,8 @@ class BFFCompressor:
             if N == 0:
                 continue
 
-            # ---- joint mean-K fingerprint across the G layers ----
-            block_means = kv_layers[0][0, valid_bids].float().view(N, -1, head_dim).mean(dim=1)
-            for kv_layer in kv_layers[1:]:
-                block_means += kv_layer[0, valid_bids].float().view(N, -1, head_dim).mean(dim=1)
-            if G > 1:
-                block_means /= G
-            block_means_norm = F.normalize(block_means, dim=1).to(torch.float16)
+            # ---- block fingerprint across the G layers (repr mode: mean|full|proj) ----
+            block_means_norm = self._block_repr(kv_layers, valid_bids, N)
 
             proj_all       = (block_means_norm @ lsh_proj).sign()
             proj_bits      = (proj_all > 0).to(torch.int32).cpu()
@@ -995,12 +1072,7 @@ class BFFCompressor:
 
             new_bids_t  = torch.tensor(new_bids, dtype=torch.long, device=kv_layers[0].device)
             M           = len(new_bids)
-            block_means = kv_layers[0][0, new_bids_t].float().view(M, -1, head_dim).mean(dim=1)
-            for kv_layer in kv_layers[1:]:
-                block_means += kv_layer[0, new_bids_t].float().view(M, -1, head_dim).mean(dim=1)
-            if G > 1:
-                block_means /= G
-            means_norm  = F.normalize(block_means, dim=1).to(torch.float16)
+            means_norm  = self._block_repr(kv_layers, new_bids_t, M)
 
             proj_all       = (means_norm @ lsh_proj).sign()
             proj_bits      = (proj_all > 0).to(torch.int32).cpu()
@@ -1797,7 +1869,7 @@ def execute_model(
         _n_fusion_layers = sum(
             1 for g in self.kv_cache_config.kv_cache_groups[1:] if g.layer_names
         )
-        if len(req_to_compress) > 1:
+        if False: #len(req_to_compress) > 1:
             # Full BFF: recursive merge across concurrent prefills, then register blocks.
             self._run_post_forward_bff(req_to_compress, req_idx_to_compress, attn_metadata)
             self._update_block_tables_after_compression(req_to_compress)
@@ -1806,7 +1878,7 @@ def execute_model(
                 "BFF post-forward: compressed %d requests across %d fusion layers",
                 len(req_to_compress), _n_fusion_layers,
             )
-        elif False: #len(req_to_compress) > 1:
+        elif len(req_to_compress) > 1:
             # LSH dedup: normalise + look up registry for each individual prefill.
             self._run_lsh_dedup_and_register(req_to_compress, req_idx_to_compress, attn_metadata)
             self._update_block_tables_after_compression(req_to_compress)
