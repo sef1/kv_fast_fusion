@@ -66,12 +66,13 @@ def kernel_bff_attention_2d(
     alibi_slopes_ptr,  # [num_query_heads]
     scale,  # float32
     softcap,  # float32
-    # --- BFF per-(seq, block) norm scaling ---
-    norms_k_ptr,  # [num_seqs, max_blocks] (this layer), or 0 if unused
-    norms_v_ptr,  # [num_seqs, max_blocks] (this layer), or 0 if unused
+    # --- BFF per-(seq, block) norm scaling (slot-indexed) ---
+    norms_k_ptr,  # [num_slots+1, max_blocks] (this layer), slot 0 = sentinel (1.0)
+    norms_v_ptr,  # [num_slots+1, max_blocks] (this layer)
+    slot_ptr,  # [num_seqs] int32: batch row → slot (0 = non-fused sentinel)
     norms_stride: tl.int64,  # row stride of the norm buffers
     USE_BFF_SCALE: tl.constexpr,  # bool
-    # -----------------------------------------
+    # --------------------------------------------------------
     num_query_heads: tl.constexpr,  # int
     num_queries_per_kv: tl.constexpr,  # int
     block_table_stride: tl.int64,  # int
@@ -244,7 +245,8 @@ def kernel_bff_attention_2d(
 
         # --- BFF per-(seq, block) scaling, applied in registers ---
         if USE_BFF_SCALE:
-            norm_off = seq_idx * norms_stride + block_pos
+            slot = tl.load(slot_ptr + seq_idx).to(tl.int64)
+            norm_off = slot * norms_stride + block_pos
             nk = tl.load(norms_k_ptr + norm_off, mask=tile_mask, other=1.0)
             nv = tl.load(norms_v_ptr + norm_off, mask=tile_mask, other=1.0)
             K = (K.to(tl.float32) * nk[None, :]).to(K.dtype)
@@ -330,18 +332,22 @@ def bff_unified_attention(
     softcap,
     norms_k,
     norms_v,
+    seq_to_slot=None,
     alibi_slopes=None,
     sinks=None,
 ):
     """Paged attention with optional per-(seq, block) K/V norm scaling (2D kernel).
 
-    `norms_k`/`norms_v` are `[num_seqs, max_blocks]` float tensors for THIS layer (the
-    runner's `norms_*_buf[layer_idx]`), or None to disable scaling (→ stock attention).
-    Only causal attention is supported (matches BFF decoder layers).
+    `norms_k`/`norms_v` are `[num_slots+1, max_blocks]` float tensors for THIS layer (the
+    runner's slot-indexed `norms_*_buf[layer_idx]`), and `seq_to_slot` is an int32
+    `[num_seqs]` map (batch row → slot, 0 = sentinel/non-fused). Pass None to disable
+    scaling (→ stock attention). Only causal attention is supported.
     """
     assert causal, "Only causal attention is supported"
 
-    use_bff_scale = norms_k is not None and norms_v is not None
+    use_bff_scale = (
+        norms_k is not None and norms_v is not None and seq_to_slot is not None
+    )
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
 
@@ -384,6 +390,7 @@ def bff_unified_attention(
         softcap=softcap,
         norms_k_ptr=norms_k,
         norms_v_ptr=norms_v,
+        slot_ptr=seq_to_slot,
         norms_stride=norms_stride,
         USE_BFF_SCALE=use_bff_scale,
         num_query_heads=num_query_heads,

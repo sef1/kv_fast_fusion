@@ -39,7 +39,7 @@ class BlockCompressionHookGraph(CompressionHook):
         self.compression_stream = torch.cuda.Stream()
         self.max_layer_idx = (vllm_config.model_config.get_num_layers(vllm_config.parallel_config) - self.warmup_layers)
         self._block_size = BLOCK_SIZE
-        self.thr = 0.0
+        self.thr = THRESHOLD
         self.num_blocks = attn_metadata.block_table.shape[-1]
         req_idx = attn_metadata.req_idx_to_compress
         device = attn_metadata.block_table.device
@@ -472,54 +472,45 @@ import numpy as np
 
 def _fill_norm_buffers(
     self,
+    req_ids_in_batch: list[str],
     fused_reqs: list[str],
-    fused_reqs_idx: list[int],
 ) -> None:
-    """Reset norm buffers to 1.0 and fill with stored norms for fused requests.
+    """Slot-based norm fetch (replaces the per-step buffer relayout).
 
-    Vectorized: each request's per-(layer, block) norms are assembled ONCE into a dense
-    [num_layers, max_blocks] tensor (cached in `self._fused_stack`); per step we just stack
-    the active requests' tensors and do a single batched scatter into the buffer. This
-    replaces the previous O(fused_reqs × fusion_layers) Python `copy_` loop — at ~300 fused
-    requests that was ~8k tiny GPU launches per decode step (a major per-step cost)."""
+    `norms_*_buf` is indexed by a STABLE per-request SLOT, not the batch row. A fused
+    request's norms are written into its slot ONCE (here, on first sight); per step we only
+    build the small `seq_to_slot[num_reqs]` map (batch row → slot, 0 = sentinel/non-fused)
+    that the kernel uses to fetch. This removes the previous O(L·max_reqs·B) `fill_` + stack
+    + scatter that ran every step (~23 ms) — now per-step cost is O(num_reqs) host work plus
+    one tiny H2D."""
     if not hasattr(self, 'norms_k_buf') or self.norms_k_buf is None:
         return
-    self.norms_k_buf.fill_(1.0)
-    self.norms_v_buf.fill_(1.0)
-    if not fused_reqs:
-        return
-
-    L, _, B = self.norms_k_buf.shape
-    dev = self.norms_k_buf.device
+    B = self.norms_k_buf.shape[2]
     dt = self.norms_k_buf.dtype
-    stack = self.__dict__.setdefault('_fused_stack', {})
 
-    nk_list, nv_list, valid_idx = [], [], []
-    for req_id, req_idx in zip(fused_reqs, fused_reqs_idx):
-        st = stack.get(req_id)
-        if st is None:
-            per_layer = self.fused_requests.get(req_id)
-            if per_layer is None:
-                continue
-            # Build once (a request is compressed exactly once, so this is immutable).
-            NK = torch.ones(L, B, device=dev, dtype=dt)
-            NV = torch.ones(L, B, device=dev, dtype=dt)
-            for layer_name, (norms_k, norms_v) in per_layer.items():
-                li = int(layer_name.split('.')[2])
-                n = min(norms_k.shape[0], B)
-                NK[li, :n] = norms_k[:n].to(dev, dt)
-                NV[li, :n] = norms_v[:n].to(dev, dt)
-            st = (NK, NV)
-            stack[req_id] = st
-        nk_list.append(st[0])
-        nv_list.append(st[1])
-        valid_idx.append(req_idx)
+    # 1. Write-once: materialize norms for any fused request that lacks a slot.
+    for req_id in fused_reqs:
+        if req_id in self._fused_slot:
+            continue
+        per_layer = self.fused_requests.get(req_id)
+        if per_layer is None or not self._free_slots:
+            continue
+        slot = self._free_slots.pop()
+        self._fused_slot[req_id] = slot
+        for layer_name, (nk, nv) in per_layer.items():
+            li = int(layer_name.split('.')[2])
+            n = min(nk.shape[0], B)
+            self.norms_k_buf[li, slot, :n] = nk[:n].to(dt)
+            self.norms_v_buf[li, slot, :n] = nv[:n].to(dt)
 
-    if not valid_idx:
-        return
-    idx = torch.tensor(valid_idx, device=dev, dtype=torch.long)
-    self.norms_k_buf[:, idx, :] = torch.stack(nk_list, dim=1)  # [L, F, B]
-    self.norms_v_buf[:, idx, :] = torch.stack(nv_list, dim=1)
+    # 2. Build this step's batch-row → slot map (cheap). Padded rows → 0 (sentinel).
+    fs = self._fused_slot
+    slots = [fs.get(r, 0) for r in req_ids_in_batch]
+    n = len(slots)
+    self._seq_to_slot.zero_()
+    if n:
+        self._seq_to_slot[:n].copy_(
+            torch.tensor(slots, dtype=torch.int32), non_blocking=True)
 
 
 class BFFCompressor:
@@ -1467,6 +1458,9 @@ def _patched_build_attention_metadata(
                 if is_fusion_group:
                     attn_metadata_i.norms_k_buf_full = self.norms_k_buf
                     attn_metadata_i.norms_v_buf_full = self.norms_v_buf
+                    # Batch-row → slot map (0 = sentinel) for the kernel's per-(seq, block)
+                    # norm fetch; norms_*_buf is slot-indexed, not batch-row-indexed.
+                    attn_metadata_i.bff_seq_to_slot = self._seq_to_slot
                     # has_fused_reqs is False during CUDA-graph capture and whenever no
                     # request in the batch is fused → patched_forward takes the flash
                     # fast path; True → the BFF Triton kernel.
@@ -1691,11 +1685,16 @@ def execute_model(
             self._ff_steps = getattr(self, '_ff_steps', 0) + 1
             # ----------------------------------------------------------------------
 
-            # Evict entries for requests that have left the batch (prevents unbounded growth)
+            # Evict entries for requests that have left the batch (prevents unbounded
+            # growth) and free their norm slot back to the pool.
             active_ids = set(self.input_batch.req_ids)
             for rid in [k for k in self.fused_requests if k not in active_ids]:
                 del self.fused_requests[rid]
-                self.__dict__.get('_fused_stack', {}).pop(rid, None)
+                slot = self._fused_slot.pop(rid, None)
+                if slot is not None:
+                    self._free_slots.append(slot)
+                    self.norms_k_buf[:, slot, :] = 1.0
+                    self.norms_v_buf[:, slot, :] = 1.0
 
             # Only compress requests that FINISH their prefill this step. Compressing
             # a mid-prefill chunk (chunked prefill) would redirect/free blocks that the
@@ -1725,7 +1724,7 @@ def execute_model(
             has_fused = bool(fused_reqs)
             _t0 = _time.perf_counter()
             if has_fused or getattr(self, '_had_fused_reqs_prev_step', False):
-                self._fill_norm_buffers(fused_reqs, fused_reqs_idx)
+                self._fill_norm_buffers(self.input_batch.req_ids, fused_reqs)
             _ff['norm_fill'] = _ff.get('norm_fill', 0.0) + (_time.perf_counter() - _t0)
             self._had_fused_reqs_prev_step = has_fused
             ##
@@ -1798,7 +1797,7 @@ def execute_model(
         _n_fusion_layers = sum(
             1 for g in self.kv_cache_config.kv_cache_groups[1:] if g.layer_names
         )
-        if False: #len(req_to_compress) > 1:
+        if len(req_to_compress) > 1:
             # Full BFF: recursive merge across concurrent prefills, then register blocks.
             self._run_post_forward_bff(req_to_compress, req_idx_to_compress, attn_metadata)
             self._update_block_tables_after_compression(req_to_compress)
@@ -1807,7 +1806,7 @@ def execute_model(
                 "BFF post-forward: compressed %d requests across %d fusion layers",
                 len(req_to_compress), _n_fusion_layers,
             )
-        elif len(req_to_compress) > 1:
+        elif False: #len(req_to_compress) > 1:
             # LSH dedup: normalise + look up registry for each individual prefill.
             self._run_lsh_dedup_and_register(req_to_compress, req_idx_to_compress, attn_metadata)
             self._update_block_tables_after_compression(req_to_compress)

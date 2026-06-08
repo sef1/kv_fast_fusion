@@ -90,11 +90,13 @@ def patched_forward(
         # `has_fused_reqs` is False during CUDA-graph capture and when nothing is fused.
         bff_norms_k = None
         bff_norms_v = None
+        bff_seq_to_slot = None
         if getattr(attn_metadata, 'has_fused_reqs', False) and \
                 getattr(attn_metadata, 'norms_k_buf_full', None) is not None:
             layer_idx = int(layer.layer_name.split('.')[2])
             bff_norms_k = attn_metadata.norms_k_buf_full[layer_idx]
             bff_norms_v = attn_metadata.norms_v_buf_full[layer_idx]
+            bff_seq_to_slot = attn_metadata.bff_seq_to_slot
         ####
 
         # key and value may be None in the case of cross attention. They are
@@ -186,6 +188,7 @@ def patched_forward(
                         softcap=self.logits_soft_cap,
                         norms_k=bff_norms_k,
                         norms_v=bff_norms_v,
+                        seq_to_slot=bff_seq_to_slot,
                         alibi_slopes=self.alibi_slopes,
                         sinks=self.sinks,
                     )

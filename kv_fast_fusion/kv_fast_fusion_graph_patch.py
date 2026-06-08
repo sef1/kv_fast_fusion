@@ -87,12 +87,22 @@ def apply_fast_fusion_graph_patch():
         max_model_len = vllm_config.model_config.max_model_len
         max_blocks_per_req = max(1, max_model_len // BLOCK_SIZE)
 
+        # Norm buffers are indexed by a STABLE per-request SLOT (not batch row), so a
+        # fused request's norms are written once and never relaid-out per step. Row 0 is
+        # a sentinel (all 1.0) used by non-fused requests, hence max_reqs+1 rows.
+        num_slots = max_reqs
         self.norms_k_buf = torch.ones(
-            num_layers, max_reqs, max_blocks_per_req,
+            num_layers, num_slots + 1, max_blocks_per_req,
             dtype=torch.bfloat16, device=self.device)
         self.norms_v_buf = torch.ones(
-            num_layers, max_reqs, max_blocks_per_req,
+            num_layers, num_slots + 1, max_blocks_per_req,
             dtype=torch.bfloat16, device=self.device)
+        # Slot allocator: req_id → slot in [1, num_slots]; slot 0 is the sentinel.
+        self._fused_slot = {}
+        self._free_slots = list(range(1, num_slots + 1))
+        # Persistent scratch for the per-step seq→slot map (avoids per-step alloc).
+        self._seq_to_slot = torch.zeros(max_reqs, dtype=torch.int32, device=self.device)
+        self._seq_to_slot_cpu = torch.zeros(max_reqs, dtype=torch.int32, device="cpu")
 
         # Random projection matrix for LSH (fixed seed → deterministic across restarts)
         gen = torch.Generator(device=self.device)
