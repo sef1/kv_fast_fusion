@@ -1,12 +1,14 @@
-import argparse  
-import json  
-import os  
-import time  
-import numpy as np  
-import requests  
-from concurrent.futures import ThreadPoolExecutor  
-from collections import Counter  
-from typing import List, Dict, Any  
+import argparse
+import asyncio
+import contextlib
+import json
+import os
+import time
+import aiohttp
+import numpy as np
+from collections import Counter
+from tqdm import tqdm
+from typing import AsyncGenerator, List, Dict, Any, Tuple
   
 # standalone evaluation 
   
@@ -21,82 +23,142 @@ def f1_score(prediction, ground_truth, **kwargs):
     f1 = (2 * precision * recall) / (precision + recall)  
     return f1  
   
-def run_api_inference(  
-    prompts: List[str],   
-    model: str,   
-    api_url: str,   
-    api_key: str = "EMPTY",  
-    gen_config: Dict[str, Any] = None  
-) -> List[Dict[str, Any]]:  
-    """Pure Python inference - no vLLM dependencies."""  
-    if gen_config is None:  
-        gen_config = {}  
-      
-    headers = {  
-        "Content-Type": "application/json",  
-        "Authorization": f"Bearer {api_key}",  
-    }  
+async def get_request(
+    prompts: List[str],
+    request_rate: float,
+    burstiness: float = 1.0,
+) -> AsyncGenerator[Tuple[int, str], None]:
+    """Asynchronously yield (index, prompt) paced by the request rate, mirroring
+    `vllm.benchmarks.serve.get_request`: inter-arrival times follow a gamma distribution
+    (shape=`burstiness`, scale=1/(rate·burstiness)) — `burstiness`==1 is a Poisson
+    process, <1 burstier, >1 more uniform. `request_rate`==inf fires everything at once."""
+    assert burstiness > 0, f"A positive burstiness factor is expected, but given {burstiness}."
+    for i, prompt in enumerate(prompts):
+        yield i, prompt
+        if request_rate == float("inf"):
+            continue
+        theta = 1.0 / (request_rate * burstiness)
+        interval = np.random.gamma(shape=burstiness, scale=theta)
+        if interval > 0:
+            await asyncio.sleep(interval)
+
+
+async def run_api_inference(
+    prompts: List[str],
+    model: str,
+    api_url: str,
+    gen_config: Dict[str, Any] = None,
+    api_key: str = "EMPTY",
+    request_rate: float = float("inf"),
+    burstiness: float = 1.0,
+    max_concurrency: int = None,
+    request_timeout: float = 600.0,
+    disable_tqdm: bool = False,
+) -> List[Dict[str, Any]]:
+    """Async inference against an OpenAI-compatible server (same arrival/concurrency model
+    as `vllm bench serve`).
+
+    Requests are *dispatched* at `request_rate` req/s with gamma-distributed inter-arrival
+    times; an `asyncio.Semaphore(max_concurrency)` caps in-flight requests to the server so
+    fusion actually sees many concurrent prefills. A tqdm bar advances as each request
+    completes. Result order matches `prompts` (F1 pairing stays correct)."""
+    if gen_config is None:
+        gen_config = {}
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+    api_params = {
+        "model": model,
+        "max_tokens": gen_config.get("max_new_tokens", 4096),
+        "temperature": gen_config.get("temperature", 0.0),
+        "top_p": gen_config.get("top_p", 1.0),
+    }
+
+    n = len(prompts)
+    results: List[Any] = [None] * n
+    pbar = None if disable_tqdm else tqdm(total=n)
+    semaphore = (asyncio.Semaphore(max_concurrency)
+                 if max_concurrency else contextlib.nullcontext())
+
+    async def _send_request(idx: int, prompt: str, session: aiohttp.ClientSession):
+        payload = {"messages": [{"role": "user", "content": prompt}], **api_params}
+        async with semaphore:
+            try:
+                async with session.post(api_url, headers=headers, json=payload) as response:
+                    response.raise_for_status()
+                    data = await response.json()
+                if "choices" in data and data["choices"]:
+                    content = data["choices"][0].get("message", {}).get("content", "")
+                    results[idx] = {"prompt": prompt, "generated_text": content,
+                                    "success": True}
+                else:
+                    results[idx] = {"prompt": prompt, "generated_text": "", "success": False}
+            except Exception as e:
+                print(f"Request failed: {e}")
+                results[idx] = {"prompt": prompt, "generated_text": "", "success": False}
+            finally:
+                if pbar is not None:
+                    pbar.update(1)
+
+    timeout = aiohttp.ClientTimeout(total=request_timeout)
+    connector = aiohttp.TCPConnector(limit=0)  # don't let the client throttle below max_concurrency
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+        tasks: List[asyncio.Task] = []
+        async for idx, prompt in get_request(prompts, request_rate, burstiness):
+            tasks.append(asyncio.create_task(_send_request(idx, prompt, session)))
+        await asyncio.gather(*tasks)
+
+    if pbar is not None:
+        pbar.close()
+    return results
   
-    api_params = {  
-        "model": model,  
-        "max_tokens": gen_config.get("max_new_tokens", 512),  
-        "temperature": gen_config.get("temperature", 0.0),  
-        "top_p": gen_config.get("top_p", 1.0),  
-    }  
+def load_dataset_simple(dataset_path: str, split: str, input_key: str, output_key: str,
+                        num_samples: int, model: str = None, min_tokens: int = 0):
+    """Load dataset without vLLM dependencies.
+
+    When `min_tokens > 0`, each prompt is tokenized with the model's HF tokenizer and
+    samples shorter than `min_tokens` input tokens are skipped; we keep scanning the
+    split until `num_samples` qualifying samples are collected (or it is exhausted).
+    `references` keys stay positionally aligned with `prompts` so F1 pairing is correct.
+    """
+    from datasets import load_dataset
+
+    dataset = load_dataset(dataset_path, split=split)
+
+    tokenizer = None
+    if min_tokens > 0:
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(model)
+
+    prompts = []
+    references = {}
+    n_skipped = 0
+
+    for item in dataset:
+        if len(prompts) >= num_samples:
+            break
+        prompt = item[input_key]
+        reference = item[output_key]
+
+        if tokenizer is not None:
+            n_tok = len(tokenizer(prompt, add_special_tokens=False).input_ids)
+            if n_tok < min_tokens:
+                n_skipped += 1
+                continue
+
+        references[str(len(prompts))] = reference
+        prompts.append(prompt)
+
+    if tokenizer is not None:
+        print(f"  token filter: kept {len(prompts)} samples with >= {min_tokens} input "
+              f"tokens (skipped {n_skipped} shorter ones)")
+
+    return prompts, references
   
-    def _send_request(prompt):  
-        payload = {"messages": [{"role": "user", "content": prompt}], **api_params}  
-        try:  
-            response = requests.post(api_url, headers=headers, json=payload, timeout=60)  
-            response.raise_for_status()  
-            data = response.json()  
-              
-            if "choices" in data and data["choices"]:  
-                content = data["choices"][0].get("message", {}).get("content", "")  
-                return {  
-                    "prompt": prompt,  
-                    "generated_text": content,  
-                    "success": True  
-                }  
-            return {  
-                "prompt": prompt,  
-                "generated_text": "",  
-                "success": False  
-            }  
-        except Exception as e:  
-            print(f"Request failed: {e}")  
-            return {  
-                "prompt": prompt,  
-                "generated_text": "",  
-                "success": False  
-            }  
-  
-    with ThreadPoolExecutor(max_workers=min(len(prompts), 16)) as executor:  
-        results = list(executor.map(_send_request, prompts))  
-      
-    return results  
-  
-def load_dataset_simple(dataset_path: str, split: str, input_key: str, output_key: str, num_samples: int):  
-    """Load dataset without vLLM dependencies."""  
-    from datasets import load_dataset  
-      
-    dataset = load_dataset(dataset_path, split=split)  
-    prompts = []  
-    references = {}  
-      
-    for i, item in enumerate(dataset):  
-        if i >= num_samples:  
-            break  
-        prompt = item[input_key]  
-        reference = item[output_key]  
-          
-        prompts.append(prompt)  
-        references[str(i)] = reference  
-      
-    return prompts, references  
-  
-def main():  
-    parser = argparse.ArgumentParser(description="Run F1 Score Benchmark")  
+async def main():
+    parser = argparse.ArgumentParser(description="Run F1 Score Benchmark")
     parser.add_argument("--model", type=str, default="NousResearch/Hermes-3-Llama-3.1-8B")  
     parser.add_argument("--dataset-path", type=str, default="nvidia/OpenMathInstruct-2")  
     parser.add_argument("--hf-split", type=str, default="train")  
@@ -105,27 +167,51 @@ def main():
     parser.add_argument("--num-prompts", type=int, default=30)  
     parser.add_argument("--host", type=str, default="localhost")  
     parser.add_argument("--port", type=int, default=8000)  
-    parser.add_argument("--compute-f1", action="store_true")  
-    parser.add_argument("--result-dir", type=str, default="./results")  
-      
-    args = parser.parse_args()  
+    parser.add_argument("--compute-f1", action="store_true")
+    parser.add_argument("--result-dir", type=str, default="./results")
+    parser.add_argument("--request-rate", type=float, default=float("inf"),
+                        help="Arrival rate (req/s). 'inf' fires all at once.")
+    parser.add_argument("--burstiness", type=float, default=1.0,
+                        help="Arrival burstiness (gamma shape): 1=Poisson, <1 burstier, >1 uniform.")
+    parser.add_argument("--max-concurrency", type=int, default=None,
+                        help="Cap on in-flight requests (drives concurrent prefills for fusion).")
+    parser.add_argument("--request-timeout", type=float, default=600.0,
+                        help="Per-request HTTP timeout (s); raise it under heavy load.")
+    parser.add_argument("--min-tokens", type=int, default=0,
+                        help="Skip samples whose prompt has fewer than this many input "
+                             "tokens (0 = no filter). Uses the model's HF tokenizer.")
+    parser.add_argument("--disable-tqdm", action="store_true",
+                        help="Disable the tqdm progress bar.")
+
+    args = parser.parse_args()
       
     # Load dataset   
     print(f"Loading dataset from {args.dataset_path}...")  
-    prompts, references = load_dataset_simple(  
-        args.dataset_path, args.hf_split, args.input_key, args.output_key, args.num_prompts  
-    )  
+    prompts, references = load_dataset_simple(
+        args.dataset_path, args.hf_split, args.input_key, args.output_key, args.num_prompts,
+        model=args.model, min_tokens=args.min_tokens,
+    )
       
     # Run inference  
     api_url = f"http://{args.host}:{args.port}/v1/chat/completions"  
     gen_config = {} # or: {"max_new_tokens": 512, "temperature": 0.0}  
       
-    print("\nStarting inference...")  
-    start_time = time.perf_counter()  
-    outputs = run_api_inference(prompts, args.model, api_url, gen_config)  
-    end_time = time.perf_counter()  
-      
-    print(f"Inference completed in {end_time - start_time:.2f} seconds")  
+    print("\nStarting inference...")
+    print(f"  request_rate={args.request_rate}  burstiness={args.burstiness}  "
+          f"max_concurrency={args.max_concurrency}  num_prompts={len(prompts)}")
+    start_time = time.perf_counter()
+    outputs = await run_api_inference(
+        prompts, args.model, api_url, gen_config=gen_config,
+        request_rate=args.request_rate, burstiness=args.burstiness,
+        max_concurrency=args.max_concurrency, request_timeout=args.request_timeout,
+        disable_tqdm=args.disable_tqdm,
+    )
+    end_time = time.perf_counter()
+
+    elapsed = end_time - start_time
+    n_ok = sum(1 for o in outputs if o["success"])
+    print(f"Inference completed in {elapsed:.2f} s  |  {n_ok}/{len(outputs)} ok  |  "
+          f"achieved {len(outputs)/elapsed:.2f} req/s")
       
     # Print sample output  
     if outputs:  
@@ -166,5 +252,5 @@ def main():
               
             print(f"Results saved to {result_file}")  
   
-if __name__ == "__main__":  
-    main()
+if __name__ == "__main__":
+    asyncio.run(main())
