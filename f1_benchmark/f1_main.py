@@ -1,6 +1,5 @@
 import argparse
 import asyncio
-import contextlib
 import json
 import os
 import time
@@ -12,16 +11,15 @@ from typing import AsyncGenerator, List, Dict, Any, Tuple
   
 # standalone evaluation 
   
-def f1_score(prediction, ground_truth, **kwargs):  
-    """Calculate F1 score between prediction and ground truth."""  
-    common = Counter(prediction) & Counter(ground_truth)  
-    num_same = sum(common.values())  
-    if num_same == 0:  
-        return 0  
-    precision = 1.0 * num_same / len(prediction)  
-    recall = 1.0 * num_same / len(ground_truth)  
-    f1 = (2 * precision * recall) / (precision + recall)  
-    return f1  
+def f1_score(prediction, ground_truth, **kwargs):
+    common = Counter(prediction) & Counter(ground_truth)
+    num_same = sum(common.values())
+    if num_same == 0:
+        return 0
+    precision = 1.0 * num_same / len(prediction)
+    recall = 1.0 * num_same / len(ground_truth)
+    f1 = (2 * precision * recall) / (precision + recall)
+    return f1
   
 async def get_request(
     prompts: List[str],
@@ -79,8 +77,9 @@ async def run_api_inference(
     n = len(prompts)
     results: List[Any] = [None] * n
     pbar = None if disable_tqdm else tqdm(total=n)
-    semaphore = (asyncio.Semaphore(max_concurrency)
-                 if max_concurrency else contextlib.nullcontext())
+    # Cap in-flight requests; default to the pre-async behavior (min(n, 16)) when unset.
+    effective_concurrency = max_concurrency if max_concurrency else min(n, 16)
+    semaphore = asyncio.Semaphore(effective_concurrency)
 
     async def _send_request(idx: int, prompt: str, session: aiohttp.ClientSession):
         payload = {"messages": [{"role": "user", "content": prompt}], **api_params}
@@ -90,9 +89,16 @@ async def run_api_inference(
                     response.raise_for_status()
                     data = await response.json()
                 if "choices" in data and data["choices"]:
-                    content = data["choices"][0].get("message", {}).get("content", "")
+                    choice = data["choices"][0]
+                    content = choice.get("message", {}).get("content", "")
+                    # finish_reason="length" ⇒ hit max_tokens (no EOS) — the signature of
+                    # degraded/non-terminating generation. completion_tokens from usage if present.
+                    usage = data.get("usage") or {}
                     results[idx] = {"prompt": prompt, "generated_text": content,
-                                    "success": True}
+                                    "success": True,
+                                    "finish_reason": choice.get("finish_reason"),
+                                    "completion_tokens": usage.get("completion_tokens"),
+                                    "gen_chars": len(content)}
                 else:
                     results[idx] = {"prompt": prompt, "generated_text": "", "success": False}
             except Exception as e:
@@ -212,6 +218,22 @@ async def main():
     n_ok = sum(1 for o in outputs if o["success"])
     print(f"Inference completed in {elapsed:.2f} s  |  {n_ok}/{len(outputs)} ok  |  "
           f"achieved {len(outputs)/elapsed:.2f} req/s")
+
+    # Output-length / termination diagnostics — the decisive check for whether a config
+    # (e.g. fusion) generates longer / non-terminating outputs vs baseline. If many requests
+    # have finish_reason="length", they hit max_tokens (no EOS) → that, not the script,
+    # explains a low req/s at equal token-throughput.
+    ok_outs = [o for o in outputs if o.get("success")]
+    if ok_outs:
+        ctoks = [o["completion_tokens"] for o in ok_outs if o.get("completion_tokens") is not None]
+        chars = [o.get("gen_chars", 0) for o in ok_outs]
+        n_len = sum(1 for o in ok_outs if o.get("finish_reason") == "length")
+        n_stop = sum(1 for o in ok_outs if o.get("finish_reason") == "stop")
+        tok_str = (f"completion_tokens mean={np.mean(ctoks):.0f} median={np.median(ctoks):.0f} "
+                   f"max={max(ctoks)}" if ctoks else "completion_tokens n/a (no usage in response)")
+        print(f"  output: {tok_str} | chars mean={np.mean(chars):.0f} median={np.median(chars):.0f}")
+        print(f"  finish_reason: length(=max_tokens)={n_len}/{len(ok_outs)} "
+              f"({100*n_len/len(ok_outs):.1f}%)  stop(=EOS)={n_stop}/{len(ok_outs)}")
       
     # Print sample output  
     if outputs:  
@@ -232,9 +254,14 @@ async def main():
                     score = f1_score(generated_text, ground_truth)  
                     f1_scores.append(score)  
           
-        if f1_scores:  
-            mean_f1 = np.mean(f1_scores)  
-            print(f"\nMean F1 score: {mean_f1:.4f}")  
+        n_excluded = len(outputs) - len(f1_scores)
+        if n_excluded:
+            print(f"  note: {n_excluded}/{len(outputs)} samples excluded from F1 "
+                  f"(failed request or empty output/reference) — mean is over the rest")
+
+        if f1_scores:
+            mean_f1 = np.mean(f1_scores)
+            print(f"\nMean F1 score: {mean_f1:.4f}  (over {len(f1_scores)} samples)")
               
             # Save results  
             if not os.path.exists(args.result_dir):  

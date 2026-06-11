@@ -1,5 +1,7 @@
 import torch
 import os
+import itertools
+from collections import OrderedDict
 
 # import vllm.envs as envs
 from vllm.logger import init_logger
@@ -14,7 +16,7 @@ from typing import Any, Dict, List, Optional, Union, TYPE_CHECKING, NamedTuple
 
 from dataclasses import dataclass  
   
-THRESHOLD = float(os.environ.get("BFF_THRESHOLD", "0.7"))
+THRESHOLD = float(os.environ.get("BFF_THRESHOLD", "0.75"))
 BLOCK_SIZE = 128
 NUM_LAST_CHUNKS_TO_COMPRESS = 4
 CHUNK_SIZE = 512
@@ -29,6 +31,32 @@ CHUNK_SIZE = 512
 LSH_BLOCK_REPR = os.environ.get("BFF_LSH_REPR", "proj").lower()
 LSH_PROJ_DIM = int(os.environ.get("BFF_LSH_PROJ_DIM", "512"))
 
+# Fast-fusion writeback optimization: only scatter blocks whose content actually changed
+# (merged-group representatives), redirect duplicates, and leave singletons raw — instead
+# of rewriting every valid block each layer. Semantically identical to the full rewrite
+# (skipped blocks are unchanged or freed). Set BFF_FAST_SCATTER=0 to A/B vs full rewrite.
+BFF_FAST_SCATTER = os.environ.get("BFF_FAST_SCATTER", "1") == "1"
+
+# Merge algorithm for fast-fusion post-forward compression:
+#   'cc'   : connected-components clustering — one cosine matmul → thresholded
+#            cross-request graph → GPU label-propagation → scatter-mean centroids →
+#            write only representatives + vectorized block-table redirect. No recursion,
+#            no cache reconstruction, no per-group Python loops. (default)
+#   'tree' : the original recursive hierarchical tree merge (kept for A/B).
+BFF_MERGE = os.environ.get("BFF_MERGE", "cc").lower()
+_CC_ITERS = 32  # label-propagation iterations (cluster diameter cap; clusters are dense)
+
+# How a redirected (shared) block is scaled at decode. Both 'raw' and 'ratio' share the
+# registrant's RAW block (NO cache mutation → cannot corrupt the prefix cache), and differ
+# only in whether each sharer recovers its own magnitude:
+#   'raw'   : read the registrant's block as-is (its direction AND magnitude). No per-request
+#             norms, no custom kernel → fusion layers use flash-attn (lowest decode latency).
+#   'ratio' : kernel scales each read by ‖own block‖/‖target block‖ → registrant's direction ×
+#             reader's OWN magnitude. No mutation; keeps the Triton kernel (TPOT cost).
+#   'norm'  : LEGACY — normalize the block in place + scale by ‖own‖ + kernel. Mutates cached
+#             KV → prefix-cache corruption (kept only for A/B comparison).
+BFF_SCALE_MODE = os.environ.get("BFF_SCALE_MODE", "ratio").lower()
+
 # Number of consecutive fusion layers packed into one KV cache group.
 # G=1  → one group per layer (28 groups for a 32-layer model, original behaviour).
 # G=4  → 7 groups, 4× fewer block-pool operations per step.
@@ -41,6 +69,16 @@ LSH_BITS_PER_TABLE = 16       # bits per sub-table  (NUM_LSH_BITS // NUM_LSH_TAB
 MAX_REGISTRY_PER_LAYER = int(os.environ.get("BFF_MAX_REGISTRY", "8192"))  # max registered blocks per fusion layer (lower for 'full' repr to bound memory)
 LSH_MAX_HEAD_DIM = 512       # lsh_proj is pre-allocated up to this head_dim
 
+# Dormant-group skipping: deep-layer KV is diverse across requests and stops fusing after
+# the registry fills, so running dedup on those groups is pure overhead. Track a per-group
+# EMA of the redirect rate; when it stays below the threshold, skip that group's dedup and
+# only re-probe occasionally. Env-overridable. BFF_FUSE_MAX_GROUP statically caps the
+# highest fusion group index that runs dedup (-1 = no cap; let the EMA decide).
+LSH_DORMANT_THR   = float(os.environ.get("BFF_DORMANT_THR", "0.02"))   # redirect-rate floor
+LSH_DORMANT_EMA   = float(os.environ.get("BFF_DORMANT_EMA", "0.3"))    # EMA smoothing
+LSH_PROBE_EVERY   = int(os.environ.get("BFF_PROBE_EVERY", "50"))       # re-probe cadence (dedup steps)
+LSH_FUSE_MAX_GROUP = int(os.environ.get("BFF_FUSE_MAX_GROUP", "-1"))   # static fusion-group cap
+
 
 class BlockCompressionHookGraph(CompressionHook):  
 
@@ -48,7 +86,7 @@ class BlockCompressionHookGraph(CompressionHook):
         self.warmup_layers = warmup_layers
         self.compression_stream = torch.cuda.Stream()
         self.max_layer_idx = (vllm_config.model_config.get_num_layers(vllm_config.parallel_config) - self.warmup_layers)
-        self._block_size = BLOCK_SIZE
+        self._block_size = vllm_config.cache_config.block_size
         self.thr = THRESHOLD
         self.num_blocks = attn_metadata.block_table.shape[-1]
         req_idx = attn_metadata.req_idx_to_compress
@@ -571,10 +609,13 @@ class BFFCompressor:
         # LSH fields — precomputed once, shared by run_lsh() and run_lsh_register()
         '_head_dim', '_lsh_proj', '_kv_dtype',
         '_repr_mode', '_d_full', '_d_repr', '_lsh_jl',
+        '_block_size',
     )
 
     def __init__(self, runner, req_to_compress, req_idx_to_compress, attn_metadata_dict):
         self._runner            = runner
+        # (b) block size from vllm_config (cleaner than the module constant)
+        self._block_size        = runner.vllm_config.cache_config.block_size
         self._req_to_compress   = req_to_compress
         self._req_idx_to_compress = req_idx_to_compress
         self.B                  = len(req_idx_to_compress)
@@ -621,7 +662,7 @@ class BFFCompressor:
 
         # All fusion layers present the same seq_lens — compute once.
         seq_lens = first_meta.seq_lens[req_idx_to_compress].unsqueeze(-1)  # [B, 1]
-        self._nz_blocks = (seq_lens // BLOCK_SIZE).squeeze(-1)             # [B]
+        self._nz_blocks = (seq_lens // self._block_size).squeeze(-1)       # [B]
 
         self._idx__ = torch.arange(
             self._num_blocks_dim, dtype=torch.int, device=self._device
@@ -647,24 +688,26 @@ class BFFCompressor:
         for kv_gid2, kv_group2 in enumerate(runner.kv_cache_config.kv_cache_groups):
             if kv_gid2 == 0 or not kv_group2.layer_names:
                 continue
+            G = len(kv_group2.layer_names)
             li0 = int(kv_group2.layer_names[0].split('.')[2])
             if runner.kv_caches and li0 < len(runner.kv_caches):
                 kv0 = runner.kv_caches[li0]
                 self._head_dim = kv0.shape[-1]
                 self._kv_dtype = kv0.dtype
-                # block representation dimension + a dim-matched simHash matrix.
-                # kv0 block is [block_sz, num_kv_heads, head_dim] → D_full flat.
+                # kv0 block is [block_sz, num_kv_heads, head_dim] → D_full flat per layer.
                 self._d_full = kv0.shape[-3] * kv0.shape[-2] * kv0.shape[-1]
+                # The LSH fingerprint is the cosine of the G-layer CONCATENATION (no
+                # cross-layer mixing — see _block_repr), so the repr dim is the per-layer
+                # dim × G and the dim-matched simHash matrix is sized to that concatenation.
                 if self._repr_mode == 'mean':
-                    self._d_repr = self._head_dim
-                    self._lsh_proj = runner.lsh_proj[:self._head_dim]
+                    d_layer = self._head_dim
                 elif self._repr_mode == 'proj':
-                    self._d_repr = LSH_PROJ_DIM
+                    d_layer = LSH_PROJ_DIM
                     self._lsh_jl = _get_jl_matrix(runner, self._d_full, LSH_PROJ_DIM, self._device)
-                    self._lsh_proj = _get_simhash_matrix(runner, self._d_repr, self._device)
                 else:  # 'full'
-                    self._d_repr = self._d_full
-                    self._lsh_proj = _get_simhash_matrix(runner, self._d_repr, self._device)
+                    d_layer = self._d_full
+                self._d_repr   = d_layer * G
+                self._lsh_proj = _get_simhash_matrix(runner, self._d_repr, self._device)
                 break
 
     # ------------------------------------------------------------------
@@ -829,16 +872,51 @@ class BFFCompressor:
         bt_safe    = bt.clamp(min=0)
         flat_valid = bt_safe[self._nz_mask]
 
+        # --- sub-phase timers (localize post_fwd cost); sync for true GPU timing ---
+        import time as _t
+        _ff = runner.__dict__.setdefault('_ff_phase', {})
+        def _tick(key, t0):
+            torch.cuda.synchronize()
+            _ff[key] = _ff.get(key, 0.0) + (_t.perf_counter() - t0)
+        torch.cuda.synchronize(); _t0 = _t.perf_counter()
+
         # ---- joint representation: mean of K across the G layers ----
         kk_joint = kv_layers[0][0][bt_safe].view(self.B, P, -1).clone()
         for kv_layer in kv_layers[1:]:
             kk_joint += kv_layer[0][bt_safe].view(self.B, P, -1)
         if len(kv_layers) > 1:
             kk_joint /= len(kv_layers)
+        _tick('pf_gather', _t0); _t0 = _t.perf_counter()
 
         _k, rev_idx, fwd_idx, _ = self._fuse_all_above_thr(kk_joint, self._b_idx)
         n_valid, n_unique = self._nz_mask[0].shape[0], _k.shape[1]
         del kk_joint, _k
+        _tick('pf_tree', _t0); _t0 = _t.perf_counter()
+
+        # ---- classify valid blocks via the redirect (LSH-style write discipline) ----
+        # Redirect the (cloned) block table first so we can tell, per valid block:
+        #   • duplicate  (redirected to a representative) → freed, never written
+        #   • merged rep (content becomes the group mean) → must be written
+        #   • singleton  (never matched)                  → unchanged, left raw (norm 1.0)
+        # This is semantically identical to writing every block (skipped blocks are
+        # either unchanged or about to be freed) but avoids the full per-layer KV rewrite.
+        self._update_block_table_inplace(bt, fwd_idx, self._b_idx)
+        if BFF_FAST_SCATTER:
+            new_flat        = bt.clamp(min=0)[self._nz_mask]            # post-redirect pid
+            redirected      = new_flat != flat_valid                   # duplicates
+            target_pids     = new_flat[redirected].unique()
+            is_target       = torch.isin(flat_valid, target_pids)
+            write_mask      = is_target & ~redirected                  # merged reps
+            merged_member   = is_target | redirected                   # all size≥2 members
+            write_pos       = write_mask.nonzero(as_tuple=True)[0]
+            write_pids      = flat_valid[write_mask]
+            ones_flat       = torch.ones_like(merged_member, dtype=self._splits_k.dtype)
+
+        # raw/ratio share the representative's RAW block and never write the fused value, so
+        # they need the FAST_SCATTER redirect bookkeeping (merged_member/new_flat) to know
+        # each member's representative physical id.
+        assert BFF_SCALE_MODE == "norm" or BFF_FAST_SCATTER, \
+            "BFF_SCALE_MODE raw/ratio on the tree path requires BFF_FAST_SCATTER=1"
 
         # ---- replay the joint merge on every layer's own K and V ----
         for li, layer_name, kv_layer in zip(layer_idxs, layer_names, kv_layers):
@@ -846,20 +924,50 @@ class BFFCompressor:
             self._splits_v.fill_(1.0)
 
             kk = kv_layer[0][bt_safe].view(self.B, P, -1)
-            k_norms = kk[self._nz_mask].norm(2, -1)
-            for i, k in enumerate(k_norms.split(self._mask_split_list)):
-                self._splits_k[i, :k.shape[0]] = k
-            _kl = self._fuse_values(kk, fwd_idx, self._b_idx)
-            kv_layer[0][flat_valid] = self._restore_cache(_kl, rev_idx).squeeze(0).view(
-                -1, block_sz, num_heads, head_dim)
-
             vv = kv_layer[1][bt_safe].view(self.B, P, -1)
+            k_norms = kk[self._nz_mask].norm(2, -1)
             v_norms = vv[self._nz_mask].norm(2, -1)
-            for i, v in enumerate(v_norms.split(self._mask_split_list)):
-                self._splits_v[i, :v.shape[0]] = v
-            _vl = self._fuse_values(vv, fwd_idx, self._b_idx)
-            kv_layer[1][flat_valid] = self._restore_cache(_vl, rev_idx).squeeze(0).view(
-                -1, block_sz, num_heads, head_dim)
+
+            if BFF_SCALE_MODE == "norm":
+                # legacy: write the fused (mean) value into merged reps (MUTATES cache) and
+                # scale each member by its OWN norm; singletons stay raw → norm 1.0.
+                if BFF_FAST_SCATTER:
+                    k_norms = torch.where(merged_member, k_norms.to(ones_flat.dtype), ones_flat)
+                    v_norms = torch.where(merged_member, v_norms.to(ones_flat.dtype), ones_flat)
+                for i, k in enumerate(k_norms.split(self._mask_split_list)):
+                    self._splits_k[i, :k.shape[0]] = k
+                for i, v in enumerate(v_norms.split(self._mask_split_list)):
+                    self._splits_v[i, :v.shape[0]] = v
+                _kl = self._fuse_values(kk, fwd_idx, self._b_idx)
+                restored_k = self._restore_cache(_kl, rev_idx).squeeze(0).view(
+                    -1, block_sz, num_heads, head_dim)
+                _vl = self._fuse_values(vv, fwd_idx, self._b_idx)
+                restored_v = self._restore_cache(_vl, rev_idx).squeeze(0).view(
+                    -1, block_sz, num_heads, head_dim)
+                if BFF_FAST_SCATTER:
+                    kv_layer[0][write_pids] = restored_k[write_pos]    # merged reps only
+                    kv_layer[1][write_pids] = restored_v[write_pos]
+                else:
+                    kv_layer[0][flat_valid] = restored_k
+                    kv_layer[1][flat_valid] = restored_v
+            else:
+                # raw / ratio: NO fuse, NO cache write — members read the representative's
+                # RAW block. 'ratio' rescales each member by ‖own‖/‖rep‖ (rep located via the
+                # post-redirect physical id new_flat); 'raw' leaves splits at 1.0.
+                if BFF_SCALE_MODE == "ratio":
+                    nbp = kv_layer.shape[1]
+                    knb = torch.ones(nbp, device=kv_layer.device, dtype=k_norms.dtype)
+                    vnb = torch.ones(nbp, device=kv_layer.device, dtype=v_norms.dtype)
+                    knb[flat_valid] = k_norms
+                    vnb[flat_valid] = v_norms
+                    k_scale = (k_norms / knb[new_flat].clamp(min=1e-6)).to(ones_flat.dtype)
+                    v_scale = (v_norms / vnb[new_flat].clamp(min=1e-6)).to(ones_flat.dtype)
+                    k_scale = torch.where(merged_member, k_scale, ones_flat)
+                    v_scale = torch.where(merged_member, v_scale, ones_flat)
+                    for i, k in enumerate(k_scale.split(self._mask_split_list)):
+                        self._splits_k[i, :k.shape[0]] = k
+                    for i, v in enumerate(v_scale.split(self._mask_split_list)):
+                        self._splits_v[i, :v.shape[0]] = v
 
             # Persist per-layer norms for decode scaling.
             for i, req_id in enumerate(self._req_to_compress):
@@ -868,44 +976,169 @@ class BFFCompressor:
                 runner.fused_requests[req_id][layer_name] = (
                     self._splits_k[i].clone(), self._splits_v[i].clone()
                 )
-            if runner.norms_k_buf is not None:
+            if BFF_SCALE_MODE != "raw" and runner.norms_k_buf is not None:
                 nb = min(P, runner.norms_k_buf.shape[2])
                 for i, req_idx in enumerate(self._req_idx_to_compress):
                     runner.norms_k_buf[li, req_idx, :nb].copy_(self._splits_k[i, :nb])
                     runner.norms_v_buf[li, req_idx, :nb].copy_(self._splits_v[i, :nb])
 
-        # ---- redirect the shared block table once for the whole group ----
-        self._update_block_table_inplace(bt, fwd_idx, self._b_idx)
+        # ---- write the redirected block table (already computed above) ----
         layer_meta.block_table[self._req_idx_to_compress] = bt
+        _tick('pf_replay', _t0)
 
         return n_valid, n_unique
+
+    # ------------------------------------------------------------------
+    # Connected-components merge (vectorized; no recursion / restore_cache)
+    # ------------------------------------------------------------------
+
+    def _compress_group_cc(self, layer_names, layer_idxs, layer_meta, kv_layers):
+        """Cluster similar blocks across requests via a thresholded cosine graph, average
+        each cluster (scatter-mean) into one representative, redirect the rest, and write
+        ONLY the representatives. Fully vectorized: one similarity matmul, GPU label
+        propagation for connected components, index_add for the centroids — no recursion,
+        no `restore_cache`, no per-group Python loops, vectorized block-table redirect.
+        """
+        runner = self._runner
+        _, blk, heads, hd = kv_layers[0].shape[1:]
+        P = self._num_blocks_dim
+        dev = self._device
+        G = len(kv_layers)
+
+        bt          = layer_meta.block_table[self._req_idx_to_compress].clone()  # [B, P]
+        bt_safe     = bt.clamp(min=0)
+        flat_valid  = bt_safe[self._nz_mask]                                     # [N] phys ids
+        N = int(flat_valid.shape[0])
+        if N == 0:
+            return 0, 0
+        req_of_block = self._nz_mask[0]                                          # [N] in [0,B)
+
+        # ---- similarity = cosine of the G-layer CONCATENATION (no cross-layer mixing) ----
+        # cos(cat_i, cat_j) = (Σ_g v_g·u_g) / (||cat_i|| ||cat_j||), computed as a sum of
+        # per-layer Gram matrices with joint normalization — so we never materialize the
+        # N×(G·D) concatenation and never get the spurious cross-layer terms (v_g·u_h, g≠h)
+        # that the old averaged repr introduced. Per-layer repr honors BFF_LSH_REPR
+        # (full|proj|mean). KV centroid averaging below still uses the real per-layer K/V.
+        cross_dot = torch.zeros(N, N, device=dev, dtype=torch.float32)
+        sqnorm = torch.zeros(N, device=dev, dtype=torch.float32)
+        for kv_layer in kv_layers:
+            Kg = self._layer_repr(kv_layer, flat_valid, N)                     # [N, Dg] fp32
+            cross_dot += Kg @ Kg.T
+            sqnorm += (Kg * Kg).sum(1)
+            del Kg
+        d = sqnorm.sqrt().clamp(min=1e-6)
+        S = cross_dot / (d[:, None] * d[None, :])
+        del cross_dot
+
+        # ---- thresholded cosine graph: cross-request edges, real full blocks only ----
+        valid_node = flat_valid > 0                                            # (c) skip null block 0
+        A = (S > THRESHOLD) & (req_of_block[:, None] != req_of_block[None, :])
+        A &= valid_node[:, None] & valid_node[None, :]
+        A |= torch.eye(N, dtype=torch.bool, device=dev)
+        del S
+
+        # ---- connected components via label propagation (label = min member index) ----
+        labels = torch.arange(N, device=dev)
+        big = torch.full((N,), N, device=dev, dtype=labels.dtype)
+        for _ in range(_CC_ITERS):
+            nb_min = torch.where(A, labels[None, :], big).min(dim=1).values
+            new = torch.minimum(labels, nb_min)
+            if torch.equal(new, labels):
+                break
+            labels = new
+        del A
+        counts = torch.bincount(labels, minlength=N)                           # [N] (by rep idx)
+        merged = counts[labels] > 1                                            # [N] bool
+        rep_clusters = (counts > 1).nonzero(as_tuple=True)[0]                   # rep indices, size>1
+        n_unique = int((counts > 0).sum())
+
+        # ---- vectorized block-table redirect: members → representative phys id ----
+        rep_pid = flat_valid[labels]                                           # [N]
+        bt[self._nz_mask] = torch.where(merged, rep_pid, flat_valid).to(bt.dtype)
+
+        rep_pids = flat_valid[rep_clusters] if rep_clusters.numel() else None
+        cnt = counts.clamp(min=1).unsqueeze(1).float()
+        ones_n = None
+
+        # ---- per layer: scatter-mean centroid, write reps, store per-block norms ----
+        for li, layer_name, kv_layer in zip(layer_idxs, layer_names, kv_layers):
+            self._splits_k.fill_(1.0)
+            self._splits_v.fill_(1.0)
+            for kv_i, splits in ((0, self._splits_k), (1, self._splits_v)):
+                Bv = kv_layer[kv_i][bt_safe].view(self.B, P, -1)[self._nz_mask]  # [N, D_full]
+                norms = Bv.float().norm(dim=1)
+                if ones_n is None:
+                    ones_n = torch.ones_like(norms)
+                if BFF_SCALE_MODE == "norm":
+                    # legacy: write the normalized cluster centroid into the representative
+                    # block (MUTATES the cache) and scale each member by its OWN norm.
+                    if rep_pids is not None:
+                        summed = torch.zeros(N, Bv.shape[1], device=dev, dtype=torch.float32)
+                        summed.index_add_(0, labels, Bv.float())
+                        mean = F.normalize(summed / cnt, dim=1)
+                        kv_layer[kv_i][rep_pids] = mean[rep_clusters].view(
+                            -1, blk, heads, hd).to(kv_layer.dtype)
+                        del summed, mean
+                    # singletons stay raw → norm 1.0; merged members → own block norm
+                    splits[self._nz_mask] = torch.where(merged, norms, ones_n).to(splits.dtype)
+                elif BFF_SCALE_MODE == "ratio":
+                    # share the representative's RAW block (NO mutation); each member
+                    # recovers its own magnitude via scale = ‖own‖/‖rep‖. rep norm =
+                    # norms[labels] (labels[k] is k's representative flat index); the rep
+                    # itself gives norms/norms = 1.0, singletons stay 1.0.
+                    rep_norm = norms[labels].clamp(min=1e-6)
+                    splits[self._nz_mask] = torch.where(
+                        merged, norms / rep_norm, ones_n).to(splits.dtype)
+                # 'raw': share the representative's RAW block verbatim → splits stay 1.0,
+                # no centroid, no cache mutation.
+                del Bv
+
+            for i, req_id in enumerate(self._req_to_compress):
+                if req_id not in runner.fused_requests:
+                    runner.fused_requests[req_id] = {}
+                runner.fused_requests[req_id][layer_name] = (
+                    self._splits_k[i].clone(), self._splits_v[i].clone())
+            if BFF_SCALE_MODE != "raw" and runner.norms_k_buf is not None:
+                nb = min(P, runner.norms_k_buf.shape[2])
+                for i, req_idx in enumerate(self._req_idx_to_compress):
+                    runner.norms_k_buf[li, req_idx, :nb].copy_(self._splits_k[i, :nb])
+                    runner.norms_v_buf[li, req_idx, :nb].copy_(self._splits_v[i, :nb])
+
+        layer_meta.block_table[self._req_idx_to_compress] = bt
+        return N, n_unique
 
     # ------------------------------------------------------------------
     # LSH deduplication path (< 4 concurrent prefills)
     # ------------------------------------------------------------------
 
-    def _block_repr(self, kv_layers, valid_bids, N):
-        """Normalized per-block representation for LSH (selected by LSH_BLOCK_REPR),
-        averaged across the G layers of the group → [N, D_repr] float16.
-
-        - 'mean': mean over (tokens × heads) per head_dim  → [N, head_dim]  (coarse)
-        - 'full': full flattened block (block_sz·heads·head_dim) → fast-fusion's metric
-        - 'proj': JL projection of 'full' to LSH_PROJ_DIM (cosine-preserving, cheap)
-        """
-        head_dim = self._head_dim
-        G = len(kv_layers)
+    def _layer_repr(self, kv_layer, valid_bids, N):
+        """Per-layer block vector for the CC similarity (per BFF_LSH_REPR), NOT normalized
+        and NOT averaged across layers — the joint (concatenation) normalization is applied
+        by the caller. `full` → [N, D_full_layer]; `proj` → [N, LSH_PROJ_DIM] via the
+        per-layer JL matrix; `mean` → [N, head_dim]."""
         if self._repr_mode == 'mean':
-            rep = kv_layers[0][0, valid_bids].float().view(N, -1, head_dim).mean(dim=1)
-            for kv_layer in kv_layers[1:]:
-                rep += kv_layer[0, valid_bids].float().view(N, -1, head_dim).mean(dim=1)
-        else:
-            rep = kv_layers[0][0, valid_bids].float().view(N, -1)
-            for kv_layer in kv_layers[1:]:
-                rep += kv_layer[0, valid_bids].float().view(N, -1)
-        if G > 1:
-            rep /= G
+            return kv_layer[0, valid_bids].float().view(N, -1, self._head_dim).mean(dim=1)
+        rep = kv_layer[0, valid_bids].float().view(N, -1)
         if self._repr_mode == 'proj':
             rep = rep @ self._lsh_jl.float()
+        return rep
+
+    def _block_repr(self, kv_layers, valid_bids, N):
+        """Normalized per-block fingerprint for LSH (selected by LSH_BLOCK_REPR): the
+        unit-normalized CONCATENATION of the per-layer reprs over the G group layers →
+        [N, D_repr] float16. The cosine of two such vectors is the cosine of the G-layer
+        concatenation, i.e. Σ_g⟨v_g,u_g⟩ with one joint normalization — and a concatenation
+        dot product has NO cross-layer terms. (The old average-then-normalize fingerprint
+        used cosine(Σ_g v_g, Σ_g u_g), which mixes block i's layer g with block j's layer
+        h, g≠h — distortion that grows with BFF_GROUP_SIZE.)
+
+        Per layer (`_layer_repr`, shared with the CC path): 'mean' → head_dim; 'full' →
+        block_sz·heads·head_dim; 'proj' → JL projection to LSH_PROJ_DIM (cosine-preserving).
+        """
+        if len(kv_layers) == 1:
+            rep = self._layer_repr(kv_layers[0], valid_bids, N)
+        else:
+            rep = torch.cat([self._layer_repr(kv, valid_bids, N) for kv in kv_layers], dim=1)
         return F.normalize(rep, dim=1).to(torch.float16)
 
     def _lsh_dedup_group(self, layer_names, layer_idxs, layer_meta, kv_layers):
@@ -927,19 +1160,26 @@ class BFFCompressor:
         gkey = layer_names[0]
         if gkey not in runner.lsh_registry:
             runner.lsh_registry[gkey] = [dict() for _ in range(NUM_LSH_TABLES)]
-            runner.lsh_mean_k[gkey]   = {}
+            runner.lsh_mean_k[gkey]   = OrderedDict()
         registry_tables = runner.lsh_registry[gkey]
         mean_k_store    = runner.lsh_mean_k[gkey]
 
         block_table = layer_meta.block_table[self._req_idx_to_compress].clone()
 
+        # Sub-phase timers (host wall-clock; sum ≈ post_fwd). Localizes the LSH dedup cost
+        # into fingerprint / match / write, surfaced in the "BFF phase ms/step" log.
+        import time as _t
+        _ff = runner.__dict__.setdefault('_ff_phase', {})
+
+        grp_valid = 0       # total valid blocks seen this group (for the redirect-rate EMA)
+        grp_redir = 0       # total redirected (fused) blocks this group
         for i, req_id in enumerate(self._req_to_compress):
             nz_blocks = int(self._nz_blocks[i])
             if nz_blocks == 0:
                 continue
 
             raw_ids    = block_table[i, :nz_blocks]
-            valid_mask = raw_ids >= 0
+            valid_mask = raw_ids > 0
             valid_bids = raw_ids[valid_mask].long()
             valid_pos  = valid_mask.nonzero(as_tuple=True)[0]
             N = valid_bids.shape[0]
@@ -947,6 +1187,7 @@ class BFFCompressor:
                 continue
 
             # ---- block fingerprint across the G layers (repr mode: mean|full|proj) ----
+            _t0 = _t.perf_counter()
             block_means_norm = self._block_repr(kv_layers, valid_bids, N)
 
             proj_all       = (block_means_norm @ lsh_proj).sign()
@@ -956,8 +1197,10 @@ class BFFCompressor:
 
             valid_bids_list = valid_bids.tolist()
             valid_pos_list  = valid_pos.tolist()
+            _ff['lsh_fp'] = _ff.get('lsh_fp', 0.0) + (_t.perf_counter() - _t0)
 
             # ---- Registry lookup → decide matched vs to-register (joint) ----
+            _t0 = _t.perf_counter()
             to_register = []
             for k, (bid, pos) in enumerate(zip(valid_bids_list, valid_pos_list)):
                 candidates = set()
@@ -977,64 +1220,127 @@ class BFFCompressor:
 
                 if matched_bid is not None:
                     block_table[i, pos] = matched_bid       # redirect shared table
+                    mean_k_store.move_to_end(matched_bid)   # mark recently-used (LRU)
                 else:
                     to_register.append((k, bid, block_means_norm[k], sub_hashes_all[k]))
+            _ff['lsh_match'] = _ff.get('lsh_match', 0.0) + (_t.perf_counter() - _t0)
 
             # ---- per-layer norms + normalise unmatched blocks in each layer ----
+            _t0 = _t.perf_counter()
             local_idxs = [t[0] for t in to_register]
             for li, layer_name, kv_layer in zip(layer_idxs, layer_names, kv_layers):
-                self._splits_k.fill_(1.0)
+                self._splits_k.fill_(1.0)   # default per-(req,block) decode scale = 1.0
                 self._splits_v.fill_(1.0)
 
-                block_ks = kv_layer[0, valid_bids]
-                block_vs = kv_layer[1, valid_bids]
-                norms_k  = block_ks.float().view(N, -1).norm(dim=1)
-                norms_v  = block_vs.float().view(N, -1).norm(dim=1)
-                self._splits_k[i, valid_pos] = norms_k.clamp(min=1e-6).to(self._splits_k.dtype)
-                self._splits_v[i, valid_pos] = norms_v.clamp(min=1e-6).to(self._splits_v.dtype)
+                # 'raw': share the registrant's raw block verbatim → no norms, no mutation;
+                # the scale stays 1.0 and patched_forward uses flash-attn (no kernel).
+                if BFF_SCALE_MODE != "raw":
+                    block_ks = kv_layer[0, valid_bids]
+                    block_vs = kv_layer[1, valid_bids]
+                    norms_k  = block_ks.float().view(N, -1).norm(dim=1).clamp(min=1e-6)
+                    norms_v  = block_vs.float().view(N, -1).norm(dim=1).clamp(min=1e-6)
 
-                if local_idxs:
-                    unmatched_bids_gpu = valid_bids[local_idxs]
-                    norms_k_sub = norms_k[local_idxs].view(-1, 1, 1, 1).clamp(min=1e-6)
-                    norms_v_sub = norms_v[local_idxs].view(-1, 1, 1, 1).clamp(min=1e-6)
-                    kv_layer[0, unmatched_bids_gpu] = (block_ks[local_idxs] / norms_k_sub).to(kv_dtype)
-                    kv_layer[1, unmatched_bids_gpu] = (block_vs[local_idxs] / norms_v_sub).to(kv_dtype)
+                    if BFF_SCALE_MODE == "ratio":
+                        # scale = ‖own block‖ / ‖post-redirect target block‖. block_table[i,
+                        # valid_pos] already holds the post-redirect id, so own/unmatched
+                        # positions give ‖x‖/‖x‖=1 (no-op) and redirected give ‖B‖/‖A‖. No
+                        # cache mutation → prefix cache stays correct.
+                        tgt_bids = block_table[i, valid_pos].long()
+                        tgt_k = kv_layer[0, tgt_bids].float().view(N, -1).norm(dim=1).clamp(min=1e-6)
+                        tgt_v = kv_layer[1, tgt_bids].float().view(N, -1).norm(dim=1).clamp(min=1e-6)
+                        self._splits_k[i, valid_pos] = (norms_k / tgt_k).to(self._splits_k.dtype)
+                        self._splits_v[i, valid_pos] = (norms_v / tgt_v).to(self._splits_v.dtype)
+                    else:  # 'norm' (legacy): store ‖own‖ and normalize unmatched blocks IN PLACE
+                        self._splits_k[i, valid_pos] = norms_k.to(self._splits_k.dtype)
+                        self._splits_v[i, valid_pos] = norms_v.to(self._splits_v.dtype)
+                        if local_idxs:
+                            unmatched_bids_gpu = valid_bids[local_idxs]
+                            norms_k_sub = norms_k[local_idxs].view(-1, 1, 1, 1)
+                            norms_v_sub = norms_v[local_idxs].view(-1, 1, 1, 1)
+                            kv_layer[0, unmatched_bids_gpu] = (block_ks[local_idxs] / norms_k_sub).to(kv_dtype)
+                            kv_layer[1, unmatched_bids_gpu] = (block_vs[local_idxs] / norms_v_sub).to(kv_dtype)
 
+                # Mark the request compressed (so it isn't re-compressed each step) and persist
+                # the per-layer scales (all 1.0 in 'raw').
                 if req_id not in runner.fused_requests:
                     runner.fused_requests[req_id] = {}
                 runner.fused_requests[req_id][layer_name] = (
                     self._splits_k[i].clone(), self._splits_v[i].clone()
                 )
-                if runner.norms_k_buf is not None:
+                if BFF_SCALE_MODE != "raw" and runner.norms_k_buf is not None:
                     nb = min(self._num_blocks_dim, runner.norms_k_buf.shape[2])
                     runner.norms_k_buf[li, self._req_idx_to_compress[i], :nb].copy_(self._splits_k[i, :nb])
                     runner.norms_v_buf[li, self._req_idx_to_compress[i], :nb].copy_(self._splits_v[i, :nb])
 
             # ---- register the unmatched blocks once (joint fingerprint) ----
+            # When the registry is full, evict the least-recently-used half (registry-only;
+            # does NOT free blocks) so fresh blocks keep registering instead of freezing.
+            if to_register and len(mean_k_store) >= MAX_REGISTRY_PER_LAYER:
+                n_evict = max(1, MAX_REGISTRY_PER_LAYER // 2)
+                lru_bids = list(itertools.islice(mean_k_store.keys(), n_evict))
+                runner.evict_lsh_blocks(lru_bids)
             for _, bid, mean_k, sub_hashes in to_register:
-                if len(mean_k_store) >= MAX_REGISTRY_PER_LAYER:
-                    break
                 mean_k_store[bid] = mean_k
                 for t, h in enumerate(sub_hashes):
                     registry_tables[t].setdefault(h, []).append(bid)
                 # Reverse index for O(1) eviction when this block is freed/recycled.
                 runner.lsh_block_owner[bid] = (gkey, sub_hashes)
+            _ff['lsh_write'] = _ff.get('lsh_write', 0.0) + (_t.perf_counter() - _t0)
 
             n_redir = N - len(to_register)
-            logger.info(
+            grp_valid += N
+            grp_redir += n_redir
+            # Per-request detail at DEBUG only — at INFO this fired 7·R lines/dedup step and
+            # was ~half of post_fwd. run_lsh logs one aggregate INFO line per step instead.
+            logger.debug(
                 "LSH dedup group[%s] req=%s: %d/%d blocks redirected",
                 gkey, req_id, n_redir, N,
             )
 
         # Write redirected block IDs back to the shared block table.
         layer_meta.block_table[self._req_idx_to_compress] = block_table
+        return grp_valid, grp_redir
 
     def run_lsh(self):
-        """Run LSH dedup + registration across all fusion groups."""
+        """Run LSH dedup across fusion groups, skipping groups that have gone DORMANT.
+
+        Deep-layer KV is diverse across requests and stops fusing once its registry fills,
+        so dedup on those groups is pure overhead (the dominant `post_fwd` cost). We track a
+        per-group redirect-rate EMA; a group whose rate stays below `LSH_DORMANT_THR` is
+        skipped entirely (its blocks stay raw, exactly as if they'd matched nothing) and
+        only re-probed every `LSH_PROBE_EVERY` dedup steps. `BFF_FUSE_MAX_GROUP` is a static
+        cap. One aggregate INFO line is logged per step (the old per-(group,req) line is
+        DEBUG)."""
         if self._num_blocks_dim == 0 or self._lsh_proj is None:
             return
-        for layer_names, layer_idxs, layer_meta, kv_layers in self._iter_fusion_groups():
-            self._lsh_dedup_group(layer_names, layer_idxs, layer_meta, kv_layers)
+        runner  = self._runner
+        ema     = runner.__dict__.setdefault('_lsh_redirect_ema', {})   # gkey -> EMA rate
+        probe   = runner.__dict__.setdefault('_lsh_probe_left', {})     # gkey -> steps to re-probe
+        summary = []
+        for gi, (layer_names, layer_idxs, layer_meta, kv_layers) in enumerate(
+                self._iter_fusion_groups()):
+            gkey = layer_names[0]
+            if LSH_FUSE_MAX_GROUP >= 0 and gi > LSH_FUSE_MAX_GROUP:
+                continue                                   # static fusion-group cap
+            rate = ema.get(gkey, 1.0)                      # start active until measured
+            if rate < LSH_DORMANT_THR:
+                left = probe.get(gkey, 0)
+                if left > 0:
+                    probe[gkey] = left - 1
+                    continue                               # dormant → skip dedup this step
+                probe[gkey] = LSH_PROBE_EVERY              # probe now, then sleep again
+            n_valid, n_redir = self._lsh_dedup_group(
+                layer_names, layer_idxs, layer_meta, kv_layers)
+            if n_valid:
+                r = n_redir / n_valid
+                ema[gkey] = LSH_DORMANT_EMA * r + (1.0 - LSH_DORMANT_EMA) * rate
+                summary.append((layer_idxs[0], n_redir, n_valid))
+        if summary:
+            logger.info(
+                "LSH dedup: %d reqs | redirected %s",
+                len(self._req_to_compress),
+                " ".join(f"L{li}:{red}/{val}" for li, red, val in summary),
+            )
 
     def _lsh_register_group(self, layer_names, layer_idxs, layer_meta, kv_layers):
         """Register BFF-merged (already normalised) blocks for one fusion group.
@@ -1050,18 +1356,18 @@ class BFFCompressor:
         gkey = layer_names[0]
         if gkey not in runner.lsh_registry:
             runner.lsh_registry[gkey] = [dict() for _ in range(NUM_LSH_TABLES)]
-            runner.lsh_mean_k[gkey]   = {}
+            runner.lsh_mean_k[gkey]   = OrderedDict()
         registry_tables = runner.lsh_registry[gkey]
         mean_k_store    = runner.lsh_mean_k[gkey]
 
         for i, req_id in enumerate(self._req_to_compress):
             req_idx   = self._req_idx_to_compress[i]
             nz_blocks = int(self._nz_blocks[i])
-            if nz_blocks == 0 or len(mean_k_store) >= MAX_REGISTRY_PER_LAYER:
+            if nz_blocks == 0:
                 continue
 
             raw_ids    = layer_meta.block_table[req_idx, :nz_blocks]
-            valid_mask = raw_ids >= 0
+            valid_mask = raw_ids > 0
             valid_bids = raw_ids[valid_mask].long()
             if valid_bids.shape[0] == 0:
                 continue
@@ -1079,9 +1385,13 @@ class BFFCompressor:
             proj_bytes     = proj_bits.view(M, NUM_LSH_TABLES, LSH_BITS_PER_TABLE)
             sub_hashes_all = (proj_bytes * _LSH_POWERS).sum(dim=2).tolist()
 
+            # Full → evict the least-recently-used half (registry-only) so we keep
+            # registering fresh blocks instead of freezing on the first MAX.
+            if len(mean_k_store) >= MAX_REGISTRY_PER_LAYER:
+                n_evict = max(1, MAX_REGISTRY_PER_LAYER // 2)
+                lru_bids = list(itertools.islice(mean_k_store.keys(), n_evict))
+                runner.evict_lsh_blocks(lru_bids)
             for k, bid in enumerate(new_bids):
-                if len(mean_k_store) >= MAX_REGISTRY_PER_LAYER:
-                    break
                 mean_k_store[bid] = means_norm[k]
                 for t, h in enumerate(sub_hashes_all[k]):
                     registry_tables[t].setdefault(h, []).append(bid)
@@ -1102,8 +1412,10 @@ class BFFCompressor:
     def run(self):
         if self._num_blocks_dim == 0:
             return
+        compress = (self._compress_group_cc if BFF_MERGE == "cc"
+                    else self._compress_group)
         for layer_names, layer_idxs, layer_meta, kv_layers in self._iter_fusion_groups():
-            n_valid, n_unique = self._compress_group(
+            n_valid, n_unique = compress(
                 layer_names, layer_idxs, layer_meta, kv_layers)
             self._total_valid  += n_valid
             self._total_unique += n_unique
@@ -1304,39 +1616,43 @@ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.spec_decode.eagle import EagleProposer
 from copy import copy, deepcopy
 
-def _update_block_tables_after_compression(  
-    self,   
-    new_requests: list[str]  
-) -> dict[str, dict[int, list[int]]]:  
-    """Return final block lists instead of mappings."""  
-    request_blocks = {}  
-    for req_id in new_requests:  
-        req_idx = self.input_batch.req_id_to_index[req_id]  
-        req_state = self.requests[req_id]  
-        
-        for group_idx in range(len(self.input_batch.block_table.block_tables)):  
-            if group_idx == 0:  
-                continue  
-                
-            block_table_obj = self.input_batch.block_table.block_tables[group_idx]  
-            new_table = block_table_obj.block_table.gpu[req_idx]#block_tables_[group_idx][req_idx]  
-            num_blocks = block_table_obj.num_blocks_per_row[req_idx]    #sefi tset
-            # Update state and block table  
-            
-            final_blocks = new_table[:num_blocks].tolist()
-            if all(block_table_obj.block_table.np[req_idx, :num_blocks] == final_blocks) :
+def _update_block_tables_after_compression(
+    self,
+    new_requests: list[str],
+) -> None:
+    """Sync the (redirected) GPU block tables to CPU for the compressed requests.
+
+    Vectorized: the previous version did 2 GPU→CPU syncs per (request × group)
+    (`.tolist()` + `.cpu()`), i.e. ~14·R syncs/step — the dominant `post_fwd` cost. We
+    now do ONE bulk `.cpu()` per group (gathering all compressed requests' rows at once)
+    and do all per-row slicing/compare on CPU."""
+    request_blocks = {}
+    if not new_requests:
+        self._updated_block_tables = None
+        return
+
+    req_idxs = [self.input_batch.req_id_to_index[r] for r in new_requests]
+    for group_idx in range(len(self.input_batch.block_table.block_tables)):
+        if group_idx == 0:
+            continue
+        bt_obj = self.input_batch.block_table.block_tables[group_idx]
+        np_table = bt_obj.block_table.np
+        nbpr = bt_obj.num_blocks_per_row
+        # one D2H copy of just the compressed requests' rows
+        gpu_rows = bt_obj.block_table.gpu[req_idxs].cpu().numpy()
+        for k, (req_id, req_idx) in enumerate(zip(new_requests, req_idxs)):
+            num_blocks = int(nbpr[req_idx])
+            new_row = gpu_rows[k, :num_blocks]
+            if (np_table[req_idx, :num_blocks] == new_row).all():
                 continue
-            if req_id not in request_blocks.keys():
+            final_blocks = new_row.tolist()
+            if req_id not in request_blocks:
                 request_blocks[req_id] = {}
-            req_state.block_ids[group_idx][:num_blocks] = final_blocks
-            block_table_obj.block_table.np[req_idx, :num_blocks] = new_table[:num_blocks].cpu().numpy()  
-            # block_table_obj.block_table[req_idx, :num_blocks] = new_table[:num_blocks]
-            # block_table_obj.num_blocks_per_row[req_idx] = num_blocks  
-            
-            # Store final block list  
-            request_blocks[req_id][group_idx] = final_blocks  
-  
-    self._updated_block_tables =  request_blocks if request_blocks else None
+            self.requests[req_id].block_ids[group_idx][:num_blocks] = final_blocks
+            np_table[req_idx, :num_blocks] = new_row
+            request_blocks[req_id][group_idx] = final_blocks
+
+    self._updated_block_tables = request_blocks if request_blocks else None
 
 def _patched_build_attention_metadata(
         self,
@@ -1533,10 +1849,17 @@ def _patched_build_attention_metadata(
                     # Batch-row → slot map (0 = sentinel) for the kernel's per-(seq, block)
                     # norm fetch; norms_*_buf is slot-indexed, not batch-row-indexed.
                     attn_metadata_i.bff_seq_to_slot = self._seq_to_slot
-                    # has_fused_reqs is False during CUDA-graph capture and whenever no
-                    # request in the batch is fused → patched_forward takes the flash
-                    # fast path; True → the BFF Triton kernel.
-                    attn_metadata_i.has_fused_reqs = bool(fused_reqs)
+                    # patched_forward uses the BFF kernel iff has_fused_reqs is True.
+                    # During CUDA-graph CAPTURE we force it True so the captured graph
+                    # RECORDS the BFF kernel for fusion layers; at replay the recorded
+                    # kernel reads the per-step-updated persistent norms_*_buf + seq_to_slot
+                    # (slot 0 = sentinel 1.0 → identity for any row that isn't fused).
+                    # Without this, FULL-cudagraph capture records stock flash-attn and
+                    # replay reads the normalized KV *unscaled* → wrong outputs in graph
+                    # mode (eager/piecewise was unaffected). Outside capture, gate on the
+                    # real fused set so non-fusion steps keep the flash fast path.
+                    attn_metadata_i.has_fused_reqs = (
+                        True if for_cudagraph_capture else bool(fused_reqs))
 
             
             if ubid is None:
@@ -1795,7 +2118,10 @@ def execute_model(
             # previous step also had none (avoids pointless fill_(1.0) every step).
             has_fused = bool(fused_reqs)
             _t0 = _time.perf_counter()
-            if has_fused or getattr(self, '_had_fused_reqs_prev_step', False):
+            # 'raw' mode never scales at decode (flash-attn path) → the norm buffers/slots are
+            # unused; skip the per-step fill entirely.
+            if BFF_SCALE_MODE != "raw" and (
+                    has_fused or getattr(self, '_had_fused_reqs_prev_step', False)):
                 self._fill_norm_buffers(self.input_batch.req_ids, fused_reqs)
             _ff['norm_fill'] = _ff.get('norm_fill', 0.0) + (_time.perf_counter() - _t0)
             self._had_fused_reqs_prev_step = has_fused
@@ -1869,7 +2195,7 @@ def execute_model(
         _n_fusion_layers = sum(
             1 for g in self.kv_cache_config.kv_cache_groups[1:] if g.layer_names
         )
-        if False: #len(req_to_compress) > 1:
+        if len(req_to_compress) > 1:
             # Full BFF: recursive merge across concurrent prefills, then register blocks.
             self._run_post_forward_bff(req_to_compress, req_idx_to_compress, attn_metadata)
             self._update_block_tables_after_compression(req_to_compress)
@@ -1878,10 +2204,12 @@ def execute_model(
                 "BFF post-forward: compressed %d requests across %d fusion layers",
                 len(req_to_compress), _n_fusion_layers,
             )
-        elif len(req_to_compress) > 1:
+        elif False: #len(req_to_compress) > 1:
             # LSH dedup: normalise + look up registry for each individual prefill.
             self._run_lsh_dedup_and_register(req_to_compress, req_idx_to_compress, attn_metadata)
+            _t_bt = _time.perf_counter()
             self._update_block_tables_after_compression(req_to_compress)
+            _ff['bt_sync'] = _ff.get('bt_sync', 0.0) + (_time.perf_counter() - _t_bt)
             logger.info(
                 "LSH dedup post-forward: processed %d requests across %d fusion layers",
                 len(req_to_compress), _n_fusion_layers,

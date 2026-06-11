@@ -1,4 +1,10 @@
+import os
 import torch
+
+# 'raw' BFF scaling shares the registrant's block verbatim (no per-request norms) → fusion
+# layers take the plain flash-attn path. Read directly from env to avoid importing the runner
+# module here (keeps this attention hot-path decoupled / import-cycle free).
+_BFF_SCALE_MODE = os.environ.get("BFF_SCALE_MODE", "raw").lower()
 
 # from vllm.forward_context import get_forward_context
 from vllm.v1.attention.backends.flash_attn import  (
@@ -91,7 +97,8 @@ def patched_forward(
         bff_norms_k = None
         bff_norms_v = None
         bff_seq_to_slot = None
-        if getattr(attn_metadata, 'has_fused_reqs', False) and \
+        if _BFF_SCALE_MODE != "raw" and \
+                getattr(attn_metadata, 'has_fused_reqs', False) and \
                 getattr(attn_metadata, 'norms_k_buf_full', None) is not None:
             layer_idx = int(layer.layer_name.split('.')[2])
             bff_norms_k = attn_metadata.norms_k_buf_full[layer_idx]

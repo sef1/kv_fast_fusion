@@ -1,7 +1,14 @@
+import os
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from vllm.logger import init_logger
 logger = init_logger("vllm.patched_scheduler")
+
+# Diagnostic toggle (orthogonal to BFF_SCALE_MODE): when set, evict fusion TARGET
+# (shared) blocks from the prefix cache after a merge so future prefills can't
+# prefix-hit and re-pin them. Tests whether prefix-retention of fused targets is what
+# drives the KV-pool cliff at scale. See ROUND 19 in the plan file.
+BFF_EVICT_FUSED = os.environ.get("BFF_EVICT_FUSED", "0") == "1"
 from vllm.v1.core.kv_cache_utils import BlockHashWithGroupId
 def _handle_block_merging_with_counts_o(  
         self,   
@@ -161,11 +168,22 @@ def _handle_block_merging_with_counts(self, request_blocks: dict[str, dict[int, 
       
     old_ref_counts = defaultdict(int)  
     new_ref_counts = defaultdict(int)  
-    block_cache = {}  # Cache block objects to avoid repeated lookups  
-  
-    for req_id, group_blocks in request_blocks.items():  
-        if req_id not in self.requests or not group_blocks:  
-            continue  
+    block_cache = {}  # Cache block objects to avoid repeated lookups
+
+    for req_id, group_blocks in request_blocks.items():
+        if req_id not in self.requests or not group_blocks:
+            continue
+        # The worker computed this redirect for the batch the request was in. With the
+        # pipelined batch queue, by the time this runs the request may have been preempted
+        # (freed → num_cached_block popped, num_computed_tokens reset to 0) or finished.
+        # Re-applying req_to_blocks/num_cached_block to such a request desyncs the prefix
+        # cache: on its re-schedule from WAITING it does a prefix lookup (non-empty
+        # new_computed_blocks) while still in num_cached_block → the
+        # `assert len(new_computed_blocks) == 0` crash in single_type_kv_cache_manager.
+        # Only mutate scheduler state for requests that are still actively RUNNING.
+        if self.requests[req_id].status != RequestStatus.RUNNING:
+            continue
+
           
         for group_idx, new_block_ids in group_blocks.items():  
             if group_idx == 0:  
@@ -210,13 +228,21 @@ def _handle_block_merging_with_counts(self, request_blocks: dict[str, dict[int, 
         elif ref_change < 0:  
             blocks_to_free.extend([block_cache[block_id]] * abs(ref_change))  
   
-    # Apply batch operations  
-    if blocks_to_touch:  
-        block_pool.touch(blocks_to_touch)  
-    if blocks_to_free:  
-        block_pool.free_blocks(blocks_to_free)  
-      
-    after_free = block_pool.get_num_free_blocks()  
+    # Apply batch operations
+    if blocks_to_touch:
+        block_pool.touch(blocks_to_touch)
+    if blocks_to_free:
+        block_pool.free_blocks(blocks_to_free)
+
+    # Optionally evict the fusion TARGET (shared) blocks from the prefix cache so future
+    # prefills can't prefix-hit and re-pin them (drops discoverability only; does NOT free
+    # them — current holders read them correctly via req_to_blocks). ROUND 19 diagnostic.
+    if BFF_EVICT_FUSED and blocks_to_touch:
+        tgt_ids = {b.block_id for b in blocks_to_touch}
+        block_pool.evict_blocks(tgt_ids)
+        logger.info(f"BFF evicted {len(tgt_ids)} fusion-target blocks from prefix cache")
+
+    after_free = block_pool.get_num_free_blocks()
     logger.info(f"Block merging freed {after_free - before_free} blocks")
 
 def _handle_block_merging_with_counts_(  
