@@ -29,7 +29,7 @@ CHUNK_SIZE = 512
 #   'proj' : Johnson–Lindenstrauss random projection of the 'full' vector to LSH_PROJ_DIM
 #            (approximately preserves cosine; near-'full' accuracy, small registry).
 LSH_BLOCK_REPR = os.environ.get("BFF_LSH_REPR", "proj").lower()
-LSH_PROJ_DIM = int(os.environ.get("BFF_LSH_PROJ_DIM", "512"))
+LSH_PROJ_DIM = int(os.environ.get("BFF_LSH_PROJ_DIM", "512"))  # only for 'proj' repr; must be ≥ NUM_LSH_BITS
 
 # Fast-fusion writeback optimization: only scatter blocks whose content actually changed
 # (merged-group representatives), redirect duplicates, and leave singletons raw — instead
@@ -43,7 +43,11 @@ BFF_FAST_SCATTER = os.environ.get("BFF_FAST_SCATTER", "1") == "1"
 #            write only representatives + vectorized block-table redirect. No recursion,
 #            no cache reconstruction, no per-group Python loops. (default)
 #   'tree' : the original recursive hierarchical tree merge (kept for A/B).
-BFF_MERGE = os.environ.get("BFF_MERGE", "cc").lower()
+#   'nr_tree': non-recursive ('butterfly') tree — iterative level-by-level pairwise merge,
+#            shorter request on the left (representative), longer on the right; same G-layer
+#            concatenation cosine as cc/lsh/tree. Linear-memory (no N×N matrix); ~O(N·polylog)
+#            under good compression. (experimental, for scaling A/B vs cc/tree.)
+BFF_MERGE = os.environ.get("BFF_MERGE", "nr_tree").lower()
 _CC_ITERS = 32  # label-propagation iterations (cluster diameter cap; clusters are dense)
 
 # How a redirected (shared) block is scaled at decode. Both 'raw' and 'ratio' share the
@@ -55,7 +59,7 @@ _CC_ITERS = 32  # label-propagation iterations (cluster diameter cap; clusters a
 #             reader's OWN magnitude. No mutation; keeps the Triton kernel (TPOT cost).
 #   'norm'  : LEGACY — normalize the block in place + scale by ‖own‖ + kernel. Mutates cached
 #             KV → prefix-cache corruption (kept only for A/B comparison).
-BFF_SCALE_MODE = os.environ.get("BFF_SCALE_MODE", "ratio").lower()
+BFF_SCALE_MODE = os.environ.get("BFF_SCALE_MODE", "raw").lower()
 
 # Number of consecutive fusion layers packed into one KV cache group.
 # G=1  → one group per layer (28 groups for a 32-layer model, original behaviour).
@@ -63,10 +67,10 @@ BFF_SCALE_MODE = os.environ.get("BFF_SCALE_MODE", "ratio").lower()
 BFF_GROUP_SIZE = 4
 
 # LSH deduplication constants
-NUM_LSH_BITS = 256            # total bits per fingerprint
+NUM_LSH_BITS = 160            # total bits per fingerprint
 NUM_LSH_TABLES = 16           # independent sub-tables
-LSH_BITS_PER_TABLE = 16       # bits per sub-table  (NUM_LSH_BITS // NUM_LSH_TABLES)
-MAX_REGISTRY_PER_LAYER = int(os.environ.get("BFF_MAX_REGISTRY", "8192"))  # max registered blocks per fusion layer (lower for 'full' repr to bound memory)
+LSH_BITS_PER_TABLE = 10       # bits per sub-table  (NUM_LSH_BITS // NUM_LSH_TABLES)
+MAX_REGISTRY_PER_LAYER = int(os.environ.get("BFF_MAX_REGISTRY", "2048"))  # max registered blocks per fusion layer (lower for 'full' repr to bound memory)
 LSH_MAX_HEAD_DIM = 512       # lsh_proj is pre-allocated up to this head_dim
 
 # Dormant-group skipping: deep-layer KV is diverse across requests and stops fusing after
@@ -76,7 +80,7 @@ LSH_MAX_HEAD_DIM = 512       # lsh_proj is pre-allocated up to this head_dim
 # highest fusion group index that runs dedup (-1 = no cap; let the EMA decide).
 LSH_DORMANT_THR   = float(os.environ.get("BFF_DORMANT_THR", "0.02"))   # redirect-rate floor
 LSH_DORMANT_EMA   = float(os.environ.get("BFF_DORMANT_EMA", "0.3"))    # EMA smoothing
-LSH_PROBE_EVERY   = int(os.environ.get("BFF_PROBE_EVERY", "50"))       # re-probe cadence (dedup steps)
+LSH_PROBE_EVERY   = int(os.environ.get("BFF_PROBE_EVERY", "1"))       # re-probe cadence (dedup steps)
 LSH_FUSE_MAX_GROUP = int(os.environ.get("BFF_FUSE_MAX_GROUP", "-1"))   # static fusion-group cap
 
 
@@ -880,12 +884,19 @@ class BFFCompressor:
             _ff[key] = _ff.get(key, 0.0) + (_t.perf_counter() - t0)
         torch.cuda.synchronize(); _t0 = _t.perf_counter()
 
-        # ---- joint representation: mean of K across the G layers ----
-        kk_joint = kv_layers[0][0][bt_safe].view(self.B, P, -1).clone()
-        for kv_layer in kv_layers[1:]:
-            kk_joint += kv_layer[0][bt_safe].view(self.B, P, -1)
-        if len(kv_layers) > 1:
-            kk_joint /= len(kv_layers)
+        # ---- joint representation: CONCATENATION of K across the G layers ----
+        # The merge decision is _fuse_all_above_thr's xl@xrᵀ on the (joint-)normalized repr.
+        # Concatenating the per-layer K — instead of AVERAGING it — makes that matmul the
+        # cosine of the G-layer CONCATENATION: Σ_g⟨v_g,u_g⟩ / (‖cat‖‖cat‖), which has NO
+        # cross-layer terms. The old mean gave cos(Σ_g v_g, Σ_g u_g), mixing block i's layer
+        # g with block j's layer h (g≠h) — distortion that grows with BFF_GROUP_SIZE and can
+        # merge blocks that are orthogonal per layer (e.g. (e1,e2) vs (e2,e1) have identical
+        # means but concatenation cosine 0). _fuse_all_above_thr joint-normalizes (dim=-1),
+        # and the merged-cluster repr stays a normalized concatenation through the recursion,
+        # so the property holds at every merge level. fwd_idx/rev_idx are replayed on each
+        # layer's real K and V unchanged. (Matches the cc/lsh tracks, ROUND 9.)
+        kk_joint = torch.cat(
+            [kv_layer[0][bt_safe].view(self.B, P, -1) for kv_layer in kv_layers], dim=-1)
         _tick('pf_gather', _t0); _t0 = _t.perf_counter()
 
         _k, rev_idx, fwd_idx, _ = self._fuse_all_above_thr(kk_joint, self._b_idx)
@@ -1047,6 +1058,24 @@ class BFFCompressor:
                 break
             labels = new
         del A
+        return self._finalize_labels(
+            layer_names, layer_idxs, layer_meta, kv_layers,
+            bt, bt_safe, flat_valid, labels, N)
+
+    def _finalize_labels(self, layer_names, layer_idxs, layer_meta, kv_layers,
+                         bt, bt_safe, flat_valid, labels, N):
+        """Shared tail for label-based merges (cc, nr_tree).
+
+        Given `labels[i]` = the representative flat index in [0,N) for valid block i,
+        redirect the block table to representatives and, per layer, apply BFF_SCALE_MODE:
+        'norm' writes the scatter-mean centroid into the rep (mutates cache) + stores ‖own‖;
+        'ratio' stores ‖own‖/‖rep‖ (no mutation); 'raw' leaves scale 1.0 (no mutation).
+        Returns (n_valid=N, n_unique)."""
+        runner = self._runner
+        _, blk, heads, hd = kv_layers[0].shape[1:]
+        P = self._num_blocks_dim
+        dev = self._device
+
         counts = torch.bincount(labels, minlength=N)                           # [N] (by rep idx)
         merged = counts[labels] > 1                                            # [N] bool
         rep_clusters = (counts > 1).nonzero(as_tuple=True)[0]                   # rep indices, size>1
@@ -1106,6 +1135,76 @@ class BFFCompressor:
 
         layer_meta.block_table[self._req_idx_to_compress] = bt
         return N, n_unique
+
+    def _compress_group_nr_tree(self, layer_names, layer_idxs, layer_meta, kv_layers):
+        """Non-recursive ('butterfly') tree merge — an iterative alternative to the recursive
+        `_compress_group`, scaling-friendly and order-aware.
+
+        Same G-layer CONCATENATION cosine as lsh/cc/tree (via `_block_repr`: unit-normalized
+        concatenation → cosine = dot). Instead of cc's dense N×N graph + label propagation,
+        it merges pairs of nodes level by level (FFT-like). At each level the active nodes are
+        sorted by block count ASCENDING and paired adjacently, so the SHORTER request is the
+        left (representative) side and the longer is the right — the right side is where blocks
+        get redirected/freed, so putting more blocks on the right maximizes compression. A
+        right block redirects to its best-matching left block when cos > THRESHOLD; unmatched
+        right blocks (and all left blocks) carry up as the merged node. Anchoring is on the
+        representative's RAW block (like cc/lsh), not a recomputed mid-tree centroid; the
+        centroid (norm mode) / scale (ratio) is produced by the shared `_finalize_labels`.
+
+        Cost: holds only the [N, D] repr + per-pair |L|×|R| similarities (never the N×N
+        matrix), so memory is linear in N; time is ~O(N·polylog) under good compression and
+        degrades toward O(N²) only when little merges (node sizes don't shrink)."""
+        dev = self._device
+        bt          = layer_meta.block_table[self._req_idx_to_compress].clone()  # [B, P]
+        bt_safe     = bt.clamp(min=0)
+        flat_valid  = bt_safe[self._nz_mask]                                     # [N] phys ids
+        N = int(flat_valid.shape[0])
+        if N == 0:
+            return 0, 0
+        req_of_block = self._nz_mask[0]                                          # [N] in [0,B)
+        valid_node   = flat_valid > 0                                            # skip null block 0
+
+        # unit-normalized G-layer concatenation repr → cosine(i,j) = Xn[i]·Xn[j]
+        Xn = self._block_repr(kv_layers, flat_valid, N).float()                  # [N, D]
+
+        # union-find over the N flat blocks; representative = root. A request's blocks always
+        # travel together in one node, so paired (L,R) nodes never share a request → no
+        # intra-request merge (matches cc's cross-request constraint structurally).
+        parent = torch.arange(N, device=dev)
+        nodes = []
+        for r in range(self.B):
+            idxs = ((req_of_block == r) & valid_node).nonzero(as_tuple=True)[0]
+            if idxs.numel():
+                nodes.append(idxs)
+
+        while len(nodes) > 1:
+            nodes.sort(key=lambda t: t.numel())            # shorter → left
+            nxt = []
+            for k in range(0, len(nodes) - (len(nodes) & 1), 2):
+                L, R = nodes[k], nodes[k + 1]              # |L| <= |R|
+                sim = Xn[R] @ Xn[L].T                      # [|R|, |L|]
+                best_val, best_l = sim.max(dim=1)
+                match = best_val > THRESHOLD
+                if bool(match.any()):
+                    parent[R[match]] = L[best_l[match]]    # union R → matched L (vectorized)
+                    nxt.append(torch.cat([L, R[~match]]))  # carry L + unmatched R
+                else:
+                    nxt.append(torch.cat([L, R]))
+            if len(nodes) & 1:
+                nxt.append(nodes[-1])                      # odd node carries up unchanged
+            nodes = nxt
+
+        # resolve union-find chains to roots (pointer jumping) → labels[i] in [0,N)
+        labels = parent
+        for _ in range(_CC_ITERS):
+            nl = parent[labels]
+            if torch.equal(nl, labels):
+                break
+            labels = nl
+
+        return self._finalize_labels(
+            layer_names, layer_idxs, layer_meta, kv_layers,
+            bt, bt_safe, flat_valid, labels, N)
 
     # ------------------------------------------------------------------
     # LSH deduplication path (< 4 concurrent prefills)
@@ -1412,8 +1511,10 @@ class BFFCompressor:
     def run(self):
         if self._num_blocks_dim == 0:
             return
-        compress = (self._compress_group_cc if BFF_MERGE == "cc"
-                    else self._compress_group)
+        compress = {
+            "cc": self._compress_group_cc,
+            "nr_tree": self._compress_group_nr_tree,
+        }.get(BFF_MERGE, self._compress_group)
         for layer_names, layer_idxs, layer_meta, kv_layers in self._iter_fusion_groups():
             n_valid, n_unique = compress(
                 layer_names, layer_idxs, layer_meta, kv_layers)
@@ -2195,7 +2296,7 @@ def execute_model(
         _n_fusion_layers = sum(
             1 for g in self.kv_cache_config.kv_cache_groups[1:] if g.layer_names
         )
-        if len(req_to_compress) > 1:
+        if False: #len(req_to_compress) > 1:
             # Full BFF: recursive merge across concurrent prefills, then register blocks.
             self._run_post_forward_bff(req_to_compress, req_idx_to_compress, attn_metadata)
             self._update_block_tables_after_compression(req_to_compress)
@@ -2204,7 +2305,7 @@ def execute_model(
                 "BFF post-forward: compressed %d requests across %d fusion layers",
                 len(req_to_compress), _n_fusion_layers,
             )
-        elif False: #len(req_to_compress) > 1:
+        elif len(req_to_compress) > 1:
             # LSH dedup: normalise + look up registry for each individual prefill.
             self._run_lsh_dedup_and_register(req_to_compress, req_idx_to_compress, attn_metadata)
             _t_bt = _time.perf_counter()
