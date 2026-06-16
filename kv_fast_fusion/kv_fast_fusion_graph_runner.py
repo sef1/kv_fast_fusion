@@ -49,6 +49,10 @@ BFF_FAST_SCATTER = os.environ.get("BFF_FAST_SCATTER", "1") == "1"
 #            under good compression. (experimental, for scaling A/B vs cc/tree.)
 BFF_MERGE = os.environ.get("BFF_MERGE", "nr_tree").lower()
 _CC_ITERS = 32  # label-propagation iterations (cluster diameter cap; clusters are dense)
+# When the P/D connector (P2pNcclConnectorFF) owns the fusion (computed in save_kv_layer so it
+# overlaps the transfer), disable the post-forward BFF here so there's no double-fusion and the
+# connector-side overhead can be measured cleanly. See plan ROUND 21/22.
+BFF_PD_FUSE = os.environ.get("BFF_PD_FUSE", "0") == "1"
 
 # How a redirected (shared) block is scaled at decode. Both 'raw' and 'ratio' share the
 # registrant's RAW block (NO cache mutation → cannot corrupt the prefix cache), and differ
@@ -64,7 +68,7 @@ BFF_SCALE_MODE = os.environ.get("BFF_SCALE_MODE", "raw").lower()
 # Number of consecutive fusion layers packed into one KV cache group.
 # G=1  → one group per layer (28 groups for a 32-layer model, original behaviour).
 # G=4  → 7 groups, 4× fewer block-pool operations per step.
-BFF_GROUP_SIZE = 4
+BFF_GROUP_SIZE = 9
 
 # LSH deduplication constants
 NUM_LSH_BITS = 160            # total bits per fingerprint
@@ -2296,8 +2300,9 @@ def execute_model(
         _n_fusion_layers = sum(
             1 for g in self.kv_cache_config.kv_cache_groups[1:] if g.layer_names
         )
-        if False: #len(req_to_compress) > 1:
+        if len(req_to_compress) > 1 and not BFF_PD_FUSE:
             # Full BFF: recursive merge across concurrent prefills, then register blocks.
+            # (Skipped when BFF_PD_FUSE — the P/D connector owns fusion; avoids double-fusion.)
             self._run_post_forward_bff(req_to_compress, req_idx_to_compress, attn_metadata)
             self._update_block_tables_after_compression(req_to_compress)
             # self._lsh_register_bff_blocks(req_to_compress, req_idx_to_compress, attn_metadata)
@@ -2305,7 +2310,7 @@ def execute_model(
                 "BFF post-forward: compressed %d requests across %d fusion layers",
                 len(req_to_compress), _n_fusion_layers,
             )
-        elif len(req_to_compress) > 1:
+        elif False: # len(req_to_compress) > 1:
             # LSH dedup: normalise + look up registry for each individual prefill.
             self._run_lsh_dedup_and_register(req_to_compress, req_idx_to_compress, attn_metadata)
             _t_bt = _time.perf_counter()
