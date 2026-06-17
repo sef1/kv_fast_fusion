@@ -400,8 +400,25 @@ def update_from_output(
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
         # sefi
-        # block_merge_mapping = model_runner_output.updated_block_table  
+        # block_merge_mapping = model_runner_output.updated_block_table
         block_merge_mapping = getattr(model_runner_output, "_updated_block_tables", None)
+        if not block_merge_mapping:
+            # P/D path: the connector wrote the redirect map straight onto the runner. Under
+            # async scheduling the sample_tokens output is a wrapper that drops the attached
+            # attr, so read it from _ACTIVE_RUNNER directly (worker+scheduler share this process
+            # at TP=1) and CONSUME it so it applies exactly once. Single-machine is unaffected:
+            # its output carries the attr (this branch isn't taken) and is None when no fusion.
+            try:
+                from kv_fast_fusion import fast_fusion_block_pool as _bp
+                _runner = getattr(_bp, "_ACTIVE_RUNNER", None)
+                if _runner is not None:
+                    block_merge_mapping = getattr(_runner, "_updated_block_tables", None)
+                    if block_merge_mapping:
+                        _runner._updated_block_tables = None
+                        logger.info("BFF: block-merge via runner | reqs=%d",
+                                    len(block_merge_mapping))
+            except Exception as e:
+                logger.warning("BFF runner block-merge fallback failed: %s", e)
         if block_merge_mapping:
             try:
                 self._handle_block_merging_with_counts(block_merge_mapping)

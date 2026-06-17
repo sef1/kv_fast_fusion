@@ -16,8 +16,6 @@ never run — this patch deliberately omits them. It applies only what P/D needs
 Toggle in `kv_fast_fusion/__init__.py` against `apply_fast_fusion_graph_patch`.
 """
 
-from types import MethodType
-
 from vllm.logger import init_logger
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.core.sched.scheduler import Scheduler
@@ -59,8 +57,9 @@ def apply_fast_fusion_pd_patch():
     original_init = GPUModelRunner.__init__
 
     def _pd_patched_runner_init(self, *args, **kwargs):
-        # Bind the thin sample_tokens wrapper that propagates _updated_block_tables.
-        self.sample_tokens = MethodType(_pd_sample_tokens, self)
+        # No sample_tokens override: the connector writes the redirect map onto this runner and
+        # the patched scheduler `update_from_output` reads it directly off `_ACTIVE_RUNNER`
+        # (same process at TP=1) — the async sample_tokens output wrapper drops attached attrs.
         self.fused_requests = {}
         self._updated_block_tables = None
         # raw mode reads no per-block norms; the connector only needs block tables.
@@ -105,22 +104,3 @@ def apply_fast_fusion_pd_patch():
         logger.warning("Fast fusion P/D patch: connector registration skipped: %s", e)
 
     logger.info("Fast fusion P/D patch applied.")
-
-
-# Captured once; the thin wrapper delegates to the stock sampler then attaches the
-# worker→scheduler block-merge channel. Defined at import (before __init__ patches it).
-_ORIGINAL_SAMPLE_TOKENS = GPUModelRunner.sample_tokens
-
-
-def _pd_sample_tokens(self, grammar_output):
-    """Stock sample_tokens + propagate `_updated_block_tables` to the output so the patched
-    scheduler `update_from_output` can free the redundant D-side blocks (connector fusion)."""
-    output = _ORIGINAL_SAMPLE_TOKENS(self, grammar_output)
-    updated = getattr(self, "_updated_block_tables", None)
-    if updated and output is not None:
-        try:
-            output._updated_block_tables = updated
-        except Exception:
-            pass
-    self._updated_block_tables = None
-    return output

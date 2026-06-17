@@ -51,11 +51,29 @@ logger = init_logger(__name__)
 _BFF_PD_FUSE = os.environ.get("BFF_PD_FUSE", "0") == "1"
 _PD_REDIR_TAG = "#__bff_redir__#"          # side-channel tensor id suffix for the redirect map
 _PD_LOG_EVERY = int(os.environ.get("BFF_PD_LOG_EVERY", "200"))
+# Verbose consumer trace: log every recv'd tensor_id so the LAST line before a hang is the
+# unsent id `recv_tensor` (no-timeout) is blocked on. See plan ROUND 29.
+_PD_DEBUG = os.environ.get("BFF_PD_DEBUG", "0") == "1"
+# Connector within-batch clustering: nr_tree (butterfly, full precision) or cc. See ROUND 32.
+_PD_MERGE = os.environ.get("BFF_PD_MERGE", "nr_tree")
+# Per-layer block representation for the clustering similarity (producer-only). See ROUND 34.
+#   full → exact cosine over the full flattened block-K; proj → JL projection; mean → head_dim mean.
+_PD_REPR = os.environ.get("BFF_PD_REPR", "full")
+_PD_PROJ_DIM = int(os.environ.get("BFF_PD_PROJ_DIM", "512"))
+
+
+def _pd_key(request_id: str) -> str:
+    """Stable cross-P/D key for a request: vLLM v1 `InputProcessor.assign_request_id` sets
+    `request_id = f"{external_req_id}-{random_uuid():.8}"` on EACH server, so the full id carries
+    a per-server random 8-hex suffix that differs between P and D. The proxy gives both the same
+    `external_req_id` (the X-Request-Id), so strip the trailing `-<random8>` (hex, no internal
+    `-`) to recover it. Tensor ids / rep-hashes MUST use this, not the full request_id."""
+    return request_id.rsplit("-", 1)[0]
 
 
 def _rid_hash(request_id: str) -> int:
     """Process-stable positive int64 hash of a request id (Python's hash() is salted per
-    process, so it can't be shared across P and D — use blake2b)."""
+    process, so it can't be shared across P and D — use blake2b). Callers pass _pd_key(...)."""
     h = hashlib.blake2b(request_id.encode(), digest_size=8).digest()
     return int.from_bytes(h, "little") & 0x7FFFFFFFFFFFFFFF
 
@@ -127,8 +145,19 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
         self._pd_load_reqs = 0
         self._pd_recv_layers = 0
         self._pd_freed_layers = 0
+        self._pd_waiting = None   # tensor_id currently blocked on in recv_tensor (hang trace)
+        self._pd_jl = None        # lazy fixed-seed JL matrix for BFF_PD_REPR=proj (producer only)
         if self._pd_fuse:
             logger.info("P2pNcclConnectorFF: BFF_PD_FUSE enabled (connector-level fusion).")
+        # One-time identity log: role/rank/port — catches a peer-address/port mismatch.
+        try:
+            logger.info(
+                "P2pNcclConnectorFF init | is_producer=%s | rank=%s | "
+                "engine=%s | pd_fuse=%s | pd_debug=%s",
+                getattr(self, "is_producer", "?"), getattr(self, "_rank", "?"),
+                self.p2p_nccl_engine is not None, self._pd_fuse, _PD_DEBUG)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # layer_name -> kv-cache group index (from the live BFF group layout)
@@ -225,6 +254,10 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
 
         self._pd_load_calls += 1
         self._pd_load_reqs += len(metadata.requests)
+        if _PD_DEBUG or self._pd_load_calls <= 5:
+            logger.info("BFF P/D consume ENTER | call=%d | reqs=%d | layers=%d",
+                        self._pd_load_calls, len(metadata.requests),
+                        len(forward_context.no_compile_layers))
         for request in metadata.requests:
             request_id = request.request_id
             remote_address = self._remote_addr_or_none(request_id, False)
@@ -236,8 +269,14 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
                 if kv_cache is None:
                     continue
                 layer = kv_cache[forward_context.virtual_engine]
-                kv_cache = self.p2p_nccl_engine.recv_tensor(
-                    request.request_id + "#" + layer_name, remote_address)
+                tid = _pd_key(request.request_id) + "#" + layer_name
+                # Record what we're about to (possibly indefinitely) block on. The LAST value
+                # logged before a hang is the tensor_id the producer never sent.
+                self._pd_waiting = tid
+                if _PD_DEBUG:
+                    logger.info("BFF P/D consume: recv KV %s", tid)
+                kv_cache = self.p2p_nccl_engine.recv_tensor(tid, remote_address)
+                self._pd_waiting = None
                 if kv_cache is None:
                     logger.warning("🚧kv_cache is None, %s", request.request_id)
                     continue
@@ -247,8 +286,7 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
                 inject_kv_into_layer(layer, kv_cache, block_ids, request.request_id)
                 # KV is now in D's GPU cache → release the recv buffer immediately (frees the
                 # pinned-pool block if it spilled) instead of waiting for request completion.
-                self.p2p_nccl_engine.free_recv_tensor(
-                    request.request_id + "#" + layer_name)
+                self.p2p_nccl_engine.free_recv_tensor(tid)
                 self._pd_freed_layers += 1
 
         if self._pd_load_calls % _PD_LOG_EVERY == 0:
@@ -279,11 +317,28 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
             runner = getattr(_bp, "_ACTIVE_RUNNER", None)
             if runner is None:
                 return
-            # rep-request resolution + D block ids per request (consumer metadata).
-            hash2rid = {_rid_hash(r.request_id): r.request_id for r in metadata.requests}
-            rid2blocks = {r.request_id: r.block_ids for r in metadata.requests}
+            # rep-request resolution + D block ids per request. A redirect's representative may
+            # have loaded in an EARLIER step, so resolve against ALL running requests (runner
+            # state), not just this step's metadata. Key the hash on the STABLE id (rep_hash was
+            # computed on P over the stable id).
+            hash2rid: dict[int, str] = {}
+            rid2blocks: dict[str, Any] = {}
+            for rid_r, st in getattr(runner, "requests", {}).items():
+                bids = getattr(st, "block_ids", None)
+                if bids is not None:
+                    hash2rid[_rid_hash(_pd_key(rid_r))] = rid_r
+                    rid2blocks[rid_r] = bids
+            # Overlay this step's metadata (authoritative per-group tensors for loading reqs).
+            for r in metadata.requests:
+                hash2rid[_rid_hash(_pd_key(r.request_id))] = r.request_id
+                rid2blocks[r.request_id] = r.block_ids
             fusion_groups = [gi for gi in self._group_layers if gi > 0]
             updated: dict[str, dict[int, list[int]]] = {}
+            n_applied = 0
+            n_unresolved = 0
+            if _PD_DEBUG:
+                logger.info("BFF P/D apply ENTER | reqs=%d | running=%d | fusion_groups=%s",
+                            len(metadata.requests), len(rid2blocks), fusion_groups)
 
             for request in metadata.requests:
                 rid = request.request_id
@@ -291,11 +346,15 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
                 if remote_address is None:
                     continue
                 for gi in fusion_groups:
-                    payload = self.p2p_nccl_engine.recv_tensor(
-                        rid + _PD_REDIR_TAG + str(gi), remote_address)
+                    map_tid = _pd_key(rid) + _PD_REDIR_TAG + str(gi)
+                    self._pd_waiting = map_tid
+                    if _PD_DEBUG:
+                        logger.info("BFF P/D apply: recv map %s", map_tid)
+                    payload = self.p2p_nccl_engine.recv_tensor(map_tid, remote_address)
+                    self._pd_waiting = None
                     # Map ids never match the engine's get_finished cleanup pattern, so release
                     # the recv buffer here (frees the pinned block if it spilled + the dict entry).
-                    self.p2p_nccl_engine.free_recv_tensor(rid + _PD_REDIR_TAG + str(gi))
+                    self.p2p_nccl_engine.free_recv_tensor(map_tid)
                     if payload is None or payload.numel() == 0:
                         continue
                     owner_blocks = list(request.block_ids[gi].tolist())
@@ -305,11 +364,16 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
                             continue
                         rep_rid = hash2rid.get(int(rep_hash))
                         if rep_rid is None or rep_rid not in rid2blocks:
+                            n_unresolved += 1     # rep not (yet) resident on D → can't share
                             continue
-                        rep_dphys = int(rid2blocks[rep_rid][gi][rep_slot])
-                        if 0 <= owner_slot < len(owner_blocks):
-                            owner_blocks[owner_slot] = rep_dphys
-                            changed = True
+                        rep_grp = rid2blocks[rep_rid][gi]
+                        if not (0 <= rep_slot < len(rep_grp)
+                                and 0 <= owner_slot < len(owner_blocks)):
+                            n_unresolved += 1
+                            continue
+                        owner_blocks[owner_slot] = int(rep_grp[rep_slot])
+                        changed = True
+                        n_applied += 1
                     if changed:
                         updated.setdefault(rid, {})[gi] = owner_blocks
                         self._pd_write_runner_block_table(runner, rid, gi, owner_blocks)
@@ -318,6 +382,9 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
                 # Stage for D's scheduler to free the orphaned blocks + fix ref-counts
                 # (reuses the BFF merge channel: _updated_block_tables → update_from_output).
                 runner._updated_block_tables = updated
+            if n_applied or n_unresolved or _PD_DEBUG:
+                logger.info("BFF P/D apply | redirects_applied=%d | reps_unresolved=%d",
+                            n_applied, n_unresolved)
         except Exception as e:  # pragma: no cover - defensive
             logger.warning("BFF P/D consumer apply failed: %s", e)
 
@@ -354,6 +421,9 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
         connector_metadata = self._get_connector_metadata()
         assert isinstance(connector_metadata, P2pNcclConnectorMetadataFF)
         gi = self._group_of(layer_name)
+        if _PD_DEBUG:
+            logger.info("BFF P/D save ENTER | layer=%s | gi=%d | reqs=%d",
+                        layer_name, gi, len(connector_metadata.requests))
         for request in connector_metadata.requests:
             request_id = request.request_id
             remote_address = self._remote_addr_or_none(request_id, True)
@@ -361,8 +431,11 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
                 continue
             block_ids = request.block_ids[gi]            # this layer's group
             kv_cache = extract_kv_from_layer(kv_layer, block_ids)
-            self.p2p_nccl_engine.send_tensor(
-                request_id + "#" + layer_name, kv_cache, remote_address)
+            tid = _pd_key(request_id) + "#" + layer_name
+            if _PD_DEBUG:
+                logger.info("BFF P/D send KV %s -> %s | shape=%s",
+                            tid, remote_address, tuple(kv_cache.shape))
+            self.p2p_nccl_engine.send_tensor(tid, kv_cache, remote_address)
 
         # Connector-level fusion: accumulate this fusion group's per-layer K reps; when the
         # group's last layer is seen, cluster (concat cosine) and ship the per-request redirect
@@ -376,6 +449,27 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
     # NOTE: the producer math reuses the tested pd_fuse core; the NCCL send pairing and the
     # consumer apply (below) require validation on the live P/D topology.
     # ------------------------------------------------------------------
+    def _pd_block_repr(self, kv_layer, idx):
+        """Per-layer block representation [N, D_repr] (float32) for the clustering similarity,
+        selected by BFF_PD_REPR. K-only (kv_layer[0]); the concatenation cosine over the G group
+        layers is applied by the clustering. `full` = exact (whole block), `mean` = head_dim mean,
+        `proj` = fixed-seed JL projection (cosine-preserving, cheaper). Producer-only."""
+        blk = kv_layer[0, idx].float()                     # [N, block_sz, kv_heads, head_dim]
+        N = idx.shape[0]
+        if _PD_REPR == "mean":
+            head_dim = blk.shape[-1]
+            return blk.reshape(N, -1, head_dim).mean(dim=1)
+        full = blk.reshape(N, -1)                           # [N, D_full_layer]
+        if _PD_REPR == "proj":
+            if self._pd_jl is None:
+                g = torch.Generator(device=full.device)
+                g.manual_seed(1234)
+                self._pd_jl = torch.randn(
+                    full.shape[1], _PD_PROJ_DIM,
+                    generator=g, device=full.device, dtype=torch.float32)
+            return full @ self._pd_jl
+        return full                                         # full
+
     def _pd_producer_accumulate(self, gi, layer_name, kv_layer, meta):
         # New step → fresh metadata object → reset all partial group buffers + sent-tracking.
         if id(meta) != self._pd_cur_meta_id:
@@ -412,8 +506,8 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
 
         if buf["flat_bids"]:
             idx = torch.as_tensor(buf["flat_bids"], device=kv_layer.device, dtype=torch.long)
-            # K of each flat block for this layer → [N, D] for the concat-cosine.
-            buf["k_layers"].append(kv_layer[0, idx].reshape(idx.shape[0], -1).float())
+            # Per-layer block repr (full|proj|mean) → [N, D_repr] for the concat-cosine.
+            buf["k_layers"].append(self._pd_block_repr(kv_layer, idx))
         buf["seen"].add(layer_name)
 
         # Count-based completion (robust to layer-name `.attn` variance): this layer was routed to
@@ -423,7 +517,8 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
         # --- group complete: cluster + ship redirect map ---
         try:
             from kv_fast_fusion.pd_fuse import (
-                concat_cosine_cc_labels, build_group_redirect,
+                concat_cosine_cc_labels, concat_cosine_nr_tree_labels,
+                build_group_redirect,
             )
             from kv_fast_fusion.kv_fast_fusion_graph_runner import THRESHOLD
             t0 = time.perf_counter()
@@ -431,11 +526,19 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
             if buf["flat_bids"]:
                 req_of_block = torch.as_tensor(
                     buf["flat_req_local"], device=buf["k_layers"][0].device)
-                labels = concat_cosine_cc_labels(buf["k_layers"], req_of_block, THRESHOLD)
+                cluster = (concat_cosine_nr_tree_labels if _PD_MERGE == "nr_tree"
+                           else concat_cosine_cc_labels)
+                labels = cluster(buf["k_layers"], req_of_block, THRESHOLD)
                 _, redirects = build_group_redirect(
                     labels, buf["flat_req_local"], buf["flat_slot"])
             self._pd_ms += (time.perf_counter() - t0) * 1000.0
             self._pd_steps += 1
+
+            n_redir = sum(len(v) for v in redirects.values())
+            if n_redir or _PD_DEBUG:
+                logger.info(
+                    "BFF P/D fuse group gi=%d | merge=%s | repr=%s | reqs=%d | blocks=%d | redirects=%d",
+                    gi, _PD_MERGE, _PD_REPR, len(buf["req_ids"]), len(buf["flat_bids"]), n_redir)
 
             # Ship a redirect-map tensor per request for this group, co-located with the group's
             # last KV layer (just sent above). ALWAYS send (one per request per group) so the
@@ -446,8 +549,9 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
             for ri, request_id in enumerate(req_ids):
                 rows = redirects.get(ri, [])
                 if rows:
-                    # [num_rows, 3] int64: (owner_slot, rep_request_hash, rep_slot)
-                    data = [[slot, _rid_hash(req_ids[rep_local]), rep_slot]
+                    # [num_rows, 3] int64: (owner_slot, rep_request_hash, rep_slot). Hash the
+                    # STABLE key so the rep resolves on D (whose full ids differ by random8).
+                    data = [[slot, _rid_hash(_pd_key(req_ids[rep_local])), rep_slot]
                             for (slot, rep_local, rep_slot, _flat) in rows]
                     payload = torch.tensor(data, dtype=torch.int64, device=dev)
                 else:
@@ -456,7 +560,7 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
                 if remote_address is None:
                     continue
                 self.p2p_nccl_engine.send_tensor(
-                    request_id + _PD_REDIR_TAG + str(gi), payload, remote_address)
+                    _pd_key(request_id) + _PD_REDIR_TAG + str(gi), payload, remote_address)
             self._pd_sent.add(gi)
 
             if self._pd_steps and self._pd_steps % _PD_LOG_EVERY == 0:
@@ -500,7 +604,8 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
                 if remote_address is None:
                     continue
                 self.p2p_nccl_engine.send_tensor(
-                    request.request_id + _PD_REDIR_TAG + str(gi), sentinel, remote_address)
+                    _pd_key(request.request_id) + _PD_REDIR_TAG + str(gi),
+                    sentinel, remote_address)
             self._pd_sent.add(gi)
 
     def request_finished_all_groups(

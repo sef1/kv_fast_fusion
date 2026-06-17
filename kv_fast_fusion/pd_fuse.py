@@ -63,6 +63,65 @@ def concat_cosine_cc_labels(
     return labels
 
 
+def concat_cosine_nr_tree_labels(
+    k_per_layer: list[torch.Tensor],
+    req_of_block: torch.Tensor,
+    threshold: float,
+    jump_iters: int = 32,
+) -> torch.Tensor:
+    """Non-recursive ('butterfly') tree clustering of N blocks by the G-layer concatenation
+    cosine — a state-free port of the runner's ``_compress_group_nr_tree`` for the connector.
+
+    Same inputs/return contract as :func:`concat_cosine_cc_labels` (so ``build_group_redirect``
+    is unchanged). Instead of the dense N×N CC graph, a request's blocks travel together as one
+    node; each level sorts active nodes by block-count ASCENDING (shorter request → left =
+    representative), pairs adjacent nodes, and redirects each right block to its best-matching
+    left block when cosine > ``threshold`` (so the longer request sheds blocks). Cross-request
+    only by construction (paired nodes never share a request). 'full' precision: the caller
+    passes the full per-layer block-K, concatenated + unit-normalized here.
+    """
+    N = int(req_of_block.shape[0])
+    dev = req_of_block.device
+    if N == 0:
+        return torch.zeros(0, dtype=torch.long, device=dev)
+
+    # Unit-normalized G-layer concatenation → cosine(i, j) = Xn[i] · Xn[j].
+    Xn = torch.cat([Kg.float() for Kg in k_per_layer], dim=1)
+    Xn = Xn / Xn.norm(dim=1, keepdim=True).clamp(min=1e-6)
+
+    parent = torch.arange(N, device=dev)
+    nodes = []
+    for r in req_of_block.unique().tolist():
+        idxs = (req_of_block == r).nonzero(as_tuple=True)[0]
+        if idxs.numel():
+            nodes.append(idxs)
+
+    while len(nodes) > 1:
+        nodes.sort(key=lambda t: t.numel())            # shorter → left (representative)
+        nxt = []
+        for k in range(0, len(nodes) - (len(nodes) & 1), 2):
+            L, R = nodes[k], nodes[k + 1]              # |L| <= |R|
+            sim = Xn[R] @ Xn[L].T                      # [|R|, |L|]
+            best_val, best_l = sim.max(dim=1)
+            match = best_val > threshold
+            if bool(match.any()):
+                parent[R[match]] = L[best_l[match]]    # union matched R → L
+                nxt.append(torch.cat([L, R[~match]]))  # carry L + unmatched R
+            else:
+                nxt.append(torch.cat([L, R]))
+        if len(nodes) & 1:
+            nxt.append(nodes[-1])                      # odd node carries up unchanged
+        nodes = nxt
+
+    labels = parent
+    for _ in range(jump_iters):                        # pointer-jump chains → roots
+        nl = parent[labels]
+        if torch.equal(nl, labels):
+            break
+        labels = nl
+    return labels
+
+
 def build_group_redirect(
     labels: torch.Tensor,
     flat_req_idx: list[int],
