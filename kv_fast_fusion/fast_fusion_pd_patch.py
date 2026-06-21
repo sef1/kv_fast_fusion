@@ -82,6 +82,19 @@ def apply_fast_fusion_pd_patch():
     # --- 4. Dedup-before-decrement free (LSH evict is guarded → no-op here) ---
     BlockPool.free_blocks = patched_free_blocks
 
+    # ROUND 39: wrap _maybe_evict_cached_block so a recycled/evicted block drops any
+    # lever-3 fusion aliases pointing at it (staleness guard). Idempotent.
+    import kv_fast_fusion.fast_fusion_block_pool as _ffbp2
+    if _ffbp2._ORIG_MAYBE_EVICT is None:
+        _ffbp2._ORIG_MAYBE_EVICT = BlockPool._maybe_evict_cached_block
+        BlockPool._maybe_evict_cached_block = _ffbp2.patched_maybe_evict_cached_block
+
+    # ROUND 40: wrap get_computed_blocks to record per-group resume recovery (BFF_HIT_DEBUG).
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    if _ffbp2._ORIG_GET_COMPUTED is None:
+        _ffbp2._ORIG_GET_COMPUTED = KVCacheManager.get_computed_blocks
+        KVCacheManager.get_computed_blocks = _ffbp2.patched_get_computed_blocks
+
     # --- 5. P/D-only: pool lifecycle + connector ---
     try:
         from vllm.distributed.kv_transfer.kv_connector.v1.p2p.p2p_nccl_engine import (

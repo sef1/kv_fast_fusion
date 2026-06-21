@@ -87,7 +87,12 @@ async def run_api_inference(
             try:
                 async with session.post(api_url, headers=headers, json=payload) as response:
                     response.raise_for_status()
-                    data = await response.json()
+                    # The disagg proxy streams the model JSON via make_response(generator),
+                    # which Quart labels text/html — so aiohttp's default .json() rejects the
+                    # mimetype even though the body is valid JSON. content_type=None skips the
+                    # check (vllm bench serve tolerates it the same way). Harmless against a
+                    # direct vLLM server (which sends application/json).
+                    data = await response.json(content_type=None)
                 if "choices" in data and data["choices"]:
                     choice = data["choices"][0]
                     content = choice.get("message", {}).get("content", "")

@@ -17,13 +17,19 @@
 #   * BFF env: BFF_SCALE_MODE=raw (transfer-safe, no KV mutation/scales) and
 #     BFF_PD_FUSE=1 (connector-level layer-streamed fusion, sharing propagated to D).
 #
-# Topology (default 1P1D): proxy (HTTP 10001 / ZMQ 30001) -> 1 prefill -> 1 decode.
-# The benchmark targets the proxy HTTP port (10001), never a server directly
-# (a direct hit lacks the proxy-injected ___decode_addr_ and skips transfer).
+# Topology (nPmD): proxy (HTTP 10001 / ZMQ 30001) -> n prefill -> m decode. The
+# proxy round-robins requests across all registered prefill/decode instances, so
+# n,m > 1 work with no proxy change. Default 1P1D. Example: NUM_PREFILL=2 NUM_DECODE=1
+# (2 prefill GPUs feeding 1 decode → makes the DECODE instance the bottleneck, where
+# BFF's freed-KV capacity benefit shows up). The benchmark targets the proxy HTTP port
+# (10001), never a server directly (a direct hit lacks the proxy-injected
+# ___decode_addr_ and skips transfer).
 #
 # Override via env vars:
-#   MODEL, PREFILL_GPUS, DECODE_GPUS, PREFILL_PORTS, DECODE_PORTS, PROXY_PORT,
-#   KV_IP, BFF_SCALE_MODE, BFF_PD_FUSE, BFF_GROUP_SIZE, TIMEOUT_SECONDS
+#   MODEL, NUM_PREFILL (n), NUM_DECODE (m), HTTP_PORT_BASE, PROXY_PORT, KV_IP,
+#   BFF_SCALE_MODE, BFF_PD_FUSE, BFF_GROUP_SIZE, TIMEOUT_SECONDS.
+#   For a custom GPU/port mapping, override PREFILL_GPUS/DECODE_GPUS/PREFILL_PORTS/
+#   DECODE_PORTS (comma-separated lists) directly — they win over NUM_*.
 # =============================================================================
 
 # ---- Model / topology --------------------------------------------------------
@@ -33,11 +39,24 @@ PROXY_PORT=${PROXY_PORT:-30001}      # ZMQ service-discovery port (matches proxy
 PROXY_HTTP_PORT=${PROXY_HTTP_PORT:-10001}   # proxy HTTP serving port (benchmark target)
 KV_IP=${KV_IP:-10.10.10.174}
 
-# Default 1P1D (one prefill GPU, one decode GPU)
-PREFILL_GPUS=${PREFILL_GPUS:-0}
-DECODE_GPUS=${DECODE_GPUS:-1}
-PREFILL_PORTS=${PREFILL_PORTS:-20003}
-DECODE_PORTS=${DECODE_PORTS:-20005}
+# ---- Topology: n prefill (P) x m decode (D) ----------------------------------
+# Set NUM_PREFILL (n) and NUM_DECODE (m); GPUs and HTTP ports are auto-derived:
+#   P  → GPUs [0 .. n-1]              D → GPUs [n .. n+m-1]
+#   P  HTTP ports [HTTP_PORT_BASE .. +n-1]   D HTTP ports [HTTP_PORT_BASE+n .. +m-1]
+#   KV ports (set in the launch loops) → P 21001+i, D 22001+i
+# To customize the mapping, override PREFILL_GPUS/DECODE_GPUS/PREFILL_PORTS/DECODE_PORTS
+# directly (comma-separated lists) — those win over the NUM_*-derived defaults.
+NUM_PREFILL=${NUM_PREFILL:-1}        # n
+NUM_DECODE=${NUM_DECODE:-1}          # m
+HTTP_PORT_BASE=${HTTP_PORT_BASE:-20003}
+
+# Build "start,start+1,...,start+count-1".
+_seq_csv() { local start=$1 count=$2 out="" k; for ((k=0; k<count; k++)); do out+="$((start+k)),"; done; echo "${out%,}"; }
+
+PREFILL_GPUS=${PREFILL_GPUS:-$(_seq_csv 0 "$NUM_PREFILL")}
+DECODE_GPUS=${DECODE_GPUS:-$(_seq_csv "$NUM_PREFILL" "$NUM_DECODE")}
+PREFILL_PORTS=${PREFILL_PORTS:-$(_seq_csv "$HTTP_PORT_BASE" "$NUM_PREFILL")}
+DECODE_PORTS=${DECODE_PORTS:-$(_seq_csv "$((HTTP_PORT_BASE + NUM_PREFILL))" "$NUM_DECODE")}
 
 # ---- BFF knobs ---------------------------------------------------------------
 BFF_SCALE_MODE=${BFF_SCALE_MODE:-raw}   # raw is required for P/D (no KV mutation, no scales to ship)
@@ -66,6 +85,7 @@ echo "Warning: P2P NCCL disaggregated prefill XpYd for vLLM v1 is experimental."
 echo ""
 echo "BFF Disaggregated Configuration:"
 echo "  Model:        $MODEL"
+echo "  Topology:     ${NUM_PREFILL}P x ${NUM_DECODE}D"
 echo "  Prefill GPUs: $PREFILL_GPUS, Ports: $PREFILL_PORTS  (KV ports 21001+)"
 echo "  Decode GPUs:  $DECODE_GPUS, Ports: $DECODE_PORTS  (KV ports 22001+)"
 echo "  Proxy:        HTTP $PROXY_HTTP_PORT / ZMQ $PROXY_PORT   KV_IP $KV_IP"
@@ -88,11 +108,12 @@ check_required_files() {
 
 check_num_gpus() {
     num_gpus=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
-    if [ "$num_gpus" -lt 2 ]; then
-        echo "You need at least 2 GPUs to run disaggregated prefill."
+    local need=$((NUM_PREFILL + NUM_DECODE))
+    if [ "$num_gpus" -lt "$need" ]; then
+        echo "You need at least $need GPUs (${NUM_PREFILL}P + ${NUM_DECODE}D); found $num_gpus."
         exit 1
     fi
-    echo "Found $num_gpus GPUs."
+    echo "Found $num_gpus GPUs (using $need: ${NUM_PREFILL}P + ${NUM_DECODE}D)."
 }
 
 cleanup() {

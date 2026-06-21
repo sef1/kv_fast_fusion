@@ -9,7 +9,11 @@ logger = init_logger("vllm.patched_scheduler")
 # prefix-hit and re-pin them. Tests whether prefix-retention of fused targets is what
 # drives the KV-pool cliff at scale. See ROUND 19 in the plan file.
 BFF_EVICT_FUSED = os.environ.get("BFF_EVICT_FUSED", "0") == "1"
-from vllm.v1.core.kv_cache_utils import BlockHashWithGroupId
+# ROUND 39 (lever 3): alias a merged request's redirected fusion-block hash to the live
+# representative block, so on resume from preemption the request prefix-hits the rep
+# (which outlives its merge-orphan) instead of recomputing. raw mode only (KV unmutated).
+_BFF_RAW = os.environ.get("BFF_SCALE_MODE", "raw") == "raw"
+from vllm.v1.core.kv_cache_utils import BlockHashWithGroupId, make_block_hash_with_group_id
 def _handle_block_merging_with_counts_o(  
         self,   
         request_blocks: dict[str, dict[int, list[int]]],      
@@ -215,6 +219,29 @@ def _handle_block_merging_with_counts(self, request_blocks: dict[str, dict[int, 
             # `assert blk.block_hash is None`. New decode blocks (beyond this count)
             # still get cached normally.
             manager.num_cached_block[req_id] = len(new_req_blocks)
+
+            # ROUND 39 (lever 3): for every REDIRECTED position, register the representative
+            # block under THIS request's own prefix-cache key. On resume from preemption the
+            # request's prefix lookup then hits the live rep (which outlives the merge-orphan)
+            # instead of recomputing. raw mode only; the staleness guard lives in
+            # fast_fusion_block_pool.patched_maybe_evict_cached_block (drops the alias the
+            # instant the rep is recycled/evicted).
+            if _BFF_RAW and getattr(block_pool, "enable_caching", False):
+                try:
+                    from kv_fast_fusion import fast_fusion_block_pool as _bp
+                    if _bp._ALIAS_ENABLED:
+                        bhs = self.requests[req_id].block_hashes
+                        for i, blk in enumerate(new_req_blocks):
+                            if i >= len(req_blocks) or i >= len(bhs):
+                                break
+                            # Skip nulls and unchanged (not-redirected) positions — only a
+                            # redirect points at another request's still-live rep block.
+                            if blk.is_null or blk.block_id == req_blocks[i].block_id:
+                                continue
+                            key = make_block_hash_with_group_id(bhs[i], group_idx)
+                            _bp.add_block_alias(block_pool, key, blk)
+                except Exception as e:
+                    logger.warning("BFF alias-fused failed for %s: %s", req_id, e)
 
     # Calculate reference changes and prepare operations
     blocks_to_touch = []  
@@ -429,6 +456,12 @@ def update_from_output(
         # Separates "no free blocks" (static capacity cap) from "free blocks exist
         # but batch stays small" (runtime / preemption). K=50 steps.
         try:
+            # Preemption gate (ROUND 38): each preemption resets num_computed_tokens=0, so the
+            # request must re-prefill on resume minus whatever survives the prefix cache. BFF
+            # eager-evicts merged blocks, so resume recovers little → recompute. Count it.
+            _preempted = getattr(scheduler_output, "preempted_req_ids", None) or ()
+            self._bff_preempt_step = len(_preempted)
+            self._bff_preempt_total = getattr(self, "_bff_preempt_total", 0) + len(_preempted)
             _k = 50
             self._bff_step = getattr(self, "_bff_step", 0) + 1
             if self._bff_step % _k == 0:
@@ -436,12 +469,32 @@ def update_from_output(
                 _free = _bp.get_num_free_blocks()
                 _total = getattr(_bp, "num_gpu_blocks", None) or len(getattr(_bp, "blocks", []))
                 _usage = (1.0 - _free / _total) if _total else float("nan")
+                # ROUND 40: alias-fire counters disambiguate "no fusion → no aliases" (A) from
+                # "aliases fire but warmup truncates recovery" (B).
+                from kv_fast_fusion import fast_fusion_block_pool as _ffbp
                 logger.info(
                     "BFF sched | step=%d | running=%d | waiting=%d | "
-                    "free_blocks=%d / %d | block_usage=%.1f%%",
+                    "free_blocks=%d / %d | block_usage=%.1f%% | preempt(cum)=%d | preempt(step)=%d "
+                    "| alias_ins=%d | alias_drop=%d",
                     self._bff_step, len(self.running), len(self.waiting),
                     _free, _total, _usage * 100,
+                    self._bff_preempt_total, self._bff_preempt_step,
+                    _ffbp._alias_inserts, _ffbp._alias_drops,
                 )
+                # ROUND 41: per-group resume recovery (only when BFF_HIT_DEBUG). avg_recovered_tok
+                # is the overall (post cross-group-min) hit; raw_group_prefix_blocks is each
+                # group's INDEPENDENT contiguous prefix hit (group 0 = warmup) — if group 0 ≈ 0
+                # while fusion groups > 0, the warmup group is what pins the min to 0.
+                if _ffbp._HIT_DEBUG and _ffbp._resume_lookups:
+                    _nl = _ffbp._resume_lookups
+                    _avg_tok = _ffbp._resume_recovered_tok / _nl
+                    _raw_grp = {gi: round(c / _nl, 2)
+                                for gi, c in sorted(_ffbp._resume_raw_group_blocks.items())}
+                    logger.info(
+                        "BFF resume-recovery | preempted_lookups=%d | avg_recovered_tok=%.1f "
+                        "| raw_group_prefix_blocks=%s",
+                        _nl, _avg_tok, _raw_grp,
+                    )
         except Exception as e:
             logger.warning("BFF sched log failed: %s", e, exc_info=True)
         # --- end BFF measurement ---
