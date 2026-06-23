@@ -68,7 +68,7 @@ BFF_SCALE_MODE = os.environ.get("BFF_SCALE_MODE", "raw").lower()
 # Number of consecutive fusion layers packed into one KV cache group.
 # G=1  → one group per layer (28 groups for a 32-layer model, original behaviour).
 # G=4  → 7 groups, 4× fewer block-pool operations per step.
-BFF_GROUP_SIZE = 9
+BFF_GROUP_SIZE = 6
 
 # LSH deduplication constants
 NUM_LSH_BITS = 160            # total bits per fingerprint

@@ -16,6 +16,8 @@ never run — this patch deliberately omits them. It applies only what P/D needs
 Toggle in `kv_fast_fusion/__init__.py` against `apply_fast_fusion_graph_patch`.
 """
 
+import os
+
 from vllm.logger import init_logger
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.core.sched.scheduler import Scheduler
@@ -30,6 +32,11 @@ from kv_fast_fusion.fast_fusion_scheduler import (
 )
 
 logger = init_logger("vllm.fast_fusion_pd_patch")
+
+# ROUND 48: `ratio` scale mode for P/D. In raw (default) the lean patch omits the norm/kernel
+# infra. In ratio, the producer ships per-redirect K/V norm ratios and D re-enables the minimal
+# subset (norm buffers + slots + BFF Triton kernel) so the shared rep block is scaled per request.
+_PD_SCALE_MODE = os.environ.get("BFF_SCALE_MODE", "raw").lower()
 
 
 def _free_recv_tensor(self, tensor_id: str):
@@ -71,7 +78,34 @@ def apply_fast_fusion_pd_patch():
         _ffbp._ACTIVE_RUNNER = self
 
         original_init(self, *args, **kwargs)
-        logger.info("Fast fusion P/D patch: lean runner init (raw, connector-level fusion).")
+
+        # ratio mode: allocate the slot-indexed per-(layer, slot, block) K/V norm buffers the
+        # BFF Triton kernel reads (ported from the single-instance graph patch). The connector
+        # populates runner.fused_requests from the shipped ratios; _fill_norm_buffers slot-fills.
+        if _PD_SCALE_MODE == "ratio":
+            import torch
+            from kv_fast_fusion.kv_fast_fusion_graph_runner import BLOCK_SIZE
+            vcfg = self.vllm_config
+            num_layers = vcfg.model_config.get_num_layers(vcfg.parallel_config)
+            max_reqs = vcfg.scheduler_config.max_num_seqs
+            max_blocks_per_req = max(1, vcfg.model_config.max_model_len // BLOCK_SIZE)
+            num_slots = max_reqs
+            self.norms_k_buf = torch.ones(
+                num_layers, num_slots + 1, max_blocks_per_req,
+                dtype=torch.bfloat16, device=self.device)
+            self.norms_v_buf = torch.ones(
+                num_layers, num_slots + 1, max_blocks_per_req,
+                dtype=torch.bfloat16, device=self.device)
+            self._fused_slot = {}                          # req_id → slot in [1, num_slots]
+            self._free_slots = list(range(1, num_slots + 1))
+            self._seq_to_slot = torch.zeros(max_reqs, dtype=torch.int32, device=self.device)
+            self._seq_to_slot_cpu = torch.zeros(max_reqs, dtype=torch.int32, device="cpu")
+            self._ff_warmup_layers = 2
+            self._ff_max_layer_idx = num_layers - 2
+            logger.info("Fast fusion P/D ratio: norm buffers [%d layers, %d slots, %d blocks/req].",
+                        num_layers, max_reqs, max_blocks_per_req)
+        logger.info("Fast fusion P/D patch: lean runner init (mode=%s, connector-level fusion).",
+                    _PD_SCALE_MODE)
 
     GPUModelRunner.__init__ = _pd_patched_runner_init
 
@@ -116,4 +150,75 @@ def apply_fast_fusion_pd_patch():
     except Exception as e:  # pragma: no cover - optional dependency
         logger.warning("Fast fusion P/D patch: connector registration skipped: %s", e)
 
-    logger.info("Fast fusion P/D patch applied.")
+    # --- 6. ratio mode: re-enable the minimal norm-scaling kernel infra on D ---
+    if _PD_SCALE_MODE == "ratio":
+        _apply_pd_ratio_kernel_infra()
+
+    logger.info("Fast fusion P/D patch applied (mode=%s).", _PD_SCALE_MODE)
+
+
+def _apply_pd_ratio_kernel_infra() -> None:
+    """ratio-only: bind the BFF Triton-kernel attention path + a lean attention-metadata wrapper
+    that slot-fills the connector-supplied norms and attaches them to each fusion group's metadata.
+    Reuses the single-instance `patched_forward` (kernel routing) and `_fill_norm_buffers` verbatim;
+    the heavy `_build_attention_metadata` is WRAPPED (not reimplemented), attaching norms per
+    fusion layer afterward."""
+    from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
+    from kv_fast_fusion.fast_fusion_flash import patched_forward
+    from kv_fast_fusion.kv_fast_fusion_graph_runner import _fill_norm_buffers
+
+    # Route fusion-layer attention through the BFF kernel (gates internally on
+    # BFF_SCALE_MODE!=raw + has_fused_reqs + norms_k_buf_full; raw layers fall back to flash).
+    FlashAttentionImpl.forward = patched_forward
+    # Slot-fill from self.fused_requests + build the per-step seq→slot map (reused verbatim).
+    GPUModelRunner._fill_norm_buffers = _fill_norm_buffers
+
+    _orig_build_meta = GPUModelRunner._build_attention_metadata
+
+    def _pd_build_attention_metadata(self, *args, **kwargs):
+        out = _orig_build_meta(self, *args, **kwargs)
+        if getattr(self, "norms_k_buf", None) is None:
+            return out
+        try:
+            attn_metadata, _spec = out
+            # Free slots of finished requests (gone from runner.requests) → reset their norm rows.
+            live = set(getattr(self, "requests", {}).keys())
+            for rid in list(self._fused_slot.keys()):
+                if rid not in live:
+                    slot = self._fused_slot.pop(rid)
+                    self._free_slots.append(slot)
+                    self.norms_k_buf[:, slot, :] = 1.0
+                    self.norms_v_buf[:, slot, :] = 1.0
+                    self.fused_requests.pop(rid, None)
+            # Slot-fill (write-once) + build this step's seq→slot map, matching single-instance.
+            req_ids = self.input_batch.req_ids
+            fused_reqs = [r for r in req_ids if r in self.fused_requests]
+            self._fill_norm_buffers(req_ids, fused_reqs)
+            # Attach the full slot-indexed buffers + seq→slot to every fusion-layer metadata so
+            # patched_forward selects [layer_idx]. has_fused_reqs gates the kernel vs flash path
+            # (forced True during cudagraph capture so the captured graph records the kernel).
+            for_capture = bool(kwargs.get("for_cudagraph_capture", False))
+            has = for_capture or bool(fused_reqs)
+            warmup = self._ff_warmup_layers
+            max_layer = self._ff_max_layer_idx
+            md_dicts = ([attn_metadata] if isinstance(attn_metadata, dict)
+                        else attn_metadata if isinstance(attn_metadata, list) else [])
+            for md in md_dicts:
+                if not isinstance(md, dict):
+                    continue
+                for layer_name, meta_obj in md.items():
+                    try:
+                        li = int(layer_name.split('.')[2])
+                    except Exception:
+                        continue
+                    if meta_obj is not None and warmup <= li < max_layer:
+                        meta_obj.norms_k_buf_full = self.norms_k_buf
+                        meta_obj.norms_v_buf_full = self.norms_v_buf
+                        meta_obj.bff_seq_to_slot = self._seq_to_slot
+                        meta_obj.has_fused_reqs = has
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("BFF P/D ratio: build-meta attach failed: %s", e)
+        return out
+
+    GPUModelRunner._build_attention_metadata = _pd_build_attention_metadata
+    logger.info("Fast fusion P/D ratio: bound BFF kernel + norm-attach metadata wrapper.")

@@ -54,12 +54,25 @@ _PD_LOG_EVERY = int(os.environ.get("BFF_PD_LOG_EVERY", "200"))
 # Verbose consumer trace: log every recv'd tensor_id so the LAST line before a hang is the
 # unsent id `recv_tensor` (no-timeout) is blocked on. See plan ROUND 29.
 _PD_DEBUG = os.environ.get("BFF_PD_DEBUG", "0") == "1"
+# ROUND 50: per-(request, layer) hot-path send/recv tracing — SEPARATE from _PD_DEBUG. These
+# synchronous INFO lines fire inside the transfer loop (28 layers × N reqs × every step), so
+# enabling them under _PD_DEBUG throttles P enough to collapse prefill batches to ~1 req/step →
+# no co-prefill peers → fusion silently stops. Gate them on their own flag so BFF_PD_DEBUG=1 keeps
+# the cheap summary logs WITHOUT killing the batching fusion depends on.
+_PD_TRACE = os.environ.get("BFF_PD_TRACE", "0") == "1"
 # Connector within-batch clustering: nr_tree (butterfly, full precision) or cc. See ROUND 32.
 _PD_MERGE = os.environ.get("BFF_PD_MERGE", "nr_tree")
 # Per-layer block representation for the clustering similarity (producer-only). See ROUND 34.
 #   full → exact cosine over the full flattened block-K; proj → JL projection; mean → head_dim mean.
 _PD_REPR = os.environ.get("BFF_PD_REPR", "full")
 _PD_PROJ_DIM = int(os.environ.get("BFF_PD_PROJ_DIM", "512"))
+# ROUND 48: `ratio` scale mode for P/D. When BFF_SCALE_MODE=ratio the producer ALSO computes
+# per-(redirect, layer) K/V norm ratios ‖owner‖/‖rep‖ and ships them as a float side-tensor
+# (`_PD_RATIO_TAG`), co-located with the redirect map; D writes them into its norm buffers and the
+# BFF Triton kernel scales the shared rep block per request. raw (default) ships no ratios.
+_PD_SCALE_MODE = os.environ.get("BFF_SCALE_MODE", "raw").lower()
+_PD_RATIO = _PD_SCALE_MODE == "ratio"
+_PD_RATIO_TAG = "#__bff_ratio__#"          # side-channel suffix for the per-redirect K/V ratios
 
 
 def _pd_key(request_id: str) -> str:
@@ -273,7 +286,7 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
                 # Record what we're about to (possibly indefinitely) block on. The LAST value
                 # logged before a hang is the tensor_id the producer never sent.
                 self._pd_waiting = tid
-                if _PD_DEBUG:
+                if _PD_TRACE:
                     logger.info("BFF P/D consume: recv KV %s", tid)
                 kv_cache = self.p2p_nccl_engine.recv_tensor(tid, remote_address)
                 self._pd_waiting = None
@@ -348,18 +361,32 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
                 for gi in fusion_groups:
                     map_tid = _pd_key(rid) + _PD_REDIR_TAG + str(gi)
                     self._pd_waiting = map_tid
-                    if _PD_DEBUG:
+                    if _PD_TRACE:
                         logger.info("BFF P/D apply: recv map %s", map_tid)
                     payload = self.p2p_nccl_engine.recv_tensor(map_tid, remote_address)
                     self._pd_waiting = None
                     # Map ids never match the engine's get_finished cleanup pattern, so release
                     # the recv buffer here (frees the pinned block if it spilled + the dict entry).
                     self.p2p_nccl_engine.free_recv_tensor(map_tid)
+                    # ratio mode: the producer always co-sends a [num_rows, G, 2] K/V ratio
+                    # side-tensor (same row order as the map) — recv it here so the blocking
+                    # recv never deadlocks, even when payload is a sentinel.
+                    rmat = None
+                    ratio_layers = None
+                    if _PD_RATIO:
+                        ratio_tid = _pd_key(rid) + _PD_RATIO_TAG + str(gi)
+                        self._pd_waiting = ratio_tid
+                        rmat = self.p2p_nccl_engine.recv_tensor(ratio_tid, remote_address)
+                        self._pd_waiting = None
+                        self.p2p_nccl_engine.free_recv_tensor(ratio_tid)
+                        ratio_layers = sorted(
+                            self._group_layers[gi], key=lambda ln: int(ln.split('.')[2]))
                     if payload is None or payload.numel() == 0:
                         continue
                     owner_blocks = list(request.block_ids[gi].tolist())
+                    nb = len(owner_blocks)
                     changed = False
-                    for owner_slot, rep_hash, rep_slot in payload.tolist():
+                    for r_i, (owner_slot, rep_hash, rep_slot) in enumerate(payload.tolist()):
                         if owner_slot < 0:        # sentinel row → nothing to free for this group
                             continue
                         rep_rid = hash2rid.get(int(rep_hash))
@@ -374,6 +401,11 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
                         owner_blocks[owner_slot] = int(rep_grp[rep_slot])
                         changed = True
                         n_applied += 1
+                        # ratio: stash this owner block's per-layer K/V scale (‖own‖/‖rep‖) into
+                        # runner.fused_requests so _fill_norm_buffers slot-fills it for the kernel.
+                        if _PD_RATIO and rmat is not None and r_i < rmat.shape[0]:
+                            self._pd_store_ratio(
+                                runner, rid, ratio_layers, owner_slot, nb, rmat[r_i])
                     if changed:
                         updated.setdefault(rid, {})[gi] = owner_blocks
                         self._pd_write_runner_block_table(runner, rid, gi, owner_blocks)
@@ -387,6 +419,26 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
                             n_applied, n_unresolved)
         except Exception as e:  # pragma: no cover - defensive
             logger.warning("BFF P/D consumer apply failed: %s", e)
+
+    @staticmethod
+    def _pd_store_ratio(runner, rid, layers, owner_slot, nb, rrow) -> None:
+        """ratio mode (ROUND 48): record this owner block's per-layer K/V scale ‖own‖/‖rep‖ into
+        runner.fused_requests[rid][layer_name] = (nk_vec, nv_vec) ([nb], default 1.0). The single-
+        instance `_fill_norm_buffers` then slot-fills these into norms_*_buf and the BFF Triton
+        kernel scales the shared rep block per request. `rrow` is the redirect's [G, 2] ratio row
+        (col g ↔ layers[g] in sorted absolute-index order; [:,0]=K, [:,1]=V), on D's device."""
+        fr = runner.fused_requests.setdefault(rid, {})
+        for g_i, ln in enumerate(layers):
+            entry = fr.get(ln)
+            if entry is None:
+                nk = torch.ones(nb, dtype=torch.float32, device=rrow.device)
+                nv = torch.ones(nb, dtype=torch.float32, device=rrow.device)
+                fr[ln] = (nk, nv)
+            else:
+                nk, nv = entry
+            if 0 <= owner_slot < nk.shape[0]:
+                nk[owner_slot] = rrow[g_i, 0]
+                nv[owner_slot] = rrow[g_i, 1]
 
     @staticmethod
     def _pd_write_runner_block_table(runner, rid, gi, new_blocks) -> None:
@@ -421,7 +473,7 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
         connector_metadata = self._get_connector_metadata()
         assert isinstance(connector_metadata, P2pNcclConnectorMetadataFF)
         gi = self._group_of(layer_name)
-        if _PD_DEBUG:
+        if _PD_TRACE:
             logger.info("BFF P/D save ENTER | layer=%s | gi=%d | reqs=%d",
                         layer_name, gi, len(connector_metadata.requests))
         for request in connector_metadata.requests:
@@ -432,7 +484,7 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
             block_ids = request.block_ids[gi]            # this layer's group
             kv_cache = extract_kv_from_layer(kv_layer, block_ids)
             tid = _pd_key(request_id) + "#" + layer_name
-            if _PD_DEBUG:
+            if _PD_TRACE:
                 logger.info("BFF P/D send KV %s -> %s | shape=%s",
                             tid, remote_address, tuple(kv_cache.shape))
             self.p2p_nccl_engine.send_tensor(tid, kv_cache, remote_address)
@@ -501,6 +553,9 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
                 "flat_req_local": flat_req_local,
                 "flat_slot": flat_slot,
                 "req_ids": req_ids,
+                # ratio mode only: layer_name -> [N] per-flat-block K / V norms.
+                "k_norms": {},
+                "v_norms": {},
             }
             self._pd_buf[gi] = buf
 
@@ -508,6 +563,14 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
             idx = torch.as_tensor(buf["flat_bids"], device=kv_layer.device, dtype=torch.long)
             # Per-layer block repr (full|proj|mean) → [N, D_repr] for the concat-cosine.
             buf["k_layers"].append(self._pd_block_repr(kv_layer, idx))
+            if _PD_RATIO:
+                # Per-flat-block K and V L2 norms for this layer (FlashAttention layout
+                # kv_layer[0]=K, [1]=V). Shipped as ‖owner‖/‖rep‖ ratios per redirect.
+                N = idx.shape[0]
+                buf["k_norms"][layer_name] = (
+                    kv_layer[0, idx].float().reshape(N, -1).norm(dim=1))
+                buf["v_norms"][layer_name] = (
+                    kv_layer[1, idx].float().reshape(N, -1).norm(dim=1))
         buf["seen"].add(layer_name)
 
         # Count-based completion (robust to layer-name `.attn` variance): this layer was routed to
@@ -546,13 +609,19 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
             # "nothing to free → continue as usual". GPU + non-empty (NCCL can't ship 0 elements).
             req_ids = buf["req_ids"]
             dev = kv_layer.device
+            # ratio mode: layers in sorted absolute-index order — the P↔D column ordering
+            # invariant for the [num_rows, G, 2] ratio side-tensor (col g ↔ this layer).
+            ratio_layers = (
+                sorted(group_layer_set, key=lambda ln: int(ln.split('.')[2]))
+                if _PD_RATIO else [])
+            Gn = len(ratio_layers)
             for ri, request_id in enumerate(req_ids):
                 rows = redirects.get(ri, [])
                 if rows:
                     # [num_rows, 3] int64: (owner_slot, rep_request_hash, rep_slot). Hash the
                     # STABLE key so the rep resolves on D (whose full ids differ by random8).
                     data = [[slot, _rid_hash(_pd_key(req_ids[rep_local])), rep_slot]
-                            for (slot, rep_local, rep_slot, _flat) in rows]
+                            for (slot, rep_local, rep_slot, _flat, _own) in rows]
                     payload = torch.tensor(data, dtype=torch.int64, device=dev)
                 else:
                     payload = torch.tensor([[-1, -1, -1]], dtype=torch.int64, device=dev)
@@ -561,6 +630,22 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
                     continue
                 self.p2p_nccl_engine.send_tensor(
                     _pd_key(request_id) + _PD_REDIR_TAG + str(gi), payload, remote_address)
+                if _PD_RATIO:
+                    # Per-redirect, per-layer ‖owner‖/‖rep‖ K/V ratios, SAME row order as the
+                    # int map; [:, g, 0]=K, [:, g, 1]=V. Sentinel (1.0) when no redirects so D's
+                    # blocking recv never deadlocks. Vectorized per layer (small # of rows).
+                    if rows:
+                        own_f = torch.tensor([r[4] for r in rows], device=dev)
+                        rep_f = torch.tensor([r[3] for r in rows], device=dev)
+                        rmat = torch.ones((len(rows), Gn, 2), dtype=torch.float32, device=dev)
+                        for g_i, ln in enumerate(ratio_layers):
+                            nk = buf["k_norms"][ln]; nv = buf["v_norms"][ln]
+                            rmat[:, g_i, 0] = nk[own_f] / nk[rep_f].clamp(min=1e-6)
+                            rmat[:, g_i, 1] = nv[own_f] / nv[rep_f].clamp(min=1e-6)
+                    else:
+                        rmat = torch.ones((1, Gn, 2), dtype=torch.float32, device=dev)
+                    self.p2p_nccl_engine.send_tensor(
+                        _pd_key(request_id) + _PD_RATIO_TAG + str(gi), rmat, remote_address)
             self._pd_sent.add(gi)
 
             if self._pd_steps and self._pd_steps % _PD_LOG_EVERY == 0:

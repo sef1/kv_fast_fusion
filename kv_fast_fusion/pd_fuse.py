@@ -138,18 +138,20 @@ def build_group_redirect(
         unique_flat: the flat indices that are representatives of a cluster of size>1 OR
             singletons — i.e. the blocks whose KV must actually be sent (everything that is
             not redirected away). Concretely: indices ``i`` with ``labels[i] == i``.
-        redirects: ``{owner_req_idx: [(slot, rep_req_idx, rep_slot, rep_flat), ...]}`` for the
-            blocks that are redirected away (``labels[i] != i``) — i.e. the consumer should
-            point ``(owner, slot)`` at the representative's physical block and free its own.
+        redirects: ``{owner_req_idx: [(slot, rep_req_idx, rep_slot, rep_flat, owner_flat), ...]}``
+            for the blocks that are redirected away (``labels[i] != i``) — the consumer points
+            ``(owner, slot)`` at the representative's physical block and frees its own. ``rep_flat``
+            and ``owner_flat`` are the flat indices of the rep / owner blocks (used by the connector
+            in `ratio` mode to look up per-block ‖owner‖/‖rep‖ K/V norms).
     """
     labels_l = labels.tolist()
     unique_flat = [i for i in range(len(labels_l)) if labels_l[i] == i]
-    redirects: dict[int, list[tuple[int, int, int, int]]] = {}
+    redirects: dict[int, list[tuple[int, int, int, int, int]]] = {}
     for i, rep in enumerate(labels_l):
         if rep == i:
             continue
         owner = flat_req_idx[i]
         redirects.setdefault(owner, []).append(
-            (flat_slot[i], flat_req_idx[rep], flat_slot[rep], rep)
+            (flat_slot[i], flat_req_idx[rep], flat_slot[rep], rep, i)
         )
     return unique_flat, redirects
