@@ -18,6 +18,7 @@ def concat_cosine_cc_labels(
     req_of_block: torch.Tensor,
     threshold: float,
     cc_iters: int = 32,
+    tp_group=None,
 ) -> torch.Tensor:
     """Connected-components clustering of N blocks by the G-layer concatenation cosine.
 
@@ -30,6 +31,12 @@ def concat_cosine_cc_labels(
             between blocks of DIFFERENT requests (never merge within one request).
         threshold: cosine threshold for an edge.
         cc_iters: label-propagation iteration cap.
+        tp_group: optional ``torch.distributed`` process group (the tensor-parallel group). When
+            given (TP>1), each rank holds only a HEAD SHARD of K, so its local ``cross``/``sq`` are
+            partial; ``all_reduce(SUM)`` them over the group BEFORE normalizing so every rank
+            computes the identical FULL-vector cosine (``⟨a,b⟩_full = Σ_ranks⟨shard,shard⟩``,
+            ``‖a‖²_full = Σ_ranks‖shard‖²``) → identical labels → coherent global block table,
+            numerically equal to the single-GPU decision. ``None`` (TP=1) is the original path.
 
     Returns:
         ``labels`` ``[N]`` where ``labels[i]`` is the representative (smallest member index)
@@ -46,6 +53,11 @@ def concat_cosine_cc_labels(
         Kg = Kg.float()
         cross += Kg @ Kg.T
         sq += (Kg * Kg).sum(1)
+    if tp_group is not None:
+        # Reconstruct the full-vector statistics from this rank's head-shard partials.
+        import torch.distributed as dist
+        dist.all_reduce(cross, op=dist.ReduceOp.SUM, group=tp_group)
+        dist.all_reduce(sq, op=dist.ReduceOp.SUM, group=tp_group)
     d = sq.sqrt().clamp(min=1e-6)
     S = cross / (d[:, None] * d[None, :])
 

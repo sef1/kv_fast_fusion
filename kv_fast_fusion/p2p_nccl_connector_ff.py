@@ -34,6 +34,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.distributed.kv_transfer.kv_connector.v1.p2p.p2p_nccl_connector import (
     P2pNcclConnector,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.mla.common import MLACommonMetadata
 
@@ -44,6 +45,8 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+_UNSET = object()   # sentinel for lazily-resolved cached values (e.g. the TP process group)
 
 # Connector-level P/D fusion (plan ROUND 21): compute BFF dedup on the producer as KV streams
 # through save_kv_layer (overhead overlaps the NCCL transfer), ship a per-request redirect map,
@@ -112,6 +115,32 @@ class ReqMetaFF:
         )
 
 
+class BFFMergeStats(KVConnectorStats):
+    """ROUND 52: carries the D-side block-merge map worker→scheduler under TP>1.
+
+    At TP>1 the worker and scheduler are SEPARATE processes, so the in-process
+    `_ACTIVE_RUNNER._updated_block_tables` channel used at TP=1 isn't visible across them. This
+    rides `KVConnectorOutput.kv_connector_stats` (the only serializable connector→scheduler slot):
+    `data["bff_merges"] = {req_id: {group_idx: [block_ids]}}`. Every TP rank produces the identical
+    (all-reduced) map, so the cross-rank `aggregate()` just keeps the accumulator's (rank-0's) copy."""
+
+    def reset(self):
+        self.data = {}
+
+    def aggregate(self, other: "KVConnectorStats") -> "KVConnectorStats":
+        # Ranks are coherent → identical maps; keep the accumulator's, never concatenate
+        # (double-applying would corrupt ref counts).
+        if not self.data.get("bff_merges") and getattr(other, "data", None):
+            self.data = other.data
+        return self
+
+    def reduce(self) -> dict:
+        return {"bff_merge_reqs": len(self.data.get("bff_merges", {}) or {})}
+
+    def is_empty(self) -> bool:
+        return not self.data.get("bff_merges")
+
+
 @dataclass
 class P2pNcclConnectorMetadataFF(KVConnectorMetadata):
     requests: list[ReqMetaFF]
@@ -160,6 +189,8 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
         self._pd_freed_layers = 0
         self._pd_waiting = None   # tensor_id currently blocked on in recv_tensor (hang trace)
         self._pd_jl = None        # lazy fixed-seed JL matrix for BFF_PD_REPR=proj (producer only)
+        self._pd_tp = _UNSET      # lazy TP process group (None at TP=1); see _pd_tp_group (ROUND 52)
+        self._pd_pending_merges = None   # this-step block-merge map; emitted via stats under TP>1
         if self._pd_fuse:
             logger.info("P2pNcclConnectorFF: BFF_PD_FUSE enabled (connector-level fusion).")
         # One-time identity log: role/rank/port — catches a peer-address/port mismatch.
@@ -188,6 +219,41 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
         except Exception as e:  # pragma: no cover - defensive
             logger.warning("FF connector: could not build layer→group map: %s", e)
         return m
+
+    def _pd_tp_group(self):
+        """ROUND 52: the tensor-parallel torch.distributed process group when TP>1, else None.
+
+        Under TP>1 each rank holds only a head SHARD of K/V, so the producer's per-shard cosine /
+        norms are partial; the clustering + ratio norms all-reduce over THIS group to reconstruct
+        the full-vector statistics (identical decision on every rank → coherent block table).
+        Returns None at TP=1 (or if distributed isn't initialized) → the original single-GPU path.
+        Cached (resolved once)."""
+        if self._pd_tp is _UNSET:
+            grp = None
+            try:
+                import torch.distributed as dist
+                if dist.is_available() and dist.is_initialized():
+                    from vllm.distributed.parallel_state import get_tp_group
+                    tp = get_tp_group()
+                    if tp.world_size > 1:
+                        grp = tp.device_group
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning("FF connector: TP group lookup failed (assuming TP=1): %s", e)
+            self._pd_tp = grp
+            if grp is not None:
+                logger.info("P2pNcclConnectorFF: TP>1 detected → all-reduced fusion decision.")
+        return self._pd_tp
+
+    def get_kv_connector_stats(self):
+        """ROUND 52: under TP>1, emit this step's D-side block-merge map via the connector stats
+        carrier so it reaches the (separate-process) scheduler; the worker runs this after the
+        forward, when `_pd_pending_merges` holds the map set in `_pd_consumer_apply`. At TP=1 the
+        in-process `_ACTIVE_RUNNER` channel is used instead, so fall through to the base (None)."""
+        merges = self._pd_pending_merges
+        self._pd_pending_merges = None
+        if merges and self._pd_tp_group() is not None:
+            return BFFMergeStats(data={"bff_merges": merges})
+        return super().get_kv_connector_stats()
 
     def _remote_addr_or_none(self, request_id: str, is_prefill: bool) -> str | None:
         """Resolve the peer NCCL address from the request id. The disagg PROXY injects the
@@ -325,6 +391,7 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
 
         UNVALIDATED on a live P/D topology — fully guarded: any structural mismatch logs and
         leaves D correct (per-request copies, no sharing) instead of crashing the load."""
+        self._pd_pending_merges = None   # reset per step (no stale map under TP>1 stats path)
         try:
             from kv_fast_fusion import fast_fusion_block_pool as _bp
             runner = getattr(_bp, "_ACTIVE_RUNNER", None)
@@ -414,6 +481,9 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
                 # Stage for D's scheduler to free the orphaned blocks + fix ref-counts
                 # (reuses the BFF merge channel: _updated_block_tables → update_from_output).
                 runner._updated_block_tables = updated
+                # TP>1: scheduler is a different process → also emit the map via the connector
+                # stats carrier (get_kv_connector_stats). ROUND 52.
+                self._pd_pending_merges = updated
             if n_applied or n_unresolved or _PD_DEBUG:
                 logger.info("BFF P/D apply | redirects_applied=%d | reps_unresolved=%d",
                             n_applied, n_unresolved)
@@ -567,10 +637,18 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
                 # Per-flat-block K and V L2 norms for this layer (FlashAttention layout
                 # kv_layer[0]=K, [1]=V). Shipped as ‖owner‖/‖rep‖ ratios per redirect.
                 N = idx.shape[0]
-                buf["k_norms"][layer_name] = (
-                    kv_layer[0, idx].float().reshape(N, -1).norm(dim=1))
-                buf["v_norms"][layer_name] = (
-                    kv_layer[1, idx].float().reshape(N, -1).norm(dim=1))
+                ksq = kv_layer[0, idx].float().reshape(N, -1).pow(2).sum(dim=1)
+                vsq = kv_layer[1, idx].float().reshape(N, -1).pow(2).sum(dim=1)
+                tp_group = self._pd_tp_group()
+                if tp_group is not None:
+                    # TP>1: this rank holds a head shard → all-reduce the SQUARED norms to get the
+                    # full-vector norm, so the shipped ratio is ‖own‖_full/‖rep‖_full (each rank
+                    # then applies the same global scalar to its shard). ROUND 52.
+                    import torch.distributed as dist
+                    dist.all_reduce(ksq, op=dist.ReduceOp.SUM, group=tp_group)
+                    dist.all_reduce(vsq, op=dist.ReduceOp.SUM, group=tp_group)
+                buf["k_norms"][layer_name] = ksq.sqrt()
+                buf["v_norms"][layer_name] = vsq.sqrt()
         buf["seen"].add(layer_name)
 
         # Count-based completion (robust to layer-name `.attn` variance): this layer was routed to
@@ -589,9 +667,16 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
             if buf["flat_bids"]:
                 req_of_block = torch.as_tensor(
                     buf["flat_req_local"], device=buf["k_layers"][0].device)
-                cluster = (concat_cosine_nr_tree_labels if _PD_MERGE == "nr_tree"
-                           else concat_cosine_cc_labels)
-                labels = cluster(buf["k_layers"], req_of_block, THRESHOLD)
+                tp_group = self._pd_tp_group()
+                if tp_group is not None:
+                    # TP>1: only CC exposes the raw Gram/sq for the cross-rank all-reduce that makes
+                    # every rank's decision identical (nr_tree normalizes before similarity). ROUND 52.
+                    labels = concat_cosine_cc_labels(
+                        buf["k_layers"], req_of_block, THRESHOLD, tp_group=tp_group)
+                else:
+                    cluster = (concat_cosine_nr_tree_labels if _PD_MERGE == "nr_tree"
+                               else concat_cosine_cc_labels)
+                    labels = cluster(buf["k_layers"], req_of_block, THRESHOLD)
                 _, redirects = build_group_redirect(
                     labels, buf["flat_req_local"], buf["flat_slot"])
             self._pd_ms += (time.perf_counter() - t0) * 1000.0

@@ -446,6 +446,20 @@ def update_from_output(
                                     len(block_merge_mapping))
             except Exception as e:
                 logger.warning("BFF runner block-merge fallback failed: %s", e)
+        if not block_merge_mapping and kv_connector_output is not None:
+            # TP>1 path (ROUND 52): worker and scheduler are SEPARATE processes, so the map can't
+            # ride the in-process _ACTIVE_RUNNER global — it arrives on the connector stats carrier
+            # (BFFMergeStats, set by the FF worker's get_kv_connector_stats). Every TP rank shipped
+            # the identical all-reduced map, so the aggregated rank-0 copy is authoritative.
+            try:
+                _stats = getattr(kv_connector_output, "kv_connector_stats", None)
+                _data = getattr(_stats, "data", None)
+                if _data and _data.get("bff_merges"):
+                    block_merge_mapping = _data["bff_merges"]
+                    logger.info("BFF: block-merge via connector stats (TP>1) | reqs=%d",
+                                len(block_merge_mapping))
+            except Exception as e:
+                logger.warning("BFF connector-stats block-merge fallback failed: %s", e)
         if block_merge_mapping:
             try:
                 self._handle_block_merging_with_counts(block_merge_mapping)
