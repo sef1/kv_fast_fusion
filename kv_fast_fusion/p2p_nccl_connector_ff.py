@@ -20,6 +20,7 @@ does not affect the transfer. Use ``BFF_SCALE_MODE=raw`` so the transferred KV i
 """
 
 import hashlib
+import json
 import os
 import time
 from dataclasses import dataclass
@@ -54,6 +55,15 @@ _UNSET = object()   # sentinel for lazily-resolved cached values (e.g. the TP pr
 _BFF_PD_FUSE = os.environ.get("BFF_PD_FUSE", "0") == "1"
 _PD_REDIR_TAG = "#__bff_redir__#"          # side-channel tensor id suffix for the redirect map
 _PD_LOG_EVERY = int(os.environ.get("BFF_PD_LOG_EVERY", "200"))
+# Producer-side fuse summary (overhead + compression) cadence — SEPARATE from the decode consume
+# log above. The producer is prefill-only, so it accrues far fewer group-completions than the
+# decode accrues load calls; gating its summary at 200 means a short/prefill-bound run never logs
+# it. Keep this low (and emit once at step 1) so the cumulative summary is always captured.
+_PD_FUSE_LOG_EVERY = int(os.environ.get("BFF_PD_FUSE_LOG_EVERY", "50"))
+# Producer dumps its cumulative fuse overhead + compression to a per-process JSON file here (always
+# current — no log flooding, no scrape of throttled log lines). The shell reads bff_stats_*.json
+# after the run. Off the decode path; the dump is a ~nanosecond dict build + a small atomic write.
+_PD_STATS_DIR = os.environ.get("BFF_PD_STATS_DIR", ".")
 # Verbose consumer trace: log every recv'd tensor_id so the LAST line before a hang is the
 # unsent id `recv_tensor` (no-timeout) is blocked on. See plan ROUND 29.
 _PD_DEBUG = os.environ.get("BFF_PD_DEBUG", "0") == "1"
@@ -181,6 +191,11 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
         self._pd_cur_meta_id: int | None = None          # detects step boundary (reset buffers)
         self._pd_ms = 0.0                                 # accumulated fusion time (ms)
         self._pd_steps = 0
+        # Cumulative compression accounting per fusion group (gi → totals over the run):
+        # ratio = redirected(=freed) blocks / total fusable blocks. Logged periodically so the
+        # shell can scrape the run-wide compression into the results JSON.
+        self._pd_blk_total: dict[int, int] = {}
+        self._pd_redir_total: dict[int, int] = {}
         # Consumer-side diagnostics (ROUND 27): is start_load_kv actually consuming? Logged
         # every _PD_LOG_EVERY load calls — reveals empty-metadata / id-mismatch / back-pressure.
         self._pd_load_calls = 0
@@ -683,6 +698,9 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
             self._pd_steps += 1
 
             n_redir = sum(len(v) for v in redirects.values())
+            # Cumulative compression accounting (all steps), per fusion group.
+            self._pd_blk_total[gi] = self._pd_blk_total.get(gi, 0) + len(buf["flat_bids"])
+            self._pd_redir_total[gi] = self._pd_redir_total.get(gi, 0) + n_redir
             if n_redir or _PD_DEBUG:
                 logger.info(
                     "BFF P/D fuse group gi=%d | merge=%s | repr=%s | reqs=%d | blocks=%d | redirects=%d",
@@ -733,13 +751,48 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
                         _pd_key(request_id) + _PD_RATIO_TAG + str(gi), rmat, remote_address)
             self._pd_sent.add(gi)
 
-            if self._pd_steps and self._pd_steps % _PD_LOG_EVERY == 0:
-                logger.info("BFF P/D fuse: avg group dedup %.3f ms over %d groups",
-                            self._pd_ms / self._pd_steps, self._pd_steps)
+            # Persist the cumulative overhead + compression to a per-process JSON file (always the
+            # latest totals — the shell reads it post-run, no log scrape). Cheap: a dict build + a
+            # small atomic write, gated to a low cadence so it stays off the hot path.
+            if self._pd_steps and (self._pd_steps % _PD_FUSE_LOG_EVERY == 0
+                                    or self._pd_steps == 1):
+                self._pd_dump_fuse_stats()
         except Exception as e:  # pragma: no cover - defensive (do not break the transfer)
             logger.warning("BFF P/D producer fusion failed (group %d): %s", gi, e)
         finally:
             self._pd_buf.pop(gi, None)
+
+    def _pd_dump_fuse_stats(self) -> None:
+        """Write this producer's cumulative fuse overhead + compression to a per-process JSON file
+        (``bff_stats_<pid>.json`` in ``BFF_PD_STATS_DIR``). The shell reads + merges these after the
+        run — replaces the old periodic-log + scrape (which a prefill-only producer rarely emitted).
+        Compression FACTOR = total / (total - freed) — how many× smaller the KV cache gets from
+        fusion (>1; 2.0 = half the blocks); block-weighted overall + per-group."""
+        try:
+            def _factor(b, r):
+                return b / max(1, b - r)
+            tot_b = sum(self._pd_blk_total.values())
+            tot_r = sum(self._pd_redir_total.values())
+            stats = {
+                "pid": os.getpid(),
+                "is_producer": bool(getattr(self, "is_producer", False)),
+                "steps": self._pd_steps,
+                "overhead_avg_group_dedup_ms": (self._pd_ms / self._pd_steps
+                                                if self._pd_steps else 0.0),
+                "total_blocks": tot_b,
+                "freed": tot_r,
+                "compression_avg_factor": _factor(tot_b, tot_r),
+                "compression_per_group": {
+                    str(gi): _factor(self._pd_blk_total[gi], self._pd_redir_total[gi])
+                    for gi in sorted(self._pd_blk_total)},
+            }
+            path = os.path.join(_PD_STATS_DIR, f"bff_stats_{os.getpid()}.json")
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(stats, f)
+            os.replace(tmp, path)   # atomic — the reader never sees a half-written file
+        except Exception as e:  # pragma: no cover - defensive (must never break the transfer)
+            logger.warning("BFF P/D: could not dump fuse stats: %s", e)
 
     def wait_for_save(self):
         # Safety net: before blocking on the send queue, ensure EVERY fusion group sent a map this
