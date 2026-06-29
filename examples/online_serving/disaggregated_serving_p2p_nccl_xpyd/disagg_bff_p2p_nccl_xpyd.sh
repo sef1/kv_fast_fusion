@@ -50,7 +50,7 @@
 # =============================================================================
 
 # ---- Model / topology --------------------------------------------------------
-MODEL=${MODEL:-Qwen/Qwen2.5-7B-Instruct} #{MODEL:-NousResearch/Hermes-3-Llama-3.1-8B} #{MODEL:-zai-org/glm-4-9b-chat-hf}
+MODEL=${MODEL:-Qwen/Qwen2.5-32B} #-Instruct} #{MODEL:-NousResearch/Hermes-3-Llama-3.1-8B} #{MODEL:-zai-org/glm-4-9b-chat-hf}
 TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-1200}
 PROXY_PORT=${PROXY_PORT:-30001}      # ZMQ service-discovery port (matches proxy_port in connector cfg)
 PROXY_HTTP_PORT=${PROXY_HTTP_PORT:-10001}   # proxy HTTP serving port (benchmark target)
@@ -65,7 +65,7 @@ KV_IP=${KV_IP:-10.10.10.174}
 # directly (comma-separated lists) — those win over the NUM_*-derived defaults.
 NUM_PREFILL=${NUM_PREFILL:-1}        # n
 NUM_DECODE=${NUM_DECODE:-1}          # m
-TP=${TP:-1}                          # tensor-parallel size PER instance (each P/D gets TP GPUs)
+TP=${TP:-4}                          # tensor-parallel size PER instance (each P/D gets TP GPUs)
 HTTP_PORT_BASE=${HTTP_PORT_BASE:-20003}
 
 # Build "start,start+1,...,start+count-1".
@@ -116,18 +116,26 @@ fi
 
 # ---- BFF knobs ---------------------------------------------------------------
 # BFF_MERGE=${BFF_MERGE:-cc}           # merge fusion layers into a single KV cache group (cc, nr_tree)
+# BFF_LSH_REPR=${BFF_LSH_REPR:-proj}     # full (default) or proj (LSH) representation for the fusion-layer KV
 BFF_PD_MERGE=${BFF_PD_MERGE:-cc}         # merge P/D fusion layers into a single KV cache group (cc, nr_tree)
 BFF_SCALE_MODE=${BFF_SCALE_MODE:-raw}   # raw is required for P/D (no KV mutation, no scales to ship)
-BFF_LSH_REPR=${BFF_LSH_REPR:-proj}     # full (default) or proj (LSH) representation for the fusion-layer KV
+BFF_PD_REPR=${BFF_PD_REPR:-proj}         # full (default) or proj (LSH) representation for the fusion-layer KV
 BFF_PD_FUSE=${BFF_PD_FUSE:-1}           # connector-level fusion + redirect propagation to D
 BFF_GROUP_SIZE=${BFF_GROUP_SIZE:-4}     # fusion layers packed per KV cache group
 BFF_THRESHOLD=${BFF_THRESHOLD:-0.75}       # BFF fusion threshold (0.0-1.0, 0.75 default)
+# ROUND 58: cross-batch fusion window. 0 = within-batch only (per-prefill-step, today's behavior).
+# >0 = also match each prefill batch against a rolling registry of the last N requests' rep blocks
+# (frees more on D → compression can exceed ~2×). Set N near the decode-resident request count;
+# proj repr recommended to bound registry memory.
+BFF_PD_ENCODED_BATCH_SIZE=${BFF_PD_ENCODED_BATCH_SIZE:-128}
 # ---- GPU memory / recv-buffer tuning -----------------------------------------
+# P only SENDS, so its recv-buffer threshold (kv_buffer_size) can be tiny (1e1).
 # P only SENDS, so its recv-buffer threshold (kv_buffer_size) can be tiny (1e1).
 # D's kv_buffer_size IS the threshold for GPU-RESIDENT recv KV before it spills to
 # the CPU pool. It MUST be < D's free GPU memory after the KV cache, or D OOMs on
 # the recv torch.empty (the "Peer Out Of Memory/Threshold, response:1" on P).
-PREFILL_GPU_UTIL=${PREFILL_GPU_UTIL:-0.95}
+PREFILL_GPU_UTIL=${PREFILL_GPU_UTIL:-0.85}  # P frees blocks fast (low KV residency) but needs headroom
+                                            # for the prefill activation spike — 0.95 OOMs the forward
 DECODE_GPU_UTIL=${DECODE_GPU_UTIL:-0.85}     # headroom for transient recv buffers / NCCL / CPU-pool staging
 PREFILL_KV_BUFFER=${PREFILL_KV_BUFFER:-1e1} # producer never receives → tiny
 DECODE_KV_BUFFER=${DECODE_KV_BUFFER:-8e9}   # spill to CPU pool early; keep GPU-resident recv small
@@ -141,10 +149,10 @@ F1_SPLIT=${F1_SPLIT:-train}
 F1_INPUT_KEY=${F1_INPUT_KEY:-problem}
 F1_OUTPUT_KEY=${F1_OUTPUT_KEY:-generated_solution}
 NUM_PROMPTS=${NUM_PROMPTS:-500}
-MAX_CONCURRENCY=${MAX_CONCURRENCY:-200}
+MAX_CONCURRENCY=${MAX_CONCURRENCY:-125}
 REQUEST_RATE=${REQUEST_RATE:-300}      # arrivals/s (stress test). 'inf' = fire all at once (cap by MAX_CONCURRENCY)
 BURSTINESS=${BURSTINESS:-0.3}          # gamma shape: <1 burstier (spiky), 1=Poisson, >1 more uniform
-MIN_TOKENS=${MIN_TOKENS:-2048}            # skip prompts shorter than this many input tokens (0=off)
+MIN_TOKENS=${MIN_TOKENS:-512}            # skip prompts shorter than this many input tokens (0=off)
 MAX_TOKENS=${MAX_TOKENS:-4096}         # per-request generation budget (must be < max_model_len - prompt)
 # Guard: max_tokens >= max_model_len leaves no room for the prompt → the server rejects EVERY request
 # ('max_tokens too large'). Clamp an over-large value (with headroom for the prompt) and warn loudly.
@@ -161,7 +169,7 @@ RESULT_DIR=${RESULT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/f1_result
 if [[ "$BASELINE" == "vanilla" ]]; then
     RUN_TAG=${RUN_TAG:-vanilla_con_${MAX_CONCURRENCY}_${NUM_PREFILL}Px${NUM_DECODE}D}
 else
-    RUN_TAG=${RUN_TAG:-${BFF_PD_MERGE}_${BFF_SCALE_MODE}_${BFF_LSH_REPR}_thr${BFF_THRESHOLD}_gs${BFF_GROUP_SIZE}_con_${MAX_CONCURRENCY}_${NUM_PREFILL}Px${NUM_DECODE}D}
+    RUN_TAG=${RUN_TAG:-${BFF_PD_MERGE}_${BFF_SCALE_MODE}_${BFF_PD_REPR}_thr${BFF_THRESHOLD}_gs${BFF_GROUP_SIZE}_eb${BFF_PD_ENCODED_BATCH_SIZE}_con_${MAX_CONCURRENCY}_${NUM_PREFILL}Px${NUM_DECODE}D}
 fi
 
 # ---- Required BFF / HF environment (CLAUDE.md) -------------------------------
@@ -185,7 +193,7 @@ echo "  Traffic:      MAX_CONCURRENCY=$MAX_CONCURRENCY  REQUEST_RATE=$REQUEST_RA
 if [[ "$BASELINE" == "vanilla" ]]; then
 echo "  BFF:          (disabled — stock vLLM single-group reference)"
 else
-echo "  BFF:          BFF_PD_MERGE=$BFF_PD_MERGE  BFF_SCALE_MODE=$BFF_SCALE_MODE  BFF_LSH_REPR=$BFF_LSH_REPR  BFF_PD_FUSE=$BFF_PD_FUSE BFF_THRESHOLD=$BFF_THRESHOLD  BFF_GROUP_SIZE=$BFF_GROUP_SIZE"
+echo "  BFF:          BFF_PD_MERGE=$BFF_PD_MERGE  BFF_SCALE_MODE=$BFF_SCALE_MODE  BFF_PD_REPR=$BFF_PD_REPR  BFF_PD_FUSE=$BFF_PD_FUSE BFF_THRESHOLD=$BFF_THRESHOLD  BFF_GROUP_SIZE=$BFF_GROUP_SIZE  ENCODED_BATCH=$BFF_PD_ENCODED_BATCH_SIZE"
 fi
 echo "  GPU util:     P=$PREFILL_GPU_UTIL  D=$DECODE_GPU_UTIL    kv_buffer: P=$PREFILL_KV_BUFFER  D=$DECODE_KV_BUFFER"
 echo ""
@@ -291,8 +299,9 @@ main() {
 
         echo "  Prefill $((i+1)): GPU $gpu_id, HTTP $port, KV $kv_port"
         CUDA_VISIBLE_DEVICES=$gpu_id \
-        BFF_PD_MERGE=$BFF_PD_MERGE BFF_SCALE_MODE=$BFF_SCALE_MODE BFF_LSH_REPR=$BFF_LSH_REPR BFF_PD_FUSE=$BFF_PD_FUSE \
+        BFF_PD_MERGE=$BFF_PD_MERGE BFF_SCALE_MODE=$BFF_SCALE_MODE BFF_PD_REPR=$BFF_PD_REPR BFF_PD_FUSE=$BFF_PD_FUSE \
         BFF_GROUP_SIZE=$BFF_GROUP_SIZE BFF_THRESHOLD=$BFF_THRESHOLD \
+        BFF_PD_ENCODED_BATCH_SIZE=$BFF_PD_ENCODED_BATCH_SIZE \
         BFF_PD_STATS_DIR="$RESULT_DIR" \
         python3 -m $LAUNCHER serve $MODEL \
         $(common_args) \
@@ -314,7 +323,7 @@ main() {
 
         echo "  Decode $((i+1)): GPU $gpu_id, HTTP $port, KV $kv_port"
         CUDA_VISIBLE_DEVICES=$gpu_id \
-        BFF_PD_MERGE=$BFF_PD_MERGE BFF_SCALE_MODE=$BFF_SCALE_MODE BFF_LSH_REPR=$BFF_LSH_REPR BFF_PD_FUSE=$BFF_PD_FUSE \
+        BFF_PD_MERGE=$BFF_PD_MERGE BFF_SCALE_MODE=$BFF_SCALE_MODE BFF_PD_REPR=$BFF_PD_REPR BFF_PD_FUSE=$BFF_PD_FUSE \
         BFF_GROUP_SIZE=$BFF_GROUP_SIZE BFF_THRESHOLD=$BFF_THRESHOLD \
         python3 -m $LAUNCHER serve $MODEL \
         $(common_args) \
