@@ -86,6 +86,13 @@ _PD_PROJ_DIM = int(os.environ.get("BFF_PD_PROJ_DIM", "512"))
 _PD_SCALE_MODE = os.environ.get("BFF_SCALE_MODE", "raw").lower()
 _PD_RATIO = _PD_SCALE_MODE == "ratio"
 _PD_RATIO_TAG = "#__bff_ratio__#"          # side-channel suffix for the per-redirect K/V ratios
+# ROUND 58: cross-batch fusion. When >0, the producer keeps a rolling registry of the last
+# N REQUESTS' rep blocks per fusion group and matches each new prefill batch against it (not just
+# the within-step batch), so a current block can redirect to a rep from an EARLIER batch (still
+# resident + decoding on D). 0 = disabled → within-batch-only (today's behavior). The window should
+# approximate the decode-resident request count; bigger N only raises reps_unresolved. proj repr
+# recommended to bound registry memory (≈ N · blocks/req · G·D_repr floats per group).
+_PD_ENCODED_BATCH = int(os.environ.get("BFF_PD_ENCODED_BATCH_SIZE", "0"))
 
 
 def _pd_key(request_id: str) -> str:
@@ -196,6 +203,13 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
         # shell can scrape the run-wide compression into the results JSON.
         self._pd_blk_total: dict[int, int] = {}
         self._pd_redir_total: dict[int, int] = {}
+        # ROUND 58: cross-batch rolling registry, per fusion group. Each entry is a dict with the
+        # registered rep blocks' raw concat vectors (this rank's head shard), their FULL squared
+        # concat norm, stable (rep_hash, rep_slot), and (ratio) per-layer K/V norms; plus LRU
+        # bookkeeping to evict whole oldest requests past _PD_ENCODED_BATCH. None until first use.
+        self._pd_registry: dict[int, dict] = {}
+        self._pd_cross_redir_total = 0   # redirects to a PREVIOUS-batch rep (the cross-batch lift)
+        self._pd_within_redir_total = 0  # redirects to a same-batch rep (original behavior)
         # Consumer-side diagnostics (ROUND 27): is start_load_kv actually consuming? Logged
         # every _PD_LOG_EVERY load calls — reveals empty-metadata / id-mismatch / back-pressure.
         self._pd_load_calls = 0
@@ -670,83 +684,66 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
         # gi by _group_of, so it's a member; complete once we've seen all of the group's layers.
         if len(buf["seen"]) < len(group_layer_set):
             return  # group not complete yet
-        # --- group complete: cluster + ship redirect map ---
+        # --- group complete: cluster (within-batch + cross-batch registry) + ship redirect map ---
         try:
-            from kv_fast_fusion.pd_fuse import (
-                concat_cosine_cc_labels, concat_cosine_nr_tree_labels,
-                build_group_redirect,
-            )
             from kv_fast_fusion.kv_fast_fusion_graph_runner import THRESHOLD
-            t0 = time.perf_counter()
-            redirects = {}
-            if buf["flat_bids"]:
-                req_of_block = torch.as_tensor(
-                    buf["flat_req_local"], device=buf["k_layers"][0].device)
-                tp_group = self._pd_tp_group()
-                if tp_group is not None:
-                    # TP>1: only CC exposes the raw Gram/sq for the cross-rank all-reduce that makes
-                    # every rank's decision identical (nr_tree normalizes before similarity). ROUND 52.
-                    labels = concat_cosine_cc_labels(
-                        buf["k_layers"], req_of_block, THRESHOLD, tp_group=tp_group)
-                else:
-                    cluster = (concat_cosine_nr_tree_labels if _PD_MERGE == "nr_tree"
-                               else concat_cosine_cc_labels)
-                    labels = cluster(buf["k_layers"], req_of_block, THRESHOLD)
-                _, redirects = build_group_redirect(
-                    labels, buf["flat_req_local"], buf["flat_slot"])
-            self._pd_ms += (time.perf_counter() - t0) * 1000.0
-            self._pd_steps += 1
-
-            n_redir = sum(len(v) for v in redirects.values())
-            # Cumulative compression accounting (all steps), per fusion group.
-            self._pd_blk_total[gi] = self._pd_blk_total.get(gi, 0) + len(buf["flat_bids"])
-            self._pd_redir_total[gi] = self._pd_redir_total.get(gi, 0) + n_redir
-            if n_redir or _PD_DEBUG:
-                logger.info(
-                    "BFF P/D fuse group gi=%d | merge=%s | repr=%s | reqs=%d | blocks=%d | redirects=%d",
-                    gi, _PD_MERGE, _PD_REPR, len(buf["req_ids"]), len(buf["flat_bids"]), n_redir)
-
-            # Ship a redirect-map tensor per request for this group, co-located with the group's
-            # last KV layer (just sent above). ALWAYS send (one per request per group) so the
-            # consumer's blocking recv_tensor never deadlocks; a 1-row SENTINEL [[-1,-1,-1]] means
-            # "nothing to free → continue as usual". GPU + non-empty (NCCL can't ship 0 elements).
-            req_ids = buf["req_ids"]
             dev = kv_layer.device
+            req_ids = buf["req_ids"]
             # ratio mode: layers in sorted absolute-index order — the P↔D column ordering
             # invariant for the [num_rows, G, 2] ratio side-tensor (col g ↔ this layer).
             ratio_layers = (
                 sorted(group_layer_set, key=lambda ln: int(ln.split('.')[2]))
                 if _PD_RATIO else [])
             Gn = len(ratio_layers)
+            tp_group = self._pd_tp_group()
+
+            t0 = time.perf_counter()
+            # Unified rows: cross-batch (registry) matches first, then within-batch clustering on the
+            # remainder; new reps registered. send_rows[owner_ri] = [(owner_slot, rep_hash, rep_slot,
+            # own_flat, rep_kind, rep_ref), ...]. registry disabled (_PD_ENCODED_BATCH<=0) → within-only.
+            send_rows, n_cross, n_within = self._pd_build_send_rows(
+                gi, buf, dev, tp_group, THRESHOLD, ratio_layers, req_ids)
+            self._pd_ms += (time.perf_counter() - t0) * 1000.0
+            self._pd_steps += 1
+
+            n_redir = n_cross + n_within
+            # Cumulative compression accounting (all steps), per fusion group.
+            self._pd_blk_total[gi] = self._pd_blk_total.get(gi, 0) + len(buf["flat_bids"])
+            self._pd_redir_total[gi] = self._pd_redir_total.get(gi, 0) + n_redir
+            self._pd_cross_redir_total += n_cross
+            self._pd_within_redir_total += n_within
+            if n_redir or _PD_DEBUG:
+                logger.info(
+                    "BFF P/D fuse group gi=%d | merge=%s | repr=%s | reqs=%d | blocks=%d | "
+                    "redirects=%d (cross=%d within=%d) | reg_blocks=%d",
+                    gi, _PD_MERGE, _PD_REPR, len(req_ids), len(buf["flat_bids"]),
+                    n_redir, n_cross, n_within, self._pd_registry_size(gi))
+
+            # Ship a redirect-map tensor per request for this group, co-located with the group's
+            # last KV layer (just sent above). ALWAYS send (one per request per group) so the
+            # consumer's blocking recv_tensor never deadlocks; a 1-row SENTINEL [[-1,-1,-1]] means
+            # "nothing to free → continue as usual". GPU + non-empty (NCCL can't ship 0 elements).
             for ri, request_id in enumerate(req_ids):
-                rows = redirects.get(ri, [])
-                if rows:
-                    # [num_rows, 3] int64: (owner_slot, rep_request_hash, rep_slot). Hash the
-                    # STABLE key so the rep resolves on D (whose full ids differ by random8).
-                    data = [[slot, _rid_hash(_pd_key(req_ids[rep_local])), rep_slot]
-                            for (slot, rep_local, rep_slot, _flat, _own) in rows]
-                    payload = torch.tensor(data, dtype=torch.int64, device=dev)
-                else:
-                    payload = torch.tensor([[-1, -1, -1]], dtype=torch.int64, device=dev)
+                rows = send_rows.get(ri, [])
                 remote_address = self._remote_addr_or_none(request_id, True)
                 if remote_address is None:
                     continue
+                if rows:
+                    # [num_rows, 3] int64: (owner_slot, rep_request_hash, rep_slot). rep_hash is the
+                    # STABLE-key hash (resolves on D whose full ids differ by random8) — for both a
+                    # within-batch rep and a registry (earlier-batch) rep, identically.
+                    data = [[r[0], r[1], r[2]] for r in rows]
+                    payload = torch.tensor(data, dtype=torch.int64, device=dev)
+                else:
+                    payload = torch.tensor([[-1, -1, -1]], dtype=torch.int64, device=dev)
                 self.p2p_nccl_engine.send_tensor(
                     _pd_key(request_id) + _PD_REDIR_TAG + str(gi), payload, remote_address)
                 if _PD_RATIO:
-                    # Per-redirect, per-layer ‖owner‖/‖rep‖ K/V ratios, SAME row order as the
-                    # int map; [:, g, 0]=K, [:, g, 1]=V. Sentinel (1.0) when no redirects so D's
-                    # blocking recv never deadlocks. Vectorized per layer (small # of rows).
-                    if rows:
-                        own_f = torch.tensor([r[4] for r in rows], device=dev)
-                        rep_f = torch.tensor([r[3] for r in rows], device=dev)
-                        rmat = torch.ones((len(rows), Gn, 2), dtype=torch.float32, device=dev)
-                        for g_i, ln in enumerate(ratio_layers):
-                            nk = buf["k_norms"][ln]; nv = buf["v_norms"][ln]
-                            rmat[:, g_i, 0] = nk[own_f] / nk[rep_f].clamp(min=1e-6)
-                            rmat[:, g_i, 1] = nv[own_f] / nv[rep_f].clamp(min=1e-6)
-                    else:
-                        rmat = torch.ones((1, Gn, 2), dtype=torch.float32, device=dev)
+                    # Per-redirect, per-layer ‖owner‖/‖rep‖ K/V ratios, SAME row order as the int map;
+                    # [:, g, 0]=K, [:, g, 1]=V. Rep norms come from the current buffer (within-batch
+                    # rep) or the registry (cross-batch rep). Sentinel (1.0) when no redirects.
+                    rmat = (self._pd_ratio_rows(gi, buf, rows, ratio_layers, dev) if rows
+                            else torch.ones((1, Gn, 2), dtype=torch.float32, device=dev))
                     self.p2p_nccl_engine.send_tensor(
                         _pd_key(request_id) + _PD_RATIO_TAG + str(gi), rmat, remote_address)
             self._pd_sent.add(gi)
@@ -761,6 +758,186 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
             logger.warning("BFF P/D producer fusion failed (group %d): %s", gi, e)
         finally:
             self._pd_buf.pop(gi, None)
+
+    # ------------------------------------------------------------------
+    # ROUND 58: cross-batch fusion — rolling per-group rep registry.
+    # ------------------------------------------------------------------
+    def _pd_registry_size(self, gi) -> int:
+        reg = self._pd_registry.get(gi)
+        return 0 if reg is None or reg["vecs"] is None else int(reg["vecs"].shape[0])
+
+    def _pd_build_send_rows(self, gi, buf, dev, tp_group, threshold, ratio_layers, req_ids):
+        """Build the unified per-owner redirect rows for this group and update the registry.
+
+        Returns ``(send_rows, n_cross, n_within)`` where
+        ``send_rows[owner_ri] = [(owner_slot, rep_hash, rep_slot, own_flat, rep_kind, rep_ref), ...]``
+        with ``rep_kind`` ∈ {"cur" (within-batch rep, ``rep_ref``=current flat idx),
+        "reg" (registry/earlier-batch rep, ``rep_ref``=registry row)}. When ``_PD_ENCODED_BATCH<=0``
+        the registry is skipped → within-batch-only (identical to the pre-ROUND-58 path)."""
+        from kv_fast_fusion.pd_fuse import (
+            concat_cosine_cc_labels, concat_cosine_nr_tree_labels,
+            build_group_redirect, concat_cosine_cross_match)
+        send_rows: dict[int, list] = {}
+        n_cross = n_within = 0
+        if not buf["flat_bids"]:
+            return send_rows, n_cross, n_within
+        flat_req_local = buf["flat_req_local"]
+        flat_slot = buf["flat_slot"]
+        N = len(flat_req_local)
+        dev0 = buf["k_layers"][0].device
+
+        def _cluster(k_layers, req_of_block):
+            if tp_group is not None:
+                # TP>1: only CC exposes the raw Gram/sq for the cross-rank all-reduce (nr_tree
+                # normalizes before similarity). ROUND 52.
+                return concat_cosine_cc_labels(k_layers, req_of_block, threshold, tp_group=tp_group)
+            cluster = (concat_cosine_nr_tree_labels if _PD_MERGE == "nr_tree"
+                       else concat_cosine_cc_labels)
+            return cluster(k_layers, req_of_block, threshold)
+
+        # ---- registry disabled → original within-batch-only path ----
+        if _PD_ENCODED_BATCH <= 0:
+            labels = _cluster(buf["k_layers"], torch.as_tensor(flat_req_local, device=dev0))
+            _, redirects = build_group_redirect(labels, flat_req_local, flat_slot)
+            for owner_ri, rws in redirects.items():
+                for (slot, rep_local, rep_slot, rep_flat, own_flat) in rws:
+                    send_rows.setdefault(owner_ri, []).append(
+                        (slot, _rid_hash(_pd_key(req_ids[rep_local])), rep_slot,
+                         own_flat, "cur", rep_flat, None))
+                    n_within += 1
+            return send_rows, n_cross, n_within
+
+        # ---- cross-batch (registry enabled) ----
+        reg = self._pd_registry.get(gi)
+        reg_vecs = reg["vecs"] if reg else None
+        reg_sq = reg["sq"] if reg else None
+        best_idx, _score, cur_sq, cur_concat = concat_cosine_cross_match(
+            buf["k_layers"], reg_vecs, reg_sq, threshold, tp_group=tp_group)
+        # forbid a self-merge (a registered rep from the SAME request, e.g. chunked re-register).
+        if reg is not None and bool((best_idx >= 0).any()):
+            own_hash = torch.tensor(
+                [_rid_hash(_pd_key(req_ids[r])) for r in flat_req_local],
+                dtype=torch.long, device=best_idx.device)
+            self_hit = (best_idx >= 0) & (reg["hash"][best_idx.clamp(min=0)] == own_hash)
+            best_idx = torch.where(self_hit, torch.full_like(best_idx, -1), best_idx)
+        best_list = best_idx.tolist()
+
+        # Phase 1: cross-batch matches → redirect to the registry rep (already resident on D).
+        # Resolve EVERYTHING the rep contributes to VALUES now (hash, slot, and — for ratio — its
+        # per-layer K/V norms), because _pd_register_reps below mutates/re-indexes the registry in
+        # this same call; a stored row index would be stale at serialize time (ROUND 59 bug A).
+        ratio_reg = _PD_RATIO and reg is not None and reg.get("knorm") is not None
+        matched = [False] * N
+        for i, ridx in enumerate(best_list):
+            if ridx < 0:
+                continue
+            rep_norms = ((reg["knorm"][ridx].clone(), reg["vnorm"][ridx].clone())
+                         if ratio_reg else None)
+            send_rows.setdefault(flat_req_local[i], []).append(
+                (flat_slot[i], int(reg["hash"][ridx].item()), int(reg["slot"][ridx].item()),
+                 i, "reg", ridx, rep_norms))
+            matched[i] = True
+            n_cross += 1
+
+        # Phase 2: within-batch clustering on the UNMATCHED current blocks (subset → map back).
+        unmatched = [i for i in range(N) if not matched[i]]
+        reps_to_register = []
+        if unmatched:
+            sub_k = [Kg[unmatched] for Kg in buf["k_layers"]]
+            sub_req = [flat_req_local[i] for i in unmatched]
+            sub_slot = [flat_slot[i] for i in unmatched]
+            labels = _cluster(sub_k, torch.as_tensor(sub_req, device=dev0))
+            _, redirects = build_group_redirect(labels, sub_req, sub_slot)
+            for owner_ri, rws in redirects.items():
+                for (slot, rep_local, rep_slot, rep_flat_sub, own_flat_sub) in rws:
+                    send_rows.setdefault(owner_ri, []).append(
+                        (slot, _rid_hash(_pd_key(req_ids[rep_local])), rep_slot,
+                         unmatched[own_flat_sub], "cur", unmatched[rep_flat_sub], None))
+                    n_within += 1
+            labels_l = labels.tolist()
+            reps_to_register = [unmatched[i] for i in range(len(labels_l)) if labels_l[i] == i]
+
+        self._pd_register_reps(gi, buf, reps_to_register, cur_concat, cur_sq, ratio_layers, req_ids)
+        return send_rows, n_cross, n_within
+
+    def _pd_register_reps(self, gi, buf, rep_flats, cur_concat, cur_sq, ratio_layers, req_ids):
+        """Append this step's new rep blocks to the group registry, then LRU-evict to the window.
+        Only reps for requests with a remote address (i.e. actually loaded on a D) are registered."""
+        if not rep_flats:
+            return
+        flat_req_local = buf["flat_req_local"]
+        flat_slot = buf["flat_slot"]
+        dev = cur_concat.device
+        reg = self._pd_registry.get(gi)
+        if reg is None:
+            reg = {"vecs": None, "sq": None, "hash": None, "slot": None, "seq": None,
+                   "knorm": None, "vnorm": None, "key2seq": {}, "next_seq": 0}
+            self._pd_registry[gi] = reg
+        v, sq, hsh, slt, seq, kn, vn = [], [], [], [], [], [], []
+        for f in rep_flats:
+            request_id = req_ids[flat_req_local[f]]
+            if self._remote_addr_or_none(request_id, True) is None:
+                continue
+            key = _pd_key(request_id)
+            s = reg["key2seq"].get(key)
+            if s is None:
+                s = reg["next_seq"]; reg["key2seq"][key] = s; reg["next_seq"] = s + 1
+            v.append(cur_concat[f]); sq.append(cur_sq[f])
+            hsh.append(_rid_hash(key)); slt.append(flat_slot[f]); seq.append(s)
+            if _PD_RATIO:
+                kn.append(torch.stack([buf["k_norms"][ln][f] for ln in ratio_layers]))
+                vn.append(torch.stack([buf["v_norms"][ln][f] for ln in ratio_layers]))
+        if not v:
+            return
+
+        def _cat(old, new):
+            return new if old is None else torch.cat([old, new])
+        reg["vecs"] = _cat(reg["vecs"], torch.stack(v))
+        reg["sq"] = _cat(reg["sq"], torch.stack(sq))
+        reg["hash"] = _cat(reg["hash"], torch.tensor(hsh, dtype=torch.long, device=dev))
+        reg["slot"] = _cat(reg["slot"], torch.tensor(slt, dtype=torch.long, device=dev))
+        reg["seq"] = _cat(reg["seq"], torch.tensor(seq, dtype=torch.long, device=dev))
+        if _PD_RATIO:
+            reg["knorm"] = _cat(reg["knorm"], torch.stack(kn))
+            reg["vnorm"] = _cat(reg["vnorm"], torch.stack(vn))
+        self._pd_evict_registry(gi)
+
+    def _pd_evict_registry(self, gi):
+        """Drop rows from requests older than the last _PD_ENCODED_BATCH distinct requests. Seq ids
+        are dense + monotonic, so keeping seq >= next_seq - N keeps exactly the last N requests."""
+        reg = self._pd_registry.get(gi)
+        if reg is None or reg["seq"] is None:
+            return
+        keep_from = reg["next_seq"] - _PD_ENCODED_BATCH
+        if keep_from <= 0:
+            return
+        keep = reg["seq"] >= keep_from
+        if bool(keep.all()):
+            return
+        idx = keep.nonzero(as_tuple=True)[0]
+        for k in ("vecs", "sq", "hash", "slot", "seq", "knorm", "vnorm"):
+            if reg[k] is not None:
+                reg[k] = reg[k][idx]
+        reg["key2seq"] = {k: s for k, s in reg["key2seq"].items() if s >= keep_from}
+
+    def _pd_ratio_rows(self, gi, buf, rows, ratio_layers, dev):
+        """[num_rows, G, 2] ‖own‖/‖rep‖ K/V ratios for `rows`; rep norms from the current buffer
+        (within-batch "cur" rep) or the rep's per-layer norms CAPTURED at match time ("reg" rep —
+        the registry may have been re-indexed since, so never index it here; ROUND 59). Few rows →
+        a plain loop is fine."""
+        rmat = torch.ones((len(rows), len(ratio_layers), 2), dtype=torch.float32, device=dev)
+        for r_i, (_oslot, _rhash, _rslot, own_flat, rep_kind, rep_ref, rep_norms) in enumerate(rows):
+            for g, ln in enumerate(ratio_layers):
+                nk = buf["k_norms"][ln]; nv = buf["v_norms"][ln]
+                if rep_kind == "cur":
+                    rep_k = nk[rep_ref]; rep_v = nv[rep_ref]
+                elif rep_norms is not None:
+                    rep_k = rep_norms[0][g]; rep_v = rep_norms[1][g]
+                else:
+                    continue   # cross-batch rep without captured norms → leave ratio 1.0
+                rmat[r_i, g, 0] = nk[own_flat] / rep_k.clamp(min=1e-6)
+                rmat[r_i, g, 1] = nv[own_flat] / rep_v.clamp(min=1e-6)
+        return rmat
 
     def _pd_dump_fuse_stats(self) -> None:
         """Write this producer's cumulative fuse overhead + compression to a per-process JSON file
@@ -785,6 +962,13 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
                 "compression_per_group": {
                     str(gi): _factor(self._pd_blk_total[gi], self._pd_redir_total[gi])
                     for gi in sorted(self._pd_blk_total)},
+                # ROUND 58: cross-batch lift — how many redirects came from the rolling registry
+                # (earlier batches) vs the within-step batch, and the current registry size.
+                "encoded_batch_size": _PD_ENCODED_BATCH,
+                "cross_batch_redirects": self._pd_cross_redir_total,
+                "within_batch_redirects": self._pd_within_redir_total,
+                "registry_blocks": {str(gi): self._pd_registry_size(gi)
+                                    for gi in sorted(self._pd_registry)},
             }
             path = os.path.join(_PD_STATS_DIR, f"bff_stats_{os.getpid()}.json")
             tmp = path + ".tmp"
@@ -822,6 +1006,12 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
             pass
         sentinel = torch.tensor([[-1, -1, -1]], dtype=torch.int64, device=dev)
         for gi in pending:
+            # ratio mode: the consumer recvs a [rows, G, 2] ratio side-tensor per (request, group)
+            # right after the int map (blocking, no timeout) — so a pending group MUST also get a
+            # ratio sentinel here, else D deadlocks on the ratio recv (ROUND 59 bug B).
+            gn = len(self._group_layers.get(gi, ()))
+            ratio_sentinel = (torch.ones((1, gn, 2), dtype=torch.float32, device=dev)
+                              if _PD_RATIO else None)
             for request in meta.requests:
                 remote_address = self._remote_addr_or_none(request.request_id, True)
                 if remote_address is None:
@@ -829,6 +1019,10 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
                 self.p2p_nccl_engine.send_tensor(
                     _pd_key(request.request_id) + _PD_REDIR_TAG + str(gi),
                     sentinel, remote_address)
+                if _PD_RATIO:
+                    self.p2p_nccl_engine.send_tensor(
+                        _pd_key(request.request_id) + _PD_RATIO_TAG + str(gi),
+                        ratio_sentinel, remote_address)
             self._pd_sent.add(gi)
 
     def request_finished_all_groups(

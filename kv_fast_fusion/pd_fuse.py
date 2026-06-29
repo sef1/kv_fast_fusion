@@ -134,6 +134,62 @@ def concat_cosine_nr_tree_labels(
     return labels
 
 
+def concat_cosine_cross_match(
+    cur_per_layer: list[torch.Tensor],
+    reg_vecs: torch.Tensor,
+    reg_sq: torch.Tensor,
+    threshold: float,
+    tp_group=None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Match each of M current blocks against R registered rep blocks by the G-layer concatenation
+    cosine (cross-batch P/D fusion, plan ROUND 58).
+
+    Unlike the within-batch clustering, this compares two DIFFERENT sets: the current step's blocks
+    vs a rolling registry of earlier requests' rep blocks. The registry is stored as the RAW
+    concatenated vector (so TP head-shards stay reconstructable) plus its FULL squared norm.
+
+    Args:
+        cur_per_layer: list of G tensors ``[M, D]`` — current blocks' per-layer repr (this rank's
+            head shard under TP). Concatenated here into ``[M, G·D]``.
+        reg_vecs: ``[R, G·D]`` registry raw concat vectors (same rank's head shard).
+        reg_sq:   ``[R]`` registry FULL (already all-reduced at registration) squared concat norm.
+        threshold: cosine threshold for a match.
+        tp_group: optional TP process group. Under TP each rank holds a head shard, so the local
+            ``cur@reg.T`` cross terms and ``cur_sq`` are partial; ``all_reduce(SUM)`` them so every
+            rank computes the identical FULL-vector cosine → identical match → coherent block table
+            (mirrors :func:`concat_cosine_cc_labels`). ``reg_sq`` is already full.
+
+    Returns:
+        best_idx:  ``[M]`` long, the matched registry row per current block, or ``-1`` if none > thr.
+        best_score:``[M]`` the matched cosine (0 where unmatched).
+        cur_sq:    ``[M]`` the current blocks' FULL squared concat norm (reused for registration).
+        cur_concat:``[M, G·D]`` the current concat vectors (this rank's shard; stored on register).
+    """
+    cur_concat = torch.cat([Kg.float() for Kg in cur_per_layer], dim=1)   # [M, G·D]
+    M = cur_concat.shape[0]
+    dev = cur_concat.device
+    cur_sq = (cur_concat * cur_concat).sum(1)                              # [M] (partial under TP)
+    if reg_vecs is None or reg_vecs.numel() == 0 or M == 0:
+        if tp_group is not None:
+            import torch.distributed as dist
+            dist.all_reduce(cur_sq, op=dist.ReduceOp.SUM, group=tp_group)
+        return (torch.full((M,), -1, dtype=torch.long, device=dev),
+                torch.zeros(M, device=dev), cur_sq, cur_concat)
+
+    cross = cur_concat @ reg_vecs.float().T                               # [M, R] (partial under TP)
+    if tp_group is not None:
+        import torch.distributed as dist
+        dist.all_reduce(cross, op=dist.ReduceOp.SUM, group=tp_group)
+        dist.all_reduce(cur_sq, op=dist.ReduceOp.SUM, group=tp_group)
+    dcur = cur_sq.sqrt().clamp(min=1e-6)
+    dreg = reg_sq.sqrt().clamp(min=1e-6)
+    S = cross / (dcur[:, None] * dreg[None, :])                           # full-vector cosine
+    best_score, best_idx = S.max(dim=1)
+    best_idx = torch.where(best_score > threshold, best_idx,
+                           torch.full_like(best_idx, -1))
+    return best_idx, best_score, cur_sq, cur_concat
+
+
 def build_group_redirect(
     labels: torch.Tensor,
     flat_req_idx: list[int],
