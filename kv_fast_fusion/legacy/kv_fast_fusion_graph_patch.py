@@ -26,7 +26,7 @@ from kv_fast_fusion.fast_fusion_flash import patched_forward as patched_flash_fo
 
 logger = init_logger("vllm.fast_fusion_patch")
 
-from kv_fast_fusion.kv_fast_fusion_graph_runner import (
+from kv_fast_fusion.legacy.kv_fast_fusion_graph_runner import (
     _update_block_tables_after_compression,
     execute_model,
     _patched_build_attention_metadata,
@@ -42,7 +42,7 @@ from kv_fast_fusion.kv_fast_fusion_graph_runner import (
 )
 
 import vllm.v1.core.kv_cache_utils as kv_utils
-from kv_fast_fusion.fast_fusion_kv_hash_utils import hash_block_ids, get_request_block_hasher_by_ids
+from kv_fast_fusion.legacy.fast_fusion_kv_hash_utils import hash_block_ids, get_request_block_hasher_by_ids
 
 
 def apply_fast_fusion_graph_patch():

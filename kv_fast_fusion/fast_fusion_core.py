@@ -15,7 +15,7 @@ from vllm.v1.core.kv_cache_utils import (
 
 def _initialize_kv_caches(
         self, vllm_config: VllmConfig
-    ) -> tuple[int, int, KVCacheConfig]:
+    ) -> KVCacheConfig:
         start = time.time()
 
         # Get all kv cache needed by the model
@@ -67,7 +67,7 @@ def _initialize_kv_caches(
             from vllm.v1.core.kv_cache_utils import (
                 get_kv_cache_config_from_groups, _report_kv_cache_config,
             )
-            from kv_fast_fusion.kv_fast_fusion_graph_runner import BFF_GROUP_SIZE
+            from kv_fast_fusion.constants import BFF_GROUP_SIZE
 
             # Reference (global) layer ordering + a concrete per-layer spec.
             ref_group = kv_cache_configs[0].kv_cache_groups[0]
@@ -142,6 +142,18 @@ def _initialize_kv_caches(
         num_gpu_blocks = scheduler_kv_cache_config.num_blocks
         num_cpu_blocks = 0
 
+        # v0.19.1 contract: _initialize_kv_caches returns the scheduler
+        # KVCacheConfig and is itself responsible for syncing num_gpu_blocks /
+        # block_size onto cache_config (the caller no longer unpacks a tuple).
+        # Mirror stock EngineCore._initialize_kv_caches.
+        vllm_config.cache_config.num_gpu_blocks = num_gpu_blocks
+        _sched_groups = scheduler_kv_cache_config.kv_cache_groups
+        if _sched_groups:
+            vllm_config.cache_config.block_size = min(
+                g.kv_cache_spec.block_size for g in _sched_groups
+            )
+        vllm_config.validate_block_size()
+
         # --- BFF measurement: log the POST-SPLIT config ---
         # The native "Maximum concurrency" log fires inside get_kv_cache_configs
         # BEFORE the group split (len(groups)==1), so it prints misleading
@@ -183,5 +195,5 @@ def _initialize_kv_caches(
             elapsed,
             scope="local",
         )
-        return num_gpu_blocks, num_cpu_blocks, scheduler_kv_cache_config
+        return scheduler_kv_cache_config
 

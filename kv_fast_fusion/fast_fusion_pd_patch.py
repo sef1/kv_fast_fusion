@@ -84,11 +84,10 @@ def apply_fast_fusion_pd_patch():
         # populates runner.fused_requests from the shipped ratios; _fill_norm_buffers slot-fills.
         if _PD_SCALE_MODE == "ratio":
             import torch
-            from kv_fast_fusion.kv_fast_fusion_graph_runner import BLOCK_SIZE
             vcfg = self.vllm_config
             num_layers = vcfg.model_config.get_num_layers(vcfg.parallel_config)
             max_reqs = vcfg.scheduler_config.max_num_seqs
-            max_blocks_per_req = max(1, vcfg.model_config.max_model_len // BLOCK_SIZE)
+            max_blocks_per_req = max(1, vcfg.model_config.max_model_len // vcfg.cache_config.block_size)
             num_slots = max_reqs
             self.norms_k_buf = torch.ones(
                 num_layers, num_slots + 1, max_blocks_per_req,
@@ -143,7 +142,7 @@ def apply_fast_fusion_pd_patch():
         if "P2pNcclConnectorFF" not in KVConnectorFactory._registry:
             KVConnectorFactory.register_connector(
                 "P2pNcclConnectorFF",
-                "kv_fast_fusion.p2p_nccl_connector_ff",
+                "kv_fast_fusion.connectors.p2p_nccl_connector_ff",
                 "P2pNcclConnectorFF",
             )
             logger.info("Fast fusion P/D patch: registered P2pNcclConnectorFF.")
@@ -165,7 +164,7 @@ def _apply_pd_ratio_kernel_infra() -> None:
     fusion layer afterward."""
     from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
     from kv_fast_fusion.fast_fusion_flash import patched_forward
-    from kv_fast_fusion.kv_fast_fusion_graph_runner import _fill_norm_buffers
+    from kv_fast_fusion.legacy.kv_fast_fusion_graph_runner import _fill_norm_buffers
 
     # Route fusion-layer attention through the BFF kernel (gates internally on
     # BFF_SCALE_MODE!=raw + has_fused_reqs + norms_k_buf_full; raw layers fall back to flash).

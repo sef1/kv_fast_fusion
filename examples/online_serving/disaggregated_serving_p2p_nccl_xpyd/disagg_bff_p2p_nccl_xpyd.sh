@@ -8,7 +8,7 @@
 # NUM_PREFILL=2 NUM_DECODE=1 BFF_PD_MERGE=nr_tree BFF_THRESHOLD=0.85 BFF_GROUP_SIZE=4 \
 #   ./examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/disagg_bff_p2p_nccl_xpyd.sh
 ### Full BFF
-#NUM_PREFILL=2 NUM_DECODE=1 BFF_PD_MERGE=cc BFF_THRESHOLD=0.75 \
+# NUM_PREFILL=2 NUM_DECODE=1 BFF_PD_MERGE=cc BFF_THRESHOLD=0.75 \
 #  ./examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/disagg_bff_p2p_nccl_xpyd.sh
 ### Fusion ablation (BFF layout, no merge) — the fully-fair "what does fusion buy" baseline
 #NUM_PREFILL=2 NUM_DECODE=1 BFF_PD_FUSE=0 \
@@ -50,11 +50,13 @@
 # =============================================================================
 
 # ---- Model / topology --------------------------------------------------------
-MODEL=${MODEL:-Qwen/Qwen3.6-32B} #-Instruct} #{MODEL:-NousResearch/Hermes-3-Llama-3.1-8B} #{MODEL:-zai-org/glm-4-9b-chat-hf}
+MODEL=${MODEL:-Qwen/Qwen3.6-27B} #-Instruct} #{MODEL:-NousResearch/Hermes-3-Llama-3.1-8B} #{MODEL:-zai-org/glm-4-9b-chat-hf}
 TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-1200}
 PROXY_PORT=${PROXY_PORT:-30001}      # ZMQ service-discovery port (matches proxy_port in connector cfg)
 PROXY_HTTP_PORT=${PROXY_HTTP_PORT:-10001}   # proxy HTTP serving port (benchmark target)
 KV_IP=${KV_IP:-10.10.10.174}
+HF_HOME=${HF_HOME:-"/data/models/huggingface"}
+HF_HUB_CACHE=${HF_HUB_CACHE:-"/data/models/huggingface/hub"}
 
 # ---- Topology: n prefill (P) x m decode (D) ----------------------------------
 # Set NUM_PREFILL (n) and NUM_DECODE (m); GPUs and HTTP ports are auto-derived:
@@ -65,7 +67,7 @@ KV_IP=${KV_IP:-10.10.10.174}
 # directly (comma-separated lists) — those win over the NUM_*-derived defaults.
 NUM_PREFILL=${NUM_PREFILL:-1}        # n
 NUM_DECODE=${NUM_DECODE:-1}          # m
-TP=${TP:-4}                          # tensor-parallel size PER instance (each P/D gets TP GPUs)
+TP=${TP:-2}                          # tensor-parallel size PER instance (each P/D gets TP GPUs)
 HTTP_PORT_BASE=${HTTP_PORT_BASE:-20003}
 
 # Build "start,start+1,...,start+count-1".
@@ -98,7 +100,7 @@ else
     LAUNCHER="kv_fast_fusion.fast_fusion_main"
     CONNECTOR="P2pNcclConnectorFF"
     HYBRID_FLAG="--no-disable-hybrid-kv-cache-manager"
-    ENABLE_CHUNKED=${ENABLE_CHUNKED:-0}
+    ENABLE_CHUNKED=${ENABLE_CHUNKED:-1}
 fi
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-8192}
 MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-8192}
@@ -136,7 +138,7 @@ BFF_PD_ENCODED_BATCH_SIZE=${BFF_PD_ENCODED_BATCH_SIZE:-128}
 # the recv torch.empty (the "Peer Out Of Memory/Threshold, response:1" on P).
 PREFILL_GPU_UTIL=${PREFILL_GPU_UTIL:-0.85}  # P frees blocks fast (low KV residency) but needs headroom
                                             # for the prefill activation spike — 0.95 OOMs the forward
-DECODE_GPU_UTIL=${DECODE_GPU_UTIL:-0.85}     # headroom for transient recv buffers / NCCL / CPU-pool staging
+DECODE_GPU_UTIL=${DECODE_GPU_UTIL:-0.75}     # headroom for transient recv buffers / NCCL / CPU-pool staging
 PREFILL_KV_BUFFER=${PREFILL_KV_BUFFER:-1e1} # producer never receives → tiny
 DECODE_KV_BUFFER=${DECODE_KV_BUFFER:-8e9}   # spill to CPU pool early; keep GPU-resident recv small
 
@@ -144,7 +146,7 @@ DECODE_KV_BUFFER=${DECODE_KV_BUFFER:-8e9}   # spill to CPU pool early; keep GPU-
 # The run targets the PROXY (f1_main streams, so it captures TTFT/ITL/TPOT + throughput,
 # and computes F1 against the HF dataset). Results are saved to a config-tagged JSON so a
 # sweep over BFF_PD_MERGE × BFF_THRESHOLD × BFF_GROUP_SIZE is easy to tabulate.
-F1_DATASET=${F1_DATASET:-nvidia/OpenMathInstruct-2}
+F1_DATASET=${F1_DATASET:-m-a-p/CodeFeedback-Filtered-Instruction} #nvidia/OpenMathInstruct-2}
 F1_SPLIT=${F1_SPLIT:-train}
 F1_INPUT_KEY=${F1_INPUT_KEY:-problem}
 F1_OUTPUT_KEY=${F1_OUTPUT_KEY:-generated_solution}
@@ -173,12 +175,28 @@ else
 fi
 
 # ---- Required BFF / HF environment (CLAUDE.md) -------------------------------
-REPO_ROOT=${REPO_ROOT:-/data/users/sefi/from_git/vllm_013/vllm}
+REPO_ROOT=${REPO_ROOT:-/data/users/sefi/from_git/vllm_013/vllm_ff}
 export HF_HOME=${HF_HOME:-/data/models/huggingface}
 export HF_HUB_CACHE=${HF_HUB_CACHE:-/data/models/huggingface/hub}
 export VLLM_WORKER_MULTIPROC_METHOD=${VLLM_WORKER_MULTIPROC_METHOD:-spawn}
 export VLLM_USE_V1=1
 export PYTHONPATH=${REPO_ROOT}:${PYTHONPATH}
+
+# The P2P NCCL engine loads "libnccl.so.2" by bare name. The venv ships
+# nvidia-nccl 2.28.9+cuda13.0 (needs driver >=580); this host runs driver
+# 575.51.03 (CUDA 12.9). Pin the engine to the system 2.28.3+cuda12.9 build,
+# which inits a comm cleanly under this driver.
+export VLLM_NCCL_SO_PATH=${VLLM_NCCL_SO_PATH:-/lib/x86_64-linux-gnu/libnccl.so.2}
+
+# With NUM_PREFILL=1 + TP>1, the P↔D KV-transfer GPU pair is close enough that
+# NCCL attempts direct-GPU P2P transport across the disjoint per-instance
+# CUDA_VISIBLE_DEVICES namespaces and dies with "transport/p2p.cc Cuda failure
+# 101 'invalid device ordinal'" on Worker_TP1. Forcing host-staged (SHM)
+# transport fixes it. (Multi-prefill pairs are cross-NUMA so NCCL already uses
+# SHM and this isn't needed.) Process-global because NCCL caches the param.
+if [[ "$NUM_PREFILL" == "1" ]]; then
+    export NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-1}
+fi
 
 echo "Warning: P2P NCCL disaggregated prefill XpYd for vLLM v1 is experimental."
 echo ""

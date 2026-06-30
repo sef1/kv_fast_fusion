@@ -376,7 +376,9 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
                 kv_cache = getattr(layer, "kv_cache", None)
                 if kv_cache is None:
                     continue
-                layer = kv_cache[forward_context.virtual_engine]
+                # v0.19.1 removed ForwardContext.virtual_engine; layer.kv_cache is
+                # now the tensor directly (no per-virtual-engine list to index).
+                layer = kv_cache
                 tid = _pd_key(request.request_id) + "#" + layer_name
                 # Record what we're about to (possibly indefinitely) block on. The LAST value
                 # logged before a hang is the tensor_id the producer never sent.
@@ -686,7 +688,7 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
             return  # group not complete yet
         # --- group complete: cluster (within-batch + cross-batch registry) + ship redirect map ---
         try:
-            from kv_fast_fusion.kv_fast_fusion_graph_runner import THRESHOLD
+            from kv_fast_fusion.constants import THRESHOLD
             dev = kv_layer.device
             req_ids = buf["req_ids"]
             # ratio mode: layers in sorted absolute-index order — the P↔D column ordering
