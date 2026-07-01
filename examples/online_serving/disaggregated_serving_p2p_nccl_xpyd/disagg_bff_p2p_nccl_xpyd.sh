@@ -50,7 +50,7 @@
 # =============================================================================
 
 # ---- Model / topology --------------------------------------------------------
-MODEL=${MODEL:-Qwen/Qwen3.6-27B} #-Instruct} #{MODEL:-NousResearch/Hermes-3-Llama-3.1-8B} #{MODEL:-zai-org/glm-4-9b-chat-hf}
+MODEL=${MODEL:-Qwen/Qwen3.5-27B} #{MODEL:-NousResearch/Hermes-3-Llama-3.1-8B} #{MODEL:-zai-org/glm-4-9b-chat-hf}
 TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-1200}
 PROXY_PORT=${PROXY_PORT:-30001}      # ZMQ service-discovery port (matches proxy_port in connector cfg)
 PROXY_HTTP_PORT=${PROXY_HTTP_PORT:-10001}   # proxy HTTP serving port (benchmark target)
@@ -148,8 +148,8 @@ DECODE_KV_BUFFER=${DECODE_KV_BUFFER:-8e9}   # spill to CPU pool early; keep GPU-
 # sweep over BFF_PD_MERGE × BFF_THRESHOLD × BFF_GROUP_SIZE is easy to tabulate.
 F1_DATASET=${F1_DATASET:-m-a-p/CodeFeedback-Filtered-Instruction} #nvidia/OpenMathInstruct-2}
 F1_SPLIT=${F1_SPLIT:-train}
-F1_INPUT_KEY=${F1_INPUT_KEY:-problem}
-F1_OUTPUT_KEY=${F1_OUTPUT_KEY:-generated_solution}
+F1_INPUT_KEY=${F1_INPUT_KEY:-query}
+F1_OUTPUT_KEY=${F1_OUTPUT_KEY:-answer}
 NUM_PROMPTS=${NUM_PROMPTS:-500}
 MAX_CONCURRENCY=${MAX_CONCURRENCY:-125}
 REQUEST_RATE=${REQUEST_RATE:-300}      # arrivals/s (stress test). 'inf' = fire all at once (cap by MAX_CONCURRENCY)
@@ -188,15 +188,62 @@ export PYTHONPATH=${REPO_ROOT}:${PYTHONPATH}
 # which inits a comm cleanly under this driver.
 export VLLM_NCCL_SO_PATH=${VLLM_NCCL_SO_PATH:-/lib/x86_64-linux-gnu/libnccl.so.2}
 
-# With NUM_PREFILL=1 + TP>1, the P↔D KV-transfer GPU pair is close enough that
-# NCCL attempts direct-GPU P2P transport across the disjoint per-instance
-# CUDA_VISIBLE_DEVICES namespaces and dies with "transport/p2p.cc Cuda failure
-# 101 'invalid device ordinal'" on Worker_TP1. Forcing host-staged (SHM)
-# transport fixes it. (Multi-prefill pairs are cross-NUMA so NCCL already uses
-# SHM and this isn't needed.) Process-global because NCCL caches the param.
-if [[ "$NUM_PREFILL" == "1" ]]; then
+# P↔D KV transfer runs over NCCL between GPUs in DISJOINT per-instance
+# CUDA_VISIBLE_DEVICES namespaces. The crash needs TWO things together:
+#   (1) a transfer rank r>0 — at r=0 the local device ordinal is 0, always valid
+#       across namespaces, so P2P IPC succeeds (only Worker_TP{r>0} ever died); and
+#   (2) that rank's transfer GPU pair is topologically "close" — same NUMA / PCIe
+#       switch (PIX/PXB/PHB/NODE/NVLink in `nvidia-smi topo -m`), so NCCL attempts
+#       direct-GPU P2P transport. Cross-socket (SYS) pairs already fall back to SHM.
+# When both hold NCCL dies: "transport/p2p.cc Cuda failure 101 'invalid device
+# ordinal'". So probe the actual topology of the rank>0 pairs THIS run will use
+# and force host-staged (SHM) transport only when needed. Process-global because
+# NCCL caches the param + it must be set before any NCCL init. Override by
+# exporting NCCL_P2P_DISABLE yourself.
+_p2p_needs_disable() {
+    python3 - "$PREFILL_GPUS" "$DECODE_GPUS" "$TP" <<'PY' 2>/dev/null
+import subprocess, sys, re
+prefill = [int(x) for x in sys.argv[1].split(",") if x != ""]
+decode  = [int(x) for x in sys.argv[2].split(",") if x != ""]
+tp = int(sys.argv[3])
+out = subprocess.check_output(["nvidia-smi", "topo", "-m"], text=True)
+# Parse the GPUk x GPUk link-type matrix. The header row is wrapped in ANSI
+# escapes by nvidia-smi, so strip them; match GPU labels strictly (GPU\d+) to
+# avoid the trailing "GPU NUMA ID" header column.
+ansi = re.compile(r"\x1b\[[0-9;]*m")
+gpu = re.compile(r"GPU(\d+)$")
+cols, link = None, {}
+for line in out.splitlines():
+    toks = ansi.sub("", line).split()
+    if not toks:
+        continue
+    if cols is None and toks[0] == "GPU0" and "X" not in toks:
+        cols = [int(m.group(1)) for t in toks if (m := gpu.match(t))]
+        continue
+    if cols and gpu.match(toks[0]) and "X" in toks:
+        g = int(gpu.match(toks[0]).group(1))
+        for c, v in zip(cols, toks[1:1 + len(cols)]):
+            link[(g, c)] = v
+# rank-matched pairs: prefill (i,r) <-> decode (j,r); r=0 never triggers it.
+need = False
+for r in range(1, tp):
+    pg = [prefill[i * tp + r] for i in range(len(prefill) // tp)]
+    dg = [decode[j * tp + r]  for j in range(len(decode) // tp)]
+    for a in pg:
+        for b in dg:
+            if link.get((a, b), "SYS") not in ("SYS", "X"):
+                need = True
+print("1" if need else "0")
+PY
+}
+_NEED_P2P_DISABLE=$(_p2p_needs_disable)
+if [[ "$_NEED_P2P_DISABLE" == "1" ]]; then
     export NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-1}
+elif [[ -z "$_NEED_P2P_DISABLE" && "$TP" -gt 1 ]]; then
+    # Probe failed (no nvidia-smi/python) → conservatively disable for TP>1.
+    export NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-0}
 fi
+[[ -n "${NCCL_P2P_DISABLE:-}" ]] && echo "  NCCL_P2P_DISABLE=$NCCL_P2P_DISABLE (transfer-pair topo probe: ${_NEED_P2P_DISABLE:-probe-failed})"
 
 echo "Warning: P2P NCCL disaggregated prefill XpYd for vLLM v1 is experimental."
 echo ""
