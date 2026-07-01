@@ -205,13 +205,20 @@ export_ascend_env() {
   export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
   export PYTHONHASHSEED=0
   export MOONCAKE_CONFIG_PATH ASCEND_BUFFER_POOL=4:8 MC_STORE_ENABLE_HTTP_SERVER=1
+  # COMPILATION_CONFIG (cudagraph) is DECODE-ONLY (FULL_DECODE_ONLY); prefill launches without it.
   export COMPILATION_CONFIG='{"cudagraph_capture_sizes":[1,4,8,12,16,20,24,28,32,36,40,48,56,64,80,96],"cudagraph_mode":"FULL_DECODE_ONLY"}'
 }
 
-# Export BFF env into the current process env (inherited by the launched engine). No-op unless bff.
+# Export BFF env into the current process env (inherited by the launched engine).
+# For non-bff baselines, explicitly CLEAR BFF_PD_FUSE so an inherited env var can't re-enable the
+# Ascend patch (the group split): apply_fast_fusion_ascend_patch is gated on BFF_PD_FUSE==1.
 export_bff_env() {
   local role=$1   # kv_producer | kv_consumer
-  if [[ "$BFF_ON" != "1" ]]; then return; fi
+  if [[ "$BFF_ON" != "1" ]]; then
+    export BFF_PD_FUSE=0
+    unset BFF_PD_STATS_DIR
+    return
+  fi
   export BFF_PD_FUSE=$BFF_PD_FUSE BFF_SCALE_MODE=$BFF_SCALE_MODE BFF_PD_MERGE=$BFF_PD_MERGE \
          BFF_PD_REPR=$BFF_PD_REPR BFF_THRESHOLD=$BFF_THRESHOLD BFF_GROUP_SIZE=$BFF_GROUP_SIZE \
          BFF_PD_ENCODED_BATCH_SIZE=$BFF_PD_ENCODED_BATCH_SIZE
@@ -250,10 +257,14 @@ JSON
 }
 
 # vLLM args shared by P and D. BFF needs block-size 128 + prefix caching + hybrid KV manager.
+# $1 = tag (prefill|decode). --compilation-config (cudagraph) is DECODE-ONLY.
 common_args() {
-  local extra=""
+  local tag=$1 extra=""
   if [[ "$BFF_ON" == "1" ]]; then
     extra="--enable-prefix-caching --no-disable-hybrid-kv-cache-manager"
+  fi
+  if [[ "$tag" == "decode" ]]; then
+    extra="${extra} --compilation-config '${COMPILATION_CONFIG}'"
   fi
   echo "--host ${VLLM_HOST_IP} \
     --tensor-parallel-size ${TP_SIZE} \
@@ -263,7 +274,6 @@ common_args() {
     --max-model-len ${MAX_MODEL_LEN} \
     --max-num-batched-tokens ${MAX_NUM_BATCHED_TOKENS} \
     --max-num-seqs ${MAX_NUM_SEQS} \
-    --compilation-config '${COMPILATION_CONFIG}' \
     ${extra}"
 }
 
@@ -293,7 +303,7 @@ launch_engines() {
     local kv_cfg; kv_cfg=$(build_kv_transfer_config "$role" "$kv_port")
 
     nohup bash -c "python -m kv_fast_fusion.fast_fusion_main serve \"${MODEL}\" \
-        $(common_args) \
+        $(common_args "$tag") \
         --port ${port} \
         --gpu-memory-utilization ${GPU_MEM_UTIL} \
         --kv-transfer-config '${kv_cfg}' \

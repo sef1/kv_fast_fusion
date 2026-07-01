@@ -111,7 +111,27 @@ def _patch_npu_model_runner() -> None:
 
 
 def apply_fast_fusion_ascend_patch() -> None:
-    """Apply the Ascend/NPU BFF patch (see module docstring). Raw mode only."""
+    """Apply the Ascend/NPU BFF patch (see module docstring). Raw mode only.
+
+    GATED on ``BFF_PD_FUSE==1``. When BFF is off (stock ``layerwise``/``mooncakev1`` baselines that
+    still launch via ``kv_fast_fusion.fast_fusion_main``), this is a NO-OP: it must NOT split the KV
+    cache into warmup+fusion groups, because a multi-group config crashes the scheduler's
+    ``_connector_finished`` (``assert len(kv_cache_groups)==1``) whenever the top connector isn't taken
+    as ``SupportsHMA`` — and reshaping the layout for a stock run is wrong regardless. The FF connector
+    name is still registered (harmless; it self-disables fusion when ``BFF_PD_FUSE!=1``)."""
+    # Register the connector name unconditionally so it always resolves if selected.
+    try:
+        from kv_fast_fusion_ascend.connectors.mooncake_layerwise_connector_ff import (
+            register_mooncake_layerwise_ff,
+        )
+        register_mooncake_layerwise_ff()
+    except Exception as e:  # pragma: no cover
+        logger.warning("BFF Ascend: MooncakeLayerwiseConnectorFF registration skipped: %s", e)
+
+    if os.environ.get("BFF_PD_FUSE", "0") != "1":
+        logger.info("BFF Ascend: BFF_PD_FUSE!=1 → stock (no KV-cache group split, no patches).")
+        return
+
     scale_mode = os.environ.get("BFF_SCALE_MODE", "raw").lower()
     if scale_mode != "raw":
         logger.warning("BFF Ascend: BFF_SCALE_MODE=%s requested but only 'raw' is supported on NPU; "
@@ -172,13 +192,4 @@ def apply_fast_fusion_ascend_patch() -> None:
             logger.warning("BFF Ascend: failed to wrap %s.update_from_output: %s",
                            getattr(cls, "__name__", cls), e)
 
-    # --- 6. Register the fusion-adding Mooncake connector ---
-    try:
-        from kv_fast_fusion_ascend.connectors.mooncake_layerwise_connector_ff import (
-            register_mooncake_layerwise_ff,
-        )
-        register_mooncake_layerwise_ff()
-    except Exception as e:  # pragma: no cover
-        logger.warning("BFF Ascend: MooncakeLayerwiseConnectorFF registration skipped: %s", e)
-
-    logger.info("Fast fusion Ascend patch applied (mode=raw).")
+    logger.info("Fast fusion Ascend patch applied (mode=raw, BFF_PD_FUSE=1).")
