@@ -123,10 +123,49 @@ def test_end_to_end_producer_to_consumer():
     assert new_blocks == dblocks[rep_ext][1], "owner must share the representative's D block"
 
 
+def test_redirect_channel_push_pull_contract():
+    """Fire-and-forget wire contract for the FF redirect channel: a PUSH of
+    ``(_FF_REDIRECT_MSG, ext_id, gi, rows)`` (msgpack) must decode on the PULL side into the same
+    ``{ext_id: {gi: rows}}`` structure the recv thread builds — with NO ACK. The real send/recv thread
+    classes are NPU-guarded (need vllm_ascend), so this replicates just their message handling."""
+    try:
+        import msgspec
+        import zmq
+    except Exception:
+        print("  (skipped push/pull contract test: pyzmq/msgspec unavailable)")
+        return
+
+    _FF_REDIRECT_MSG = b"bff_redirect_msg"   # must match the connector's tag
+    ctx = zmq.Context()
+    pull = ctx.socket(zmq.PULL)
+    port = pull.bind_to_random_port("tcp://127.0.0.1")
+    push = ctx.socket(zmq.PUSH)
+    push.setsockopt(zmq.LINGER, 0)
+    push.connect(f"tcp://127.0.0.1:{port}")
+    enc = msgspec.msgpack.Encoder()
+    dec = msgspec.msgpack.Decoder(type=tuple)
+
+    # producer submits two groups for one request
+    push.send(enc.encode((_FF_REDIRECT_MSG, "reqB", 1, [[0, 12345, 0]])))
+    push.send(enc.encode((_FF_REDIRECT_MSG, "reqB", 2, [[1, 67890, 3]])))
+
+    pending: dict = {}
+    for _ in range(2):
+        assert pull.poll(3000), "message not received on PULL socket"
+        msg = dec.decode(pull.recv())
+        assert msg[0] == _FF_REDIRECT_MSG
+        _tag, ext_id, gi, rows = msg
+        pending.setdefault(ext_id, {})[int(gi)] = rows
+    ctx.destroy(linger=0)
+
+    assert pending == {"reqB": {1: [[0, 12345, 0]], 2: [[1, 67890, 3]]}}, pending
+
+
 if __name__ == "__main__":
     test_producer_detects_duplicate_across_requests()
     test_producer_no_merge_when_dissimilar()
     test_consumer_resolve_repoints_and_reports()
     test_consumer_resolve_unresolved_when_rep_absent()
     test_end_to_end_producer_to_consumer()
+    test_redirect_channel_push_pull_contract()
     print("OK: all mooncake layerwise FF glue tests passed")

@@ -26,6 +26,7 @@ box. The connector subclass + ZMQ wiring are defined only when ``vllm_ascend`` i
 
 import hashlib
 import os
+import queue
 import struct
 import threading
 from typing import Any
@@ -268,9 +269,11 @@ except Exception as _imp_err:  # pragma: no cover - only importable on the Ascen
 if _ASCEND_AVAILABLE:
 
     class _FFRedirectRecvThread(threading.Thread):
-        """Decode-side listener for the dedicated FF redirect channel. Stores arrived maps as
-        ``{external_id: {gi: rows}}`` for the connector to apply once the request's transfer is
-        done. Kept separate from the stock ``KVCacheRecvingLayerThread`` so that thread is untouched."""
+        """Decode-side listener for the dedicated FF redirect channel. Binds a ``zmq.PULL`` socket and
+        records each arrived redirect map as ``{external_id: {gi: rows}}`` for the connector to apply
+        at ``get_finished`` (post-transfer). Fire-and-forget: no ACK is sent, so the producer never
+        blocks — a dropped map just means that request keeps per-request copies on D (less compression,
+        never incorrect). Kept separate from the stock ``KVCacheRecvingLayerThread`` (untouched)."""
 
         def __init__(self, host: str, port: int):
             super().__init__(daemon=True, name="BFF-FFRedirectRecvThread")
@@ -287,28 +290,69 @@ if _ASCEND_AVAILABLE:
 
         def run(self):
             path = make_zmq_path("tcp", self._host, self._port)
-            logger.info("BFF FF redirect listener on %s", path)
-            with zmq_ctx(zmq.ROUTER, path) as sock:
+            logger.info("BFF FF redirect listener (PULL) on %s", path)
+            ctx = zmq.Context()
+            sock = make_zmq_socket(ctx=ctx, path=path, socket_type=zmq.PULL, bind=True)
+            try:
                 while True:
                     try:
-                        frames = sock.recv_multipart()
-                        if len(frames) < 2:
-                            continue
-                        identity = frames[0]
-                        payload = [f for f in frames[1:] if f != b""]
-                        if len(payload) != 1:
-                            continue
-                        msg = self._decoder.decode(payload[0])
+                        msg = self._decoder.decode(sock.recv())
                         if msg and msg[0] == _FF_REDIRECT_MSG:
                             # (tag, external_id, gi, rows) — rows: list[[owner_slot, rep_hash, rep_slot]]
                             _tag, ext_id, gi, rows = msg
                             with self.lock:
                                 self.pending.setdefault(ext_id, {})[int(gi)] = rows
-                            sock.send_multipart((identity, b"", b"ACK"))
-                        else:
-                            sock.send_multipart((identity, b"", b"NAK"))
                     except Exception as e:  # pragma: no cover - defensive (never kill the listener)
                         logger.warning("BFF FF redirect listener error: %s", e)
+            finally:
+                ctx.destroy(linger=0)
+
+
+    class _FFRedirectSendThread(threading.Thread):
+        """Producer-side fire-and-forget sender for the FF redirect channel. The ``save_kv_layer``
+        hook only enqueues ``(host, port, ext_id, gi, rows)``; this daemon thread owns persistent
+        ``zmq.PUSH`` sockets keyed by ``(host, port)`` and sends off the prefill hot path. No ACK —
+        a dropped map costs compression, not correctness (the consumer apply is fully guarded)."""
+
+        def __init__(self):
+            super().__init__(daemon=True, name="BFF-FFRedirectSendThread")
+            self._q: "queue.Queue" = queue.Queue()
+            self._ctx = None
+            self._socks: dict[tuple, Any] = {}
+            self._encoder = msgspec.msgpack.Encoder()
+
+        def submit(self, host, port, ext_id, gi, rows) -> None:
+            if host is None or port is None:
+                return
+            self._q.put((host, int(port), ext_id, int(gi), rows))   # non-blocking (unbounded queue)
+
+        def _sock_for(self, host, port):
+            key = (host, port)
+            s = self._socks.get(key)
+            if s is None:
+                path = make_zmq_path("tcp", host, port)
+                s = make_zmq_socket(ctx=self._ctx, path=path, socket_type=zmq.PUSH, bind=False)
+                s.setsockopt(zmq.LINGER, 0)
+                s.setsockopt(zmq.SNDTIMEO, 2000)   # bound the bg thread if a peer is (briefly) absent
+                self._socks[key] = s
+            return s
+
+        def run(self):
+            self._ctx = zmq.Context()
+            try:
+                while True:
+                    item = self._q.get()
+                    if item is None:
+                        break
+                    host, port, ext_id, gi, rows = item
+                    try:
+                        payload = self._encoder.encode((_FF_REDIRECT_MSG, ext_id, gi, rows))
+                        self._sock_for(host, port).send(payload)
+                    except Exception as e:  # pragma: no cover - drop on timeout/no-peer (best-effort)
+                        logger.warning("BFF Mooncake ship redirect dropped (%s:%d): %s", host, port, e)
+            finally:
+                if self._ctx is not None:
+                    self._ctx.destroy(linger=0)
 
 
     class MooncakeLayerwiseConnectorFF(MooncakeLayerwiseConnector, SupportsHMA):
@@ -322,7 +366,7 @@ if _ASCEND_AVAILABLE:
             self._ff_group_layers: dict[int, set[str]] | None = None
             self._ff_fusion_groups: set[int] | None = None
             self._ff_recv_thread: _FFRedirectRecvThread | None = None
-            self._ff_send_sockets: dict[str, Any] = {}
+            self._ff_send_thread: _FFRedirectSendThread | None = None
             if self._ff_enabled and self.connector_worker is not None:
                 self._ff_install_worker_hooks()
             if self._ff_enabled:
@@ -337,6 +381,8 @@ if _ASCEND_AVAILABLE:
             is_consumer = self.vllm_config.kv_transfer_config.is_kv_consumer
 
             if is_producer:
+                self._ff_send_thread = _FFRedirectSendThread()
+                self._ff_send_thread.start()
                 orig_save = worker.save_kv_layer
 
                 def _wrapped_save(layer_name, kv_layer, attn_metadata, connector_metadata, **kw):
@@ -409,21 +455,13 @@ if _ASCEND_AVAILABLE:
                 self._ff_ship_redirect(rm.remote_host, rm.remote_port, ext_id, gi, rows)
 
         def _ff_ship_redirect(self, host, base_port, ext_id, gi, rows) -> None:
-            """Send one request's redirect rows for group ``gi`` to the decode node's FF channel."""
-            if host is None or base_port is None:
+            """Enqueue one request's redirect rows for group ``gi`` to the background sender (the
+            decode node's FF PULL channel). Non-blocking: NOTHING here runs on the prefill hot path
+            beyond a queue append. Rows are normalized to plain ints for msgpack."""
+            if host is None or base_port is None or self._ff_send_thread is None:
                 return
-            port = base_port + _FF_PORT_OFFSET
-            path = make_zmq_path("tcp", host, port)
             data = [[int(o), int(h), int(s)] for (o, h, s) in rows]
-            payload = msgspec.msgpack.Encoder().encode((_FF_REDIRECT_MSG, ext_id, int(gi), data))
-            try:
-                with zmq_ctx(zmq.REQ, path) as sock:
-                    sock.setsockopt(zmq.SNDTIMEO, 1000)
-                    sock.send(payload)
-                    if sock.poll(1000, zmq.POLLIN):
-                        sock.recv()
-            except Exception as e:  # pragma: no cover - defensive
-                logger.warning("BFF Mooncake ship redirect failed (%s:%d): %s", host, port, e)
+            self._ff_send_thread.submit(host, base_port + _FF_PORT_OFFSET, ext_id, gi, data)
 
         # -- consumer apply -----------------------------------------------------------------
         def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
