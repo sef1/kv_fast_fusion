@@ -59,6 +59,17 @@ case "$BASELINE" in
   *) echo "Unknown BASELINE=$BASELINE (use bff|layerwise|mooncakev1)"; exit 1 ;;
 esac
 
+# Wrap the mover in MultiConnector + AscendStoreConnector (external KV pool)?
+# Default: OFF for bff, ON for the stock baselines. BFF needs HMA (multi-group), but the deployed
+# AscendMultiConnector/AscendStoreConnector may not implement SupportsHMA — so bff runs the FF mover
+# standalone (it IS HMA-capable). For an apples-to-apples comparison set USE_ASCEND_STORE=0 on the
+# stock baselines too.
+if [[ "$BASELINE" == "bff" ]]; then
+  USE_ASCEND_STORE=${USE_ASCEND_STORE:-0}
+else
+  USE_ASCEND_STORE=${USE_ASCEND_STORE:-1}
+fi
+
 # ---- BFF knobs (only take effect when BASELINE=bff) ----
 BFF_PD_FUSE=${BFF_PD_FUSE:-1}            # connector-level fusion + redirect propagation to D
 BFF_SCALE_MODE=${BFF_SCALE_MODE:-raw}    # NPU supports raw only (ratio needs a CUDA Triton kernel)
@@ -226,10 +237,14 @@ export_bff_env() {
   if [[ "$role" == "kv_producer" ]]; then export BFF_PD_STATS_DIR="$results_root"; else unset BFF_PD_STATS_DIR; fi
 }
 
-# Build the MultiConnector KV_TRANSFER_CONFIG for a given role + kv_port.
+# Build the KV_TRANSFER_CONFIG for a given role + kv_port.
+#   USE_ASCEND_STORE=1 → MultiConnector wrapping [<mover>, AscendStoreConnector].
+#   USE_ASCEND_STORE=0 → the mover alone (top-level connector; kv_port at top level). Required for
+#                        bff on a deployment whose AscendMultiConnector isn't SupportsHMA.
 build_kv_transfer_config() {
   local role=$1 kv_port=$2
-  cat <<JSON
+  if [[ "$USE_ASCEND_STORE" == "1" ]]; then
+    cat <<JSON
 {
   "kv_connector": "MultiConnector",
   "kv_role": "${role}",
@@ -254,6 +269,20 @@ build_kv_transfer_config() {
   }
 }
 JSON
+  else
+    cat <<JSON
+{
+  "kv_connector": "${CONNECTOR}",
+  "kv_role": "${role}",
+  "kv_port": ${kv_port},
+  "kv_connector_extra_config": {
+    "use_ascend_direct": true,
+    "prefill": { "dp_size": ${DP_SIZE}, "tp_size": ${TP_SIZE} },
+    "decode":  { "dp_size": ${DP_SIZE}, "tp_size": ${TP_SIZE} }
+  }
+}
+JSON
+  fi
 }
 
 # vLLM args shared by P and D. BFF needs block-size 128 + prefix caching + hybrid KV manager.
@@ -396,7 +425,7 @@ main() {
 
   if [ "$KILL_ONLY" = true ]; then kill_all_nodes; echo "Cleanup done."; exit 0; fi
 
-  echo "BFF Ascend config: BASELINE=$BASELINE connector=$CONNECTOR ${NUM_PREFILL}Px${NUM_DECODE}D tp=$TP_SIZE"
+  echo "BFF Ascend config: BASELINE=$BASELINE connector=$CONNECTOR ${NUM_PREFILL}Px${NUM_DECODE}D tp=$TP_SIZE use_ascend_store=$USE_ASCEND_STORE"
   [[ "$BFF_ON" == "1" ]] && echo "  BFF: fuse=$BFF_PD_FUSE scale=$BFF_SCALE_MODE merge=$BFF_PD_MERGE repr=$BFF_PD_REPR thr=$BFF_THRESHOLD gs=$BFF_GROUP_SIZE eb=$BFF_PD_ENCODED_BATCH_SIZE"
 
   rm -rf "${logs_root}" "${results_root}"; mkdir -p "${logs_root}" "${results_root}"
