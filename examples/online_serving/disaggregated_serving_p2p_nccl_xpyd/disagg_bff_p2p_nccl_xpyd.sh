@@ -129,7 +129,7 @@ BFF_THRESHOLD=${BFF_THRESHOLD:-0.75}       # BFF fusion threshold (0.0-1.0, 0.75
 # >0 = also match each prefill batch against a rolling registry of the last N requests' rep blocks
 # (frees more on D → compression can exceed ~2×). Set N near the decode-resident request count;
 # proj repr recommended to bound registry memory.
-BFF_PD_ENCODED_BATCH_SIZE=${BFF_PD_ENCODED_BATCH_SIZE:-128}
+BFF_PD_ENCODED_BATCH_SIZE=${BFF_PD_ENCODED_BATCH_SIZE:-32}
 # ---- GPU memory / recv-buffer tuning -----------------------------------------
 # P only SENDS, so its recv-buffer threshold (kv_buffer_size) can be tiny (1e1).
 # P only SENDS, so its recv-buffer threshold (kv_buffer_size) can be tiny (1e1).

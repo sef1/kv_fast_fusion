@@ -1,0 +1,33 @@
+From fe44c0e40eb4f5707d6740aaeeccdebe42119b60 Mon Sep 17 00:00:00 2001
+From: bff-rebase <kampeas@post.bgu.ac.il>
+Date: Thu, 2 Jul 2026 14:29:54 +0300
+Subject: [PATCH 1/5] [P/D] Fix Mooncake Connector MTP accuracy bug
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Slice remote_block_ids to num_prompt_blocks so the decode side only pulls the
+prompt KV blocks (not decode-appended blocks) — MTP accuracy fix. Rebased to
+vllm-ascend v0.19.1 (request_finished return dict).
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ .../distributed/kv_transfer/kv_p2p/mooncake_connector.py        | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py
+index bcd2aacf..74998049 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py
+@@ -1066,7 +1066,7 @@ class MooncakeConnectorScheduler:
+         return delay_free_blocks, dict(
+             do_remote_prefill=True,
+             do_remote_decode=False,
+-            remote_block_ids=computed_block_ids,
++            remote_block_ids=computed_block_ids[:num_prompt_blocks],
+             remote_engine_id=self.engine_id,
+             remote_request_id=request.request_id,
+             remote_host=self.side_channel_host,
+-- 
+2.25.1
+

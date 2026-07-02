@@ -1,0 +1,94 @@
+From 82b14725c70e3d14faa0bf3b24b8b72d5ee26e3c Mon Sep 17 00:00:00 2001
+From: bff-rebase <kampeas@post.bgu.ac.il>
+Date: Thu, 2 Jul 2026 14:35:15 +0300
+Subject: [PATCH 3/5] fix mtp+kv pool (ascend_store deferred-finish replay)
+
+When deferred KV connector finalization is enabled, get_finished() runs before
+wait_for_save() publishes the store jobs, so just-finished requests were never
+registered and their delay-free blocks never released. Stash finished ids in
+get_finished and replay them via a new KVPoolWorker.register_finished_requests
+after wait_for_save. Rebased to vllm-ascend v0.19.1. (The model_runner
+sample_tokens parts of the original 0001/0002 are already covered by v0.19.1's
+finalize_kv_connector / maybe_get_kv_connector_output(defer_finalize).)
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ .../ascend_store/ascend_store_connector.py       | 16 +++++++++++++++-
+ .../kv_pool/ascend_store/pool_worker.py          | 13 ++++++++++++-
+ 2 files changed, 27 insertions(+), 2 deletions(-)
+
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py
+index 48048805..409721ce 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py
+@@ -94,6 +94,8 @@ class AscendStoreConnector(KVConnectorBase_V1):
+         self._kv_cache_events: AscendStoreKVEvents | None = None
+ 
+         self.sended_but_unfinished_reqs: set[str] = set()
++        self._finished_req_ids_waiting_for_save: set[str] = set()
++        self._late_finished_sending: set[str] = set()
+ 
+         if role == KVConnectorRole.SCHEDULER:
+             self.connector_scheduler = KVPoolScheduler(vllm_config, self.use_layerwise)
+@@ -202,14 +204,26 @@ class AscendStoreConnector(KVConnectorBase_V1):
+         if self.use_layerwise:
+             return
+ 
+-        self.connector_worker.wait_for_save(self._get_connector_metadata())
++        connector_metadata = self._get_connector_metadata()
++        self.connector_worker.wait_for_save(connector_metadata)
++        # Deferred-finalization ordering: get_finished() ran before this wait_for_save() published
++        # the store jobs, so replay the just-finished requests now that they are in stored_requests.
++        if self._finished_req_ids_waiting_for_save:
++            self._late_finished_sending |= self.connector_worker.register_finished_requests(
++                self._finished_req_ids_waiting_for_save
++            )
++            self._finished_req_ids_waiting_for_save = set()
+ 
+     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
+         """Get the finished recving and sending requests."""
+         assert self.connector_worker is not None
++        self._finished_req_ids_waiting_for_save = set(finished_req_ids)
+         done_sending, done_recving = self.connector_worker.get_finished(
+             finished_req_ids, self._get_connector_metadata()
+         )
++        if self._late_finished_sending:
++            done_sending |= self._late_finished_sending
++            self._late_finished_sending = set()
+         return done_sending, done_recving
+ 
+     def get_kv_connector_kv_cache_events(self) -> AscendStoreKVEvents | None:
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
+index abe65893..7642e698 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
+@@ -525,6 +525,18 @@ class KVPoolWorker:
+                     req_id
+                 )
+ 
++        finished_sending |= self.register_finished_requests(finished_req_ids)
++        return finished_sending
++
++    def register_finished_requests(self, finished_req_ids: set[str]) -> set[str]:
++        """Replay finished request IDs after wait_for_save publishes store jobs.
++
++        When deferred KV connector finalization is enabled, get_finished() runs
++        before wait_for_save(). At that point the just-finished requests are not
++        yet present in stored_requests, so they would never enter
++        finished_store_req and their delay-free blocks would never be released.
++        """
++        finished_sending = set()
+         for req_id in finished_req_ids:
+             req_remain_jobs = self.kv_send_thread.stored_requests.get(  # type: ignore[union-attr]
+                 req_id
+@@ -536,7 +548,6 @@ class KVPoolWorker:
+                 )
+             elif req_remain_jobs is not None:
+                 self.finished_store_req.add(req_id)
+-
+         return finished_sending
+ 
+     def lookup(
+-- 
+2.25.1
+

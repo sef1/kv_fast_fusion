@@ -1,0 +1,92 @@
+From a223408ccc3db3366592dcf99a3df3994c0410d4 Mon Sep 17 00:00:00 2001
+From: bff-rebase <kampeas@post.bgu.ac.il>
+Date: Thu, 2 Jul 2026 14:43:18 +0300
+Subject: [PATCH] support mooncake SSD metrics
+
+Read MC_STORE_ENABLE_HTTP_SERVER / MC_STORE_HTTP_PORT in RealClient::setup_internal
+and offset the HTTP port by the ssd_offload_path rank so per-rank SSD stores expose
+distinct metrics endpoints. Rebased to Mooncake v0.3.11.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ mooncake-store/src/real_client.cpp | 50 ++++++++++++++++++++++++++++++
+ 1 file changed, 50 insertions(+)
+
+diff --git a/mooncake-store/src/real_client.cpp b/mooncake-store/src/real_client.cpp
+index b0cab936..f5699190 100644
+--- a/mooncake-store/src/real_client.cpp
++++ b/mooncake-store/src/real_client.cpp
+@@ -48,6 +48,54 @@ DEFINE_int32(http_port, 9300,
+ 
+ namespace mooncake {
+ namespace {
++void apply_http_server_from_env() {
++    const char *enable_http = std::getenv("MC_STORE_ENABLE_HTTP_SERVER");
++    FLAGS_enable_http_server =
++        (enable_http != nullptr && std::string(enable_http) == "1");
++
++    const char *http_port = std::getenv("MC_STORE_HTTP_PORT");
++    if (http_port != nullptr) {
++        std::string port_str(http_port);
++        bool is_digit_only =
++            !port_str.empty() &&
++            std::all_of(port_str.begin(), port_str.end(), [](unsigned char c) {
++                return std::isdigit(c) != 0;
++            });
++        if (is_digit_only) {
++            FLAGS_http_port = std::stoi(port_str);
++        } else {
++            FLAGS_http_port = 9300;
++            LOG(WARNING) << "Invalid MC_STORE_HTTP_PORT value: " << http_port
++                         << ". Falling back to 9300.";
++        }
++    }
++}
++
++void apply_http_port_from_ssd_offload_path(const std::string &ssd_offload_path) {
++    if (!FLAGS_enable_http_server || ssd_offload_path.empty()) {
++        return;
++    }
++
++    std::string path = ssd_offload_path;
++    while (!path.empty() && path.back() == '/') {
++        path.pop_back();
++    }
++    if (path.empty()) {
++        return;
++    }
++
++    const char last = path.back();
++    if (!std::isdigit(static_cast<unsigned char>(last))) {
++        LOG(WARNING) << "ssd_offload_path does not end with a digit: " << path;
++        return;
++    }
++
++    const int rank = last - '0';
++    FLAGS_http_port += rank;
++    LOG(INFO) << "HTTP port from ssd_offload_path: " << FLAGS_http_port
++              << " (path=" << path << ", rank=" << rank << ")";
++}
++
+ #ifdef USE_ASCEND_DIRECT
+ bool checkAcl(aclError result, const char *message) {
+     if (result != ACL_ERROR_NONE) {
+@@ -633,6 +681,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
+     const std::string &ipc_socket_path, int local_rpc_port,
+     bool enable_ssd_offload, bool start_offload_rpc_server,
+     const std::string &ssd_offload_path) {
++    apply_http_server_from_env();
+     this->protocol = protocol;
+     this->ipc_socket_path_ = ipc_socket_path;
+     const bool should_use_hugepage =
+@@ -912,6 +961,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
+         auto file_storage_config = FileStorageConfig::FromEnvironment();
+         if (!ssd_offload_path.empty()) {
+             file_storage_config.storage_filepath = ssd_offload_path;
++            apply_http_port_from_ssd_offload_path(file_storage_config.storage_filepath);
+         }
+         file_storage_ = std::make_shared<FileStorage>(
+             file_storage_config, client_, this->local_rpc_addr,
+-- 
+2.25.1
+

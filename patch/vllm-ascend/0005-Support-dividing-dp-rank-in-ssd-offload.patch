@@ -1,0 +1,46 @@
+From a35fc52ef829801bee09adcacf37ccf8c7038dc1 Mon Sep 17 00:00:00 2001
+From: bff-rebase <kampeas@post.bgu.ac.il>
+Date: Thu, 2 Jul 2026 14:38:34 +0300
+Subject: [PATCH 5/5] Support dividing dp-rank in ssd offload
+
+Include the DP rank in the per-rank SSD offload sub-path (dp_{dp}_rank_{local})
+so DP replicas on one machine don't collide. Rebased to vllm-ascend v0.19.1.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ .../kv_pool/ascend_store/backend/mooncake_backend.py   | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/mooncake_backend.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/mooncake_backend.py
+index 2ef861c2..17d37263 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/mooncake_backend.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/mooncake_backend.py
+@@ -12,7 +12,7 @@ import torch
+ # Third Party
+ from mooncake.store import ReplicateConfig  # type: ignore
+ from vllm.config import ParallelConfig
+-from vllm.distributed.parallel_state import get_world_group
++from vllm.distributed.parallel_state import get_dp_group, get_world_group
+ from vllm.logger import logger
+ from vllm.utils.network_utils import get_ip
+ 
+@@ -103,9 +103,15 @@ class MooncakeBackend(Backend):
+         # Each TP rank must use a separate SSD directory to avoid bucket file
+         # collisions (independent BucketStorageBackend instances generate the
+         # same bucket_id sequence and would overwrite each other's data).
++        # Under DP, every DP replica is a separate process with its own world
++        # group, so its local_rank also starts from 0. On a single machine
++        # (e.g. DP2TP4) DP0 and DP1 would both create rank_0..rank_3 and
++        # overwrite each other. Include the DP rank in the sub-path to keep
++        # each (dp, tp) rank isolated.
+         if ssd_kwargs and ssd_kwargs.get("ssd_offload_path"):
+             local_rank = get_world_group().local_rank
+-            rank_path = os.path.join(str(ssd_kwargs["ssd_offload_path"]), f"rank_{local_rank}")
++            dp_rank = get_dp_group().rank_in_group
++            rank_path = os.path.join(str(ssd_kwargs["ssd_offload_path"]), f"dp_{dp_rank}_rank_{local_rank}")
+             try:
+                 os.makedirs(rank_path, exist_ok=True)
+             except OSError as e:
+-- 
+2.25.1
+

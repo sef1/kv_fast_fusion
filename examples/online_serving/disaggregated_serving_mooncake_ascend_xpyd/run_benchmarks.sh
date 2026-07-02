@@ -15,10 +15,15 @@
 #   layerwise            → stock MooncakeLayerwiseConnector (layerwise transfer, no fusion)
 #   mooncakev1           → stock MooncakeConnectorV1 (whole-request transfer)
 #
+# SSD offload (opt-in): ENABLE_SSD_OFFLOAD=1 spills the AscendStore KV pool to SSD via Mooncake. It
+# only takes effect with USE_ASCEND_STORE=1 and requires the SSD patches applied on the host
+# (ENABLE_SSD=1 <repo>/patch/apply_all.sh). Tune the path with SSD_OFFLOAD_PATH.
+#
 # Example runs:
 #   ./run_benchmarks.sh                                   # 2P1D, bff, defaults
 #   NUM_PREFILL=2 NUM_DECODE=1 BASELINE=bff BFF_THRESHOLD=0.85 ./run_benchmarks.sh
 #   BASELINE=layerwise ./run_benchmarks.sh                # fusion ablation (BFF layout off entirely)
+#   ENABLE_SSD_OFFLOAD=1 USE_ASCEND_STORE=1 BASELINE=layerwise ./run_benchmarks.sh   # KV pool → SSD
 #   ./run_benchmarks.sh -k                                # kill a previous cluster and exit
 # =============================================================================
 
@@ -91,11 +96,37 @@ F1_SPLIT=${F1_SPLIT:-train}
 F1_INPUT_KEY=${F1_INPUT_KEY:-query}
 F1_OUTPUT_KEY=${F1_OUTPUT_KEY:-answer}
 
+# ---- SSD offload (opt-in; only meaningful when USE_ASCEND_STORE=1) ----
+# Spills the AscendStore KV pool to SSD via Mooncake. Requires the SSD patches applied on the host:
+#   ENABLE_SSD=1 <path>/vllm_ff/patch/apply_all.sh   (adds enable_ssd_offload to mooncake_backend.py)
+ENABLE_SSD_OFFLOAD=${ENABLE_SSD_OFFLOAD:-0}
+SSD_OFFLOAD_PATH=${SSD_OFFLOAD_PATH:-/data/mooncake_offload}   # ssd_offload_path + MOONCAKE_OFFLOAD_FILE_STORAGE_PATH
+
+# ---- mooncake.json base fields (auto-generated unless MOONCAKE_CONFIG_PATH is overridden) ----
+MC_METADATA_SERVER=${MC_METADATA_SERVER:-P2PHANDSHAKE}
+MC_PROTOCOL=${MC_PROTOCOL:-ascend}
+MC_DEVICE_NAME=${MC_DEVICE_NAME:-}
+MC_MASTER_ADDR=${MC_MASTER_ADDR:-127.0.0.1}                    # master_server_address = MC_MASTER_ADDR:MASTER_PORT
+MC_GLOBAL_SEGMENT_SIZE=${MC_GLOBAL_SEGMENT_SIZE:-100GB}
+MC_LOCAL_BUFFER_SIZE=${MC_LOCAL_BUFFER_SIZE:-1GB}
+
+# ---- MOONCAKE_OFFLOAD_* tunables (wiki defaults; only exported when ENABLE_SSD_OFFLOAD=1) ----
+MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=${MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR:-bucket_storage_backend}
+MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY=${MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY:-lru}
+MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES=${MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES:-8589934592}   # 8 GiB
+MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=${MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS:-3}
+MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES=${MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES:-1649267441664}   # ~1.5 TiB
+MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE=${MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE:-1484340654899}     # ~1.35 TiB
+MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES=${MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES:-536870912}     # 512 MiB
+MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT=${MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT:-1000}
+MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT=${MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT:-120000000}
+
 # ---- Paths / infra ----
 REPO_ROOT=${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}
 VLLM_ASCEND_ROOT=${VLLM_ASCEND_ROOT:-/vllm-workspace/vllm-ascend}
 PROXY_DIR=${PROXY_DIR:-${VLLM_ASCEND_ROOT}/examples/disaggregated_prefill_v1}
-MOONCAKE_CONFIG_PATH=${MOONCAKE_CONFIG_PATH:-"$(pwd)/mooncake.json"}
+# If the user set MOONCAKE_CONFIG_PATH, respect it; otherwise write_mooncake_config() generates one.
+MOONCAKE_CONFIG_PATH=${MOONCAKE_CONFIG_PATH:-}
 LOG_ROOT=${LOG_ROOT:-logs}
 RESULT_ROOT=${RESULT_ROOT:-results}
 MIN_FREE_MEMORY_MB=${MIN_FREE_MEMORY_MB:-40000}
@@ -218,6 +249,71 @@ export_ascend_env() {
   export MOONCAKE_CONFIG_PATH ASCEND_BUFFER_POOL=4:8 MC_STORE_ENABLE_HTTP_SERVER=1
   # COMPILATION_CONFIG (cudagraph) is DECODE-ONLY (FULL_DECODE_ONLY); prefill launches without it.
   export COMPILATION_CONFIG='{"cudagraph_capture_sizes":[1,4,8,12,16,20,24,28,32,36,40,48,56,64,80,96],"cudagraph_mode":"FULL_DECODE_ONLY"}'
+  export_ssd_offload_env   # no-op unless ENABLE_SSD_OFFLOAD=1
+}
+
+# Export the MOONCAKE_OFFLOAD_* env consumed by the Mooncake store/master when SSD offload is on.
+# No-op when ENABLE_SSD_OFFLOAD=0 so the default path is unchanged. Called on both the master and the
+# engines (superset is harmless — the master reads only the storage/heartbeat subset).
+export_ssd_offload_env() {
+  [[ "$ENABLE_SSD_OFFLOAD" != "1" ]] && return 0
+  export MOONCAKE_OFFLOAD_FILE_STORAGE_PATH="$SSD_OFFLOAD_PATH"
+  export MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY \
+         MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS \
+         MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE \
+         MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT \
+         MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT
+}
+
+# Guard the SSD-offload prerequisites and prepare the offload directory. Offload only flows through
+# AscendStoreConnector -> MooncakeBackend, so it is a no-op (and misleading) without USE_ASCEND_STORE=1,
+# and it needs the SSD backend patch applied on the host (adds enable_ssd_offload to mooncake_backend.py).
+validate_ssd_offload() {
+  [[ "$ENABLE_SSD_OFFLOAD" != "1" ]] && return 0
+  if [[ "$USE_ASCEND_STORE" != "1" ]]; then
+    echo "ERROR: ENABLE_SSD_OFFLOAD=1 requires USE_ASCEND_STORE=1 — offload flows through the" >&2
+    echo "       AscendStore KV pool (MooncakeBackend) and has no effect on the standalone mover." >&2
+    echo "       Re-run with USE_ASCEND_STORE=1 (note: bff also needs a SupportsHMA AscendMultiConnector)." >&2
+    exit 1
+  fi
+  local backend_py="${VLLM_ASCEND_ROOT}/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/mooncake_backend.py"
+  if [ -f "$backend_py" ] && ! grep -q "enable_ssd_offload" "$backend_py"; then
+    echo "WARNING: ${backend_py} has no 'enable_ssd_offload' support — offload will be ignored." >&2
+    echo "         Apply the SSD patches first:  ENABLE_SSD=1 ${REPO_ROOT}/patch/apply_all.sh" >&2
+  fi
+  mkdir -p "$SSD_OFFLOAD_PATH" || true
+  echo "SSD offload: path=${SSD_OFFLOAD_PATH} (requires patch/vllm-ascend/0004,0005 applied on host)"
+}
+
+# Generate mooncake.json (read only by AscendStoreConnector's MooncakeBackend, i.e. USE_ASCEND_STORE=1)
+# into the run dir and point MOONCAKE_CONFIG_PATH at it — unless the user supplied their own path.
+# The enable_ssd_offload/ssd_offload_path keys are emitted only when ENABLE_SSD_OFFLOAD=1.
+write_mooncake_config() {
+  if [ -n "$MOONCAKE_CONFIG_PATH" ]; then
+    echo "Using user-provided MOONCAKE_CONFIG_PATH=$MOONCAKE_CONFIG_PATH"
+    export MOONCAKE_CONFIG_PATH
+    return 0
+  fi
+  MOONCAKE_CONFIG_PATH="${logs_root}/mooncake.json"
+  local ssd_keys=""
+  if [[ "$ENABLE_SSD_OFFLOAD" == "1" ]]; then
+    ssd_keys="
+  \"enable_ssd_offload\": true,
+  \"ssd_offload_path\": \"${SSD_OFFLOAD_PATH}\","
+  fi
+  cat > "$MOONCAKE_CONFIG_PATH" <<JSON
+{
+  "metadata_server": "${MC_METADATA_SERVER}",
+  "protocol": "${MC_PROTOCOL}",
+  "device_name": "${MC_DEVICE_NAME}",
+  "master_server_address": "${MC_MASTER_ADDR}:${MASTER_PORT}",
+  "global_segment_size": "${MC_GLOBAL_SEGMENT_SIZE}",
+  "local_buffer_size": "${MC_LOCAL_BUFFER_SIZE}",${ssd_keys}
+  "_generated_by": "run_benchmarks.sh"
+}
+JSON
+  echo "Wrote mooncake.json → $MOONCAKE_CONFIG_PATH (ssd_offload=$ENABLE_SSD_OFFLOAD)"
+  export MOONCAKE_CONFIG_PATH
 }
 
 # Export BFF env into the current process env (inherited by the launched engine).
@@ -311,9 +407,16 @@ common_args() {
 # ============================================================
 launch_mooncake_master() {
   echo "Launching mooncake_master on port ${MASTER_PORT}..."
+  local offload_flag=""
+  if [[ "$ENABLE_SSD_OFFLOAD" == "1" ]]; then
+    offload_flag="--enable_offload=true"
+    export_ssd_offload_env   # master reads MOONCAKE_OFFLOAD_FILE_STORAGE_PATH / heartbeat / eviction
+    echo "  SSD offload ENABLED (path=${SSD_OFFLOAD_PATH})"
+  fi
   nohup mooncake_master --port ${MASTER_PORT} --eviction_high_watermark_ratio 0.95 \
     --eviction_ratio 0.05 --rpc_thread_num 128 --promotion_on_hit=true \
     --promotion_admission_threshold=3 --default_kv_lease_ttl=30s --client_ttl=30 \
+    ${offload_flag} \
     > ${logs_root}/mooncake_master.log 2>&1 &
   sleep 3
 }
@@ -430,6 +533,9 @@ main() {
 
   rm -rf "${logs_root}" "${results_root}"; mkdir -p "${logs_root}" "${results_root}"
   rm -f "${results_root}"/bff_stats_*.json
+
+  validate_ssd_offload
+  write_mooncake_config
 
   kill_all_nodes
   echo "Detecting free NPUs..."; AVAILABLE_NPUS=$(get_free_npus ${MIN_FREE_MEMORY_MB}); echo "  $AVAILABLE_NPUS"
