@@ -14,6 +14,10 @@
 #   bff        (default) → MooncakeLayerwiseConnectorFF + BFF_PD_FUSE=1 (fusion + D-side sharing)
 #   layerwise            → stock MooncakeLayerwiseConnector (layerwise transfer, no fusion)
 #   mooncakev1           → stock MooncakeConnectorV1 (whole-request transfer)
+#   vanilla              → true stock: launches via `vllm.entrypoints.cli.main`, so
+#                          `kv_fast_fusion`/`kv_fast_fusion_ascend` are never imported (no patches,
+#                          no FF connector registration at all). Connector choice via
+#                          VANILLA_CONNECTOR=MooncakeLayerwiseConnector (default) | MooncakeConnectorV1.
 #
 # SSD offload (opt-in): ENABLE_SSD_OFFLOAD=1 spills the AscendStore KV pool to SSD via Mooncake. It
 # only takes effect with USE_ASCEND_STORE=1 and requires the SSD patches applied on the host
@@ -24,6 +28,7 @@
 #   NUM_PREFILL=2 NUM_DECODE=1 BASELINE=bff BFF_THRESHOLD=0.85 ./run_benchmarks.sh
 #   BASELINE=layerwise ./run_benchmarks.sh                # fusion ablation (BFF layout off entirely)
 #   ENABLE_SSD_OFFLOAD=1 USE_ASCEND_STORE=1 BASELINE=layerwise ./run_benchmarks.sh   # KV pool → SSD
+#   BASELINE=vanilla ./run_benchmarks.sh                  # true stock, no BFF code imported at all
 #   ./run_benchmarks.sh -k                                # kill a previous cluster and exit
 # =============================================================================
 
@@ -56,12 +61,17 @@ BLOCK_SIZE=${BLOCK_SIZE:-128}         # BFF requires 128
 SEED=${SEED:-1024}
 
 # ---- Baseline / connector selection ----
-BASELINE=${BASELINE:-bff}             # bff | layerwise | mooncakev1
+BASELINE=${BASELINE:-bff}             # bff | layerwise | mooncakev1 | vanilla
+VANILLA_CONNECTOR=${VANILLA_CONNECTOR:-MooncakeLayerwiseConnector}  # vanilla only: MooncakeLayerwiseConnector | MooncakeConnectorV1
 case "$BASELINE" in
-  bff)         CONNECTOR="MooncakeLayerwiseConnectorFF"; LAYER_WISE=true;  BFF_ON=1 ;;
-  layerwise)   CONNECTOR="MooncakeLayerwiseConnector";   LAYER_WISE=true;  BFF_ON=0 ;;
-  mooncakev1)  CONNECTOR="MooncakeConnectorV1";          LAYER_WISE=false; BFF_ON=0 ;;
-  *) echo "Unknown BASELINE=$BASELINE (use bff|layerwise|mooncakev1)"; exit 1 ;;
+  bff)         CONNECTOR="MooncakeLayerwiseConnectorFF"; LAYER_WISE=true;  BFF_ON=1; LAUNCHER="kv_fast_fusion.fast_fusion_main" ;;
+  layerwise)   CONNECTOR="MooncakeLayerwiseConnector";   LAYER_WISE=true;  BFF_ON=0; LAUNCHER="kv_fast_fusion.fast_fusion_main" ;;
+  mooncakev1)  CONNECTOR="MooncakeConnectorV1";          LAYER_WISE=false; BFF_ON=0; LAUNCHER="kv_fast_fusion.fast_fusion_main" ;;
+  vanilla)
+    CONNECTOR="$VANILLA_CONNECTOR"
+    [[ "$CONNECTOR" == "MooncakeLayerwiseConnector" ]] && LAYER_WISE=true || LAYER_WISE=false
+    BFF_ON=0; LAUNCHER="vllm.entrypoints.cli.main" ;;
+  *) echo "Unknown BASELINE=$BASELINE (use bff|layerwise|mooncakev1|vanilla)"; exit 1 ;;
 esac
 
 # Wrap the mover in MultiConnector + AscendStoreConnector (external KV pool)?
@@ -224,8 +234,8 @@ kill_all_nodes() {
   echo "Wiping existing cluster..."
   destroy_node_by_port_and_pattern ${PROXY_PORT} "proxy_server"
   destroy_node_by_port_and_pattern ${MASTER_PORT} "mooncake_master"
-  for ((i=0; i<NUM_PREFILL; i++)); do destroy_node_by_port_and_pattern $((PREFILL_PORT_BASE + i)) "fast_fusion_main"; done
-  for ((i=0; i<NUM_DECODE; i++));  do destroy_node_by_port_and_pattern $((DECODE_PORT_BASE + i))  "fast_fusion_main"; done
+  for ((i=0; i<NUM_PREFILL; i++)); do destroy_node_by_port_and_pattern $((PREFILL_PORT_BASE + i)) "$LAUNCHER"; done
+  for ((i=0; i<NUM_DECODE; i++));  do destroy_node_by_port_and_pattern $((DECODE_PORT_BASE + i))  "$LAUNCHER"; done
   curl -X POST http://${VLLM_HOST_IP}:${MASTER_PORT}/admin/clear_all 2>/dev/null || true
   for ((i=0; i<NUM_PREFILL; i++)); do rm -f "/tmp/lookup_rpc_port_$((PREFILL_PORT_BASE+i))_dp_rank0" 2>/dev/null || true; done
   for ((i=0; i<NUM_DECODE; i++));  do rm -f "/tmp/lookup_rpc_port_$((DECODE_PORT_BASE+i))_dp_rank0"  2>/dev/null || true; done
@@ -434,7 +444,7 @@ launch_engines() {
     export ASCEND_RT_VISIBLE_DEVICES=$npu
     local kv_cfg; kv_cfg=$(build_kv_transfer_config "$role" "$kv_port")
 
-    nohup bash -c "python -m kv_fast_fusion.fast_fusion_main serve \"${MODEL}\" \
+    nohup bash -c "python -m ${LAUNCHER} serve \"${MODEL}\" \
         $(common_args "$tag") \
         --port ${port} \
         --gpu-memory-utilization ${GPU_MEM_UTIL} \
@@ -528,7 +538,7 @@ main() {
 
   if [ "$KILL_ONLY" = true ]; then kill_all_nodes; echo "Cleanup done."; exit 0; fi
 
-  echo "BFF Ascend config: BASELINE=$BASELINE connector=$CONNECTOR ${NUM_PREFILL}Px${NUM_DECODE}D tp=$TP_SIZE use_ascend_store=$USE_ASCEND_STORE"
+  echo "BFF Ascend config: BASELINE=$BASELINE launcher=$LAUNCHER connector=$CONNECTOR ${NUM_PREFILL}Px${NUM_DECODE}D tp=$TP_SIZE use_ascend_store=$USE_ASCEND_STORE"
   [[ "$BFF_ON" == "1" ]] && echo "  BFF: fuse=$BFF_PD_FUSE scale=$BFF_SCALE_MODE merge=$BFF_PD_MERGE repr=$BFF_PD_REPR thr=$BFF_THRESHOLD gs=$BFF_GROUP_SIZE eb=$BFF_PD_ENCODED_BATCH_SIZE"
 
   rm -rf "${logs_root}" "${results_root}"; mkdir -p "${logs_root}" "${results_root}"
