@@ -468,14 +468,28 @@ if _ASCEND_AVAILABLE:
             sending, recving = super().get_finished(finished_req_ids)
             if self._ff_enabled and self._ff_recv_thread is not None:
                 try:
-                    self._ff_apply_pending()
+                    # `recving` = request ids whose KV *just* fully landed this step. Applying a
+                    # redirect only for those requests guarantees we repoint+free BEFORE the owner
+                    # decodes — mirroring the NCCL connector's load-time apply. Draining and applying
+                    # for already-decoding requests frees in-use blocks → pool aliasing → global KV
+                    # corruption (every request garbage → no EOS → runs to max_tokens).
+                    self._ff_apply_pending(recving)
                 except Exception as e:  # pragma: no cover - defensive
                     logger.warning("BFF Mooncake consumer apply failed: %s", e)
             return sending, recving
 
-        def _ff_apply_pending(self) -> None:
-            """Apply any arrived redirect maps whose owner + rep requests are resident on D, then
-            stage the freed/redirected block tables for the scheduler via the BFF merge channel."""
+        def _ff_apply_pending(self, recving: set[str]) -> None:
+            """Apply redirect maps for the requests whose KV *just* completed this step (``recving``),
+            then stage the freed/redirected block tables for the scheduler via the BFF merge channel.
+
+            Timing is the correctness gate (see ``get_finished``): a redirect is applied ONLY at the
+            step its owner's recv completes — before the owner decodes — so repoint+free is safe.
+            Three cases for a pending owner:
+              * owner in ``recving``  → apply now (pre-decode window);
+              * owner not yet resident → arrived early, re-queue for the step it lands;
+              * owner resident but not in ``recving`` → its window already passed (it is decoding) →
+                DROP. Applying now would free in-use blocks; a dropped map costs compression, not
+                correctness. Dropping also bounds the pending map."""
             pending = self._ff_recv_thread.drain()
             if not pending:
                 return
@@ -496,31 +510,40 @@ if _ASCEND_AVAILABLE:
                 ext2blocks[ext] = bids
                 hash2ext[_ext_hash(ext)] = ext
                 rid_by_ext[ext] = rid
+            just_recv_ext = {get_external_request_id(rid) for rid in recving}
             updated: dict[str, dict[int, list[int]]] = {}
-            n_applied = n_unresolved = 0
+            n_applied = n_unresolved = n_deferred = n_dropped = 0
             leftover: dict[str, dict[int, list]] = {}
             for ext_id, groups in pending.items():
-                for gi, rows in groups.items():
-                    new_blocks, na, nu = resolve_redirect_rows(
-                        ext2blocks, hash2ext, ext_id, gi, rows)
-                    n_applied += na
-                    n_unresolved += nu
-                    if new_blocks is None and nu and ext_id not in ext2blocks:
-                        # owner not resident yet → keep for a later step
-                        leftover.setdefault(ext_id, {})[gi] = rows
-                    elif new_blocks is not None:
-                        rid = rid_by_ext[ext_id]
-                        updated.setdefault(rid, {})[gi] = new_blocks
-                        self._ff_write_runner_block_table(runner, rid, gi, new_blocks)
+                if ext_id in just_recv_ext:
+                    # Owner's KV just landed and it has not decoded yet → safe to repoint + free.
+                    for gi, rows in groups.items():
+                        new_blocks, na, nu = resolve_redirect_rows(
+                            ext2blocks, hash2ext, ext_id, gi, rows)
+                        n_applied += na
+                        n_unresolved += nu
+                        if new_blocks is not None:
+                            rid = rid_by_ext[ext_id]
+                            updated.setdefault(rid, {})[gi] = new_blocks
+                            self._ff_write_runner_block_table(runner, rid, gi, new_blocks)
+                elif ext_id not in ext2blocks:
+                    # Redirect arrived before the owner's KV → keep for the step its recv completes.
+                    leftover[ext_id] = groups
+                    n_deferred += 1
+                else:
+                    # Owner resident but past its recv-complete window (already decoding) → unsafe to
+                    # apply; drop to avoid freeing in-use blocks (and to bound the pending map).
+                    n_dropped += 1
             if leftover:
                 with self._ff_recv_thread.lock:
                     for ext_id, groups in leftover.items():
                         self._ff_recv_thread.pending.setdefault(ext_id, {}).update(groups)
             if updated:
                 runner._updated_block_tables = updated
-            if n_applied or n_unresolved or _PD_DEBUG:
-                logger.info("BFF Mooncake apply | redirects_applied=%d | reps_unresolved=%d",
-                            n_applied, n_unresolved)
+            if n_applied or n_unresolved or n_dropped or _PD_DEBUG:
+                logger.info("BFF Mooncake apply | redirects_applied=%d | reps_unresolved=%d | "
+                            "owners_deferred=%d | owners_dropped_post_decode=%d",
+                            n_applied, n_unresolved, n_deferred, n_dropped)
 
         @staticmethod
         def _ff_write_runner_block_table(runner, rid, gi, new_blocks) -> None:

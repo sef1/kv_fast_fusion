@@ -84,10 +84,12 @@ DECODE_PORTS=${DECODE_PORTS:-$(_seq_csv "$((HTTP_PORT_BASE + NUM_PREFILL))" "$NU
 # ---- Baseline mode -----------------------------------------------------------
 # BASELINE=bff (default)  → BFF launcher + group-aware P2pNcclConnectorFF (the system under test).
 # BASELINE=vanilla        → stock `vllm serve` + stock P2pNcclConnector, single KV-cache group, NO
-#                           BFF patches/group-split — the true end-to-end reference. (Stock asserts
-#                           under chunked prefill, so vanilla forces --no-enable-chunked-prefill; and
-#                           it must launch via vllm.entrypoints.cli.main, since fast_fusion_main's
-#                           import unconditionally applies the BFF group split.)
+#                           BFF patches/group-split — the true end-to-end reference. (It must launch
+#                           via vllm.entrypoints.cli.main, since fast_fusion_main's import
+#                           unconditionally applies the BFF group split. Chunked prefill defaults ON
+#                           for both baselines now — some hybrid Mamba/attention models, e.g.
+#                           Qwen3.5, hard-require it whenever prefix caching is enabled; see the
+#                           ENABLE_CHUNKED comment below for why that's safe for this benchmark.)
 # NOTE: BFF_PD_FUSE=0 is the *fusion ablation* (BFF layout, no merge) — NOT vanilla. Use FUSE=1 vs
 # FUSE=0 to isolate fusion (fully fair); use BASELINE=vanilla for the layout-cost / end-to-end ref.
 BASELINE=${BASELINE:-bff}
@@ -95,7 +97,15 @@ if [[ "$BASELINE" == "vanilla" ]]; then
     LAUNCHER="vllm.entrypoints.cli.main"
     CONNECTOR="P2pNcclConnector"
     HYBRID_FLAG=""                      # stock single-group default
-    ENABLE_CHUNKED=${ENABLE_CHUNKED:-0} # stock connector asserts under chunked prefill → off
+    # Some hybrid Mamba/attention models (e.g. Qwen3.5) hard-require chunked prefill whenever
+    # prefix caching is enabled (vLLM auto-sets mamba_cache_mode="align" when the model doesn't
+    # support mamba_cache_mode="all", which asserts enable_chunked_prefill) -- so vanilla can no
+    # longer default to chunked-off unconditionally. The stock P2pNcclConnector's own
+    # chunked-prefill limitation only trips when a request's prompt genuinely spans multiple
+    # scheduler steps, which cannot happen here since MAX_NUM_BATCHED_TOKENS==MAX_MODEL_LEN caps
+    # every prompt in one step -- so defaulting to chunked ON is safe for this benchmark. Override
+    # with ENABLE_CHUNKED=0 if testing a model/config where a request can genuinely span steps.
+    ENABLE_CHUNKED=${ENABLE_CHUNKED:-1}
 else
     LAUNCHER="kv_fast_fusion.fast_fusion_main"
     CONNECTOR="P2pNcclConnectorFF"
