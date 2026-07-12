@@ -25,10 +25,12 @@ box. The connector subclass + ZMQ wiring are defined only when ``vllm_ascend`` i
 """
 
 import hashlib
+import json
 import os
 import queue
 import struct
 import threading
+import time
 from typing import Any
 
 import torch
@@ -54,6 +56,12 @@ _PD_DEBUG = os.environ.get("BFF_PD_DEBUG", "0") == "1"
 # maps there. Kept separate from the connector's own handshake port so the stock recv thread is
 # untouched. TP=1 assumed for M1 (the new setup runs tp_size=1 on both P and D).
 _FF_PORT_OFFSET = int(os.environ.get("BFF_MOONCAKE_FF_PORT_OFFSET", "20000"))
+
+# Fusion-stats dump: the producer drops a per-process ``bff_stats_<pid>.json`` into this dir so the
+# benchmark's collect_bff_stats() can report real compression (mirrors the NCCL connector). The shell
+# exports BFF_PD_STATS_DIR only for the kv_producer role, so "not None" also gates on producer-only.
+_PD_STATS_DIR = os.environ.get("BFF_PD_STATS_DIR")
+_PD_STATS_EVERY = int(os.environ.get("BFF_PD_STATS_EVERY", "50"))
 
 _FF_REDIRECT_MSG = b"bff_redirect_msg"
 
@@ -110,11 +118,14 @@ class MooncakeFFProducer:
         # cumulative compression accounting (per fusion group)
         self.blk_total: dict[int, int] = {}
         self.redir_total: dict[int, int] = {}
+        self.steps = 0                        # scheduler steps seen (for the stats dump)
+        self.dedup_ms = 0.0                   # cumulative clustering time (ms), for overhead avg
 
     def reset_step(self, step_id: int) -> None:
         if step_id != self._cur_step_id:
             self._cur_step_id = step_id
             self._buf.clear()
+            self.steps += 1
 
     def on_layer(
         self,
@@ -172,6 +183,7 @@ class MooncakeFFProducer:
         ext_ids = buf["ext_ids"]
         n_redir = 0
         if buf["flat_bids"] and buf["k_layers"]:
+            t0 = time.perf_counter()
             dev0 = buf["k_layers"][0].device
             req_of_block = torch.as_tensor(flat_req_local, device=dev0)
             if tp_group is not None:
@@ -189,6 +201,7 @@ class MooncakeFFProducer:
                     send_rows.setdefault(owner_ext, []).append(
                         (int(slot), _ext_hash(ext_ids[rep_local]), int(rep_slot)))
                     n_redir += 1
+            self.dedup_ms += (time.perf_counter() - t0) * 1e3
         self.blk_total[gi] = self.blk_total.get(gi, 0) + len(buf["flat_bids"])
         self.redir_total[gi] = self.redir_total.get(gi, 0) + n_redir
         if n_redir or _PD_DEBUG:
@@ -196,6 +209,36 @@ class MooncakeFFProducer:
                         "redirects=%d", gi, _PD_MERGE, _PD_REPR, len(ext_ids),
                         len(buf["flat_bids"]), n_redir)
         return send_rows
+
+    def dump_stats(self, stats_dir: str) -> None:
+        """Write this producer's cumulative fusion compression to ``bff_stats_<pid>.json`` in
+        ``stats_dir``. The benchmark's collect_bff_stats() merges these after the run. Ascend analogue
+        of the NCCL connector's ``_pd_dump_fuse_stats``. Compression FACTOR = total / (total - freed):
+        how many x smaller the KV cache gets from fusion (>1; 2.0 = half the blocks)."""
+        try:
+            def _factor(b, r):
+                return b / max(1, b - r)
+            tot_b = sum(self.blk_total.values())
+            tot_r = sum(self.redir_total.values())
+            stats = {
+                "pid": os.getpid(),
+                "steps": self.steps,
+                "overhead_avg_group_dedup_ms": (self.dedup_ms / self.steps
+                                                if self.steps else 0.0),
+                "total_blocks": tot_b,
+                "freed": tot_r,
+                "compression_avg_factor": _factor(tot_b, tot_r),
+                "compression_per_group": {
+                    str(gi): _factor(self.blk_total[gi], self.redir_total.get(gi, 0))
+                    for gi in sorted(self.blk_total)},
+            }
+            path = os.path.join(stats_dir, f"bff_stats_{os.getpid()}.json")
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(stats, f)
+            os.replace(tmp, path)   # atomic — the reader never sees a half-written file
+        except Exception as e:  # pragma: no cover - defensive (must never break the transfer)
+            logger.warning("BFF Mooncake: could not dump fuse stats: %s", e)
 
 
 def resolve_redirect_rows(
@@ -513,6 +556,11 @@ if _ASCEND_AVAILABLE:
                 if not rows:
                     continue
                 self._ff_ship_redirect(rm.remote_host, rm.remote_port, ext_id, gi, rows)
+            # Periodically dump fusion stats so the benchmark's collect_bff_stats() can report real
+            # compression (mirrors the NCCL cadence: step 1, then every _PD_STATS_EVERY steps).
+            steps = self._ff_producer.steps
+            if _PD_STATS_DIR and steps and (steps % _PD_STATS_EVERY == 0 or steps == 1):
+                self._ff_producer.dump_stats(_PD_STATS_DIR)
 
         def _ff_ship_redirect(self, host, base_port, ext_id, gi, rows) -> None:
             """Enqueue one request's redirect rows for group ``gi`` to the background sender (the
