@@ -490,10 +490,21 @@ if _ASCEND_AVAILABLE:
                 for rid, rm in connector_metadata.requests.items()
                 if gi < len(rm.local_block_ids)
             ]
+            # BFF temporary diagnostic (remove once root cause confirmed):
+            print(
+                f">>> BFF-DIAG: _ff_producer_accumulate requests built layer_name={layer_name!r} "
+                f"gi={gi} len(requests)={len(requests)} ext_ids={[r[0] for r in requests]!r} <<<"
+            )
             if not requests:
                 return
             send_rows = self._ff_producer.on_layer(
                 gi, layer_name, kv_layer[0], self._ff_group_layers[gi], requests)
+            # BFF temporary diagnostic (remove once root cause confirmed):
+            print(
+                f">>> BFF-DIAG: _ff_producer_accumulate on_layer result layer_name={layer_name!r} "
+                f"gi={gi} send_rows_is_none={send_rows is None} "
+                f"num_send_rows={len(send_rows) if send_rows is not None else 'n/a'} <<<"
+            )
             if send_rows is None:
                 return
             for rid, rm in connector_metadata.requests.items():
