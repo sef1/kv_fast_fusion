@@ -45,7 +45,7 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.request import Request
 
-logger = init_logger(__name__)
+logger = init_logger("vllm.p2p_nccl_connector_ff")
 
 _UNSET = object()   # sentinel for lazily-resolved cached values (e.g. the TP process group)
 
@@ -332,9 +332,18 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
         attn_metadata = forward_context.attn_metadata
         if attn_metadata is None:
             return
+        # `attn_metadata` is dict[str, AttentionMetadata] (or list[dict[...]] under
+        # ubatching) per ForwardContext's own type — never a single AttentionMetadata
+        # instance, unlike save_kv_layer's per-layer `attn_metadata` parameter on the
+        # producer side. Normalize to a layer-name-keyed dict so inject_kv_into_layer
+        # can isinstance-check the correct per-layer object instead of the whole dict
+        # (which always failed the isinstance check, silently, before this fix).
+        attn_metadata_by_layer = (
+            attn_metadata[0] if isinstance(attn_metadata, list) else attn_metadata
+        )
 
-        def inject_kv_into_layer(layer, kv_cache, block_ids, request_id):
-            if isinstance(attn_metadata, MLACommonMetadata) or layer.shape[1] == 2:
+        def inject_kv_into_layer(layer, kv_cache, block_ids, request_id, layer_attn_metadata):
+            if isinstance(layer_attn_metadata, MLACommonMetadata) or layer.shape[1] == 2:
                 num_block = kv_cache.shape[0]
                 self.check_tensors_except_dim(layer, kv_cache, 0)
                 if len(block_ids) == num_block:
@@ -376,9 +385,11 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
                 kv_cache = getattr(layer, "kv_cache", None)
                 if kv_cache is None:
                     continue
-                # v0.19.1 removed ForwardContext.virtual_engine; layer.kv_cache is
-                # now the tensor directly (no per-virtual-engine list to index).
-                layer = kv_cache
+                # bind_kv_cache always wraps the tensor in a single-element list
+                # ("NOTE: Use list because of v0 PP virtual engine", vllm/v1/worker/
+                # utils.py) — layer.kv_cache is never the bare tensor, even though
+                # ForwardContext.virtual_engine itself was removed. Unwrap it.
+                layer = kv_cache[0]
                 tid = _pd_key(request.request_id) + "#" + layer_name
                 # Record what we're about to (possibly indefinitely) block on. The LAST value
                 # logged before a hang is the tensor_id the producer never sent.
@@ -393,7 +404,14 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
                 self._pd_recv_layers += 1
                 # group-aware: index this layer by ITS group's block table
                 block_ids = request.block_ids[self._group_of(layer_name)]
-                inject_kv_into_layer(layer, kv_cache, block_ids, request.request_id)
+                layer_attn_metadata = (
+                    attn_metadata_by_layer.get(layer_name)
+                    if isinstance(attn_metadata_by_layer, dict)
+                    else None
+                )
+                inject_kv_into_layer(
+                    layer, kv_cache, block_ids, request.request_id, layer_attn_metadata
+                )
                 # KV is now in D's GPU cache → release the recv buffer immediately (frees the
                 # pinned-pool block if it spilled) instead of waiting for request completion.
                 self.p2p_nccl_engine.free_recv_tensor(tid)
@@ -565,6 +583,17 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
         assert self.p2p_nccl_engine is not None
 
         def extract_kv_from_layer(layer, block_ids):
+            if _PD_DEBUG or _PD_TRACE:
+                dim = 0 if (isinstance(attn_metadata, MLACommonMetadata) or layer.shape[1] == 2) else 1
+                bound = layer.shape[dim]
+                bmin = int(block_ids.min().item()) if len(block_ids) else None
+                bmax = int(block_ids.max().item()) if len(block_ids) else None
+                oob = bmax is not None and (bmin < 0 or bmax >= bound)
+                logger.info(
+                    "BFF P/D save gather | layer=%s | gi=%s | n_block_ids=%d | "
+                    "block_ids=[%s,%s] | layer.shape=%s | bound(dim%d)=%d | OOB=%s",
+                    layer_name, gi, len(block_ids), bmin, bmax,
+                    tuple(layer.shape), dim, bound, oob)
             if isinstance(attn_metadata, MLACommonMetadata) or layer.shape[1] == 2:
                 return layer[block_ids, ...]
             if layer.shape[0] == 2:  # FlashAttention
@@ -595,19 +624,25 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
         # map. KV data is still sent per-layer above (no wire-dedup yet); D applies the map to
         # share physical blocks and free the redundant copies.
         if self._pd_fuse and gi > 0:
-            self._pd_producer_accumulate(gi, layer_name, kv_layer, connector_metadata)
+            is_mla = isinstance(attn_metadata, MLACommonMetadata) or kv_layer.shape[1] == 2
+            self._pd_producer_accumulate(gi, layer_name, kv_layer, connector_metadata, is_mla)
 
     # ------------------------------------------------------------------
     # Producer P/D fusion: buffer a group's layers, decide at completion, ship redirect map.
     # NOTE: the producer math reuses the tested pd_fuse core; the NCCL send pairing and the
     # consumer apply (below) require validation on the live P/D topology.
     # ------------------------------------------------------------------
-    def _pd_block_repr(self, kv_layer, idx):
+    def _pd_block_repr(self, kv_layer, idx, is_mla):
         """Per-layer block representation [N, D_repr] (float32) for the clustering similarity,
-        selected by BFF_PD_REPR. K-only (kv_layer[0]); the concatenation cosine over the G group
-        layers is applied by the clustering. `full` = exact (whole block), `mean` = head_dim mean,
-        `proj` = fixed-seed JL projection (cosine-preserving, cheaper). Producer-only."""
-        blk = kv_layer[0, idx].float()                     # [N, block_sz, kv_heads, head_dim]
+        selected by BFF_PD_REPR. K-only; the concatenation cosine over the G group layers is
+        applied by the clustering. `full` = exact (whole block), `mean` = head_dim mean, `proj` =
+        fixed-seed JL projection (cosine-preserving, cheaper). Producer-only.
+
+        MLA has no separate K/V cache (single latent, dim 0 = num_blocks) vs. FlashAttention's
+        stacked [2, num_blocks, ...] layout (dim 0 = K/V selector, kv_layer[0] = K) — same
+        discriminant `extract_kv_from_layer` above uses, threaded in via `is_mla` since this
+        method has no direct access to `attn_metadata`."""
+        blk = (kv_layer[idx] if is_mla else kv_layer[0, idx]).float()  # [N, block_sz, kv_heads, head_dim]
         N = idx.shape[0]
         if _PD_REPR == "mean":
             head_dim = blk.shape[-1]
@@ -623,7 +658,7 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
             return full @ self._pd_jl
         return full                                         # full
 
-    def _pd_producer_accumulate(self, gi, layer_name, kv_layer, meta):
+    def _pd_producer_accumulate(self, gi, layer_name, kv_layer, meta, is_mla):
         # New step → fresh metadata object → reset all partial group buffers + sent-tracking.
         if id(meta) != self._pd_cur_meta_id:
             self._pd_cur_meta_id = id(meta)
@@ -663,10 +698,17 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
         if buf["flat_bids"]:
             idx = torch.as_tensor(buf["flat_bids"], device=kv_layer.device, dtype=torch.long)
             # Per-layer block repr (full|proj|mean) → [N, D_repr] for the concat-cosine.
-            buf["k_layers"].append(self._pd_block_repr(kv_layer, idx))
+            buf["k_layers"].append(self._pd_block_repr(kv_layer, idx, is_mla))
             if _PD_RATIO:
                 # Per-flat-block K and V L2 norms for this layer (FlashAttention layout
                 # kv_layer[0]=K, [1]=V). Shipped as ‖owner‖/‖rep‖ ratios per redirect.
+                # MLA has no separate K/V cache to take independent norms of — unsupported.
+                if is_mla:
+                    raise NotImplementedError(
+                        "BFF_SCALE_MODE=ratio is not supported for MLA models "
+                        "(no separate K/V cache to compute independent norms of); "
+                        "use BFF_SCALE_MODE=raw."
+                    )
                 N = idx.shape[0]
                 ksq = kv_layer[0, idx].float().reshape(N, -1).pow(2).sum(dim=1)
                 vsq = kv_layer[1, idx].float().reshape(N, -1).pow(2).sum(dim=1)

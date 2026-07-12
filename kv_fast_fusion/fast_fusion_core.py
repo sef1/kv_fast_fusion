@@ -61,8 +61,9 @@ def _initialize_kv_caches(
             # `num_blocks = available/(page*max_layers_per_group)` (≈ G× larger) and
             # the shared-tensor layout is used — recovering ≈ vanilla concurrency plus
             # the fusion bonus. Mirrors the per-worker loop in get_kv_cache_configs.
+            from dataclasses import replace
             from vllm.v1.kv_cache_interface import (
-                SlidingWindowSpec, KVCacheGroupSpec, UniformTypeKVCacheSpecs,
+                KVCacheGroupSpec, UniformTypeKVCacheSpecs,
             )
             from vllm.v1.core.kv_cache_utils import (
                 get_kv_cache_config_from_groups, _report_kv_cache_config,
@@ -78,7 +79,20 @@ def _initialize_kv_caches(
             else:
                 per_layer_spec = ref_spec
 
-            # first 2 + last 2 layers → warmup (sliding window); the rest → fusion.
+            # first 2 + last 2 layers → warmup group; the rest → fusion.
+            # NOTE: HybridKVCacheCoordinator.verify_and_split_kv_cache_groups groups
+            # kv_cache_groups by spec *equality* and requires >1 resulting group. The
+            # warmup group must therefore be a distinct spec value from the fusion
+            # spec — but get_uniform_page_size requires all groups' page_size_bytes to
+            # match. `sliding_window` is part of FullAttentionSpec/MLAAttentionSpec but
+            # is NOT part of the page_size_bytes formula, so flipping only that field
+            # gives us a distinct spec with an identical page size, and it keeps the
+            # same manager class (FullAttentionManager, not SlidingWindowManager) so no
+            # real windowed eviction is introduced. (A plain SlidingWindowSpec instead
+            # would mismatch page size for MLA models: its formula assumes separate K/V
+            # caches (2x) while MLAAttentionSpec's single-latent-cache formula has no
+            # such factor, tripping `assert len(page_sizes) == 1` in
+            # get_uniform_page_size.)
             warmup_layers_names = original_layers[0:2] + original_layers[-2:]
             fused_layers_names = original_layers[2:-2]
             fused_chunks = [
@@ -86,13 +100,8 @@ def _initialize_kv_caches(
                 for i in range(0, len(fused_layers_names), BFF_GROUP_SIZE)
             ]
 
-            warmup_spec = SlidingWindowSpec(
-                sliding_window=8192,
-                block_size=per_layer_spec.block_size,
-                num_kv_heads=per_layer_spec.num_kv_heads,
-                head_size=per_layer_spec.head_size,
-                dtype=per_layer_spec.dtype,
-            )
+            warmup_spec = replace(per_layer_spec, sliding_window=8192)
+
             # Global group spec list (warmup first, then fusion chunks).
             global_groups = [KVCacheGroupSpec(warmup_layers_names, warmup_spec)]
             global_groups += [

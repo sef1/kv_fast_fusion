@@ -50,7 +50,7 @@
 # =============================================================================
 
 # ---- Model / topology --------------------------------------------------------
-MODEL=${MODEL:-Qwen/Qwen3.5-27B} #{MODEL:-NousResearch/Hermes-3-Llama-3.1-8B} #{MODEL:-zai-org/glm-4-9b-chat-hf}
+MODEL=${MODEL:-zai-org/GLM-4.7-Flash} #{MODEL:-NousResearch/Hermes-3-Llama-3.1-8B} #{MODEL:-zai-org/glm-4-9b-chat-hf}
 TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-1200}
 PROXY_PORT=${PROXY_PORT:-30001}      # ZMQ service-discovery port (matches proxy_port in connector cfg)
 PROXY_HTTP_PORT=${PROXY_HTTP_PORT:-10001}   # proxy HTTP serving port (benchmark target)
@@ -67,7 +67,7 @@ HF_HUB_CACHE=${HF_HUB_CACHE:-"/data/models/huggingface/hub"}
 # directly (comma-separated lists) — those win over the NUM_*-derived defaults.
 NUM_PREFILL=${NUM_PREFILL:-1}        # n
 NUM_DECODE=${NUM_DECODE:-1}          # m
-TP=${TP:-2}                          # tensor-parallel size PER instance (each P/D gets TP GPUs)
+TP=${TP:-4}                          # tensor-parallel size PER instance (each P/D gets TP GPUs)
 HTTP_PORT_BASE=${HTTP_PORT_BASE:-20003}
 
 # Build "start,start+1,...,start+count-1".
