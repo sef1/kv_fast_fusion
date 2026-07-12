@@ -375,6 +375,9 @@ if _ASCEND_AVAILABLE:
             self._ff_fusion_groups: set[int] | None = None
             self._ff_recv_thread: _FFRedirectRecvThread | None = None
             self._ff_send_thread: _FFRedirectSendThread | None = None
+            # BFF temporary diagnostic (remove once root cause confirmed):
+            self._ff_diag_save_calls = 0
+            self._ff_diag_logged_empty_requests = False
             if self._ff_enabled and self.connector_worker is not None:
                 self._ff_install_worker_hooks()
             if self._ff_enabled:
@@ -394,6 +397,16 @@ if _ASCEND_AVAILABLE:
                 orig_save = worker.save_kv_layer
 
                 def _wrapped_save(layer_name, kv_layer, attn_metadata, connector_metadata, **kw):
+                    # BFF temporary diagnostic (remove once root cause confirmed): rate-limited to
+                    # the first 5 calls so it doesn't flood the log.
+                    if self._ff_diag_save_calls < 5:
+                        self._ff_diag_save_calls += 1
+                        print(
+                            f">>> BFF-DIAG: _wrapped_save call #{self._ff_diag_save_calls} "
+                            f"layer_name={layer_name!r} "
+                            f"has_requests={bool(connector_metadata.requests)} "
+                            f"num_requests={len(connector_metadata.requests)} <<<"
+                        )
                     # Resolve the layer name the SAME way the connector does (empty → index_to_name),
                     # but BEFORE orig_save runs, since orig_save increments worker.current_layer.
                     resolved = layer_name
@@ -437,6 +450,13 @@ if _ASCEND_AVAILABLE:
 
         def _ff_producer_accumulate(self, worker, layer_name, kv_layer, connector_metadata) -> None:
             if not connector_metadata.requests:
+                # BFF temporary diagnostic (remove once root cause confirmed): first-hit only.
+                if not self._ff_diag_logged_empty_requests:
+                    self._ff_diag_logged_empty_requests = True
+                    print(
+                        f">>> BFF-DIAG: _ff_producer_accumulate early-return "
+                        f"(empty connector_metadata.requests) layer_name={layer_name!r} <<<"
+                    )
                 return
             if self._ff_group_layers is None:
                 self._ff_build_group_layers(worker)
