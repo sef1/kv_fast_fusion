@@ -161,7 +161,7 @@ F1_SPLIT=${F1_SPLIT:-train}
 F1_INPUT_KEY=${F1_INPUT_KEY:-query}
 F1_OUTPUT_KEY=${F1_OUTPUT_KEY:-answer}
 NUM_PROMPTS=${NUM_PROMPTS:-500}
-MAX_CONCURRENCY=${MAX_CONCURRENCY:-125}
+MAX_CONCURRENCY=${MAX_CONCURRENCY:-1}
 REQUEST_RATE=${REQUEST_RATE:-300}      # arrivals/s (stress test). 'inf' = fire all at once (cap by MAX_CONCURRENCY)
 BURSTINESS=${BURSTINESS:-0.3}          # gamma shape: <1 burstier (spiky), 1=Poisson, >1 more uniform
 MIN_TOKENS=${MIN_TOKENS:-512}            # skip prompts shorter than this many input tokens (0=off)
@@ -335,7 +335,7 @@ common_args() {
         $CHUNKED_FLAG \
         --max-model-len $MAX_MODEL_LEN \
         --max-num-batched-tokens $MAX_NUM_BATCHED_TOKENS \
-        --max-num-seqs 256"
+        --max-num-seqs $MAX_CONCURRENCY"
 }
 
 main() {

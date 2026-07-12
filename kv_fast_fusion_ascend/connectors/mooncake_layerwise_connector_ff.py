@@ -362,6 +362,14 @@ if _ASCEND_AVAILABLE:
                      kv_cache_config: "KVCacheConfig | None" = None):
             super().__init__(vllm_config, role, kv_cache_config)
             self._ff_enabled = os.environ.get("BFF_PD_FUSE", "0") == "1" and _PD_SCALE_MODE == "raw"
+            # BFF temporary diagnostic (remove once root cause confirmed):
+            print(
+                f">>> BFF-DIAG: MooncakeLayerwiseConnectorFF.__init__ role={role} "
+                f"_ff_enabled={self._ff_enabled} _PD_SCALE_MODE={_PD_SCALE_MODE!r} "
+                f"BFF_SCALE_MODE_env={os.environ.get('BFF_SCALE_MODE')!r} "
+                f"BFF_PD_FUSE_env={os.environ.get('BFF_PD_FUSE')!r} "
+                f"connector_worker_is_none={self.connector_worker is None} <<<"
+            )
             self._ff_producer = MooncakeFFProducer() if self._ff_enabled else None
             self._ff_group_layers: dict[int, set[str]] | None = None
             self._ff_fusion_groups: set[int] | None = None
