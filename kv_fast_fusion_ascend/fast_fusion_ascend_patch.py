@@ -104,12 +104,6 @@ def _patch_npu_model_runner() -> None:
         _ffbp._ACTIVE_RUNNER = self
         _orig(self, *args, **kwargs)
         logger.info("BFF Ascend: lean NPUModelRunner init (raw, _ACTIVE_RUNNER published).")
-        # BFF temporary diagnostic (Step 0, remove after root-cause confirmation):
-        cc = self.vllm_config.compilation_config
-        print(
-            f">>> BFF-DIAG: NPUModelRunner init done | cudagraph_mode={cc.cudagraph_mode} | "
-            f"splitting_ops={cc.splitting_ops} | mode={cc.mode} <<<"
-        )
 
     setattr(_init, _WRAP_SENTINEL, True)
     NPUModelRunner.__init__ = _init

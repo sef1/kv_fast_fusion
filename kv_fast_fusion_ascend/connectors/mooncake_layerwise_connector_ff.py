@@ -153,6 +153,10 @@ class MooncakeFFProducer:
                         flat_bids.append(bid)
                         flat_req_local.append(ri)
                         flat_slot.append(slot)
+            # Build the block-index tensor once — flat_bids is constant across the group's layers,
+            # so this avoids G-1 redundant host->device copies per group per step.
+            idx = (torch.as_tensor(flat_bids, device=k_cache.device, dtype=torch.long)
+                   if flat_bids else None)
             buf = {
                 "seen": set(),
                 "k_layers": [],
@@ -160,12 +164,12 @@ class MooncakeFFProducer:
                 "flat_req_local": flat_req_local,
                 "flat_slot": flat_slot,
                 "ext_ids": ext_ids,
+                "idx": idx,
             }
             self._buf[gi] = buf
 
-        if buf["flat_bids"]:
-            idx = torch.as_tensor(buf["flat_bids"], device=k_cache.device, dtype=torch.long)
-            buf["k_layers"].append(_block_repr(k_cache, idx, self._jl))
+        if buf["idx"] is not None:
+            buf["k_layers"].append(_block_repr(k_cache, buf["idx"], self._jl))
         buf["seen"].add(layer_name)
 
         if len(buf["seen"]) < len(group_layer_names):
@@ -405,22 +409,11 @@ if _ASCEND_AVAILABLE:
                      kv_cache_config: "KVCacheConfig | None" = None):
             super().__init__(vllm_config, role, kv_cache_config)
             self._ff_enabled = os.environ.get("BFF_PD_FUSE", "0") == "1" and _PD_SCALE_MODE == "raw"
-            # BFF temporary diagnostic (remove once root cause confirmed):
-            print(
-                f">>> BFF-DIAG: MooncakeLayerwiseConnectorFF.__init__ role={role} "
-                f"_ff_enabled={self._ff_enabled} _PD_SCALE_MODE={_PD_SCALE_MODE!r} "
-                f"BFF_SCALE_MODE_env={os.environ.get('BFF_SCALE_MODE')!r} "
-                f"BFF_PD_FUSE_env={os.environ.get('BFF_PD_FUSE')!r} "
-                f"connector_worker_is_none={self.connector_worker is None} <<<"
-            )
             self._ff_producer = MooncakeFFProducer() if self._ff_enabled else None
             self._ff_group_layers: dict[int, set[str]] | None = None
             self._ff_fusion_groups: set[int] | None = None
             self._ff_recv_thread: _FFRedirectRecvThread | None = None
             self._ff_send_thread: _FFRedirectSendThread | None = None
-            # BFF temporary diagnostic (remove once root cause confirmed):
-            self._ff_diag_save_calls = 0
-            self._ff_diag_logged_empty_requests = False
             if self._ff_enabled and self.connector_worker is not None:
                 self._ff_install_worker_hooks()
             if self._ff_enabled:
@@ -440,16 +433,6 @@ if _ASCEND_AVAILABLE:
                 orig_save = worker.save_kv_layer
 
                 def _wrapped_save(layer_name, kv_layer, attn_metadata, connector_metadata, **kw):
-                    # BFF temporary diagnostic (remove once root cause confirmed): rate-limited to
-                    # the first 5 calls so it doesn't flood the log.
-                    if self._ff_diag_save_calls < 5:
-                        self._ff_diag_save_calls += 1
-                        print(
-                            f">>> BFF-DIAG: _wrapped_save call #{self._ff_diag_save_calls} "
-                            f"layer_name={layer_name!r} "
-                            f"has_requests={bool(connector_metadata.requests)} "
-                            f"num_requests={len(connector_metadata.requests)} <<<"
-                        )
                     # Resolve the layer name the SAME way the connector does (empty → index_to_name),
                     # but BEFORE orig_save runs, since orig_save increments worker.current_layer.
                     resolved = layer_name
@@ -463,13 +446,6 @@ if _ASCEND_AVAILABLE:
                             self._ff_producer_accumulate(
                                 worker, resolved, kv_layer, connector_metadata)
                     except Exception as e:  # pragma: no cover - never break the transfer
-                        # BFF temporary diagnostic (remove once root cause confirmed): print alongside
-                        # the logger call in case logger output from this module isn't visible.
-                        import traceback
-                        print(
-                            f">>> BFF-DIAG: _ff_producer_accumulate EXCEPTION: {e!r}\n"
-                            f"{traceback.format_exc()} <<<"
-                        )
                         logger.warning("BFF Mooncake producer fusion failed: %s", e)
 
                 worker.save_kv_layer = _wrapped_save
@@ -483,8 +459,6 @@ if _ASCEND_AVAILABLE:
         def _ff_build_group_layers(self, worker) -> None:
             """Map fusion group index → layer names + the set of fusion groups (full-attention,
             gi>0), from the worker's registered ``layer_metadata`` + kv-cache specs."""
-            # BFF temporary diagnostic (remove once root cause confirmed):
-            print(">>> BFF-DIAG: _ff_build_group_layers ENTER <<<")
             group_layers: dict[int, set[str]] = {}
             for ln, lm in worker.layer_metadata.items():
                 group_layers.setdefault(lm.tensor_group_idx[0], set()).add(ln)
@@ -499,32 +473,13 @@ if _ASCEND_AVAILABLE:
             self._ff_fusion_groups = fusion_groups
             logger.info("BFF Mooncake: fusion groups=%s (of %d groups)",
                         sorted(fusion_groups), len(group_layers))
-            # BFF temporary diagnostic (remove once root cause confirmed):
-            print(
-                f">>> BFF-DIAG: _ff_build_group_layers DONE fusion_groups={sorted(fusion_groups)} "
-                f"groups={len(group_layers)} <<<"
-            )
 
         def _ff_producer_accumulate(self, worker, layer_name, kv_layer, connector_metadata) -> None:
             if not connector_metadata.requests:
-                # BFF temporary diagnostic (remove once root cause confirmed): first-hit only.
-                if not self._ff_diag_logged_empty_requests:
-                    self._ff_diag_logged_empty_requests = True
-                    print(
-                        f">>> BFF-DIAG: _ff_producer_accumulate early-return "
-                        f"(empty connector_metadata.requests) layer_name={layer_name!r} <<<"
-                    )
                 return
             if self._ff_group_layers is None:
                 self._ff_build_group_layers(worker)
             gi = worker.layer_metadata[layer_name].tensor_group_idx[0]
-            # BFF temporary diagnostic (remove once root cause confirmed): rate-limited, reuses the
-            # _wrapped_save call counter so it only prints for the first few calls.
-            if self._ff_diag_save_calls <= 5:
-                print(
-                    f">>> BFF-DIAG: _ff_producer_accumulate layer_name={layer_name!r} gi={gi} "
-                    f"in_fusion_groups={gi in self._ff_fusion_groups} <<<"
-                )
             if gi not in self._ff_fusion_groups:
                 return
             self._ff_producer.reset_step(id(connector_metadata))
@@ -533,21 +488,10 @@ if _ASCEND_AVAILABLE:
                 for rid, rm in connector_metadata.requests.items()
                 if gi < len(rm.local_block_ids)
             ]
-            # BFF temporary diagnostic (remove once root cause confirmed):
-            print(
-                f">>> BFF-DIAG: _ff_producer_accumulate requests built layer_name={layer_name!r} "
-                f"gi={gi} len(requests)={len(requests)} ext_ids={[r[0] for r in requests]!r} <<<"
-            )
             if not requests:
                 return
             send_rows = self._ff_producer.on_layer(
                 gi, layer_name, kv_layer[0], self._ff_group_layers[gi], requests)
-            # BFF temporary diagnostic (remove once root cause confirmed):
-            print(
-                f">>> BFF-DIAG: _ff_producer_accumulate on_layer result layer_name={layer_name!r} "
-                f"gi={gi} send_rows_is_none={send_rows is None} "
-                f"num_send_rows={len(send_rows) if send_rows is not None else 'n/a'} <<<"
-            )
             if send_rows is None:
                 return
             for rid, rm in connector_metadata.requests.items():
