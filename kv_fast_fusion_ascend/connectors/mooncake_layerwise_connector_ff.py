@@ -420,6 +420,13 @@ if _ASCEND_AVAILABLE:
                             self._ff_producer_accumulate(
                                 worker, resolved, kv_layer, connector_metadata)
                     except Exception as e:  # pragma: no cover - never break the transfer
+                        # BFF temporary diagnostic (remove once root cause confirmed): print alongside
+                        # the logger call in case logger output from this module isn't visible.
+                        import traceback
+                        print(
+                            f">>> BFF-DIAG: _ff_producer_accumulate EXCEPTION: {e!r}\n"
+                            f"{traceback.format_exc()} <<<"
+                        )
                         logger.warning("BFF Mooncake producer fusion failed: %s", e)
 
                 worker.save_kv_layer = _wrapped_save
@@ -433,6 +440,8 @@ if _ASCEND_AVAILABLE:
         def _ff_build_group_layers(self, worker) -> None:
             """Map fusion group index → layer names + the set of fusion groups (full-attention,
             gi>0), from the worker's registered ``layer_metadata`` + kv-cache specs."""
+            # BFF temporary diagnostic (remove once root cause confirmed):
+            print(">>> BFF-DIAG: _ff_build_group_layers ENTER <<<")
             group_layers: dict[int, set[str]] = {}
             for ln, lm in worker.layer_metadata.items():
                 group_layers.setdefault(lm.tensor_group_idx[0], set()).add(ln)
@@ -447,6 +456,11 @@ if _ASCEND_AVAILABLE:
             self._ff_fusion_groups = fusion_groups
             logger.info("BFF Mooncake: fusion groups=%s (of %d groups)",
                         sorted(fusion_groups), len(group_layers))
+            # BFF temporary diagnostic (remove once root cause confirmed):
+            print(
+                f">>> BFF-DIAG: _ff_build_group_layers DONE fusion_groups={sorted(fusion_groups)} "
+                f"groups={len(group_layers)} <<<"
+            )
 
         def _ff_producer_accumulate(self, worker, layer_name, kv_layer, connector_metadata) -> None:
             if not connector_metadata.requests:
@@ -461,6 +475,13 @@ if _ASCEND_AVAILABLE:
             if self._ff_group_layers is None:
                 self._ff_build_group_layers(worker)
             gi = worker.layer_metadata[layer_name].tensor_group_idx[0]
+            # BFF temporary diagnostic (remove once root cause confirmed): rate-limited, reuses the
+            # _wrapped_save call counter so it only prints for the first few calls.
+            if self._ff_diag_save_calls <= 5:
+                print(
+                    f">>> BFF-DIAG: _ff_producer_accumulate layer_name={layer_name!r} gi={gi} "
+                    f"in_fusion_groups={gi in self._ff_fusion_groups} <<<"
+                )
             if gi not in self._ff_fusion_groups:
                 return
             self._ff_producer.reset_step(id(connector_metadata))
