@@ -20,6 +20,7 @@ Two categories:
 import os
 
 from vllm.logger import init_logger
+from vllm.v1.request import RequestStatus
 
 logger = init_logger("vllm.fast_fusion_ascend_patch")
 
@@ -60,9 +61,40 @@ def _bff_apply_block_merge(scheduler, model_runner_output) -> None:
                             len(block_merge_mapping))
         except Exception as e:
             logger.warning("BFF Ascend connector-stats block-merge fallback failed: %s", e)
+    # Persist-and-retry: the worker stages the redirect map at the step the owner's KV recv
+    # completes, but a just-loaded P/D consumer request is usually not RUNNING/allocated in the
+    # scheduler until a LATER step — so _handle_block_merging_with_counts (which only mutates RUNNING
+    # requests) would skip it, and the consume-once map would be lost (→ "freed 0 blocks"). Instead we
+    # accumulate maps and apply each request's map only once it is RUNNING; the rest wait, finished
+    # ones are dropped. The worker-side repoint already happened pre-decode, so retrying the
+    # scheduler-side orphan free later is safe.
+    pending = getattr(scheduler, "_bff_pending_merges", None)
+    if pending is None:
+        pending = {}
+        scheduler._bff_pending_merges = pending
     if block_merge_mapping:
+        for rid, groups in block_merge_mapping.items():
+            pending.setdefault(rid, {}).update(groups)
+    if not pending:
+        return
+    ready: dict[str, dict[int, list[int]]] = {}
+    keep: dict[str, dict[int, list[int]]] = {}
+    n_dropped = 0
+    for rid, groups in pending.items():
+        req = scheduler.requests.get(rid)
+        if req is None:
+            n_dropped += 1                       # finished / evicted → drop
+        elif req.status == RequestStatus.RUNNING:
+            ready[rid] = groups
+        else:
+            keep[rid] = groups                   # not RUNNING yet → retry next step
+    scheduler._bff_pending_merges = keep
+    if ready or keep or n_dropped:
+        logger.info("BFF Ascend: block-merge partition | ready=%d pending=%d dropped=%d",
+                    len(ready), len(keep), n_dropped)
+    if ready:
         try:
-            scheduler._handle_block_merging_with_counts(block_merge_mapping)
+            scheduler._handle_block_merging_with_counts(ready)
         except Exception as e:
             logger.error("BFF Ascend block merging failed — skipping this step: %s", e,
                          exc_info=True)
