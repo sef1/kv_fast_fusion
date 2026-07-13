@@ -41,10 +41,11 @@ from kv_fast_fusion.constants import THRESHOLD
 from kv_fast_fusion.pd_fuse import (
     build_group_redirect,
     concat_cosine_cc_labels,
+    concat_cosine_cross_match,
     concat_cosine_nr_tree_labels,
 )
 
-logger = init_logger(__name__)
+logger = init_logger("vllm." + __name__)
 
 # --- fusion config (self-contained; mirrors the env knobs used by the NCCL connector) ---
 _PD_MERGE = os.environ.get("BFF_PD_MERGE", "nr_tree")
@@ -52,6 +53,9 @@ _PD_REPR = os.environ.get("BFF_PD_REPR", "full")
 _PD_PROJ_DIM = int(os.environ.get("BFF_PD_PROJ_DIM", "512"))
 _PD_SCALE_MODE = os.environ.get("BFF_SCALE_MODE", "raw").lower()
 _PD_DEBUG = os.environ.get("BFF_PD_DEBUG", "0") == "1"
+# Cross-batch encoded registry window: keep the last N distinct requests' rep blocks per fusion
+# group and match this step's blocks against them. 0 = disabled (within-batch fusion only).
+_PD_ENCODED_BATCH = int(os.environ.get("BFF_PD_ENCODED_BATCH_SIZE", "0"))
 # Dedicated FF ZMQ control channel: D binds (its side-channel base + this offset); P sends redirect
 # maps there. Kept separate from the connector's own handshake port so the stock recv thread is
 # untouched. TP=1 assumed for M1 (the new setup runs tp_size=1 on both P and D).
@@ -118,8 +122,14 @@ class MooncakeFFProducer:
         # cumulative compression accounting (per fusion group)
         self.blk_total: dict[int, int] = {}
         self.redir_total: dict[int, int] = {}
-        self.steps = 0                        # scheduler steps seen (for the stats dump)
+        self.cross_redir_total = 0            # redirects to a PREVIOUS-batch rep (cross-batch lift)
+        self.within_redir_total = 0           # redirects to a same-batch rep (legacy behavior)
+        self.steps = 0                        # scheduler steps seen (approximate; via metadata id())
+        self.group_completions = 0            # group finishes seen (true denominator for overhead avg)
         self.dedup_ms = 0.0                   # cumulative clustering time (ms), for overhead avg
+        # Cross-batch encoded registry: gi -> rolling window of the last _PD_ENCODED_BATCH distinct
+        # requests' representative block K-reps (raw mode). Empty/unused when _PD_ENCODED_BATCH <= 0.
+        self._registry: dict[int, dict] = {}
 
     def reset_step(self, step_id: int) -> None:
         if step_id != self._cur_step_id:
@@ -133,12 +143,14 @@ class MooncakeFFProducer:
         layer_name: str,
         k_cache: torch.Tensor,
         group_layer_names: set[str],
-        requests: list[tuple[str, list[int]]],
+        requests: list[tuple],
         tp_group=None,
     ) -> dict[str, list[tuple[int, int, int]]] | None:
         """Accumulate one layer of fusion group ``gi``. ``requests`` is the ordered list of
-        ``(external_id, local_block_ids_for_gi)`` for this step's batch. Returns ``None`` until the
-        group completes, then a dict ``{owner_external_id: [(owner_slot, rep_hash, rep_slot), ...]}``.
+        ``(external_id, local_block_ids_for_gi[, has_remote])`` for this step's batch (``has_remote``
+        defaults to True when omitted; it gates cross-batch registration to decode-bound requests).
+        Returns ``None`` until the group completes, then a dict
+        ``{owner_external_id: [(owner_slot, rep_hash, rep_slot), ...]}``.
         """
         buf = self._buf.get(gi)
         if buf is None:
@@ -146,8 +158,11 @@ class MooncakeFFProducer:
             flat_req_local: list[int] = []
             flat_slot: list[int] = []
             ext_ids: list[str] = []
-            for ri, (ext_id, bids) in enumerate(requests):
+            ext_has_remote: list[bool] = []
+            for ri, req in enumerate(requests):
+                ext_id, bids = req[0], req[1]
                 ext_ids.append(ext_id)
+                ext_has_remote.append(bool(req[2]) if len(req) > 2 else True)
                 for slot, bid in enumerate(bids):
                     if bid > 0:                        # skip the null block 0
                         flat_bids.append(bid)
@@ -164,6 +179,7 @@ class MooncakeFFProducer:
                 "flat_req_local": flat_req_local,
                 "flat_slot": flat_slot,
                 "ext_ids": ext_ids,
+                "ext_has_remote": ext_has_remote,
                 "idx": idx,
             }
             self._buf[gi] = buf
@@ -176,43 +192,165 @@ class MooncakeFFProducer:
             return None                                # group not complete yet
         # --- group complete: cluster + build redirect rows ---
         try:
-            return self._finish_group(gi, buf, tp_group)
+            return self._build_send_rows(gi, buf, tp_group)
         finally:
             self._buf.pop(gi, None)
 
-    def _finish_group(self, gi, buf, tp_group) -> dict[str, list[tuple[int, int, int]]]:
+    def _build_send_rows(self, gi, buf, tp_group) -> dict[str, list[tuple[int, int, int]]]:
+        """Cluster the completed group's blocks and build ``{owner_ext: [(owner_slot, rep_hash,
+        rep_slot), ...]}``. When ``_PD_ENCODED_BATCH>0`` also matches against the rolling cross-batch
+        registry (earlier requests' reps) before within-batch clustering the remainder, then registers
+        the new reps. When disabled it is the original within-batch-only path."""
+        self.group_completions += 1
         send_rows: dict[str, list[tuple[int, int, int]]] = {}
         flat_req_local = buf["flat_req_local"]
         flat_slot = buf["flat_slot"]
         ext_ids = buf["ext_ids"]
-        n_redir = 0
+        n_cross = 0
+        n_within = 0
         if buf["flat_bids"] and buf["k_layers"]:
             t0 = time.perf_counter()
             dev0 = buf["k_layers"][0].device
-            req_of_block = torch.as_tensor(flat_req_local, device=dev0)
-            if tp_group is not None:
+
+            def _cluster(k_layers, req_of_block):
                 # TP>1: only CC exposes the raw Gram/sq for the cross-rank all-reduce.
-                labels = concat_cosine_cc_labels(
-                    buf["k_layers"], req_of_block, THRESHOLD, tp_group=tp_group)
+                if tp_group is not None:
+                    return concat_cosine_cc_labels(k_layers, req_of_block, THRESHOLD,
+                                                   tp_group=tp_group)
+                fn = (concat_cosine_nr_tree_labels if _PD_MERGE == "nr_tree"
+                      else concat_cosine_cc_labels)
+                return fn(k_layers, req_of_block, THRESHOLD)
+
+            def _emit_within(redirects):
+                nonlocal n_within
+                for owner_ri, rws in redirects.items():
+                    owner_ext = ext_ids[owner_ri]
+                    for (slot, rep_local, rep_slot, _rep_flat, _own_flat) in rws:
+                        send_rows.setdefault(owner_ext, []).append(
+                            (int(slot), _ext_hash(ext_ids[rep_local]), int(rep_slot)))
+                        n_within += 1
+
+            N = len(flat_req_local)
+            if _PD_ENCODED_BATCH <= 0:
+                # ---- within-batch only (legacy path, unchanged behavior) ----
+                labels = _cluster(buf["k_layers"], torch.as_tensor(flat_req_local, device=dev0))
+                _, redirects = build_group_redirect(labels, flat_req_local, flat_slot)
+                _emit_within(redirects)
             else:
-                cluster = (concat_cosine_nr_tree_labels if _PD_MERGE == "nr_tree"
-                           else concat_cosine_cc_labels)
-                labels = cluster(buf["k_layers"], req_of_block, THRESHOLD)
-            _, redirects = build_group_redirect(labels, flat_req_local, flat_slot)
-            for owner_ri, rws in redirects.items():
-                owner_ext = ext_ids[owner_ri]
-                for (slot, rep_local, rep_slot, _rep_flat, _own_flat) in rws:
+                # ---- cross-batch (registry enabled) ----
+                reg = self._registry.get(gi)
+                reg_vecs = reg["vecs"] if reg else None
+                reg_sq = reg["sq"] if reg else None
+                best_idx, _score, cur_sq, cur_concat = concat_cosine_cross_match(
+                    buf["k_layers"], reg_vecs, reg_sq, THRESHOLD, tp_group=tp_group)
+                # Forbid a self-merge (a registered rep from the SAME request, e.g. chunked prefill).
+                if reg is not None and bool((best_idx >= 0).any()):
+                    own_hash = torch.tensor(
+                        [_ext_hash(ext_ids[r]) for r in flat_req_local],
+                        dtype=torch.long, device=best_idx.device)
+                    self_hit = (best_idx >= 0) & (reg["hash"][best_idx.clamp(min=0)] == own_hash)
+                    best_idx = torch.where(self_hit, torch.full_like(best_idx, -1), best_idx)
+                best_list = best_idx.tolist()
+                # Phase 1: cross-batch matches → redirect to the registry rep (already resident on D).
+                # Resolve hash/slot NOW — _register_reps below re-indexes the registry in this call.
+                matched = [False] * N
+                for i, ridx in enumerate(best_list):
+                    if ridx < 0:
+                        continue
+                    owner_ext = ext_ids[flat_req_local[i]]
                     send_rows.setdefault(owner_ext, []).append(
-                        (int(slot), _ext_hash(ext_ids[rep_local]), int(rep_slot)))
-                    n_redir += 1
+                        (int(flat_slot[i]), int(reg["hash"][ridx].item()),
+                         int(reg["slot"][ridx].item())))
+                    matched[i] = True
+                    n_cross += 1
+                # Phase 2: within-batch clustering on the UNMATCHED remainder (subset → map back).
+                unmatched = [i for i in range(N) if not matched[i]]
+                reps_to_register: list[int] = []
+                if unmatched:
+                    sub_k = [Kg[unmatched] for Kg in buf["k_layers"]]
+                    sub_req = [flat_req_local[i] for i in unmatched]
+                    sub_slot = [flat_slot[i] for i in unmatched]
+                    labels = _cluster(sub_k, torch.as_tensor(sub_req, device=dev0))
+                    _, redirects = build_group_redirect(labels, sub_req, sub_slot)
+                    _emit_within(redirects)
+                    labels_l = labels.tolist()
+                    reps_to_register = [unmatched[i] for i in range(len(labels_l))
+                                        if labels_l[i] == i]
+                self._register_reps(gi, buf, reps_to_register, cur_concat, cur_sq)
             self.dedup_ms += (time.perf_counter() - t0) * 1e3
+        n_redir = n_cross + n_within
         self.blk_total[gi] = self.blk_total.get(gi, 0) + len(buf["flat_bids"])
         self.redir_total[gi] = self.redir_total.get(gi, 0) + n_redir
+        self.cross_redir_total += n_cross
+        self.within_redir_total += n_within
         if n_redir or _PD_DEBUG:
             logger.info("BFF Mooncake fuse group gi=%d | merge=%s | repr=%s | reqs=%d | blocks=%d | "
-                        "redirects=%d", gi, _PD_MERGE, _PD_REPR, len(ext_ids),
-                        len(buf["flat_bids"]), n_redir)
+                        "redirects=%d (cross=%d within=%d) | reg=%d", gi, _PD_MERGE, _PD_REPR,
+                        len(ext_ids), len(buf["flat_bids"]), n_redir, n_cross, n_within,
+                        self._registry_size(gi))
         return send_rows
+
+    # -- cross-batch encoded registry (raw mode; NCCL analogue) -----------------------------
+    def _registry_size(self, gi) -> int:
+        reg = self._registry.get(gi)
+        return 0 if reg is None or reg["vecs"] is None else int(reg["vecs"].shape[0])
+
+    def _register_reps(self, gi, buf, rep_flats, cur_concat, cur_sq) -> None:
+        """Append this step's new representative blocks to the group registry, then FIFO-evict to the
+        window. Only reps for requests bound to a decode target (``has_remote``) are registered, so a
+        future owner can always resolve them on D."""
+        if not rep_flats:
+            return
+        flat_req_local = buf["flat_req_local"]
+        flat_slot = buf["flat_slot"]
+        ext_ids = buf["ext_ids"]
+        ext_has_remote = buf["ext_has_remote"]
+        dev = cur_concat.device
+        reg = self._registry.get(gi)
+        if reg is None:
+            reg = {"vecs": None, "sq": None, "hash": None, "slot": None, "seq": None,
+                   "key2seq": {}, "next_seq": 0}
+            self._registry[gi] = reg
+        v, sq, hsh, slt, seq = [], [], [], [], []
+        for f in rep_flats:
+            ri = flat_req_local[f]
+            if not ext_has_remote[ri]:
+                continue
+            ext = ext_ids[ri]
+            s = reg["key2seq"].get(ext)
+            if s is None:
+                s = reg["next_seq"]; reg["key2seq"][ext] = s; reg["next_seq"] = s + 1
+            v.append(cur_concat[f]); sq.append(cur_sq[f])
+            hsh.append(_ext_hash(ext)); slt.append(flat_slot[f]); seq.append(s)
+        if not v:
+            return
+
+        def _cat(old, new):
+            return new if old is None else torch.cat([old, new])
+        reg["vecs"] = _cat(reg["vecs"], torch.stack(v))
+        reg["sq"] = _cat(reg["sq"], torch.stack(sq))
+        reg["hash"] = _cat(reg["hash"], torch.tensor(hsh, dtype=torch.long, device=dev))
+        reg["slot"] = _cat(reg["slot"], torch.tensor(slt, dtype=torch.long, device=dev))
+        reg["seq"] = _cat(reg["seq"], torch.tensor(seq, dtype=torch.long, device=dev))
+        self._evict_registry(gi)
+
+    def _evict_registry(self, gi) -> None:
+        """Drop rows from requests older than the last ``_PD_ENCODED_BATCH`` distinct requests. Seq
+        ids are dense + monotonic, so keeping ``seq >= next_seq - N`` keeps exactly the last N."""
+        reg = self._registry.get(gi)
+        if reg is None or reg["seq"] is None:
+            return
+        keep_from = reg["next_seq"] - _PD_ENCODED_BATCH
+        if keep_from <= 0:
+            return
+        keep = reg["seq"] >= keep_from
+        if bool(keep.all()):
+            return
+        idx = keep.nonzero(as_tuple=True)[0]
+        for k in ("vecs", "sq", "hash", "slot", "seq"):
+            if reg[k] is not None:
+                reg[k] = reg[k][idx]
+        reg["key2seq"] = {k: s for k, s in reg["key2seq"].items() if s >= keep_from}
 
     def dump_stats(self, stats_dir: str) -> None:
         """Write this producer's cumulative fusion compression to ``bff_stats_<pid>.json`` in
@@ -227,14 +365,23 @@ class MooncakeFFProducer:
             stats = {
                 "pid": os.getpid(),
                 "steps": self.steps,
-                "overhead_avg_group_dedup_ms": (self.dedup_ms / self.steps
-                                                if self.steps else 0.0),
+                # dedup_ms accumulates once per group-completion, so the true per-group average
+                # divides by group_completions (not steps, which id()-collisions undercount).
+                "overhead_avg_group_dedup_ms": (self.dedup_ms / self.group_completions
+                                                if self.group_completions else 0.0),
                 "total_blocks": tot_b,
                 "freed": tot_r,
                 "compression_avg_factor": _factor(tot_b, tot_r),
                 "compression_per_group": {
                     str(gi): _factor(self.blk_total[gi], self.redir_total.get(gi, 0))
                     for gi in sorted(self.blk_total)},
+                # Cross-batch lift: how many redirects came from the rolling registry (earlier
+                # batches) vs the within-step batch, plus the window size and current registry size.
+                "encoded_batch_size": _PD_ENCODED_BATCH,
+                "cross_batch_redirects": self.cross_redir_total,
+                "within_batch_redirects": self.within_redir_total,
+                "registry_blocks": {str(gi): self._registry_size(gi)
+                                    for gi in sorted(self._registry)},
             }
             path = os.path.join(stats_dir, f"bff_stats_{os.getpid()}.json")
             tmp = path + ".tmp"
@@ -484,7 +631,8 @@ if _ASCEND_AVAILABLE:
                 return
             self._ff_producer.reset_step(id(connector_metadata))
             requests = [
-                (get_external_request_id(rid), list(rm.local_block_ids[gi]))
+                (get_external_request_id(rid), list(rm.local_block_ids[gi]),
+                 rm.remote_host is not None and rm.remote_port is not None)
                 for rid, rm in connector_metadata.requests.items()
                 if gi < len(rm.local_block_ids)
             ]
