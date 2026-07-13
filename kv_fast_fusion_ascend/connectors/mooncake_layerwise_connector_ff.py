@@ -605,6 +605,11 @@ if _ASCEND_AVAILABLE:
                 port = worker.side_channel_port + _FF_PORT_OFFSET + worker.tp_rank
                 self._ff_recv_thread = _FFRedirectRecvThread(host, port)
                 self._ff_recv_thread.start()
+                # Persistent load-metadata block tables (ext_id -> (rid, local_block_ids)). The
+                # consumer load metadata is transient (scheduler clears _reqs_need_recv each step) but
+                # a request's KV recv completes a LATER step; accumulate here so the owner is still
+                # resolvable when its recv finally lands. Pruned as requests become resident/finish.
+                self._ff_load_blocks: dict[str, tuple[str, list]] = {}
 
         def _ff_build_group_layers(self, worker) -> None:
             """Map fusion group index → layer names + the set of fusion groups (full-attention,
@@ -671,6 +676,9 @@ if _ASCEND_AVAILABLE:
             sending, recving = super().get_finished(finished_req_ids)
             if self._ff_enabled and self._ff_recv_thread is not None:
                 try:
+                    # Snapshot this step's (transient) load metadata EVERY step — the owner's recv
+                    # completes a later step, by which point its metadata has been cleared.
+                    self._ff_snapshot_load_meta(finished_req_ids)
                     # `recving` = request ids whose KV *just* fully landed this step. Applying a
                     # redirect only for those requests guarantees we repoint+free BEFORE the owner
                     # decodes — mirroring the NCCL connector's load-time apply. Draining and applying
@@ -680,6 +688,20 @@ if _ASCEND_AVAILABLE:
                 except Exception as e:  # pragma: no cover - defensive
                     logger.warning("BFF Mooncake consumer apply failed: %s", e)
             return sending, recving
+
+        def _ff_snapshot_load_meta(self, finished_req_ids: set[str]) -> None:
+            """Accumulate this step's consumer load-metadata block tables into ``_ff_load_blocks``.
+            The scheduler clears its recv list each step, so a request's D-side ``local_block_ids`` is
+            only in the metadata the step it is scheduled — but its recv completes later. Persisting
+            them here keeps the owner resolvable at recv-completion. Pruned on finish (and, in
+            ``_ff_apply_pending``, once the request becomes resident in ``runner.requests``)."""
+            meta = self._connector_metadata
+            for rid, rm in getattr(meta, "requests", {}).items():
+                lb = getattr(rm, "local_block_ids", None)
+                if lb:
+                    self._ff_load_blocks[get_external_request_id(rid)] = (rid, lb)
+            for fid in finished_req_ids:
+                self._ff_load_blocks.pop(get_external_request_id(fid), None)
 
         def _ff_apply_pending(self, recving: set[str]) -> None:
             """Apply redirect maps for the requests whose KV *just* completed this step (``recving``),
@@ -715,19 +737,18 @@ if _ASCEND_AVAILABLE:
                 ext2blocks[ext] = bids
                 hash2ext[_ext_hash(ext)] = ext
                 rid_by_ext[ext] = rid
-            # RESOLUTION set = residency set overlaid with THIS step's load metadata. A request whose
-            # KV just landed (`recving`) is in the connector's load metadata but not yet in
-            # runner.requests; without this overlay resolve_redirect_rows can't find the owner (or a
-            # co-loading rep) → every row counts as unresolved. Metadata is still bound here — the
-            # runner clears it only after get_finished. Mirrors the NCCL _pd_consumer_apply overlay.
+            # RESOLUTION set = residency set overlaid with the accumulated load-metadata block tables
+            # (`_ff_load_blocks`, filled every step by _ff_snapshot_load_meta). A request whose KV just
+            # landed (`recving`) is not yet in runner.requests and its load metadata was cleared a
+            # step or more ago; without this overlay resolve_redirect_rows can't find the owner (or a
+            # not-yet-decoding rep) → every row counts as owner-missing. Skip ext already resident —
+            # the runner's live table wins — and prune those from the store to keep it bounded.
             res_ext2blocks = dict(ext2blocks)
             res_hash2ext = dict(hash2ext)
-            meta = self._connector_metadata
-            for rid, rm in getattr(meta, "requests", {}).items():
-                lb = getattr(rm, "local_block_ids", None)
-                if lb is None:
+            for ext, (rid, lb) in list(self._ff_load_blocks.items()):
+                if ext in ext2blocks:
+                    del self._ff_load_blocks[ext]   # now resident → covered by runner.requests
                     continue
-                ext = get_external_request_id(rid)
                 res_ext2blocks[ext] = lb
                 res_hash2ext[_ext_hash(ext)] = ext
                 rid_by_ext.setdefault(ext, rid)
