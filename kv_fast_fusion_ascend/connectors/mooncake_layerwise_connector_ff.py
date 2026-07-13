@@ -398,16 +398,19 @@ def resolve_redirect_rows(
     owner_ext_id: str,
     gi: int,
     rows: list[tuple[int, int, int]],
-) -> tuple[list[int] | None, int, int]:
+) -> tuple[list[int] | None, int, int, int]:
     """Consumer-side: turn shipped redirect ``rows`` into the owner's new (deduped) block table.
 
-    ``ext2blocks`` maps external id → per-group D-physical block ids (from the decode runner);
-    ``hash2ext`` maps ``_ext_hash`` → external id. Returns ``(new_owner_blocks, n_applied,
-    n_unresolved)``; ``new_owner_blocks`` is ``None`` when nothing changed. Port of the resolve loop
-    in the NCCL connector's ``_pd_consumer_apply`` (raw mode)."""
+    ``ext2blocks`` maps external id → per-group D-physical block ids (from the decode runner, plus
+    this step's load metadata); ``hash2ext`` maps ``_ext_hash`` → external id. Returns
+    ``(new_owner_blocks, n_applied, n_unresolved, n_owner_missing)``; ``new_owner_blocks`` is ``None``
+    when nothing changed. ``n_owner_missing`` counts rows we couldn't even attempt because the OWNER
+    itself was not resolvable (distinct from ``n_unresolved`` = the REP not resolvable) — kept
+    separate so the apply log can tell owner-residency problems from rep-residency problems. Port of
+    the resolve loop in the NCCL connector's ``_pd_consumer_apply`` (raw mode)."""
     owner_groups = ext2blocks.get(owner_ext_id)
     if owner_groups is None or gi >= len(owner_groups):
-        return None, 0, len(rows)
+        return None, 0, 0, len(rows)                   # owner not resident → owner-miss, not rep-miss
     owner_blocks = list(owner_groups[gi])
     n_applied = n_unresolved = 0
     changed = False
@@ -427,7 +430,7 @@ def resolve_redirect_rows(
         owner_blocks[owner_slot] = int(rep_grp[rep_slot])
         changed = True
         n_applied += 1
-    return (owner_blocks if changed else None), n_applied, n_unresolved
+    return (owner_blocks if changed else None), n_applied, n_unresolved, 0
 
 
 # ---------------------------------------------------------------------------------------------
@@ -699,6 +702,8 @@ if _ASCEND_AVAILABLE:
                 logger.warning("BFF Mooncake: _ACTIVE_RUNNER unset on D; redirect maps dropped.")
                 return
             # external id -> per-group D block ids, + hash -> external id (from resident requests).
+            # This is the RESIDENCY set (requests already in runner state): it decides defer-vs-drop
+            # below and must NOT include still-loading requests.
             ext2blocks: dict[str, list] = {}
             hash2ext: dict[int, str] = {}
             rid_by_ext: dict[str, str] = {}
@@ -710,22 +715,40 @@ if _ASCEND_AVAILABLE:
                 ext2blocks[ext] = bids
                 hash2ext[_ext_hash(ext)] = ext
                 rid_by_ext[ext] = rid
+            # RESOLUTION set = residency set overlaid with THIS step's load metadata. A request whose
+            # KV just landed (`recving`) is in the connector's load metadata but not yet in
+            # runner.requests; without this overlay resolve_redirect_rows can't find the owner (or a
+            # co-loading rep) → every row counts as unresolved. Metadata is still bound here — the
+            # runner clears it only after get_finished. Mirrors the NCCL _pd_consumer_apply overlay.
+            res_ext2blocks = dict(ext2blocks)
+            res_hash2ext = dict(hash2ext)
+            meta = self._connector_metadata
+            for rid, rm in getattr(meta, "requests", {}).items():
+                lb = getattr(rm, "local_block_ids", None)
+                if lb is None:
+                    continue
+                ext = get_external_request_id(rid)
+                res_ext2blocks[ext] = lb
+                res_hash2ext[_ext_hash(ext)] = ext
+                rid_by_ext.setdefault(ext, rid)
             just_recv_ext = {get_external_request_id(rid) for rid in recving}
             updated: dict[str, dict[int, list[int]]] = {}
-            n_applied = n_unresolved = n_deferred = n_dropped = 0
+            n_applied = n_unresolved = n_owner_missing = n_deferred = n_dropped = 0
             leftover: dict[str, dict[int, list]] = {}
             for ext_id, groups in pending.items():
                 if ext_id in just_recv_ext:
                     # Owner's KV just landed and it has not decoded yet → safe to repoint + free.
                     for gi, rows in groups.items():
-                        new_blocks, na, nu = resolve_redirect_rows(
-                            ext2blocks, hash2ext, ext_id, gi, rows)
+                        new_blocks, na, nu, nom = resolve_redirect_rows(
+                            res_ext2blocks, res_hash2ext, ext_id, gi, rows)
                         n_applied += na
                         n_unresolved += nu
+                        n_owner_missing += nom
                         if new_blocks is not None:
-                            rid = rid_by_ext[ext_id]
-                            updated.setdefault(rid, {})[gi] = new_blocks
-                            self._ff_write_runner_block_table(runner, rid, gi, new_blocks)
+                            rid = rid_by_ext.get(ext_id)
+                            if rid is not None:
+                                updated.setdefault(rid, {})[gi] = new_blocks
+                                self._ff_write_runner_block_table(runner, rid, gi, new_blocks)
                 elif ext_id not in ext2blocks:
                     # Redirect arrived before the owner's KV → keep for the step its recv completes.
                     leftover[ext_id] = groups
@@ -740,10 +763,10 @@ if _ASCEND_AVAILABLE:
                         self._ff_recv_thread.pending.setdefault(ext_id, {}).update(groups)
             if updated:
                 runner._updated_block_tables = updated
-            if n_applied or n_unresolved or n_dropped or _PD_DEBUG:
-                logger.info("BFF Mooncake apply | redirects_applied=%d | reps_unresolved=%d | "
-                            "owners_deferred=%d | owners_dropped_post_decode=%d",
-                            n_applied, n_unresolved, n_deferred, n_dropped)
+            if n_applied or n_unresolved or n_owner_missing or n_dropped or _PD_DEBUG:
+                logger.info("BFF Mooncake apply | redirects_applied=%d | owner_unresident=%d | "
+                            "reps_unresolved=%d | owners_deferred=%d | owners_dropped_post_decode=%d",
+                            n_applied, n_owner_missing, n_unresolved, n_deferred, n_dropped)
 
         @staticmethod
         def _ff_write_runner_block_table(runner, rid, gi, new_blocks) -> None:
