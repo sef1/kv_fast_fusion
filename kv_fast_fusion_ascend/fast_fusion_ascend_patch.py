@@ -62,12 +62,12 @@ def _bff_apply_block_merge(scheduler, model_runner_output) -> None:
         except Exception as e:
             logger.warning("BFF Ascend connector-stats block-merge fallback failed: %s", e)
     # Persist-and-retry: the worker stages the redirect map at the step the owner's KV recv
-    # completes, but a just-loaded P/D consumer request is usually not RUNNING/allocated in the
-    # scheduler until a LATER step — so _handle_block_merging_with_counts (which only mutates RUNNING
-    # requests) would skip it, and the consume-once map would be lost (→ "freed 0 blocks"). Instead we
-    # accumulate maps and apply each request's map only once it is RUNNING; the rest wait, finished
-    # ones are dropped. The worker-side repoint already happened pre-decode, so retrying the
-    # scheduler-side orphan free later is safe.
+    # completes, but a just-loaded P/D consumer request is usually not yet applicable in the scheduler
+    # (still receiving, or WAITING behind the max_num_seqs cap) — so the consume-once map would be lost
+    # (→ "freed 0 blocks"). Accumulate maps and apply each once its request is SAFE to merge, retrying
+    # the rest and dropping finished ones. A request is safe once its KV load has finished
+    # (not WAITING_FOR_REMOTE_KVS) and it has computed tokens — this frees post-load WAITING consumers
+    # too (they pin the receive-buffer backlog), not just RUNNING ones. The shared handler re-checks.
     pending = getattr(scheduler, "_bff_pending_merges", None)
     if pending is None:
         pending = {}
@@ -84,14 +84,19 @@ def _bff_apply_block_merge(scheduler, model_runner_output) -> None:
         req = scheduler.requests.get(rid)
         if req is None:
             n_dropped += 1                       # finished / evicted → drop
-        elif req.status == RequestStatus.RUNNING:
-            ready[rid] = groups
+        elif (req.status != RequestStatus.WAITING_FOR_REMOTE_KVS
+              and req.num_computed_tokens > 0):
+            ready[rid] = groups                  # post-KV-load (RUNNING or WAITING) → safe to merge
         else:
-            keep[rid] = groups                   # not RUNNING yet → retry next step
+            keep[rid] = groups                   # still receiving KV → retry next step
     scheduler._bff_pending_merges = keep
-    if ready or keep or n_dropped:
-        logger.info("BFF Ascend: block-merge partition | ready=%d pending=%d dropped=%d",
-                    len(ready), len(keep), n_dropped)
+    # Throttle: log only when something applies or every 64th quiet step (avoid per-step flooding).
+    scheduler._bff_merge_calls = getattr(scheduler, "_bff_merge_calls", 0) + 1
+    if ready or n_dropped or scheduler._bff_merge_calls % 64 == 0:
+        n_wait = len(getattr(scheduler, "waiting", ())) + len(getattr(scheduler, "skipped_waiting", ()))
+        logger.info("BFF Ascend: block-merge partition | ready=%d pending=%d dropped=%d | "
+                    "running=%d waiting=%d", len(ready), len(keep), n_dropped,
+                    len(getattr(scheduler, "running", ())), n_wait)
     if ready:
         try:
             scheduler._handle_block_merging_with_counts(ready)

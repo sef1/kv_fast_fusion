@@ -13,6 +13,13 @@ BFF_EVICT_FUSED = os.environ.get("BFF_EVICT_FUSED", "0") == "1"
 # representative block, so on resume from preemption the request prefix-hits the rep
 # (which outlives its merge-orphan) instead of recomputing. raw mode only (KV unmutated).
 _BFF_RAW = os.environ.get("BFF_SCALE_MODE", "raw") == "raw"
+# Free redundant blocks for post-KV-load consumers that are not yet RUNNING (still WAITING behind the
+# max_num_seqs cap). Those requests hold their receive blocks until they finish, so only freeing at
+# RUNNING never relieves the receive-buffer backlog. Safe when keyed on num_computed_tokens>0 +
+# num_cached_block membership (NOT status): the assert-crash the old RUNNING guard protected against
+# only fires for genuinely preempted-and-freed requests (num_computed_tokens==0). Off → legacy
+# RUNNING-only behavior (NCCL default until validated).
+_BFF_FREE_PRERUNNING = os.environ.get("BFF_FREE_PRERUNNING", "1") == "1"
 from vllm.v1.core.kv_cache_utils import BlockHashWithGroupId, make_block_hash_with_group_id
 def _handle_block_merging_with_counts_o(  
         self,   
@@ -184,17 +191,31 @@ def _handle_block_merging_with_counts(self, request_blocks: dict[str, dict[int, 
         # cache: on its re-schedule from WAITING it does a prefix lookup (non-empty
         # new_computed_blocks) while still in num_cached_block → the
         # `assert len(new_computed_blocks) == 0` crash in single_type_kv_cache_manager.
-        # Only mutate scheduler state for requests that are still actively RUNNING.
-        if self.requests[req_id].status != RequestStatus.RUNNING:
+        req = self.requests[req_id]
+        if _BFF_FREE_PRERUNNING:
+            # Also free for post-KV-load consumers still WAITING behind the max_num_seqs cap (they
+            # pin the receive-buffer backlog). Safe iff the request has computed tokens (so the
+            # scheduler skips the prefix lookup → new_computed_blocks stays empty → assert can't
+            # fire) and its KV load has finished (exclude WAITING_FOR_REMOTE_KVS). The per-group
+            # num_cached_block check below confirms the cache is populated.
+            if (req.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+                    or req.num_computed_tokens == 0):
+                continue
+        elif req.status != RequestStatus.RUNNING:
+            # Legacy: only mutate scheduler state for requests that are still actively RUNNING.
             continue
 
-          
-        for group_idx, new_block_ids in group_blocks.items():  
-            if group_idx == 0:  
-                continue  
-                  
-            manager = self.kv_cache_manager.coordinator.single_type_managers[group_idx]  
-            req_blocks = manager.req_to_blocks.get(req_id, [])  
+
+        for group_idx, new_block_ids in group_blocks.items():
+            if group_idx == 0:
+                continue
+
+            manager = self.kv_cache_manager.coordinator.single_type_managers[group_idx]
+            # Skip if this group's cache isn't populated for the request (e.g. load not fully cached);
+            # mutating req_to_blocks/num_cached_block without it risks the prefix-cache desync.
+            if _BFF_FREE_PRERUNNING and req_id not in manager.num_cached_block:
+                continue
+            req_blocks = manager.req_to_blocks.get(req_id, [])
               
             # Count old references and cache blocks  
             for block in req_blocks:  
