@@ -154,6 +154,44 @@ def test_lsh_cross_request_across_steps_without_encoded_batch():
         f"reqB must cross-redirect to reqA's rep across steps at ENCODED_BATCH=0, got {out2}"
 
 
+def test_intra_req_ff_disables_within_batch_cc():
+    """BFF_PD_INTRA_REQ_FF=0 must skip the within-batch cc merge (two same-step requests with identical
+    blocks no longer fuse), while cross-request LSH still works: every unmatched block is registered, so
+    an identical block in a LATER step cross-matches. Toggle the module constant directly (it's read
+    live inside _build_send_rows) and restore it afterwards."""
+    from kv_fast_fusion_ascend.connectors import mooncake_layerwise_connector_ff as m
+    if m._PD_CROSS_INDEX != "lsh":
+        print("  (skipped: BFF_PD_CROSS_INDEX != lsh)")
+        return
+    saved = m._PD_INTRA_REQ_FF
+    m._PD_INTRA_REQ_FF = False
+    try:
+        prod = MooncakeFFProducer()
+        group_layers = {"L0", "L1"}
+        shared = _make_k(1, seed=11)[0]
+
+        # Step 1: two requests, identical blocks, same step. With within-batch cc OFF they must NOT
+        # merge (index is empty so cross finds nothing) — but both reps get registered.
+        base1 = _cache_with_blocks({10: shared, 20: shared})
+        prod.reset_step(1)
+        prod.on_layer(1, "L0", base1, group_layers, [("reqA", [10], True), ("reqB", [20], True)])
+        out1 = prod.on_layer(1, "L1", base1, group_layers,
+                             [("reqA", [10], True), ("reqB", [20], True)])
+        assert out1 == {}, f"within-batch cc disabled must not merge same-step dupes, got {out1}"
+
+        # Step 2: a later request with the same block cross-matches a registered rep from step 1.
+        base2 = _cache_with_blocks({30: shared}, seed=13)
+        prod.reset_step(2)
+        prod.on_layer(1, "L0", base2, group_layers, [("reqC", [30], True)])
+        out2 = prod.on_layer(1, "L1", base2, group_layers, [("reqC", [30], True)])
+        assert list(out2.keys()) == ["reqC"], f"reqC must cross-match a step-1 rep, got {out2}"
+        (owner_slot, rep_hash, rep_slot) = out2["reqC"][0]
+        assert rep_hash in (_ext_hash("reqA"), _ext_hash("reqB")), \
+            f"rep must be one of step-1's registered reqs, got hash {rep_hash}"
+    finally:
+        m._PD_INTRA_REQ_FF = saved
+
+
 def test_redirect_channel_push_pull_contract():
     """Fire-and-forget wire contract for the FF redirect channel: a PUSH of
     ``(_FF_REDIRECT_MSG, ext_id, gi, rows)`` (msgpack) must decode on the PULL side into the same
@@ -199,5 +237,6 @@ if __name__ == "__main__":
     test_consumer_resolve_unresolved_when_rep_absent()
     test_end_to_end_producer_to_consumer()
     test_lsh_cross_request_across_steps_without_encoded_batch()
+    test_intra_req_ff_disables_within_batch_cc()
     test_redirect_channel_push_pull_contract()
     print("OK: all mooncake layerwise FF glue tests passed")

@@ -61,6 +61,10 @@ _PD_ENCODED_BATCH = int(os.environ.get("BFF_PD_ENCODED_BATCH_SIZE", "0"))
 # Cross-request index backend: "lsh" (SimHash banded index — O(N) probe, large capacity) or "matrix"
 # (the legacy dense concat_cosine_cross_match over a bounded FIFO window). Within-batch stays cc.
 _PD_CROSS_INDEX = os.environ.get("BFF_PD_CROSS_INDEX", "lsh").lower()
+# Within-batch cc fusion (merges duplicate blocks across DIFFERENT requests in the same step). This is
+# the O(N²) concat_cosine_cc/nr_tree pass — the main per-group overhead. 1 = on (default, current
+# behavior); 0 = off (only cross-request matching runs; unmatched blocks still register into the index).
+_PD_INTRA_REQ_FF = os.environ.get("BFF_PD_INTRA_REQ_FF", "1") == "1"
 # SimHash LSH config (ported from kv_fast_fusion/legacy): NUM_LSH_TABLES banded sub-hashes of
 # LSH_BITS_PER_TABLE bits each, from sign() of a fixed-seed random-hyperplane projection.
 _LSH_TABLES = int(os.environ.get("BFF_LSH_TABLES", "16"))
@@ -290,9 +294,11 @@ class MooncakeFFProducer:
             run_cross = use_lsh or _PD_ENCODED_BATCH > 0
             if not run_cross:
                 # ---- within-batch only (legacy path, unchanged behavior) ----
-                labels = _cluster(buf["k_layers"], torch.as_tensor(flat_req_local, device=dev0))
-                _, redirects = build_group_redirect(labels, flat_req_local, flat_slot)
-                _emit_within(redirects)
+                if _PD_INTRA_REQ_FF:
+                    labels = _cluster(buf["k_layers"], torch.as_tensor(flat_req_local, device=dev0))
+                    _, redirects = build_group_redirect(labels, flat_req_local, flat_slot)
+                    _emit_within(redirects)
+                # else: no cross backend and within-batch cc disabled → emit no redirects.
             else:
                 # ---- cross-request phase 1: match this step's blocks against earlier requests' reps.
                 # "lsh" (default, tp=1): O(N) SimHash bucket probe over a large-capacity index.
@@ -336,7 +342,7 @@ class MooncakeFFProducer:
                 # Phase 2: within-batch clustering on the UNMATCHED remainder (subset → map back).
                 unmatched = [i for i in range(N) if not matched[i]]
                 reps_to_register: list[int] = []
-                if unmatched:
+                if unmatched and _PD_INTRA_REQ_FF:
                     sub_k = [Kg[unmatched] for Kg in buf["k_layers"]]
                     sub_req = [flat_req_local[i] for i in unmatched]
                     sub_slot = [flat_slot[i] for i in unmatched]
@@ -346,6 +352,10 @@ class MooncakeFFProducer:
                     labels_l = labels.tolist()
                     reps_to_register = [unmatched[i] for i in range(len(labels_l))
                                         if labels_l[i] == i]
+                elif unmatched:
+                    # Within-batch cc disabled: skip the O(N²) clustering and register every unmatched
+                    # block as its own rep, so the cross-request index still grows (no within redirects).
+                    reps_to_register = list(unmatched)
                 # Register this step's new reps into the chosen cross-request index.
                 if use_lsh:
                     self._lsh_register(gi, cur_norm, sub_hashes, ext_ids, flat_req_local,
@@ -544,6 +554,7 @@ class MooncakeFFProducer:
                 # batches) vs the within-step batch, plus the window size and current registry size.
                 "encoded_batch_size": _PD_ENCODED_BATCH,
                 "cross_index": _PD_CROSS_INDEX,
+                "intra_req_ff": _PD_INTRA_REQ_FF,
                 "cross_batch_redirects": self.cross_redir_total,
                 "within_batch_redirects": self.within_redir_total,
                 "registry_blocks": {str(gi): self._registry_size(gi)
