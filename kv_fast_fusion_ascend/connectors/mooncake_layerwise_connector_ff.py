@@ -25,12 +25,14 @@ box. The connector subclass + ZMQ wiring are defined only when ``vllm_ascend`` i
 """
 
 import hashlib
+import itertools
 import json
 import os
 import queue
 import struct
 import threading
 import time
+from collections import OrderedDict
 from typing import Any
 
 import torch
@@ -56,6 +58,16 @@ _PD_DEBUG = os.environ.get("BFF_PD_DEBUG", "0") == "1"
 # Cross-batch encoded registry window: keep the last N distinct requests' rep blocks per fusion
 # group and match this step's blocks against them. 0 = disabled (within-batch fusion only).
 _PD_ENCODED_BATCH = int(os.environ.get("BFF_PD_ENCODED_BATCH_SIZE", "0"))
+# Cross-request index backend: "lsh" (SimHash banded index — O(N) probe, large capacity) or "matrix"
+# (the legacy dense concat_cosine_cross_match over a bounded FIFO window). Within-batch stays cc.
+_PD_CROSS_INDEX = os.environ.get("BFF_PD_CROSS_INDEX", "lsh").lower()
+# SimHash LSH config (ported from kv_fast_fusion/legacy): NUM_LSH_TABLES banded sub-hashes of
+# LSH_BITS_PER_TABLE bits each, from sign() of a fixed-seed random-hyperplane projection.
+_LSH_TABLES = int(os.environ.get("BFF_LSH_TABLES", "16"))
+_LSH_BITS = int(os.environ.get("BFF_LSH_BITS_PER_TABLE", "10"))
+# Max rep entries kept per fusion group in the LSH index before LRU-evicting the oldest half.
+_LSH_MAX_ENTRIES = int(os.environ.get("BFF_LSH_MAX_ENTRIES", "50000"))
+_LSH_POWERS = (2 ** torch.arange(_LSH_BITS, dtype=torch.int64)).tolist()
 # Dedicated FF ZMQ control channel: D binds (its side-channel base + this offset); P sends redirect
 # maps there. Kept separate from the connector's own handshake port so the stock recv thread is
 # untouched. TP=1 assumed for M1 (the new setup runs tp_size=1 on both P and D).
@@ -83,19 +95,24 @@ def _external_id(request_id: str) -> str:
     return request_id[:-9]
 
 
-def _block_repr(k_cache: torch.Tensor, idx: torch.Tensor, jl_holder: list) -> torch.Tensor:
+def _block_repr(caches, idx: torch.Tensor, jl_holder: list) -> torch.Tensor:
     """Per-layer block representation ``[N, D_repr]`` (float32) for the clustering similarity.
 
-    ``k_cache`` is one layer's paged K tensor ``[num_blocks, block_size, kv_heads, head_dim]`` (the
-    Mooncake list layout ``kv_layer[0]``); ``idx`` selects the flat blocks. ``full`` = exact whole
-    block, ``mean`` = head_dim mean, ``proj`` = fixed-seed JL projection. ``jl_holder`` is a 1-elem
-    list caching the lazily-built projection matrix."""
-    blk = k_cache[idx].float()                         # [N, block_size, kv_heads, head_dim]
+    ``caches`` is one layer's paged cache tensor(s) selected by ``idx``. For standard attention it is a
+    single K tensor ``[num_blocks, block_size, kv_heads, head_dim]`` (``kv_layer[0]``); for MLA it is
+    the pair ``[compressed/nope, rope]`` (each ``[num_blocks, block_size, 1, dim]``), whose per-block
+    reprs are concatenated because they share one physical block. A bare tensor is accepted too.
+    ``full`` = exact whole block, ``mean`` = per-token-feature mean, ``proj`` = fixed-seed JL
+    projection. ``jl_holder`` caches the lazily-built projection matrix (sized to the concatenated
+    width on first call)."""
+    if not isinstance(caches, (list, tuple)):
+        caches = (caches,)
     n = idx.shape[0]
     if _PD_REPR == "mean":
-        head_dim = blk.shape[-1]
-        return blk.reshape(n, -1, head_dim).mean(dim=1)
-    full = blk.reshape(n, -1)
+        parts = [c[idx].float().reshape(n, -1, c.shape[-1]).mean(dim=1) for c in caches]
+        return parts[0] if len(parts) == 1 else torch.cat(parts, dim=1)
+    parts = [c[idx].float().reshape(n, -1) for c in caches]
+    full = parts[0] if len(parts) == 1 else torch.cat(parts, dim=1)
     if _PD_REPR == "proj":
         if jl_holder[0] is None:
             g = torch.Generator(device=full.device)
@@ -104,6 +121,29 @@ def _block_repr(k_cache: torch.Tensor, idx: torch.Tensor, jl_holder: list) -> to
                 full.shape[1], _PD_PROJ_DIM, generator=g, device=full.device, dtype=torch.float32)
         return full @ jl_holder[0]
     return full
+
+
+def _lsh_get_proj(jl_holder: list, d: int, device) -> torch.Tensor:
+    """Fixed-seed random-hyperplane projection ``[d, _LSH_TABLES*_LSH_BITS]`` for SimHash, cached in
+    ``jl_holder`` per feature width (deterministic across restarts). Ported from the legacy
+    ``_get_simhash_matrix``."""
+    m = jl_holder[0]
+    if m is None or m.shape[0] != d:
+        g = torch.Generator(device="cpu")
+        g.manual_seed(20240517)
+        m = torch.randn(d, _LSH_TABLES * _LSH_BITS, generator=g, dtype=torch.float32).to(device)
+        jl_holder[0] = m
+    return m
+
+
+def _lsh_sub_hashes(vecs_norm: torch.Tensor, proj: torch.Tensor) -> list:
+    """Per-row list of ``_LSH_TABLES`` banded sub-hashes (each an int in ``[0, 2**_LSH_BITS)``) from
+    the sign bits of ``vecs_norm @ proj``. ``vecs_norm`` is ``[M, d]``; returns a length-M list of
+    length-``_LSH_TABLES`` int lists. Mirrors legacy ``_lsh_fingerprint`` (batched)."""
+    bits = (vecs_norm.float() @ proj > 0).to(torch.int64).cpu()          # [M, T*B]
+    powers = torch.tensor(_LSH_POWERS, dtype=torch.int64)
+    packed = (bits.view(-1, _LSH_TABLES, _LSH_BITS) * powers).sum(dim=2)  # [M, T]
+    return packed.tolist()
 
 
 class MooncakeFFProducer:
@@ -130,6 +170,11 @@ class MooncakeFFProducer:
         # Cross-batch encoded registry: gi -> rolling window of the last _PD_ENCODED_BATCH distinct
         # requests' representative block K-reps (raw mode). Empty/unused when _PD_ENCODED_BATCH <= 0.
         self._registry: dict[int, dict] = {}
+        # SimHash LSH cross-request index (BFF_PD_CROSS_INDEX="lsh"): gi -> dict with banded bucket
+        # tables, a rep-vector store (verify), and per-entry (ext_hash, slot, req_ext). Large-capacity
+        # alternative to the bounded _registry, O(N) probe.
+        self._lsh: dict[int, dict] = {}
+        self._lsh_proj = [None]                # lazy fixed-seed SimHash projection (per feature width)
 
     def reset_step(self, step_id: int) -> None:
         if step_id != self._cur_step_id:
@@ -141,17 +186,22 @@ class MooncakeFFProducer:
         self,
         gi: int,
         layer_name: str,
-        k_cache: torch.Tensor,
+        caches,
         group_layer_names: set[str],
         requests: list[tuple],
         tp_group=None,
     ) -> dict[str, list[tuple[int, int, int]]] | None:
-        """Accumulate one layer of fusion group ``gi``. ``requests`` is the ordered list of
+        """Accumulate one layer of fusion group ``gi``. ``caches`` is the layer's paged cache tensor —
+        a single K tensor for standard attention, or the ``[nope, rope]`` pair for MLA (a bare tensor
+        is also accepted). ``requests`` is the ordered list of
         ``(external_id, local_block_ids_for_gi[, has_remote])`` for this step's batch (``has_remote``
         defaults to True when omitted; it gates cross-batch registration to decode-bound requests).
         Returns ``None`` until the group completes, then a dict
         ``{owner_external_id: [(owner_slot, rep_hash, rep_slot), ...]}``.
         """
+        if not isinstance(caches, (list, tuple)):
+            caches = (caches,)
+        dev = caches[0].device
         buf = self._buf.get(gi)
         if buf is None:
             flat_bids: list[int] = []
@@ -170,7 +220,7 @@ class MooncakeFFProducer:
                         flat_slot.append(slot)
             # Build the block-index tensor once — flat_bids is constant across the group's layers,
             # so this avoids G-1 redundant host->device copies per group per step.
-            idx = (torch.as_tensor(flat_bids, device=k_cache.device, dtype=torch.long)
+            idx = (torch.as_tensor(flat_bids, device=dev, dtype=torch.long)
                    if flat_bids else None)
             buf = {
                 "seen": set(),
@@ -185,7 +235,7 @@ class MooncakeFFProducer:
             self._buf[gi] = buf
 
         if buf["idx"] is not None:
-            buf["k_layers"].append(_block_repr(k_cache, buf["idx"], self._jl))
+            buf["k_layers"].append(_block_repr(caches, buf["idx"], self._jl))
         buf["seen"].add(layer_name)
 
         if len(buf["seen"]) < len(group_layer_names):
@@ -237,32 +287,46 @@ class MooncakeFFProducer:
                 _, redirects = build_group_redirect(labels, flat_req_local, flat_slot)
                 _emit_within(redirects)
             else:
-                # ---- cross-batch (registry enabled) ----
-                reg = self._registry.get(gi)
-                reg_vecs = reg["vecs"] if reg else None
-                reg_sq = reg["sq"] if reg else None
-                best_idx, _score, cur_sq, cur_concat = concat_cosine_cross_match(
-                    buf["k_layers"], reg_vecs, reg_sq, THRESHOLD, tp_group=tp_group)
-                # Forbid a self-merge (a registered rep from the SAME request, e.g. chunked prefill).
-                if reg is not None and bool((best_idx >= 0).any()):
-                    own_hash = torch.tensor(
-                        [_ext_hash(ext_ids[r]) for r in flat_req_local],
-                        dtype=torch.long, device=best_idx.device)
-                    self_hit = (best_idx >= 0) & (reg["hash"][best_idx.clamp(min=0)] == own_hash)
-                    best_idx = torch.where(self_hit, torch.full_like(best_idx, -1), best_idx)
-                best_list = best_idx.tolist()
-                # Phase 1: cross-batch matches → redirect to the registry rep (already resident on D).
-                # Resolve hash/slot NOW — _register_reps below re-indexes the registry in this call.
-                matched = [False] * N
-                for i, ridx in enumerate(best_list):
-                    if ridx < 0:
-                        continue
-                    owner_ext = ext_ids[flat_req_local[i]]
-                    send_rows.setdefault(owner_ext, []).append(
-                        (int(flat_slot[i]), int(reg["hash"][ridx].item()),
-                         int(reg["slot"][ridx].item())))
-                    matched[i] = True
-                    n_cross += 1
+                # ---- cross-request phase 1: match this step's blocks against earlier requests' reps.
+                # "lsh" (default, tp=1): O(N) SimHash bucket probe over a large-capacity index.
+                # "matrix" (or any tp>1): the dense concat_cosine_cross_match over the FIFO window.
+                use_lsh = _PD_CROSS_INDEX == "lsh" and tp_group is None
+                cur_concat = cur_sq = cur_norm = sub_hashes = None
+                if use_lsh:
+                    cur_concat = torch.cat([Kg.float() for Kg in buf["k_layers"]], dim=1)  # [N, G*D]
+                    cur_norm = cur_concat / cur_concat.norm(dim=1, keepdim=True).clamp(min=1e-6)
+                    proj = _lsh_get_proj(self._lsh_proj, cur_concat.shape[1], cur_concat.device)
+                    sub_hashes = _lsh_sub_hashes(cur_norm, proj)
+                    matched, hits = self._lsh_probe(
+                        gi, cur_norm, sub_hashes, ext_ids, flat_req_local)
+                    for (i, rep_hash, rep_slot) in hits:
+                        owner_ext = ext_ids[flat_req_local[i]]
+                        send_rows.setdefault(owner_ext, []).append(
+                            (int(flat_slot[i]), int(rep_hash), int(rep_slot)))
+                        n_cross += 1
+                else:
+                    reg = self._registry.get(gi)
+                    reg_vecs = reg["vecs"] if reg else None
+                    reg_sq = reg["sq"] if reg else None
+                    best_idx, _score, cur_sq, cur_concat = concat_cosine_cross_match(
+                        buf["k_layers"], reg_vecs, reg_sq, THRESHOLD, tp_group=tp_group)
+                    # Forbid a self-merge (a registered rep from the SAME request, e.g. chunked prefill).
+                    if reg is not None and bool((best_idx >= 0).any()):
+                        own_hash = torch.tensor(
+                            [_ext_hash(ext_ids[r]) for r in flat_req_local],
+                            dtype=torch.long, device=best_idx.device)
+                        self_hit = (best_idx >= 0) & (reg["hash"][best_idx.clamp(min=0)] == own_hash)
+                        best_idx = torch.where(self_hit, torch.full_like(best_idx, -1), best_idx)
+                    matched = [False] * N
+                    for i, ridx in enumerate(best_idx.tolist()):
+                        if ridx < 0:
+                            continue
+                        owner_ext = ext_ids[flat_req_local[i]]
+                        send_rows.setdefault(owner_ext, []).append(
+                            (int(flat_slot[i]), int(reg["hash"][ridx].item()),
+                             int(reg["slot"][ridx].item())))
+                        matched[i] = True
+                        n_cross += 1
                 # Phase 2: within-batch clustering on the UNMATCHED remainder (subset → map back).
                 unmatched = [i for i in range(N) if not matched[i]]
                 reps_to_register: list[int] = []
@@ -276,7 +340,12 @@ class MooncakeFFProducer:
                     labels_l = labels.tolist()
                     reps_to_register = [unmatched[i] for i in range(len(labels_l))
                                         if labels_l[i] == i]
-                self._register_reps(gi, buf, reps_to_register, cur_concat, cur_sq)
+                # Register this step's new reps into the chosen cross-request index.
+                if use_lsh:
+                    self._lsh_register(gi, cur_norm, sub_hashes, ext_ids, flat_req_local,
+                                       flat_slot, reps_to_register, buf["ext_has_remote"])
+                else:
+                    self._register_reps(gi, buf, reps_to_register, cur_concat, cur_sq)
             self.dedup_ms += (time.perf_counter() - t0) * 1e3
         n_redir = n_cross + n_within
         self.blk_total[gi] = self.blk_total.get(gi, 0) + len(buf["flat_bids"])
@@ -352,6 +421,96 @@ class MooncakeFFProducer:
                 reg[k] = reg[k][idx]
         reg["key2seq"] = {k: s for k, s in reg["key2seq"].items() if s >= keep_from}
 
+    # -- SimHash LSH cross-request index (BFF_PD_CROSS_INDEX="lsh") -------------------------
+    def _lsh_index(self, gi) -> dict:
+        idx = self._lsh.get(gi)
+        if idx is None:
+            idx = {
+                "tables": [dict() for _ in range(_LSH_TABLES)],  # bucket_hash -> [entry_id]
+                "vecs": OrderedDict(),                           # entry_id -> normalized rep (cpu f32)
+                "meta": {},                                      # entry_id -> (ext_hash, slot, req_ext)
+                "owner": {},                                     # entry_id -> sub_hashes (for eviction)
+                "next_id": 0,
+            }
+            self._lsh[gi] = idx
+        return idx
+
+    def _lsh_size(self, gi) -> int:
+        idx = self._lsh.get(gi)
+        return 0 if idx is None else len(idx["vecs"])
+
+    def _lsh_probe(self, gi, cur_norm, sub_hashes, ext_ids, flat_req_local):
+        """Probe the group's LSH index for each current block; return (matched[list[bool]],
+        hits[list[(i, rep_hash, rep_slot)]]). A hit requires a bucket-candidate from a DIFFERENT
+        request whose exact cosine with the current block is >= THRESHOLD (best wins)."""
+        idx = self._lsh.get(gi)
+        n = cur_norm.shape[0]
+        matched = [False] * n
+        hits: list[tuple[int, int, int]] = []
+        if idx is None or not idx["vecs"]:
+            return matched, hits
+        tables, vecs, meta = idx["tables"], idx["vecs"], idx["meta"]
+        cur_cpu = cur_norm.detach().cpu().float()
+        for i in range(n):
+            owner_ext = ext_ids[flat_req_local[i]]
+            cand: set = set()
+            for t, h in enumerate(sub_hashes[i]):
+                cand.update(tables[t].get(h, ()))
+            cids = [c for c in cand if c in vecs and meta[c][2] != owner_ext]
+            if not cids:
+                continue
+            stack = torch.stack([vecs[c] for c in cids])          # [C, d]
+            sims = cur_cpu[i] @ stack.T                            # [C]
+            best_val, best_j = sims.max(dim=0)
+            if best_val.item() > THRESHOLD:
+                rep_hash, rep_slot, _ = meta[cids[int(best_j.item())]]
+                hits.append((i, rep_hash, rep_slot))
+                matched[i] = True
+                vecs.move_to_end(cids[int(best_j.item())])        # LRU touch
+        return matched, hits
+
+    def _lsh_register(self, gi, cur_norm, sub_hashes, ext_ids, flat_req_local, flat_slot,
+                      rep_flats, ext_has_remote) -> None:
+        """Insert this step's unmatched reps (decode-bound only) into the LSH index; LRU-evict the
+        oldest half when over the per-group cap."""
+        if not rep_flats:
+            return
+        idx = self._lsh_index(gi)
+        tables, vecs, meta, owner = idx["tables"], idx["vecs"], idx["meta"], idx["owner"]
+        if len(vecs) >= _LSH_MAX_ENTRIES:
+            for eid in list(itertools.islice(vecs.keys(), max(1, _LSH_MAX_ENTRIES // 2))):
+                self._lsh_evict(idx, eid)
+        cur_cpu = cur_norm.detach().cpu().float()
+        for f in rep_flats:
+            ri = flat_req_local[f]
+            if not ext_has_remote[ri]:
+                continue
+            ext = ext_ids[ri]
+            eid = idx["next_id"]
+            idx["next_id"] += 1
+            vecs[eid] = cur_cpu[f]
+            meta[eid] = (_ext_hash(ext), int(flat_slot[f]), ext)
+            sh = sub_hashes[f]
+            owner[eid] = sh
+            for t, h in enumerate(sh):
+                tables[t].setdefault(h, []).append(eid)
+
+    @staticmethod
+    def _lsh_evict(idx, eid) -> None:
+        sh = idx["owner"].pop(eid, None)
+        idx["vecs"].pop(eid, None)
+        idx["meta"].pop(eid, None)
+        if sh is not None:
+            for t, h in enumerate(sh):
+                bucket = idx["tables"][t].get(h)
+                if bucket:
+                    try:
+                        bucket.remove(eid)
+                    except ValueError:
+                        pass
+                    if not bucket:
+                        del idx["tables"][t][h]
+
     def dump_stats(self, stats_dir: str) -> None:
         """Write this producer's cumulative fusion compression to ``bff_stats_<pid>.json`` in
         ``stats_dir``. The benchmark's collect_bff_stats() merges these after the run. Ascend analogue
@@ -378,10 +537,12 @@ class MooncakeFFProducer:
                 # Cross-batch lift: how many redirects came from the rolling registry (earlier
                 # batches) vs the within-step batch, plus the window size and current registry size.
                 "encoded_batch_size": _PD_ENCODED_BATCH,
+                "cross_index": _PD_CROSS_INDEX,
                 "cross_batch_redirects": self.cross_redir_total,
                 "within_batch_redirects": self.within_redir_total,
                 "registry_blocks": {str(gi): self._registry_size(gi)
                                     for gi in sorted(self._registry)},
+                "lsh_index_blocks": {str(gi): self._lsh_size(gi) for gi in sorted(self._lsh)},
             }
             path = os.path.join(stats_dir, f"bff_stats_{os.getpid()}.json")
             tmp = path + ".tmp"
@@ -446,7 +607,11 @@ try:
         SupportsHMA,
     )
     from vllm.utils.network_utils import make_zmq_path, make_zmq_socket
-    from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheConfig,
+        MLAAttentionSpec,
+    )
 
     from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
         MooncakeLayerwiseConnector,
@@ -562,6 +727,7 @@ if _ASCEND_AVAILABLE:
             self._ff_producer = MooncakeFFProducer() if self._ff_enabled else None
             self._ff_group_layers: dict[int, set[str]] | None = None
             self._ff_fusion_groups: set[int] | None = None
+            self._ff_mla_groups: set[int] | None = None
             self._ff_recv_thread: _FFRedirectRecvThread | None = None
             self._ff_send_thread: _FFRedirectSendThread | None = None
             if self._ff_enabled and self.connector_worker is not None:
@@ -618,16 +784,23 @@ if _ASCEND_AVAILABLE:
             for ln, lm in worker.layer_metadata.items():
                 group_layers.setdefault(lm.tensor_group_idx[0], set()).add(ln)
             fusion_groups = set()
+            mla_groups = set()
             for gi in group_layers:
                 if gi <= 0 or gi >= len(worker.kv_cache_specs):
                     continue
                 spec = worker.kv_cache_specs[gi]
+                # MLAAttentionSpec subclasses FullAttentionSpec, so MLA groups pass this gate too; we
+                # additionally flag them so on_layer clusters on the full latent+rope key (not just
+                # the compressed latent kv_layer[0]).
                 if isinstance(spec, FullAttentionSpec) and worker.kernel_block_size_scale[gi] == 1:
                     fusion_groups.add(gi)
+                    if isinstance(spec, MLAAttentionSpec):
+                        mla_groups.add(gi)
             self._ff_group_layers = group_layers
             self._ff_fusion_groups = fusion_groups
-            logger.info("BFF Mooncake: fusion groups=%s (of %d groups)",
-                        sorted(fusion_groups), len(group_layers))
+            self._ff_mla_groups = mla_groups
+            logger.info("BFF Mooncake: fusion groups=%s (mla=%s) (of %d groups)",
+                        sorted(fusion_groups), sorted(mla_groups), len(group_layers))
 
         def _ff_producer_accumulate(self, worker, layer_name, kv_layer, connector_metadata) -> None:
             if not connector_metadata.requests:
@@ -646,8 +819,15 @@ if _ASCEND_AVAILABLE:
             ]
             if not requests:
                 return
+            # Standard attention clusters on K (kv_layer[0]) only. MLA's key is split across two
+            # latent tensors (kv_layer[0]=compressed/nope, kv_layer[1]=rope) that share one physical
+            # block, so both must be compared or the redirect aliases the un-compared rope cache.
+            if gi in self._ff_mla_groups and len(kv_layer) > 1:
+                caches = [kv_layer[0], kv_layer[1]]
+            else:
+                caches = [kv_layer[0]]
             send_rows = self._ff_producer.on_layer(
-                gi, layer_name, kv_layer[0], self._ff_group_layers[gi], requests)
+                gi, layer_name, caches, self._ff_group_layers[gi], requests)
             if send_rows is None:
                 return
             for rid, rm in connector_metadata.requests.items():

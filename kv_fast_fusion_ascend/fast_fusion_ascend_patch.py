@@ -24,6 +24,10 @@ from vllm.v1.request import RequestStatus
 
 logger = init_logger("vllm.fast_fusion_ascend_patch")
 
+# Per-step block-merge diagnostics (ready/pending/dropped, running vs waiting) are noisy once we free
+# pre-RUNNING; gate them behind BFF_PD_DEBUG. Errors/warnings and "Block merging freed X" stay on.
+_BFF_DEBUG = os.environ.get("BFF_PD_DEBUG", "0") == "1"
+
 # Marks a wrapped update_from_output / __init__ so re-applying the patch is a no-op.
 _WRAP_SENTINEL = "_bff_ascend_wrapped"
 
@@ -45,8 +49,9 @@ def _bff_apply_block_merge(scheduler, model_runner_output) -> None:
                 block_merge_mapping = getattr(_runner, "_updated_block_tables", None)
                 if block_merge_mapping:
                     _runner._updated_block_tables = None
-                    logger.info("BFF Ascend: block-merge via runner | reqs=%d",
-                                len(block_merge_mapping))
+                    if _BFF_DEBUG:
+                        logger.info("BFF Ascend: block-merge via runner | reqs=%d",
+                                    len(block_merge_mapping))
         except Exception as e:
             logger.warning("BFF Ascend runner block-merge fallback failed: %s", e)
     kv_connector_output = getattr(model_runner_output, "kv_connector_output", None)
@@ -90,9 +95,8 @@ def _bff_apply_block_merge(scheduler, model_runner_output) -> None:
         else:
             keep[rid] = groups                   # still receiving KV → retry next step
     scheduler._bff_pending_merges = keep
-    # Throttle: log only when something applies or every 64th quiet step (avoid per-step flooding).
-    scheduler._bff_merge_calls = getattr(scheduler, "_bff_merge_calls", 0) + 1
-    if ready or n_dropped or scheduler._bff_merge_calls % 64 == 0:
+    # Diagnostic (BFF_PD_DEBUG only): ready/pending/dropped + running vs waiting (block-bound check).
+    if _BFF_DEBUG:
         n_wait = len(getattr(scheduler, "waiting", ())) + len(getattr(scheduler, "skipped_waiting", ()))
         logger.info("BFF Ascend: block-merge partition | ready=%d pending=%d dropped=%d | "
                     "running=%d waiting=%d", len(ready), len(keep), n_dropped,
