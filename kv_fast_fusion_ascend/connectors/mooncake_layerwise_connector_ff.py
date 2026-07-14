@@ -167,8 +167,9 @@ class MooncakeFFProducer:
         self.steps = 0                        # scheduler steps seen (approximate; via metadata id())
         self.group_completions = 0            # group finishes seen (true denominator for overhead avg)
         self.dedup_ms = 0.0                   # cumulative clustering time (ms), for overhead avg
-        # Cross-batch encoded registry: gi -> rolling window of the last _PD_ENCODED_BATCH distinct
-        # requests' representative block K-reps (raw mode). Empty/unused when _PD_ENCODED_BATCH <= 0.
+        # Cross-batch encoded registry (MATRIX backend only): gi -> rolling window of the last
+        # _PD_ENCODED_BATCH distinct requests' representative block K-reps (raw mode). Empty/unused
+        # under the "lsh" backend, whose pool is bounded by BFF_LSH_MAX_ENTRIES instead.
         self._registry: dict[int, dict] = {}
         # SimHash LSH cross-request index (BFF_PD_CROSS_INDEX="lsh"): gi -> dict with banded bucket
         # tables, a rep-vector store (verify), and per-entry (ext_hash, slot, req_ext). Large-capacity
@@ -248,9 +249,10 @@ class MooncakeFFProducer:
 
     def _build_send_rows(self, gi, buf, tp_group) -> dict[str, list[tuple[int, int, int]]]:
         """Cluster the completed group's blocks and build ``{owner_ext: [(owner_slot, rep_hash,
-        rep_slot), ...]}``. When ``_PD_ENCODED_BATCH>0`` also matches against the rolling cross-batch
-        registry (earlier requests' reps) before within-batch clustering the remainder, then registers
-        the new reps. When disabled it is the original within-batch-only path."""
+        rep_slot), ...]}``. The cross-request phase (matching against earlier requests' reps before
+        within-batch clustering the remainder, then registering the new reps) runs when the "lsh"
+        backend is active (tp=1) OR ``_PD_ENCODED_BATCH>0`` for the "matrix" backend; ``_PD_ENCODED_BATCH``
+        is the matrix FIFO-window size only. When neither applies it is the within-batch-only path."""
         self.group_completions += 1
         send_rows: dict[str, list[tuple[int, int, int]]] = {}
         flat_req_local = buf["flat_req_local"]
@@ -281,7 +283,12 @@ class MooncakeFFProducer:
                         n_within += 1
 
             N = len(flat_req_local)
-            if _PD_ENCODED_BATCH <= 0:
+            # Cross-request backend + gate. "lsh" (tp=1) runs independently of _PD_ENCODED_BATCH
+            # (its pool is bounded by BFF_LSH_MAX_ENTRIES, not the matrix FIFO window). The "matrix"
+            # backend (and lsh's tp>1 fallback) is gated on _PD_ENCODED_BATCH > 0, its window size.
+            use_lsh = _PD_CROSS_INDEX == "lsh" and tp_group is None
+            run_cross = use_lsh or _PD_ENCODED_BATCH > 0
+            if not run_cross:
                 # ---- within-batch only (legacy path, unchanged behavior) ----
                 labels = _cluster(buf["k_layers"], torch.as_tensor(flat_req_local, device=dev0))
                 _, redirects = build_group_redirect(labels, flat_req_local, flat_slot)
@@ -290,7 +297,6 @@ class MooncakeFFProducer:
                 # ---- cross-request phase 1: match this step's blocks against earlier requests' reps.
                 # "lsh" (default, tp=1): O(N) SimHash bucket probe over a large-capacity index.
                 # "matrix" (or any tp>1): the dense concat_cosine_cross_match over the FIFO window.
-                use_lsh = _PD_CROSS_INDEX == "lsh" and tp_group is None
                 cur_concat = cur_sq = cur_norm = sub_hashes = None
                 if use_lsh:
                     cur_concat = torch.cat([Kg.float() for Kg in buf["k_layers"]], dim=1)  # [N, G*D]

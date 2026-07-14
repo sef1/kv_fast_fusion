@@ -46,10 +46,10 @@ def test_producer_detects_duplicate_across_requests():
     base = _cache_with_blocks({10: shared, 20: shared})
     step_id = 12345
     prod.reset_step(step_id)
-    out = prod.on_layer(gi=1, layer_name="model.layers.2.attn", k_cache=base,
+    out = prod.on_layer(gi=1, layer_name="model.layers.2.attn", caches=base,
                         group_layer_names=group_layers, requests=requests)
     assert out is None, "group not complete after 1 of 2 layers"
-    out = prod.on_layer(gi=1, layer_name="model.layers.3.attn", k_cache=base,
+    out = prod.on_layer(gi=1, layer_name="model.layers.3.attn", caches=base,
                         group_layer_names=group_layers, requests=requests)
     assert out is not None, "group complete after 2 layers"
 
@@ -85,19 +85,19 @@ def test_consumer_resolve_repoints_and_reports():
     }
     hash2ext = {_ext_hash("reqA"): "reqA", _ext_hash("reqB"): "reqB"}
     rows = [(0, _ext_hash("reqA"), 0)]  # owner slot 0 -> reqA slot 0
-    new_blocks, n_applied, n_unresolved = resolve_redirect_rows(
+    new_blocks, n_applied, n_unresolved, n_owner_missing = resolve_redirect_rows(
         ext2blocks, hash2ext, "reqB", gi=1, rows=rows)
     assert new_blocks == [100], f"owner block table should point at rep block 100, got {new_blocks}"
-    assert n_applied == 1 and n_unresolved == 0
+    assert n_applied == 1 and n_unresolved == 0 and n_owner_missing == 0
 
 
 def test_consumer_resolve_unresolved_when_rep_absent():
     ext2blocks = {"reqB": [[0], [200]]}  # rep reqA not resident
     hash2ext = {_ext_hash("reqB"): "reqB"}
     rows = [(0, _ext_hash("reqA"), 0)]
-    new_blocks, n_applied, n_unresolved = resolve_redirect_rows(
+    new_blocks, n_applied, n_unresolved, n_owner_missing = resolve_redirect_rows(
         ext2blocks, hash2ext, "reqB", gi=1, rows=rows)
-    assert new_blocks is None and n_applied == 0 and n_unresolved == 1
+    assert new_blocks is None and n_applied == 0 and n_unresolved == 1 and n_owner_missing == 0
 
 
 def test_end_to_end_producer_to_consumer():
@@ -118,9 +118,40 @@ def test_end_to_end_producer_to_consumer():
     # D physical blocks (arbitrary but distinct)
     dblocks = {"reqA": [[0], [100]], "reqB": [[0], [200]]}
     hash2ext = {_ext_hash("reqA"): "reqA", _ext_hash("reqB"): "reqB"}
-    new_blocks, na, nu = resolve_redirect_rows(dblocks, hash2ext, owner_ext, 1, out[owner_ext])
-    assert na == 1 and nu == 0
+    new_blocks, na, nu, nom = resolve_redirect_rows(dblocks, hash2ext, owner_ext, 1, out[owner_ext])
+    assert na == 1 and nu == 0 and nom == 0
     assert new_blocks == dblocks[rep_ext][1], "owner must share the representative's D block"
+
+
+def test_lsh_cross_request_across_steps_without_encoded_batch():
+    """Gate decoupling: with the default lsh backend and BFF_PD_ENCODED_BATCH_SIZE=0, a block seen in
+    a LATER step must still cross-match the earlier step's registered rep. Before the decoupling this
+    path only ran when the matrix FIFO window (_PD_ENCODED_BATCH) was > 0, so it produced 0 redirects
+    here. The connector is imported with the env default (0), so this exercises the =0 case directly."""
+    from kv_fast_fusion_ascend.connectors import mooncake_layerwise_connector_ff as m
+    if m._PD_CROSS_INDEX != "lsh":
+        print("  (skipped: BFF_PD_CROSS_INDEX != lsh)")
+        return
+    assert m._PD_ENCODED_BATCH == 0, "test asserts the =0 (matrix-window-off) case"
+
+    prod = MooncakeFFProducer()
+    group_layers = {"L0", "L1"}
+    shared = _make_k(1, seed=5)[0]
+
+    # Step 1: reqA registers its rep into the LSH index (has_remote=True so it is registered).
+    base1 = _cache_with_blocks({10: shared})
+    prod.reset_step(1)
+    prod.on_layer(1, "L0", base1, group_layers, [("reqA", [10], True)])
+    out1 = prod.on_layer(1, "L1", base1, group_layers, [("reqA", [10], True)])
+    assert sum(len(v) for v in out1.values()) == 0, f"single new block, nothing to merge: {out1}"
+
+    # Step 2: reqB has an identical block in a different step -> LSH cross-match to reqA's rep.
+    base2 = _cache_with_blocks({20: shared}, seed=9)
+    prod.reset_step(2)
+    prod.on_layer(1, "L0", base2, group_layers, [("reqB", [20], True)])
+    out2 = prod.on_layer(1, "L1", base2, group_layers, [("reqB", [20], True)])
+    assert out2 == {"reqB": [(0, _ext_hash("reqA"), 0)]}, \
+        f"reqB must cross-redirect to reqA's rep across steps at ENCODED_BATCH=0, got {out2}"
 
 
 def test_redirect_channel_push_pull_contract():
@@ -167,5 +198,6 @@ if __name__ == "__main__":
     test_consumer_resolve_repoints_and_reports()
     test_consumer_resolve_unresolved_when_rep_absent()
     test_end_to_end_producer_to_consumer()
+    test_lsh_cross_request_across_steps_without_encoded_batch()
     test_redirect_channel_push_pull_contract()
     print("OK: all mooncake layerwise FF glue tests passed")
