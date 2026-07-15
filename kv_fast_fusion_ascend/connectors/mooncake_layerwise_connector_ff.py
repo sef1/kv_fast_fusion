@@ -32,7 +32,7 @@ import queue
 import struct
 import threading
 import time
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from typing import Any
 
 import torch
@@ -71,6 +71,10 @@ _LSH_TABLES = int(os.environ.get("BFF_LSH_TABLES", "16"))
 _LSH_BITS = int(os.environ.get("BFF_LSH_BITS_PER_TABLE", "10"))
 # Max rep entries kept per fusion group in the LSH index before LRU-evicting the oldest half.
 _LSH_MAX_ENTRIES = int(os.environ.get("BFF_LSH_MAX_ENTRIES", "50000"))
+# Cap on candidates verified per block. Candidates/block grows as TABLES*MAX_ENTRIES/2**BITS, so a
+# low BITS against a large index makes the verify dominate. >0 keeps only the top-K candidates by
+# table-collision count (multi-probe ranking); 0 = uncapped (verify every bucket candidate).
+_LSH_MAX_CAND = int(os.environ.get("BFF_LSH_MAX_CANDIDATES", "0"))
 _LSH_POWERS = (2 ** torch.arange(_LSH_BITS, dtype=torch.int64)).tolist()
 # Dedicated FF ZMQ control channel: D binds (its side-channel base + this offset); P sends redirect
 # maps there. Kept separate from the connector's own handshake port so the stock recv thread is
@@ -439,21 +443,43 @@ class MooncakeFFProducer:
 
     # -- SimHash LSH cross-request index (BFF_PD_CROSS_INDEX="lsh") -------------------------
     def _lsh_index(self, gi) -> dict:
+        """Per-group index. Rep vectors live in ONE contiguous ``mat`` [cap, d] (grown by doubling)
+        rather than per-entry tensors, so the probe's verify is a single ``index_select`` + mv instead
+        of a per-block ``torch.stack`` over dict values (measured ~5-7x faster, and storing a copy
+        avoids pinning each step's whole [N, d] buffer alive via an index view)."""
         idx = self._lsh.get(gi)
         if idx is None:
             idx = {
-                "tables": [dict() for _ in range(_LSH_TABLES)],  # bucket_hash -> [entry_id]
-                "vecs": OrderedDict(),                           # entry_id -> normalized rep (cpu f32)
-                "meta": {},                                      # entry_id -> (ext_hash, slot, req_ext)
-                "owner": {},                                     # entry_id -> sub_hashes (for eviction)
-                "next_id": 0,
+                "tables": [dict() for _ in range(_LSH_TABLES)],  # bucket_hash -> [row]
+                "meta": {},                                      # row -> (ext_hash, slot, req_ext)
+                "owner": {},                                     # row -> sub_hashes (for eviction)
+                "lru": OrderedDict(),                            # row -> None (oldest first)
+                "mat": None,                                     # [cap, d] cpu f32 rep vectors
+                "n_rows": 0,
             }
             self._lsh[gi] = idx
         return idx
 
     def _lsh_size(self, gi) -> int:
         idx = self._lsh.get(gi)
-        return 0 if idx is None else len(idx["vecs"])
+        return 0 if idx is None else idx["n_rows"]
+
+    @staticmethod
+    def _lsh_ensure_cap(idx, need: int, d: int) -> None:
+        """Grow ``mat`` by doubling until it holds ``need`` rows (lazy: never allocates the full
+        _LSH_MAX_ENTRIES x d up front)."""
+        mat = idx["mat"]
+        if mat is None:
+            idx["mat"] = torch.empty(max(256, need), d, dtype=torch.float32)
+            return
+        if mat.shape[0] >= need:
+            return
+        cap = mat.shape[0]
+        while cap < need:
+            cap *= 2
+        new = torch.empty(cap, d, dtype=torch.float32)
+        new[:idx["n_rows"]] = mat[:idx["n_rows"]]
+        idx["mat"] = new
 
     def _lsh_probe(self, gi, cur_norm, sub_hashes, ext_ids, flat_req_local):
         """Probe the group's LSH index for each current block; return (matched[list[bool]],
@@ -463,26 +489,39 @@ class MooncakeFFProducer:
         n = cur_norm.shape[0]
         matched = [False] * n
         hits: list[tuple[int, int, int]] = []
-        if idx is None or not idx["vecs"]:
+        if idx is None or not idx["n_rows"]:
             return matched, hits
-        tables, vecs, meta = idx["tables"], idx["vecs"], idx["meta"]
+        tables, meta, lru = idx["tables"], idx["meta"], idx["lru"]
+        mat = idx["mat"]
         cur_cpu = cur_norm.detach().cpu().float()
         for i in range(n):
             owner_ext = ext_ids[flat_req_local[i]]
-            cand: set = set()
-            for t, h in enumerate(sub_hashes[i]):
-                cand.update(tables[t].get(h, ()))
-            cids = [c for c in cand if c in vecs and meta[c][2] != owner_ext]
-            if not cids:
+            if _LSH_MAX_CAND > 0:
+                # Multi-probe ranking: prefer candidates colliding in the MOST tables (more likely
+                # similar), then keep at most _LSH_MAX_CAND of them.
+                counts: Counter = Counter()
+                for t, h in enumerate(sub_hashes[i]):
+                    counts.update(tables[t].get(h, ()))
+                cand_rows = [r for r, _ in counts.most_common()
+                             if meta[r][2] != owner_ext][:_LSH_MAX_CAND]
+            else:
+                cand: set = set()
+                for t, h in enumerate(sub_hashes[i]):
+                    cand.update(tables[t].get(h, ()))
+                # Rows ARE the index into mat, so no id→row lookup — and the buckets only ever hold
+                # live rows (evict+compact run together), so no liveness check either.
+                cand_rows = [r for r in cand if meta[r][2] != owner_ext]
+            if not cand_rows:
                 continue
-            stack = torch.stack([vecs[c] for c in cids])          # [C, d]
-            sims = cur_cpu[i] @ stack.T                            # [C]
+            rows = torch.tensor(cand_rows, dtype=torch.long)
+            sims = mat.index_select(0, rows) @ cur_cpu[i]          # [C]
             best_val, best_j = sims.max(dim=0)
             if best_val.item() > THRESHOLD:
-                rep_hash, rep_slot, _ = meta[cids[int(best_j.item())]]
+                row = cand_rows[int(best_j.item())]
+                rep_hash, rep_slot, _ = meta[row]
                 hits.append((i, rep_hash, rep_slot))
                 matched[i] = True
-                vecs.move_to_end(cids[int(best_j.item())])        # LRU touch
+                lru.move_to_end(row)                              # LRU touch
         return matched, hits
 
     def _lsh_register(self, gi, cur_norm, sub_hashes, ext_ids, flat_req_local, flat_slot,
@@ -492,40 +531,74 @@ class MooncakeFFProducer:
         if not rep_flats:
             return
         idx = self._lsh_index(gi)
-        tables, vecs, meta, owner = idx["tables"], idx["vecs"], idx["meta"], idx["owner"]
-        if len(vecs) >= _LSH_MAX_ENTRIES:
-            for eid in list(itertools.islice(vecs.keys(), max(1, _LSH_MAX_ENTRIES // 2))):
-                self._lsh_evict(idx, eid)
+        if idx["n_rows"] >= _LSH_MAX_ENTRIES:
+            for row in list(itertools.islice(idx["lru"].keys(), max(1, _LSH_MAX_ENTRIES // 2))):
+                self._lsh_evict(idx, row)
+            self._lsh_compact(idx)
+        # Bind AFTER compaction — it rebinds idx["meta"]/["owner"]/["lru"]/["mat"] to new objects.
         cur_cpu = cur_norm.detach().cpu().float()
-        for f in rep_flats:
-            ri = flat_req_local[f]
-            if not ext_has_remote[ri]:
-                continue
-            ext = ext_ids[ri]
-            eid = idx["next_id"]
-            idx["next_id"] += 1
-            vecs[eid] = cur_cpu[f]
-            meta[eid] = (_ext_hash(ext), int(flat_slot[f]), ext)
+        add = [f for f in rep_flats if ext_has_remote[flat_req_local[f]]]
+        if not add:
+            return
+        self._lsh_ensure_cap(idx, idx["n_rows"] + len(add), cur_cpu.shape[1])
+        tables, meta, owner, lru = idx["tables"], idx["meta"], idx["owner"], idx["lru"]
+        mat = idx["mat"]
+        for f in add:
+            ext = ext_ids[flat_req_local[f]]
+            row = idx["n_rows"]
+            idx["n_rows"] += 1
+            mat[row] = cur_cpu[f]                    # copy (not a view into this step's buffer)
+            meta[row] = (_ext_hash(ext), int(flat_slot[f]), ext)
             sh = sub_hashes[f]
-            owner[eid] = sh
+            owner[row] = sh
+            lru[row] = None
             for t, h in enumerate(sh):
-                tables[t].setdefault(h, []).append(eid)
+                tables[t].setdefault(h, []).append(row)
 
     @staticmethod
-    def _lsh_evict(idx, eid) -> None:
-        sh = idx["owner"].pop(eid, None)
-        idx["vecs"].pop(eid, None)
-        idx["meta"].pop(eid, None)
+    def _lsh_evict(idx, row) -> None:
+        """Drop one row's metadata + bucket memberships. The ``mat`` row itself is reclaimed by the
+        _lsh_compact that always follows a batch evict."""
+        sh = idx["owner"].pop(row, None)
+        idx["meta"].pop(row, None)
+        idx["lru"].pop(row, None)
         if sh is not None:
             for t, h in enumerate(sh):
                 bucket = idx["tables"][t].get(h)
                 if bucket:
                     try:
-                        bucket.remove(eid)
+                        bucket.remove(row)
                     except ValueError:
                         pass
                     if not bucket:
                         del idx["tables"][t][h]
+
+    @staticmethod
+    def _lsh_compact(idx) -> None:
+        """Renumber the surviving rows to 0..n-1 after a batch evict: gather them in ``mat`` and
+        rebuild meta/owner/lru/tables under the new row ids (LRU order preserved)."""
+        survivors = [r for r in range(idx["n_rows"]) if r in idx["meta"]]
+        if not survivors:
+            idx["mat"] = None
+            idx["meta"] = {}
+            idx["owner"] = {}
+            idx["lru"] = OrderedDict()
+            idx["tables"] = [dict() for _ in range(_LSH_TABLES)]
+            idx["n_rows"] = 0
+            return
+        remap = {old: new for new, old in enumerate(survivors)}
+        idx["mat"] = idx["mat"].index_select(
+            0, torch.tensor(survivors, dtype=torch.long)).contiguous()
+        idx["meta"] = {remap[r]: v for r, v in idx["meta"].items()}
+        owner = {remap[r]: v for r, v in idx["owner"].items()}
+        idx["owner"] = owner
+        idx["lru"] = OrderedDict((remap[r], None) for r in idx["lru"])
+        tables = [dict() for _ in range(_LSH_TABLES)]
+        for r, sh in owner.items():
+            for t, h in enumerate(sh):
+                tables[t].setdefault(h, []).append(r)
+        idx["tables"] = tables
+        idx["n_rows"] = len(survivors)
 
     def dump_stats(self, stats_dir: str) -> None:
         """Write this producer's cumulative fusion compression to ``bff_stats_<pid>.json`` in

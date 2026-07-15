@@ -192,6 +192,92 @@ def test_intra_req_ff_disables_within_batch_cc():
         m._PD_INTRA_REQ_FF = saved
 
 
+def _lsh_fill(prod, gi, n_entries, d, seed=0):
+    """Register n_entries synthetic reps into group gi's LSH index; returns the normalized vectors."""
+    from kv_fast_fusion_ascend.connectors import mooncake_layerwise_connector_ff as m
+    g = torch.Generator().manual_seed(seed)
+    v = torch.randn(n_entries, d, generator=g)
+    v = v / v.norm(dim=1, keepdim=True)
+    proj = m._lsh_get_proj(prod._lsh_proj, d, torch.device("cpu"))
+    sh = m._lsh_sub_hashes(v, proj)
+    ext_ids = [f"reg{j}" for j in range(n_entries)]
+    prod._lsh_register(gi, v, sh, ext_ids, list(range(n_entries)), list(range(n_entries)),
+                       list(range(n_entries)), [True] * n_entries)
+    return v
+
+
+def test_lsh_probe_matches_bruteforce_oracle():
+    """The matrix-backed probe must pick exactly the rep a brute-force cosine scan would, for every
+    block that has a bucket candidate above THRESHOLD. Guards the index_select verify rewrite."""
+    from kv_fast_fusion_ascend.connectors import mooncake_layerwise_connector_ff as m
+    d, E, N = 64, 2000, 32
+    prod = m.MooncakeFFProducer()
+    reg = _lsh_fill(prod, 1, E, d, seed=3)
+
+    # Probe blocks: half are near-duplicates of registered reps (guaranteed hits), half random.
+    g = torch.Generator().manual_seed(99)
+    q = torch.randn(N, d, generator=g)
+    q[: N // 2] = reg[: N // 2] + 0.01 * torch.randn(N // 2, d, generator=g)
+    q = q / q.norm(dim=1, keepdim=True)
+    proj = m._lsh_get_proj(prod._lsh_proj, d, torch.device("cpu"))
+    sh = m._lsh_sub_hashes(q, proj)
+    ext_ids = [f"probe{i}" for i in range(N)]
+    matched, hits = prod._lsh_probe(1, q, sh, ext_ids, list(range(N)))
+
+    idx = prod._lsh[1]
+    hit_by_block = {i: (rh, rs) for (i, rh, rs) in hits}
+    for i in range(N):
+        # Oracle: brute-force the exact candidate set the probe was allowed to consider.
+        cand = set()
+        for t, h in enumerate(sh[i]):
+            cand.update(idx["tables"][t].get(h, ()))
+        cand = sorted(cand)
+        if not cand:
+            assert i not in hit_by_block, f"block {i} hit with no candidates"
+            continue
+        rows = torch.tensor(cand, dtype=torch.long)
+        sims = idx["mat"].index_select(0, rows) @ q[i]
+        bv, bj = sims.max(dim=0)
+        if bv.item() > m.THRESHOLD:
+            assert matched[i], f"block {i}: oracle found {bv.item():.4f} > thr but probe missed"
+            exp_hash, exp_slot, _ = idx["meta"][cand[int(bj.item())]]
+            assert hit_by_block[i] == (exp_hash, exp_slot), f"block {i} picked the wrong rep"
+        else:
+            assert not matched[i], f"block {i}: probe hit but oracle best is {bv.item():.4f}"
+    assert sum(matched) >= N // 4, f"expected the planted near-duplicates to hit, got {sum(matched)}"
+
+
+def test_lsh_evict_compacts_and_still_probes():
+    """Over-cap registration LRU-drops the oldest half and compacts `mat`; survivors must still be
+    found, and _lsh_size must track the compacted row count."""
+    from kv_fast_fusion_ascend.connectors import mooncake_layerwise_connector_ff as m
+    d = 32
+    saved = m._LSH_MAX_ENTRIES
+    m._LSH_MAX_ENTRIES = 64
+    try:
+        prod = m.MooncakeFFProducer()
+        _lsh_fill(prod, 1, 64, d, seed=5)               # fill exactly to the cap
+        assert prod._lsh_size(1) == 64
+        late = _lsh_fill(prod, 1, 8, d, seed=6)         # triggers evict-half + compact
+        idx = prod._lsh[1]
+        assert prod._lsh_size(1) == len(idx["meta"]) == len(idx["owner"]) == len(idx["lru"])
+        assert idx["mat"].shape[0] >= prod._lsh_size(1), "mat capacity must cover n_rows"
+        assert prod._lsh_size(1) == 40, f"64 - 32 evicted + 8 new = 40, got {prod._lsh_size(1)}"
+        # Compaction must renumber rows to a dense 0..n-1 and leave every bucket pointing at a live row.
+        assert set(idx["meta"]) == set(range(40)), "rows must be dense after compaction"
+        for t in idx["tables"]:
+            for bucket in t.values():
+                for r in bucket:
+                    assert r in idx["meta"], "a bucket references an evicted/stale row"
+        # A late-registered rep is still findable by an identical probe.
+        proj = m._lsh_get_proj(prod._lsh_proj, d, torch.device("cpu"))
+        qs = m._lsh_sub_hashes(late[:1], proj)
+        matched, hits = prod._lsh_probe(1, late[:1], qs, ["other"], [0])
+        assert matched[0] and hits, "a surviving rep must still be probe-able after compaction"
+    finally:
+        m._LSH_MAX_ENTRIES = saved
+
+
 def test_redirect_channel_push_pull_contract():
     """Fire-and-forget wire contract for the FF redirect channel: a PUSH of
     ``(_FF_REDIRECT_MSG, ext_id, gi, rows)`` (msgpack) must decode on the PULL side into the same
@@ -238,5 +324,7 @@ if __name__ == "__main__":
     test_end_to_end_producer_to_consumer()
     test_lsh_cross_request_across_steps_without_encoded_batch()
     test_intra_req_ff_disables_within_batch_cc()
+    test_lsh_probe_matches_bruteforce_oracle()
+    test_lsh_evict_compacts_and_still_probes()
     test_redirect_channel_push_pull_contract()
     print("OK: all mooncake layerwise FF glue tests passed")
