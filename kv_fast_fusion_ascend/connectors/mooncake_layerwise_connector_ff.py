@@ -150,11 +150,15 @@ def _lsh_get_proj(jl_holder: list, d: int, device) -> torch.Tensor:
 def _lsh_sub_hashes(vecs_norm: torch.Tensor, proj: torch.Tensor) -> list:
     """Per-row list of ``_LSH_TABLES`` banded sub-hashes (each an int in ``[0, 2**_LSH_BITS)``) from
     the sign bits of ``vecs_norm @ proj``. ``vecs_norm`` is ``[M, d]``; returns a length-M list of
-    length-``_LSH_TABLES`` int lists. Mirrors legacy ``_lsh_fingerprint`` (batched)."""
-    bits = (vecs_norm.float() @ proj > 0).to(torch.int64).cpu()          # [M, T*B]
-    powers = torch.tensor(_LSH_POWERS, dtype=torch.int64)
-    packed = (bits.view(-1, _LSH_TABLES, _LSH_BITS) * powers).sum(dim=2)  # [M, T]
-    return packed.tolist()
+    length-``_LSH_TABLES`` int lists. Mirrors legacy ``_lsh_fingerprint`` (batched).
+
+    Packs on ``vecs_norm``'s device and only then copies: the host only ever needs the ``[M, T]``
+    bucket ids, so transferring the unpacked ``[M, T*B]`` bits would move _LSH_BITS x more bytes
+    across a device sync that stalls the forward pass."""
+    bits = (vecs_norm.float() @ proj > 0).to(torch.int64)                # [M, T*B] (on device)
+    powers = torch.tensor(_LSH_POWERS, dtype=torch.int64, device=bits.device)
+    packed = (bits.view(-1, _LSH_TABLES, _LSH_BITS) * powers).sum(dim=2)  # [M, T] (on device)
+    return packed.cpu().tolist()
 
 
 class MooncakeFFProducer:
@@ -310,14 +314,19 @@ class MooncakeFFProducer:
                 # ---- cross-request phase 1: match this step's blocks against earlier requests' reps.
                 # "lsh" (default, tp=1): O(N) SimHash bucket probe over a large-capacity index.
                 # "matrix" (or any tp>1): the dense concat_cosine_cross_match over the FIFO window.
-                cur_concat = cur_sq = cur_norm = sub_hashes = None
+                cur_concat = cur_sq = cur_cpu = sub_hashes = None
                 if use_lsh:
                     cur_concat = torch.cat([Kg.float() for Kg in buf["k_layers"]], dim=1)  # [N, G*D]
                     cur_norm = cur_concat / cur_concat.norm(dim=1, keepdim=True).clamp(min=1e-6)
                     proj = _lsh_get_proj(self._lsh_proj, cur_concat.shape[1], cur_concat.device)
                     sub_hashes = _lsh_sub_hashes(cur_norm, proj)
+                    # ONE host copy of the rep vectors per group, reused by probe AND register (both
+                    # verify/store against the host-side index). Each .cpu() drains the device
+                    # pipeline, so a second copy of the same tensor costs a full sync for nothing.
+                    # _lsh_sub_hashes just synced, so this transfer lands on an already-idle device.
+                    cur_cpu = cur_norm.detach().cpu().float()
                     matched, hits = self._lsh_probe(
-                        gi, cur_norm, sub_hashes, ext_ids, flat_req_local)
+                        gi, cur_cpu, sub_hashes, ext_ids, flat_req_local)
                     for (i, rep_hash, rep_slot) in hits:
                         owner_ext = ext_ids[flat_req_local[i]]
                         send_rows.setdefault(owner_ext, []).append(
@@ -365,7 +374,7 @@ class MooncakeFFProducer:
                     reps_to_register = list(unmatched)
                 # Register this step's new reps into the chosen cross-request index.
                 if use_lsh:
-                    self._lsh_register(gi, cur_norm, sub_hashes, ext_ids, flat_req_local,
+                    self._lsh_register(gi, cur_cpu, sub_hashes, ext_ids, flat_req_local,
                                        flat_slot, reps_to_register, buf["ext_has_remote"])
                 else:
                     self._register_reps(gi, buf, reps_to_register, cur_concat, cur_sq)
@@ -484,19 +493,21 @@ class MooncakeFFProducer:
         new[:idx["n_rows"]] = mat[:idx["n_rows"]]
         idx["mat"] = new
 
-    def _lsh_probe(self, gi, cur_norm, sub_hashes, ext_ids, flat_req_local):
+    def _lsh_probe(self, gi, cur_cpu, sub_hashes, ext_ids, flat_req_local):
         """Probe the group's LSH index for each current block; return (matched[list[bool]],
         hits[list[(i, rep_hash, rep_slot)]]). A hit requires a bucket-candidate from a DIFFERENT
-        request whose exact cosine with the current block is >= THRESHOLD (best wins)."""
+        request whose exact cosine with the current block is >= THRESHOLD (best wins).
+
+        ``cur_cpu`` is the caller's single HOST copy of the normalized reps ``[N, d]`` (the index it
+        verifies against lives on the host)."""
         idx = self._lsh.get(gi)
-        n = cur_norm.shape[0]
+        n = cur_cpu.shape[0]
         matched = [False] * n
         hits: list[tuple[int, int, int]] = []
         if idx is None or not idx["n_rows"]:
             return matched, hits
         tables, meta, lru = idx["tables"], idx["meta"], idx["lru"]
         mat = idx["mat"]
-        cur_cpu = cur_norm.detach().cpu().float()
         for i in range(n):
             owner_ext = ext_ids[flat_req_local[i]]
             if _LSH_MAX_CAND > 0:
@@ -527,10 +538,11 @@ class MooncakeFFProducer:
                 lru.move_to_end(row)                              # LRU touch
         return matched, hits
 
-    def _lsh_register(self, gi, cur_norm, sub_hashes, ext_ids, flat_req_local, flat_slot,
+    def _lsh_register(self, gi, cur_cpu, sub_hashes, ext_ids, flat_req_local, flat_slot,
                       rep_flats, ext_has_remote) -> None:
         """Insert this step's unmatched reps (decode-bound only) into the LSH index; LRU-evict the
-        oldest half when over the per-group cap."""
+        oldest half when over the per-group cap. ``cur_cpu`` is the caller's single HOST copy of the
+        normalized reps ``[N, d]`` (shared with :meth:`_lsh_probe` — one sync per group, not two)."""
         if not rep_flats:
             return
         idx = self._lsh_index(gi)
@@ -539,7 +551,6 @@ class MooncakeFFProducer:
                 self._lsh_evict(idx, row)
             self._lsh_compact(idx)
         # Bind AFTER compaction — it rebinds idx["meta"]/["owner"]/["lru"]/["mat"] to new objects.
-        cur_cpu = cur_norm.detach().cpu().float()
         add = [f for f in rep_flats if ext_has_remote[flat_req_local[f]]]
         if not add:
             return
