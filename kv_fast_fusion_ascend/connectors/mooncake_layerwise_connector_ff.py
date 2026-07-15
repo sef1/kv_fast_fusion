@@ -81,9 +81,12 @@ _LSH_POWERS = (2 ** torch.arange(_LSH_BITS, dtype=torch.int64)).tolist()
 # untouched. TP=1 assumed for M1 (the new setup runs tp_size=1 on both P and D).
 _FF_PORT_OFFSET = int(os.environ.get("BFF_MOONCAKE_FF_PORT_OFFSET", "20000"))
 
-# Fusion-stats dump: the producer drops a per-process ``bff_stats_<pid>.json`` into this dir so the
-# benchmark's collect_bff_stats() can report real compression (mirrors the NCCL connector). The shell
-# exports BFF_PD_STATS_DIR only for the kv_producer role, so "not None" also gates on producer-only.
+# Fusion-stats dump dir, now exported for BOTH roles. Each side drops a per-process file the
+# benchmark's collect_bff_stats() merges: the producer's ``bff_stats_<pid>.json`` (blocks seen +
+# redirects SHIPPED — an upper bound), the consumer worker's ``bff_apply_stats_<pid>.json`` (how many
+# landed, and why the rest didn't), and the decode scheduler's ``bff_decode_stats_<pid>.json`` (the
+# real block-pool delta — see fast_fusion_scheduler). Only the producer runs save_kv_layer, so the
+# decode side never writes a bff_stats_ file even though the dir is now set there too.
 _PD_STATS_DIR = os.environ.get("BFF_PD_STATS_DIR")
 _PD_STATS_EVERY = int(os.environ.get("BFF_PD_STATS_EVERY", "50"))
 
@@ -601,10 +604,14 @@ class MooncakeFFProducer:
         idx["n_rows"] = len(survivors)
 
     def dump_stats(self, stats_dir: str) -> None:
-        """Write this producer's cumulative fusion compression to ``bff_stats_<pid>.json`` in
-        ``stats_dir``. The benchmark's collect_bff_stats() merges these after the run. Ascend analogue
-        of the NCCL connector's ``_pd_dump_fuse_stats``. Compression FACTOR = total / (total - freed):
-        how many x smaller the KV cache gets from fusion (>1; 2.0 = half the blocks)."""
+        """Write this producer's cumulative fusion counters to ``bff_stats_<pid>.json`` in
+        ``stats_dir``. The benchmark's collect_bff_stats() merges these after the run.
+
+        NOTE these are PRODUCER-side counters: ``redirects_emitted`` is the number of redirect ROWS
+        SHIPPED, which is an UPPER BOUND on blocks actually freed — a row frees a block only if the
+        decode side resolves it (rep still resident, owner resident, merge not dropped). Hence
+        ``compression_potential_factor``, not a measurement. The REAL number comes from the decode
+        side's block-pool delta (``bff_decode_stats_<pid>.json``, see fast_fusion_scheduler)."""
         try:
             def _factor(b, r):
                 return b / max(1, b - r)
@@ -618,9 +625,9 @@ class MooncakeFFProducer:
                 "overhead_avg_group_dedup_ms": (self.dedup_ms / self.group_completions
                                                 if self.group_completions else 0.0),
                 "total_blocks": tot_b,
-                "freed": tot_r,
-                "compression_avg_factor": _factor(tot_b, tot_r),
-                "compression_per_group": {
+                "redirects_emitted": tot_r,
+                "compression_potential_factor": _factor(tot_b, tot_r),
+                "compression_potential_per_group": {
                     str(gi): _factor(self.blk_total[gi], self.redir_total.get(gi, 0))
                     for gi in sorted(self.blk_total)},
                 # Cross-batch lift: how many redirects came from the rolling registry (earlier
@@ -866,6 +873,12 @@ if _ASCEND_AVAILABLE:
                 # a request's KV recv completes a LATER step; accumulate here so the owner is still
                 # resolvable when its recv finally lands. Pruned as requests become resident/finish.
                 self._ff_load_blocks: dict[str, tuple[str, list]] = {}
+                # Cumulative apply outcomes. The producer only knows how many redirects it SHIPPED;
+                # these say how many actually landed and, when they didn't, why — which is what
+                # explains the emitted→freed gap in the benchmark report.
+                self._ff_apply_totals: dict[str, int] = {
+                    "applied": 0, "reps_unresolved": 0, "owner_unresident": 0,
+                    "owners_deferred": 0, "owners_dropped_post_decode": 0, "apply_calls": 0}
 
         def _ff_build_group_layers(self, worker) -> None:
             """Map fusion group index → layer names + the set of fusion groups (full-attention,
@@ -1058,6 +1071,31 @@ if _ASCEND_AVAILABLE:
                 logger.info("BFF Mooncake apply | redirects_applied=%d | owner_unresident=%d | "
                             "reps_unresolved=%d | owners_deferred=%d | owners_dropped_post_decode=%d",
                             n_applied, n_owner_missing, n_unresolved, n_deferred, n_dropped)
+            self._ff_record_apply(n_applied, n_unresolved, n_owner_missing, n_deferred, n_dropped)
+
+        def _ff_record_apply(self, n_applied, n_unresolved, n_owner_missing, n_deferred,
+                             n_dropped) -> None:
+            """Accumulate this step's apply outcomes and periodically dump them, so the benchmark can
+            attribute the gap between redirects shipped and blocks actually freed."""
+            t = self._ff_apply_totals
+            t["applied"] += n_applied
+            t["reps_unresolved"] += n_unresolved
+            t["owner_unresident"] += n_owner_missing
+            t["owners_deferred"] += n_deferred
+            t["owners_dropped_post_decode"] += n_dropped
+            t["apply_calls"] += 1
+            if not _PD_STATS_DIR:
+                return
+            if t["apply_calls"] != 1 and t["apply_calls"] % _PD_STATS_EVERY:
+                return
+            try:
+                path = os.path.join(_PD_STATS_DIR, f"bff_apply_stats_{os.getpid()}.json")
+                tmp = path + ".tmp"
+                with open(tmp, "w") as f:
+                    json.dump({"pid": os.getpid(), **t}, f)
+                os.replace(tmp, path)
+            except Exception as e:  # pragma: no cover - defensive (must never break the transfer)
+                logger.warning("BFF Mooncake: could not dump apply stats: %s", e)
 
         @staticmethod
         def _ff_write_runner_block_table(runner, rid, gi, new_blocks) -> None:

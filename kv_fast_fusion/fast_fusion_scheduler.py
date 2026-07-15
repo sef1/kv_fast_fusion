@@ -1,8 +1,38 @@
+import json
 import os
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from vllm.logger import init_logger
 logger = init_logger("vllm.patched_scheduler")
+
+# Decode-side GROUND TRUTH for fusion compression. The producer can only count redirect rows it
+# SHIPPED, which overstates the win (a row frees a block only if the decode side resolves it: rep
+# still resident, owner resident, merge not dropped). The block-pool delta below is what actually
+# happened, so the benchmark reports a measurement instead of an upper bound. Dumped only when
+# BFF_PD_STATS_DIR is set; the bff_decode_stats_* prefix keeps the producers' bff_stats_* globs
+# from matching it. This module is shared with the NCCL/legacy patches, hence the env gate.
+_PD_STATS_DIR = os.environ.get("BFF_PD_STATS_DIR")
+_PD_STATS_EVERY = int(os.environ.get("BFF_PD_STATS_EVERY", "50"))
+_bff_decode_stats = {"blocks_freed_total": 0, "merge_events": 0}
+
+
+def _bff_record_decode_free(freed: int) -> None:
+    """Accumulate one merge event's real block-pool delta and periodically dump it."""
+    s = _bff_decode_stats
+    s["blocks_freed_total"] += int(freed)
+    s["merge_events"] += 1
+    if not _PD_STATS_DIR:
+        return
+    if s["merge_events"] != 1 and s["merge_events"] % _PD_STATS_EVERY:
+        return
+    try:
+        path = os.path.join(_PD_STATS_DIR, f"bff_decode_stats_{os.getpid()}.json")
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"pid": os.getpid(), **s}, f)
+        os.replace(tmp, path)   # atomic — the reader never sees a half-written file
+    except Exception as e:  # pragma: no cover - defensive (must never break scheduling)
+        logger.warning("BFF: could not dump decode fuse stats: %s", e)
 
 # Diagnostic toggle (orthogonal to BFF_SCALE_MODE): when set, evict fusion TARGET
 # (shared) blocks from the prefix cache after a merge so future prefills can't
@@ -291,10 +321,12 @@ def _handle_block_merging_with_counts(self, request_blocks: dict[str, dict[int, 
         logger.info(f"BFF evicted {len(tgt_ids)} fusion-target blocks from prefix cache")
 
     after_free = block_pool.get_num_free_blocks()
-    logger.info(f"Block merging freed {after_free - before_free} blocks")
+    freed = after_free - before_free
+    logger.info(f"Block merging freed {freed} blocks")
+    _bff_record_decode_free(freed)
 
-def _handle_block_merging_with_counts_(  
-    self,  
+def _handle_block_merging_with_counts_(
+    self,
     request_blocks: dict[str, dict[int, list[int]]],  
 ) -> None:  
     """Apply reference changes using pre-calculated counts and block ID hashing."""  
