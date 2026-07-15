@@ -339,8 +339,9 @@ export_bff_env() {
   export BFF_PD_FUSE=$BFF_PD_FUSE BFF_SCALE_MODE=$BFF_SCALE_MODE BFF_PD_MERGE=$BFF_PD_MERGE \
          BFF_PD_REPR=$BFF_PD_REPR BFF_THRESHOLD=$BFF_THRESHOLD BFF_GROUP_SIZE=$BFF_GROUP_SIZE \
          BFF_PD_ENCODED_BATCH_SIZE=$BFF_PD_ENCODED_BATCH_SIZE
-  # Only the producer dumps fuse stats; point it at the results dir for post-run collection.
-  if [[ "$role" == "kv_producer" ]]; then export BFF_PD_STATS_DIR="$results_root"; else unset BFF_PD_STATS_DIR; fi
+  # BOTH roles dump fuse stats: the producer counts blocks + redirects shipped, the decode side counts
+  # the redirects that actually landed and the REAL freed-block delta (the measured compression).
+  export BFF_PD_STATS_DIR="$results_root"
 }
 
 # Build the KV_TRANSFER_CONFIG for a given role + kv_port.
@@ -505,23 +506,120 @@ run_benchmark() {
 }
 
 # Post-run BFF stats (producer dumps bff_stats_<pid>.json into results_root when BASELINE=bff).
+# Did the decode ever actually run out of KV blocks? BFF's ONLY product is freed KV capacity, so if
+# capacity never binds, fusion cannot improve throughput no matter how well it compresses. Printed for
+# every run (vanilla included) so this precondition is never invisible again.
+report_capacity_bound() {
+  python3 - "$logs_root" <<'PY' || true
+import glob, os, re, sys
+
+d = sys.argv[1]
+files = sorted(glob.glob(os.path.join(d, "decode-*.txt")))
+if not files:
+    print("  capacity: no decode logs found"); raise SystemExit
+
+# vLLM v1 logs: "<prefix>Avg prompt throughput: .., Avg generation throughput: .., Running: N reqs,
+# Waiting: N reqs[, Preemptions: N], GPU KV cache usage: X%, Prefix cache hit rate: Y%"
+# (Preemptions only appears when >0). Fields are matched independently — order/optionality safe.
+pk = pw = pr = 0.0
+preempt_samples = preempt_max = 0
+samples = 0
+for fp in files:
+    try:
+        txt = open(fp, errors="replace").read()
+    except Exception:
+        continue
+    for m in re.finditer(r"GPU KV cache usage: ([0-9.]+)%", txt):
+        pk = max(pk, float(m.group(1))); samples += 1
+    for m in re.finditer(r"Waiting: (\d+) reqs", txt):
+        pw = max(pw, int(m.group(1)))
+    for m in re.finditer(r"Running: (\d+) reqs", txt):
+        pr = max(pr, int(m.group(1)))
+    for m in re.finditer(r"Preemptions: (\d+)", txt):
+        preempt_samples += 1
+        preempt_max = max(preempt_max, int(m.group(1)))
+
+if not samples:
+    print("  capacity: no scheduler stats in decode logs (is log-stats disabled?)"); raise SystemExit
+
+bound = preempt_samples > 0 or pk >= 90.0
+verdict = "YES" if bound else ("MARGINAL" if pk >= 70.0 else "NO")
+print(f"  capacity-bound: {verdict} (peak KV {pk:.1f}%, peak waiting {int(pw)}, "
+      f"peak running {int(pr)}, preemptions {preempt_max} in {preempt_samples} samples)")
+if verdict == "NO":
+    print(f"    -> KV cache never filled ({pk:.1f}%): capacity is NOT the bottleneck, so freeing "
+          f"blocks cannot raise throughput here.")
+    print(f"    -> to make fusion matter: lower GPU_MEM_UTIL (shrink the pool) or raise "
+          f"MAX_CONCURRENCY/MAX_NUM_SEQS/prompt length until this says YES.")
+PY
+}
+
 collect_bff_stats() {
   [[ "$BFF_ON" != "1" ]] && return 0
   python3 - "$results_root" <<'PY' || true
 import glob, json, os, sys
 d = sys.argv[1]
-files = sorted(glob.glob(os.path.join(d, "bff_stats_*.json")))
-if not files:
+
+
+def load(pat):
+    out = []
+    for fp in sorted(glob.glob(os.path.join(d, pat))):
+        try:
+            out.append(json.load(open(fp)))
+        except Exception:
+            pass
+    return out
+
+
+prod = load("bff_stats_*.json")           # producer: blocks seen + redirects SHIPPED
+dec = load("bff_decode_stats_*.json")     # decode scheduler: REAL freed-block delta
+app = load("bff_apply_stats_*.json")      # decode worker: which redirects landed, and why not
+if not prod:
     print("  bff stats: none found (fusion may not have engaged)"); raise SystemExit
-B = F = 0; ov = []
-for fp in files:
-    try: s = json.load(open(fp))
-    except Exception: continue
-    B += s.get("total_blocks", 0); F += s.get("freed", 0)
-    if s.get("steps"): ov.append(s.get("overhead_avg_group_dedup_ms", 0.0))
-factor = B / max(1, B - F)
-print(f"  bff compression: {factor:.3f}x smaller (blocks={B} freed={F}) over {len(files)} producer(s)"
-      + (f" | fusion overhead {sum(ov)/len(ov):.3f} ms/group" if ov else ""))
+
+B = sum(s.get("total_blocks", 0) for s in prod)
+ov = [s.get("overhead_avg_group_dedup_ms", 0.0) for s in prod if s.get("steps")]
+ov_s = f" | fusion overhead {sum(ov)/len(ov):.3f} ms/group" if ov else ""
+
+
+def emitted(s):
+    """Redirect rows the producer shipped. 'freed' is the legacy name for the same counter (it was
+    never blocks freed). Tolerate either, and return None if the producer speaks neither dialect —
+    a silent .get(key, 0) there renders a version skew as a believable '1.000x', which is exactly
+    how a stale run_benchmarks.sh vs a newer connector went unnoticed."""
+    for k in ("redirects_emitted", "freed"):
+        if k in s:
+            return s[k]
+    return None
+
+
+vals = [emitted(s) for s in prod]
+if any(v is None for v in vals):
+    keys = sorted({k for s in prod for k in s})
+    print(f"  bff stats: SCHEMA MISMATCH — no redirect count in producer stats (keys seen: {keys}).")
+    print(f"    -> run_benchmarks.sh is out of sync with the connector; re-sync and rerun. "
+          f"Refusing to report a compression number.")
+    raise SystemExit
+E = sum(vals)
+
+if dec:
+    # MEASURED: blocks the decode block-pool actually reclaimed.
+    R = sum(s.get("blocks_freed_total", 0) for s in dec)
+    print(f"  bff compression: {B/max(1,B-R):.3f}x smaller (blocks={B} freed={R}) "
+          f"[measured, decode-side]{ov_s}")
+    rate = f"{100.0*R/E:.1f}%" if E else "n/a"
+    print(f"    producer potential: {B/max(1,B-E):.3f}x (redirects_emitted={E}) "
+          f"→ realized {rate}")
+else:
+    print(f"  bff compression: {B/max(1,B-E):.3f}x POTENTIAL only (blocks={B} redirects_emitted={E}) "
+          f"over {len(prod)} producer(s){ov_s}")
+    print("    (no decode-side stats: rerun with BFF_PD_STATS_DIR exported for the consumer role)")
+
+if app:
+    a = {k: sum(s.get(k, 0) for s in app) for k in
+         ("applied", "reps_unresolved", "owner_unresident", "owners_deferred",
+          "owners_dropped_post_decode")}
+    print("    apply: " + " ".join(f"{k}={v}" for k, v in a.items()))
 PY
 }
 
@@ -558,6 +656,7 @@ main() {
   launch_proxy
 
   run_benchmark
+  report_capacity_bound
   collect_bff_stats
 
   echo "Benchmark done. Logs: ${logs_root}  Results: ${results_root}"

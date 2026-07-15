@@ -8,9 +8,9 @@
 # NUM_PREFILL=2 NUM_DECODE=1 BFF_PD_MERGE=nr_tree BFF_THRESHOLD=0.85 BFF_GROUP_SIZE=4 \
 #   ./examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/disagg_bff_p2p_nccl_xpyd.sh
 ### Full BFF
-# NUM_PREFILL=2 NUM_DECODE=1 BFF_PD_MERGE=cc BFF_THRESHOLD=0.75 \
-#  ./examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/disagg_bff_p2p_nccl_xpyd.sh
-### Fusion ablation (BFF layout, no merge) — the fully-fair "what does fusion buy" baseline
+NUM_PREFILL=2 NUM_DECODE=1 BFF_PD_MERGE=cc BFF_THRESHOLD=0.75 \
+ ./examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/disagg_bff_p2p_nccl_xpyd.sh
+## Fusion ablation (BFF layout, no merge) — the fully-fair "what does fusion buy" baseline
 #NUM_PREFILL=2 NUM_DECODE=1 BFF_PD_FUSE=0 \
 #  ./examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/disagg_bff_p2p_nccl_xpyd.sh
 ### True vanilla — stock vLLM P/D, single group (end-to-end reference, exposes layout cost)
