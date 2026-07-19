@@ -100,6 +100,24 @@ def test_consumer_resolve_unresolved_when_rep_absent():
     assert new_blocks is None and n_applied == 0 and n_unresolved == 1 and n_owner_missing == 0
 
 
+def test_rep_safe_skips_stale_overlay_rep():
+    # BFF_FF_REP_SAFE: the owner set (overlay, res_*) still carries a STALE rep reqA, but the live rep set
+    # does NOT → the rep must count as unresolved (owner keeps its own block), never a wrong repoint.
+    owner_set = {"reqB": [[0], [200, 201]], "reqA": [[0], [999]]}   # overlay still has stale reqA
+    hash2ext = {_ext_hash("reqA"): "reqA", _ext_hash("reqB"): "reqB"}
+    rows = [(0, _ext_hash("reqA"), 0)]                              # reqB slot0 -> reqA slot0
+    # rep resolved from LIVE-only set that lacks reqA → unresolved, owner unchanged
+    nb, na, nu, nom = resolve_redirect_rows(
+        owner_set, hash2ext, "reqB", gi=1, rows=rows,
+        rep_ext2blocks={"reqB": [[0], [200, 201]]}, rep_hash2ext={})
+    assert nb is None and na == 0 and nu == 1 and nom == 0
+    # when the rep IS live, the same row applies (repoint slot0 -> 999)
+    nb2, na2, nu2, nom2 = resolve_redirect_rows(
+        owner_set, hash2ext, "reqB", gi=1, rows=rows,
+        rep_ext2blocks={"reqA": [[0], [999]]}, rep_hash2ext={_ext_hash("reqA"): "reqA"})
+    assert nb2 == [999, 201] and na2 == 1 and nu2 == 0
+
+
 def test_end_to_end_producer_to_consumer():
     """Full round-trip: cluster on P, resolve on D, and confirm the merged-away request ends up
     sharing the representative's physical block."""

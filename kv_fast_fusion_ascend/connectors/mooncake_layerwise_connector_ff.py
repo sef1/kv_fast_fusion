@@ -65,6 +65,17 @@ _PD_CROSS_INDEX = os.environ.get("BFF_PD_CROSS_INDEX", "lsh").lower()
 # the O(N²) concat_cosine_cc/nr_tree pass — the main per-group overhead. 1 = on (default, current
 # behavior); 0 = off (only cross-request matching runs; unmatched blocks still register into the index).
 _PD_INTRA_REQ_FF = os.environ.get("BFF_PD_INTRA_REQ_FF", "1") == "1"
+# Rep-lifetime safety (con512 merge corruption fix). The consumer apply resolves the redirect REP from a
+# residency set overlaid with accumulated load-metadata (`_ff_load_blocks`). A rep resolved from that
+# overlay can be STALE (its request since preempted/finished → blocks recycled) → the owner is repointed to
+# another request's live KV → garbage → rambling (seen at con512, not con256; churn-gated). With
+# BFF_FF_REP_SAFE=1 the REP is resolved ONLY from live `runner.requests` — a stale rep then counts as
+# `unresolved`, so the owner safely keeps its own block (compression lost on that row, never wrong).
+# Owners still use the overlay (a just-landed owner isn't in runner.requests yet). Default OFF for A/B.
+_FF_REP_SAFE = os.environ.get("BFF_FF_REP_SAFE", "0") == "1"
+# Diagnostic: count applied redirects whose REP was resolved from the (stale-prone) load-metadata overlay
+# vs live runner state, surfaced in the apply log + stats. Cheap; helps confirm the mechanism at con512.
+_FF_AUDIT = os.environ.get("BFF_FF_AUDIT", "0") == "1"
 # SimHash LSH config (ported from kv_fast_fusion/legacy): NUM_LSH_TABLES banded sub-hashes of
 # LSH_BITS_PER_TABLE bits each, from sign() of a fixed-seed random-hyperplane projection.
 _LSH_TABLES = int(os.environ.get("BFF_LSH_TABLES", "16"))
@@ -646,6 +657,7 @@ class MooncakeFFProducer:
                 "encoded_batch_size": _PD_ENCODED_BATCH,
                 "cross_index": _PD_CROSS_INDEX,
                 "intra_req_ff": _PD_INTRA_REQ_FF,
+                "rep_safe": _FF_REP_SAFE,
                 "cross_batch_redirects": self.cross_redir_total,
                 "within_batch_redirects": self.within_redir_total,
                 "registry_blocks": {str(gi): self._registry_size(gi)
@@ -667,6 +679,8 @@ def resolve_redirect_rows(
     owner_ext_id: str,
     gi: int,
     rows: list[tuple[int, int, int]],
+    rep_ext2blocks: dict[str, list[list[int]]] | None = None,
+    rep_hash2ext: dict[int, str] | None = None,
 ) -> tuple[list[int] | None, int, int, int]:
     """Consumer-side: turn shipped redirect ``rows`` into the owner's new (deduped) block table.
 
@@ -676,7 +690,16 @@ def resolve_redirect_rows(
     when nothing changed. ``n_owner_missing`` counts rows we couldn't even attempt because the OWNER
     itself was not resolvable (distinct from ``n_unresolved`` = the REP not resolvable) — kept
     separate so the apply log can tell owner-residency problems from rep-residency problems. Port of
-    the resolve loop in the NCCL connector's ``_pd_consumer_apply`` (raw mode)."""
+    the resolve loop in the NCCL connector's ``_pd_consumer_apply`` (raw mode).
+
+    ``rep_ext2blocks``/``rep_hash2ext`` (optional): a SEPARATE, usually smaller, set to resolve the
+    REP from — used by the rep-lifetime fix (BFF_FF_REP_SAFE) to restrict reps to live runner state so a
+    stale overlay rep counts as ``unresolved`` (owner keeps its own block) instead of a wrong repoint.
+    Defaults to the owner set (``ext2blocks``/``hash2ext``) → original behavior."""
+    if rep_ext2blocks is None:
+        rep_ext2blocks = ext2blocks
+    if rep_hash2ext is None:
+        rep_hash2ext = hash2ext
     owner_groups = ext2blocks.get(owner_ext_id)
     if owner_groups is None or gi >= len(owner_groups):
         return None, 0, 0, len(rows)                   # owner not resident → owner-miss, not rep-miss
@@ -684,11 +707,11 @@ def resolve_redirect_rows(
     n_applied = n_unresolved = 0
     changed = False
     for owner_slot, rep_hash, rep_slot in rows:
-        rep_ext = hash2ext.get(int(rep_hash))
-        if rep_ext is None or rep_ext not in ext2blocks:
+        rep_ext = rep_hash2ext.get(int(rep_hash))
+        if rep_ext is None or rep_ext not in rep_ext2blocks:
             n_unresolved += 1                          # rep not (yet) resident on D → can't share
             continue
-        rep_groups = ext2blocks[rep_ext]
+        rep_groups = rep_ext2blocks[rep_ext]
         if gi >= len(rep_groups):
             n_unresolved += 1
             continue
@@ -1050,12 +1073,19 @@ if _ASCEND_AVAILABLE:
             updated: dict[str, dict[int, list[int]]] = {}
             n_applied = n_unresolved = n_owner_missing = n_deferred = n_dropped = 0
             leftover: dict[str, dict[int, list]] = {}
+            # Rep-lifetime fix: resolve the REP only from LIVE runner state (ext2blocks/hash2ext), not the
+            # load-metadata overlay (res_*), so a stale/recycled rep counts as unresolved (owner keeps its
+            # own block) instead of being repointed to another request's live KV. Owners still use res_*
+            # (a just-landed owner isn't in runner.requests yet). Off → original behavior (rep from res_*).
+            rep_e2b = ext2blocks if _FF_REP_SAFE else None
+            rep_h2e = hash2ext if _FF_REP_SAFE else None
             for ext_id, groups in pending.items():
                 if ext_id in just_recv_ext:
                     # Owner's KV just landed and it has not decoded yet → safe to repoint + free.
                     for gi, rows in groups.items():
                         new_blocks, na, nu, nom = resolve_redirect_rows(
-                            res_ext2blocks, res_hash2ext, ext_id, gi, rows)
+                            res_ext2blocks, res_hash2ext, ext_id, gi, rows,
+                            rep_ext2blocks=rep_e2b, rep_hash2ext=rep_h2e)
                         n_applied += na
                         n_unresolved += nu
                         n_owner_missing += nom
@@ -1078,10 +1108,11 @@ if _ASCEND_AVAILABLE:
                         self._ff_recv_thread.pending.setdefault(ext_id, {}).update(groups)
             if updated:
                 runner._updated_block_tables = updated
-            if n_applied or n_unresolved or n_owner_missing or n_dropped or _PD_DEBUG:
+            if n_applied or n_unresolved or n_owner_missing or n_dropped or _PD_DEBUG or _FF_AUDIT:
                 logger.info("BFF Mooncake apply | redirects_applied=%d | owner_unresident=%d | "
-                            "reps_unresolved=%d | owners_deferred=%d | owners_dropped_post_decode=%d",
-                            n_applied, n_owner_missing, n_unresolved, n_deferred, n_dropped)
+                            "reps_unresolved=%d | owners_deferred=%d | owners_dropped_post_decode=%d | "
+                            "rep_safe=%d", n_applied, n_owner_missing, n_unresolved, n_deferred,
+                            n_dropped, int(_FF_REP_SAFE))
             self._ff_record_apply(n_applied, n_unresolved, n_owner_missing, n_deferred, n_dropped)
 
         def _ff_record_apply(self, n_applied, n_unresolved, n_owner_missing, n_deferred,
