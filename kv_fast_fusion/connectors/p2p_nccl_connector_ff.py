@@ -73,6 +73,21 @@ _PD_DEBUG = os.environ.get("BFF_PD_DEBUG", "0") == "1"
 # no co-prefill peers → fusion silently stops. Gate them on their own flag so BFF_PD_DEBUG=1 keeps
 # the cheap summary logs WITHOUT killing the batching fusion depends on.
 _PD_TRACE = os.environ.get("BFF_PD_TRACE", "0") == "1"
+# Diagnostic: byte-checksum each transferred (request, layer) KV tensor on BOTH the producer (after
+# gather, before send) and the consumer (after recv, before inject), keyed by the identical `tid`, so an
+# offline join settles corruption-vs-saturation directly. Like _PD_TRACE the per-layer .cpu() hash syncs
+# the device and throttles batching — so it is SAMPLED per request (BFF_PD_CKSUM_SAMPLE=N hashes ~1/N
+# requests, keeping most batches full). Default OFF ⇒ zero effect on normal runs.
+_PD_CKSUM = os.environ.get("BFF_PD_CKSUM", "0") == "1"
+_PD_CKSUM_SAMPLE = max(1, int(os.environ.get("BFF_PD_CKSUM_SAMPLE", "1")))
+# Preempt/resume correctness: a decode request received its prompt-1 KV once from the producer, which
+# then FREED it. If that request is later preempted (KV saturation) its cached blocks are evicted, and on
+# resume the base `get_num_new_matched_tokens` (prompt-1 - num_computed) again advertises external tokens →
+# the connector re-issues a `recv_tensor` for KV the producer no longer holds → stale/missing context →
+# the request rambles (F1 collapse observed only once preemption starts). Fix: once a request has been
+# loaded, force it to RECOMPUTE the prompt locally on any resume (return 0 external tokens) instead of
+# re-fetching. Default ON; set BFF_PD_RESUME_LOCAL=0 to restore the old (buggy) behavior for A/B.
+_PD_RESUME_LOCAL = os.environ.get("BFF_PD_RESUME_LOCAL", "1") == "1"
 # Connector within-batch clustering: nr_tree (butterfly, full precision) or cc. See ROUND 32.
 _PD_MERGE = os.environ.get("BFF_PD_MERGE", "nr_tree")
 # Per-layer block representation for the clustering similarity (producer-only). See ROUND 34.
@@ -109,6 +124,23 @@ def _rid_hash(request_id: str) -> int:
     process, so it can't be shared across P and D — use blake2b). Callers pass _pd_key(...)."""
     h = hashlib.blake2b(request_id.encode(), digest_size=8).digest()
     return int.from_bytes(h, "little") & 0x7FFFFFFFFFFFFFFF
+
+
+def _cksum_sampled(request_id: str) -> bool:
+    """Whether to checksum this request (BFF_PD_CKSUM). Uses the P/D-stable _rid_hash so the producer
+    and consumer pick the SAME sampled requests; sampling keeps most batches full (the .cpu() hash
+    syncs the device, like _PD_TRACE)."""
+    if not _PD_CKSUM:
+        return False
+    return _rid_hash(_pd_key(request_id)) % _PD_CKSUM_SAMPLE == 0
+
+
+def _kv_fingerprint(t: "torch.Tensor") -> str:
+    """Exact 8-byte blake2b of a KV tensor's raw bytes — identical on P (post-gather) and D (post-recv)
+    iff the transferred bytes are identical. Diagnostic only (forces a D2H copy). Reinterpret as uint8
+    so it works for any dtype (numpy has no bfloat16)."""
+    b = t.detach().contiguous().flatten().view(torch.uint8).cpu().numpy().tobytes()
+    return hashlib.blake2b(b, digest_size=8).hexdigest()
 
 
 @dataclass
@@ -217,6 +249,11 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
         self._pd_recv_layers = 0
         self._pd_freed_layers = 0
         self._pd_waiting = None   # tensor_id currently blocked on in recv_tensor (hang trace)
+        # Scheduler-side (consumer) preempt/resume state. `_pd_loaded_once` holds request_ids whose remote
+        # KV load has already committed; on a later resume we must NOT re-fetch it (producer freed it) →
+        # recompute locally. `_pd_resume_reloads` counts times the old re-fetch branch fired (diagnostic).
+        self._pd_loaded_once: set[str] = set()
+        self._pd_resume_reloads = 0
         self._pd_jl = None        # lazy fixed-seed JL matrix for BFF_PD_REPR=proj (producer only)
         self._pd_tp = _UNSET      # lazy TP process group (None at TP=1); see _pd_tp_group (ROUND 52)
         self._pd_pending_merges = None   # this-step block-merge map; emitted via stats under TP>1
@@ -404,6 +441,12 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
                 self._pd_recv_layers += 1
                 # group-aware: index this layer by ITS group's block table
                 block_ids = request.block_ids[self._group_of(layer_name)]
+                if _cksum_sampled(request.request_id):
+                    # Same tid + same fingerprint fn as the producer → an offline join on `tid`
+                    # yields h-match (bytes correct) / shape|nblk-mismatch (truncation).
+                    logger.info("BFF CKSUM recv | %s | h=%s | shape=%s | nblk=%d",
+                                tid, _kv_fingerprint(kv_cache), tuple(kv_cache.shape),
+                                len(block_ids))
                 layer_attn_metadata = (
                     attn_metadata_by_layer.get(layer_name)
                     if isinstance(attn_metadata_by_layer, dict)
@@ -617,6 +660,9 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
             if _PD_TRACE:
                 logger.info("BFF P/D send KV %s -> %s | shape=%s",
                             tid, remote_address, tuple(kv_cache.shape))
+            if _cksum_sampled(request_id):
+                logger.info("BFF CKSUM send | %s | h=%s | shape=%s | nblk=%d",
+                            tid, _kv_fingerprint(kv_cache), tuple(kv_cache.shape), len(block_ids))
             self.p2p_nccl_engine.send_tensor(tid, kv_cache, remote_address)
 
         # Connector-level fusion: accumulate this fusion group's per-layer K reps; when the
@@ -1013,6 +1059,10 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
                 "within_batch_redirects": self._pd_within_redir_total,
                 "registry_blocks": {str(gi): self._pd_registry_size(gi)
                                     for gi in sorted(self._pd_registry)},
+                # Consumer preempt/resume: times the resume path re-fetched freed remote KV. Should be 0
+                # with BFF_PD_RESUME_LOCAL=1 (the fix); >0 exposes the corruption path (old behavior).
+                "resume_reloads": self._pd_resume_reloads,
+                "resume_local_recompute": _PD_RESUME_LOCAL,
             }
             path = os.path.join(_PD_STATS_DIR, f"bff_stats_{os.getpid()}.json")
             tmp = path + ".tmp"
@@ -1076,7 +1126,22 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
         synchronously — `wait_for_save` already blocked until the KV was sent — so the per-group
         `block_ids` aren't needed here; mirror the parent's `request_finished` body."""
         self.chunked_prefill.pop(request.request_id, None)
+        self._pd_loaded_once.discard(request.request_id)  # bound the resume-tracking set
         return False, None
+
+    # ------------------------------------------------------------------
+    # Scheduler-side: force local recompute on resume (see _PD_RESUME_LOCAL)
+    # ------------------------------------------------------------------
+    def get_num_new_matched_tokens(
+        self, request: "Request", num_computed_tokens: int
+    ) -> tuple[int, bool]:
+        # A request that already consumed its remote KV once must NOT re-fetch it on a later resume —
+        # the producer freed it after the first send. Advertise 0 external tokens so vLLM recomputes the
+        # prompt locally (it has the prompt token ids). Only initial loads use the base remote path.
+        if _PD_RESUME_LOCAL and not self.is_producer \
+                and request.request_id in self._pd_loaded_once:
+            return 0, False
+        return super().get_num_new_matched_tokens(request, num_computed_tokens)
 
     # ------------------------------------------------------------------
     # Scheduler-side: carry ALL groups' block ids (parent kept only [0])
@@ -1119,6 +1184,8 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
                     block_size=self._block_size,
                 )
                 self._requests_need_load.pop(new_req.req_id)
+                # Initial remote load committed → a future resume must recompute locally, not re-fetch.
+                self._pd_loaded_once.add(new_req.req_id)
 
         cached_reqs = scheduler_output.scheduled_cached_reqs
         for i, req_id in enumerate(cached_reqs.req_ids):
@@ -1163,6 +1230,13 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
                 request, _ = self._requests_need_load.pop(req_id)
                 if new_block_ids is None:
                     continue                                    # nothing new to load this step
+                # This re-issues a remote fetch for a resumed request. With _PD_RESUME_LOCAL on, a
+                # loaded-once request advertises 0 external tokens (recompute locally) so it never lands
+                # in _requests_need_load and this branch no-ops — the counter proves the buggy path is gone.
+                self._pd_resume_reloads += 1
+                if _PD_TRACE:
+                    logger.warning("BFF RESUME reload | %s | num_computed=%d (re-fetching freed remote KV)",
+                                   req_id, num_computed_tokens)
                 total_tokens = num_computed_tokens + 1
                 token_ids = request.all_token_ids[:total_tokens]
                 meta.add_request(

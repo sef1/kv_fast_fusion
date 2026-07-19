@@ -8,8 +8,8 @@
 # NUM_PREFILL=2 NUM_DECODE=1 BFF_PD_MERGE=nr_tree BFF_THRESHOLD=0.85 BFF_GROUP_SIZE=4 \
 #   ./examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/disagg_bff_p2p_nccl_xpyd.sh
 ### Full BFF
-NUM_PREFILL=2 NUM_DECODE=1 BFF_PD_MERGE=cc BFF_THRESHOLD=0.75 \
- ./examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/disagg_bff_p2p_nccl_xpyd.sh
+# NUM_PREFILL=2 NUM_DECODE=1 BFF_PD_MERGE=cc BFF_THRESHOLD=0.75 \
+#  ./examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/disagg_bff_p2p_nccl_xpyd.sh
 ## Fusion ablation (BFF layout, no merge) — the fully-fair "what does fusion buy" baseline
 #NUM_PREFILL=2 NUM_DECODE=1 BFF_PD_FUSE=0 \
 #  ./examples/online_serving/disaggregated_serving_p2p_nccl_xpyd/disagg_bff_p2p_nccl_xpyd.sh
@@ -50,7 +50,7 @@ NUM_PREFILL=2 NUM_DECODE=1 BFF_PD_MERGE=cc BFF_THRESHOLD=0.75 \
 # =============================================================================
 
 # ---- Model / topology --------------------------------------------------------
-MODEL=${MODEL:-zai-org/GLM-4.7-Flash} #{MODEL:-NousResearch/Hermes-3-Llama-3.1-8B} #{MODEL:-zai-org/glm-4-9b-chat-hf}
+MODEL=${MODEL:-Qwen/Qwen2.5-7B-Instruct} #{MODEL:-NousResearch/Hermes-3-Llama-3.1-8B} #{MODEL:-zai-org/glm-4-9b-chat-hf}
 TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-1200}
 PROXY_PORT=${PROXY_PORT:-30001}      # ZMQ service-discovery port (matches proxy_port in connector cfg)
 PROXY_HTTP_PORT=${PROXY_HTTP_PORT:-10001}   # proxy HTTP serving port (benchmark target)
@@ -67,7 +67,7 @@ HF_HUB_CACHE=${HF_HUB_CACHE:-"/data/models/huggingface/hub"}
 # directly (comma-separated lists) — those win over the NUM_*-derived defaults.
 NUM_PREFILL=${NUM_PREFILL:-1}        # n
 NUM_DECODE=${NUM_DECODE:-1}          # m
-TP=${TP:-4}                          # tensor-parallel size PER instance (each P/D gets TP GPUs)
+TP=${TP:-1}                          # tensor-parallel size PER instance (each P/D gets TP GPUs)
 HTTP_PORT_BASE=${HTTP_PORT_BASE:-20003}
 
 # Build "start,start+1,...,start+count-1".
@@ -114,6 +114,13 @@ else
 fi
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-8192}
 MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-8192}
+# Attention backend. Normally auto-selected (leave empty). VLLM_BATCH_INVARIANT=1 hard-requires an
+# explicitly pinned backend (init crashes with "got 'None'" otherwise), so auto-default it to FLASH_ATTN
+# — already the auto-choice here — when batch-invariant mode is on. Override by exporting ATTENTION_BACKEND.
+ATTENTION_BACKEND=${ATTENTION_BACKEND:-}
+if [[ "${VLLM_BATCH_INVARIANT:-0}" == "1" && -z "$ATTENTION_BACKEND" ]]; then
+    ATTENTION_BACKEND=FLASH_ATTN
+fi
 if [[ "$ENABLE_CHUNKED" == "1" ]]; then
     CHUNKED_FLAG="--enable-chunked-prefill"
 else
@@ -161,7 +168,7 @@ F1_SPLIT=${F1_SPLIT:-train}
 F1_INPUT_KEY=${F1_INPUT_KEY:-query}
 F1_OUTPUT_KEY=${F1_OUTPUT_KEY:-answer}
 NUM_PROMPTS=${NUM_PROMPTS:-500}
-MAX_CONCURRENCY=${MAX_CONCURRENCY:-1}
+MAX_CONCURRENCY=${MAX_CONCURRENCY:-300}  # max inflight requests (stress test)
 REQUEST_RATE=${REQUEST_RATE:-300}      # arrivals/s (stress test). 'inf' = fire all at once (cap by MAX_CONCURRENCY)
 BURSTINESS=${BURSTINESS:-0.3}          # gamma shape: <1 burstier (spiky), 1=Poisson, >1 more uniform
 MIN_TOKENS=${MIN_TOKENS:-512}            # skip prompts shorter than this many input tokens (0=off)
@@ -210,6 +217,7 @@ export VLLM_NCCL_SO_PATH=${VLLM_NCCL_SO_PATH:-/lib/x86_64-linux-gnu/libnccl.so.2
 # and force host-staged (SHM) transport only when needed. Process-global because
 # NCCL caches the param + it must be set before any NCCL init. Override by
 # exporting NCCL_P2P_DISABLE yourself.
+export NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-1}  # see _p2p_needs_disable() above
 _p2p_needs_disable() {
     python3 - "$PREFILL_GPUS" "$DECODE_GPUS" "$TP" <<'PY' 2>/dev/null
 import subprocess, sys, re
@@ -335,6 +343,7 @@ common_args() {
         $CHUNKED_FLAG \
         --max-model-len $MAX_MODEL_LEN \
         --max-num-batched-tokens $MAX_NUM_BATCHED_TOKENS \
+        ${ATTENTION_BACKEND:+--attention-backend $ATTENTION_BACKEND} \
         --max-num-seqs $MAX_CONCURRENCY"
 }
 
