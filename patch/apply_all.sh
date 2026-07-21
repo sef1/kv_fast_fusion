@@ -18,6 +18,9 @@ git -C "$VLLM_ASCEND_DIR" am \
 echo "== vLLM loggers guard =="
 VLLM_DIR="$VLLM_DIR" bash "$HERE/vllm/apply_fix.sh"
 
+echo "== vLLM p2p stable request id + chunked continuation (local fix, required for P/D) =="
+VLLM_DIR="$VLLM_DIR" bash "$HERE/vllm/apply_p2p_stable_id.sh"
+
 if [ "$ENABLE_GLM" = "1" ]; then
     echo "== vLLM GLM chat + reasoning (optional) =="
     VLLM_DIR="$VLLM_DIR" bash "$HERE/vllm/apply_glm_and_chat.sh"

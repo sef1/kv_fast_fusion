@@ -20,6 +20,29 @@ container. Paths are overridable via `VLLM_ASCEND_DIR` / `VLLM_DIR` / `MOONCAKE_
 | 0005 GLM chat template | `vllm/apply_glm_and_chat.sh` | rebased (string-replace) |
 | 0006 + 0011 GLM reasoning parser | `vllm/apply_glm_and_chat.sh` + `vllm/glm_reasoning_parser.py` | 0006 and 0011 **folded** into one bundled parser file |
 
+## Not from the wiki: `vllm/apply_p2p_stable_id.sh` (local fix, **required** for stock-connector P/D)
+
+Applied by `apply_all.sh` alongside the loggers guard. Two independent fixes to
+`vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_connector.py`, both needed before the stock
+`P2pNcclConnector` can serve as a P/D baseline at any real concurrency:
+
+- **Stable cross-P/D tensor id.** `InputProcessor.assign_request_id` appends a *per-server* random
+  8-hex suffix (`f"{external_req_id}-{random_uuid():.8}"`). The proxy gives P and D the same
+  `external_req_id`, but each server generates its own suffix, so a tensor_id keyed on the full id
+  never matches. `P2pNcclEngine.recv_tensor` waits on an unbounded condition variable, so the
+  consumer's **first forward step blocks forever** — the decode logs zero engine stats while producer
+  KV piles up undrained (`Out Of Threshold`) and clients hang to their timeout. Keys send/recv **and
+  `get_finished`** on the stripped id; the `get_finished` hunk is not cosmetic — under the full id the
+  engine pops `recv_store` keys that were never stored, leaking spilled KV until OOM.
+  (Carried since v0.14.0. `P2pNcclConnectorFF._pd_key` is the same fix, which is why BFF was immune.)
+- **Chunked-prefill continuation.** Stock asserts `new_block_ids is not None` in its continuation
+  branches; a continuation step that allocates no new block passes `None` → `AssertionError` → EngineCore
+  dies. Mirrors `P2pNcclConnectorFF.build_connector_meta`. Without this, vanilla must run
+  `--no-enable-chunked-prefill` and is no longer config-comparable to a BFF run.
+
+`VLLM_DISABLE_REQUEST_ID_RANDOMIZATION=1` also makes the ids match with no code change, but vLLM marks
+it deprecated and it disables the uniqueness guard process-wide — useful as a quick check, not as the fix.
+
 Relevance to the current setup (Qwen2.5-7B, no MTP, BFF runs the FF mover standalone): the two that
 fix the P/D transfer slowness are **vllm-ascend/0001 (MTP-accuracy) and 0002 (transmit-kv-cache-failure)**.
 The ascend_store (0003), SSD (0004/0005 + mooncake), and GLM (vllm) patches are situational.
