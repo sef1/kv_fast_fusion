@@ -191,6 +191,13 @@ def apply_fast_fusion_ascend_patch() -> None:
     if _ffbp._ORIG_MAYBE_EVICT is None:
         _ffbp._ORIG_MAYBE_EVICT = BlockPool._maybe_evict_cached_block
         BlockPool._maybe_evict_cached_block = _ffbp.patched_maybe_evict_cached_block
+    # Tolerate an already-hashed block in cache_full_blocks: BFF_ALIAS_FUSED shares a rep block
+    # across requests, so a later request can prefix-hit a block that already carries its
+    # original owner's hash → stock's `assert blk.block_hash is None` kills EngineCore (seen on
+    # NPU via _update_waiting_for_remote_kv → cache_blocks). Wrapper delegates to this original.
+    if _ffbp._ORIG_CACHE_FULL is None:
+        _ffbp._ORIG_CACHE_FULL = BlockPool.cache_full_blocks
+        BlockPool.cache_full_blocks = _ffbp.patched_cache_full_blocks
     if _ffbp._ORIG_GET_COMPUTED is None:
         _ffbp._ORIG_GET_COMPUTED = KVCacheManager.get_computed_blocks
         KVCacheManager.get_computed_blocks = _ffbp.patched_get_computed_blocks

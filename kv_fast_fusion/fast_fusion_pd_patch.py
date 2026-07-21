@@ -122,6 +122,15 @@ def apply_fast_fusion_pd_patch():
         _ffbp2._ORIG_MAYBE_EVICT = BlockPool._maybe_evict_cached_block
         BlockPool._maybe_evict_cached_block = _ffbp2.patched_maybe_evict_cached_block
 
+    # Tolerate an already-hashed block in cache_full_blocks. Lever 3 (add_block_alias) shares a
+    # representative block across requests, so a later request can prefix-hit a block that already
+    # carries its original owner's hash and stock's `assert blk.block_hash is None` kills
+    # EngineCore. Observed on NPU (via _update_waiting_for_remote_kv → cache_blocks); the same
+    # latent bug exists here, so keep both backends patched identically.
+    if _ffbp2._ORIG_CACHE_FULL is None:
+        _ffbp2._ORIG_CACHE_FULL = BlockPool.cache_full_blocks
+        BlockPool.cache_full_blocks = _ffbp2.patched_cache_full_blocks
+
     # ROUND 40: wrap get_computed_blocks to record per-group resume recovery (BFF_HIT_DEBUG).
     from vllm.v1.core.kv_cache_manager import KVCacheManager
     if _ffbp2._ORIG_GET_COMPUTED is None:

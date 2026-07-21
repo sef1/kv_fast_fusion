@@ -542,11 +542,11 @@ def update_from_output(
                 logger.info(
                     "BFF sched | step=%d | running=%d | waiting=%d | "
                     "free_blocks=%d / %d | block_usage=%.1f%% | preempt(cum)=%d | preempt(step)=%d "
-                    "| alias_ins=%d | alias_drop=%d",
+                    "| alias_ins=%d | alias_drop=%d | hash_skip=%d",
                     self._bff_step, len(self.running), len(self.waiting),
                     _free, _total, _usage * 100,
                     self._bff_preempt_total, self._bff_preempt_step,
-                    _ffbp._alias_inserts, _ffbp._alias_drops,
+                    _ffbp._alias_inserts, _ffbp._alias_drops, _ffbp._alias_hash_skips,
                 )
                 # ROUND 41: per-group resume recovery (only when BFF_HIT_DEBUG). avg_recovered_tok
                 # is the overall (post cross-group-min) hit; raw_group_prefix_blocks is each

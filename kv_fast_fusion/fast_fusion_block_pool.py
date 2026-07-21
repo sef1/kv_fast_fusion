@@ -1,15 +1,9 @@
 import os
-from typing import Any
 
-from vllm.distributed.kv_events import MEDIUM_GPU, BlockStored
-from vllm.v1.core.kv_cache_utils import (
-    BlockHashList,
-    BlockHashListWithBlockSize,
-    ExternalBlockHash,
-    generate_block_hash_extra_keys,
-    make_block_hash_with_group_id,
-    maybe_convert_block_hash,
-)
+# NOTE: this module deliberately imports nothing from vllm. patched_cache_full_blocks used to
+# carry a verbatim copy of BlockPool.cache_full_blocks (and needed its kv_cache_utils imports);
+# it now delegates to the stock function captured at patch time, so the copy — and the vllm
+# dependency — are gone. Keep it that way: it lets the block-pool logic be unit-tested off-device.
 
 # Set by the GPUModelRunner __init__ patch so the free path (scheduler side, same
 # EngineCore process for TP=1) can evict freed block IDs from the LSH dedup registry.
@@ -36,9 +30,15 @@ _ALIAS_ENABLED = os.environ.get("BFF_ALIAS_FUSED", "1") == "1"
 _BLOCK_ALIASES: dict = {}
 # Set once at patch time to the original BlockPool._maybe_evict_cached_block.
 _ORIG_MAYBE_EVICT = None
+# Set once at patch time to the original BlockPool.cache_full_blocks.
+_ORIG_CACHE_FULL = None
 # Debug counters (alias inserts vs drops) — confirm aliases are invalidated, not leaked.
 _alias_inserts = 0
 _alias_drops = 0
+# Blocks skipped by patched_cache_full_blocks because they already carried a hash (i.e. how
+# often the alias/fusion sharing actually collides with the prefix cache). 0 on a run that
+# crashed on `assert blk.block_hash is None` would mean the crash came from somewhere else.
+_alias_hash_skips = 0
 
 # ROUND 40 diagnostic (gated by BFF_HIT_DEBUG): per-group prefix-cache recovery for requests
 # that have been preempted at least once. Distinguishes "no fusion → no aliases" (A) from
@@ -172,97 +172,60 @@ def patched_cache_full_blocks(
     block_size: int,
     kv_cache_group_id: int,
 ) -> None:
-    """Verbatim copy of stock BlockPool.cache_full_blocks (vllm/v1/core/block_pool.py),
-    except the `assert blk.block_hash is None` becomes a skip. Stock vLLM assumes every
-    block reaching this loop is fresh/exclusively-owned; BFF's block aliasing/fusion
-    (add_block_alias, BFF_ALIAS_FUSED) deliberately shares physical blocks across
-    requests, so a resumed (preempted-then-retried) request can prefix-hit an aliased
-    representative block that already carries its original owner's hash. Skipping is
-    correct here: the block is already in the prefix cache and reachable through its
-    block table, so a fused/shared block shouldn't be re-registered under a different
-    request's exact-token hash. The caller (cache_blocks) still sets
-    num_cached_block = num_full regardless, so accounting stays consistent."""
+    """Wrapper around stock BlockPool.cache_full_blocks that tolerates already-hashed blocks.
+
+    Stock asserts `blk.block_hash is None` for every block in the range: it assumes each one is
+    fresh and exclusively owned. BFF breaks that assumption on purpose — `add_block_alias`
+    (BFF_ALIAS_FUSED, lever 3) registers a representative block under ANOTHER request's
+    prefix-cache key so a resumed request prefix-hits the live rep instead of recomputing. That
+    request's block list then contains a block already carrying its original owner's hash, and
+    the next `cache_blocks` (e.g. from the scheduler's `_update_waiting_for_remote_kv` once the
+    remote KV lands) trips the assert and kills EngineCore.
+
+    Skipping such a block is the correct semantics: it is already in the prefix cache and
+    reachable through its block table, so it must NOT be re-registered under a different
+    request's exact-token hash. The caller (`cache_blocks`) advances `num_cached_block` to
+    `num_full_blocks` regardless, so accounting stays consistent.
+
+    We delegate to the STOCK implementation rather than carrying a copy of its body: this file
+    is shared by the CUDA and Ascend patches, which run against different vLLM versions (0.18.0
+    locally, 0.19.1 on the NPU node), and a stale body copy would silently revert upstream
+    changes. When no block in the range is pre-hashed — the overwhelmingly common case — this is
+    exactly one passthrough call, byte-identical to stock. Otherwise we call stock once per
+    maximal run of unhashed blocks, passing absolute indices (stock slices both `blocks` and
+    `request.block_hashes` by them, so hashes stay aligned per segment).
+
+    Caveat: with `enable_kv_cache_events`, a segmented call emits one BlockStored event per run
+    instead of one for the whole range (`parent_block_hash` is per segment). Events are off in
+    BFF runs, and the single-call fast path keeps the common case identical regardless.
+    """
+    global _alias_hash_skips
+    assert _ORIG_CACHE_FULL is not None, (
+        "patched_cache_full_blocks installed without _ORIG_CACHE_FULL")
+
     if num_cached_blocks >= num_full_blocks:
         return
-    new_full_blocks = blocks[num_cached_blocks:num_full_blocks]
-    assert len(request.block_hashes) >= num_full_blocks
-    if block_size == self.hash_block_size:
-        # Common case.
-        block_hashes: BlockHashList = request.block_hashes
-    else:
-        # block_size is a multiple of hash_block_size. This happens when
-        # different KV cache groups have different block sizes.
-        assert block_size % self.hash_block_size == 0
-        # Recalculate block_hashes at the granularity of block_size, using
-        # the original block_hashes (at the granularity of hash_block_size).
-        block_hashes = BlockHashListWithBlockSize(
-            request.block_hashes, self.hash_block_size, block_size
-        )
 
-    new_block_hashes = block_hashes[num_cached_blocks:]
-    new_hashes: list[ExternalBlockHash] | None = (
-        [] if self.enable_kv_cache_events else None
-    )
-    for i, blk in enumerate(new_full_blocks):
-        # Some blocks may be null blocks when enabling sparse attention like
-        # sliding window attention, or Mamba models with prefix-caching in
-        # align mode. We skip null blocks here.
-        if blk.is_null:
+    # Absolute indices of blocks that already carry a hash (shared/aliased) → must be skipped.
+    hashed = {
+        i for i in range(num_cached_blocks, num_full_blocks)
+        if getattr(blocks[i], "block_hash", None) is not None
+    }
+
+    if not hashed:
+        _ORIG_CACHE_FULL(self, request, blocks, num_cached_blocks, num_full_blocks,
+                         block_size, kv_cache_group_id)
+        return
+
+    _alias_hash_skips += len(hashed)
+
+    # Hand each maximal run of unhashed blocks to stock, with absolute bounds.
+    start = None
+    for i in range(num_cached_blocks, num_full_blocks + 1):
+        if i < num_full_blocks and i not in hashed:
+            if start is None:
+                start = i
             continue
-        if blk.block_hash is not None:
-            continue   # BFF: fused/shared block already cached — don't re-hash it
-        block_hash = new_block_hashes[i]
-
-        # Update and added the full block to the cache.
-        block_hash_with_group_id = make_block_hash_with_group_id(
-            block_hash, kv_cache_group_id
-        )
-        blk.block_hash = block_hash_with_group_id
-        self.cached_block_hash_to_block.insert(block_hash_with_group_id, blk)
-        if new_hashes is not None:
-            new_hashes.append(maybe_convert_block_hash(block_hash))
-
-    if self.enable_kv_cache_events:
-        if num_cached_blocks == 0:
-            parent_block_hash: ExternalBlockHash | None = None
-        else:
-            parent_block_hash = maybe_convert_block_hash(
-                block_hashes[num_cached_blocks - 1]
-            )
-
-        # Calculate token range for the blocks being cached
-        start_token_idx = num_cached_blocks * block_size
-        end_token_idx = num_full_blocks * block_size
-
-        # Generate extra keys for each block individually.
-        # Each block may have different extra_keys (e.g., different MM
-        # features, or cache_salt only for the first block).
-        # Skip null blocks to match the length of new_hashes.
-        extra_keys_list: list[tuple[Any, ...] | None] = []
-        curr_mm_idx = 0
-        for i in range(num_cached_blocks, num_full_blocks):
-            if blocks[i].is_null:
-                continue
-            block_start = i * block_size
-            block_end = block_start + block_size
-            extra_keys, curr_mm_idx = generate_block_hash_extra_keys(
-                request, block_start, block_end, curr_mm_idx
-            )
-            extra_keys_list.append(extra_keys)
-
-        self.kv_event_queue.append(
-            BlockStored(
-                block_hashes=new_hashes,
-                parent_block_hash=parent_block_hash,
-                token_ids=request.all_token_ids[start_token_idx:end_token_idx],
-                block_size=block_size,
-                lora_id=request.lora_request.adapter_id
-                if request.lora_request
-                else None,
-                medium=MEDIUM_GPU,
-                lora_name=request.lora_request.name
-                if request.lora_request
-                else None,
-                extra_keys=extra_keys_list if extra_keys_list else None,
-            )
-        )
+        if start is not None:
+            _ORIG_CACHE_FULL(self, request, blocks, start, i, block_size, kv_cache_group_id)
+            start = None
