@@ -334,6 +334,31 @@ def test_redirect_channel_push_pull_contract():
     assert pending == {"reqB": {1: [[0, 12345, 0]], 2: [[1, 67890, 3]]}}, pending
 
 
+def test_ff_groups_parsing():
+    from kv_fast_fusion_ascend.connectors import mooncake_layerwise_connector_ff as m
+    # Unset / empty / degenerate all mean "all eligible groups", never "fuse nothing" — a typo
+    # must not silently disable fusion.
+    for raw in (None, "", "   ", ",,", " , "):
+        assert m._parse_groups(raw) is None, raw
+    assert m._parse_groups("1,2,3") == {1, 2, 3}
+    assert m._parse_groups("1, 2,") == {1, 2}      # tolerate spaces + trailing comma
+    assert m._parse_groups("3") == {3}
+
+
+def test_ff_groups_filters_fusion_set():
+    """The knob intersects with the eligible set; it can never ADD an ineligible group."""
+    eligible = {1, 2, 3, 4, 5, 6}
+
+    def apply(selected):
+        return eligible if selected is None else eligible & selected
+
+    assert apply(None) == eligible                      # default = unchanged behavior
+    assert apply({1, 2, 3}) == {1, 2, 3}                 # the measured-productive groups
+    assert apply({1, 99}) == {1}                         # 99 is not eligible -> ignored
+    assert apply({0}) == set()                           # group 0 is warmup, never eligible
+
+
+
 if __name__ == "__main__":
     test_producer_detects_duplicate_across_requests()
     test_producer_no_merge_when_dissimilar()
@@ -345,4 +370,15 @@ if __name__ == "__main__":
     test_lsh_probe_matches_bruteforce_oracle()
     test_lsh_evict_compacts_and_still_probes()
     test_redirect_channel_push_pull_contract()
+    test_ff_groups_parsing()
+    test_ff_groups_filters_fusion_set()
     print("OK: all mooncake layerwise FF glue tests passed")
+
+
+# --------------------------------------------------------------------------------------------
+# BFF_FF_GROUPS: restrict fusion to the groups that actually pay.
+# Measured at con512: groups 1-3 = 90.9% of redirects but 23% of the LSH index; groups 4-6 =
+# 9.1% of redirects but 77% of the index. Excluding a group must remove it from the producer's
+# fusion set entirely (no clustering/hash/probe/register) while leaving the rest untouched.
+# --------------------------------------------------------------------------------------------
+

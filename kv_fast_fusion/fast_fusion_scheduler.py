@@ -16,13 +16,35 @@ _PD_STATS_EVERY = int(os.environ.get("BFF_PD_STATS_EVERY", "50"))
 _bff_decode_stats = {"blocks_freed_total": 0, "merge_events": 0}
 
 
-def _bff_record_decode_free(freed: int) -> None:
-    """Accumulate one merge event's real block-pool delta and periodically dump it."""
+# Per-merge freed-block-id trace. Gated: it appends to a JSONL file on EVERY merge event, which is
+# the scheduler's hot path — it must not ride on _PD_STATS_DIR (which is always set when the
+# benchmark collects stats) or it becomes unconditional per-merge file I/O.
+_FF_AUDIT = os.environ.get("BFF_FF_AUDIT", "0") == "1"
+
+
+def _bff_record_decode_free(freed: int, freed_ids: list | None = None) -> None:
+    """Accumulate one merge event's real block-pool delta and periodically dump it.
+
+    ``freed_ids`` (only used under BFF_FF_AUDIT) are the block ids handed to ``free_blocks`` this
+    event — an upper bound, since the dedup in ``patched_free_blocks`` may skip some decrements —
+    for tracing premature frees at high concurrency."""
     s = _bff_decode_stats
     s["blocks_freed_total"] += int(freed)
     s["merge_events"] += 1
     if not _PD_STATS_DIR:
         return
+    if _FF_AUDIT and freed_ids:
+        try:
+            audit = os.path.join(_PD_STATS_DIR, f"bff_free_audit_{os.getpid()}.jsonl")
+            with open(audit, "a") as f:
+                f.write(json.dumps({
+                    "event": s["merge_events"],
+                    "freed": freed,
+                    "block_ids": freed_ids[:20],       # cap: this is a trace, not a ledger
+                    "total_freed_so_far": s["blocks_freed_total"],
+                }) + "\n")
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("BFF: could not write free audit log: %s", e)
     if s["merge_events"] != 1 and s["merge_events"] % _PD_STATS_EVERY:
         return
     try:
@@ -309,7 +331,11 @@ def _handle_block_merging_with_counts(self, request_blocks: dict[str, dict[int, 
     # Apply batch operations
     if blocks_to_touch:
         block_pool.touch(blocks_to_touch)
+    freed_ids = None
     if blocks_to_free:
+        # Snapshot ids BEFORE freeing (the objects are recycled after) — audit only.
+        if _FF_AUDIT:
+            freed_ids = [b.block_id for b in blocks_to_free]
         block_pool.free_blocks(blocks_to_free)
 
     # Optionally evict the fusion TARGET (shared) blocks from the prefix cache so future
@@ -323,7 +349,7 @@ def _handle_block_merging_with_counts(self, request_blocks: dict[str, dict[int, 
     after_free = block_pool.get_num_free_blocks()
     freed = after_free - before_free
     logger.info(f"Block merging freed {freed} blocks")
-    _bff_record_decode_free(freed)
+    _bff_record_decode_free(freed, freed_ids)
 
 def _handle_block_merging_with_counts_(
     self,

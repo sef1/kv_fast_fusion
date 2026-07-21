@@ -76,6 +76,28 @@ _FF_REP_SAFE = os.environ.get("BFF_FF_REP_SAFE", "0") == "1"
 # Diagnostic: count applied redirects whose REP was resolved from the (stale-prone) load-metadata overlay
 # vs live runner state, surfaced in the apply log + stats. Cheap; helps confirm the mechanism at con512.
 _FF_AUDIT = os.environ.get("BFF_FF_AUDIT", "0") == "1"
+
+
+def _parse_groups(raw: str | None):
+    """Parse BFF_FF_GROUPS ("1,2,3") into a set of group indices, or None for "all eligible".
+    Unset/empty/whitespace → None. Ignores blanks so "1, 2," is accepted; a value that parses to
+    nothing (e.g. ",,") also yields None rather than silently disabling fusion entirely."""
+    if not raw or not raw.strip():
+        return None
+    out = {int(p) for p in raw.split(",") if p.strip()}
+    return out or None
+
+
+# Restrict fusion to specific KV-cache group indices (comma list, e.g. "1,2,3"). Unset = all
+# eligible groups. Compression is very unevenly distributed across depth — see the rationale at
+# the filter site in _ff_build_group_layers — so this trades a little potential for a lot of
+# producer overhead. Applies to the PRODUCER only; the consumer applies whatever it receives.
+_FF_GROUPS = _parse_groups(os.environ.get("BFF_FF_GROUPS"))
+# A/B knob for the redirect-write predicate. Default 0 = identity only (the rid must still name the
+# same external request). 1 additionally requires the rid to be in `runner.requests`, which is
+# stricter but rejects just-landed owners — see the apply site. Expect `rid_not_live` > 0 and
+# compression DOWN when this is on; it exists to measure that, not as a recommended setting.
+_FF_RID_LIVE = os.environ.get("BFF_FF_RID_LIVE", "0") == "1"
 # SimHash LSH config (ported from kv_fast_fusion/legacy): NUM_LSH_TABLES banded sub-hashes of
 # LSH_BITS_PER_TABLE bits each, from sign() of a fixed-seed random-hyperplane projection.
 _LSH_TABLES = int(os.environ.get("BFF_LSH_TABLES", "16"))
@@ -912,7 +934,11 @@ if _ASCEND_AVAILABLE:
                 # explains the emitted→freed gap in the benchmark report.
                 self._ff_apply_totals: dict[str, int] = {
                     "applied": 0, "reps_unresolved": 0, "owner_unresident": 0,
-                    "owners_deferred": 0, "owners_dropped_post_decode": 0, "apply_calls": 0}
+                    "owners_deferred": 0, "owners_dropped_post_decode": 0, "apply_calls": 0,
+                    # Resolved-but-not-written rows. `applied` counts a row before the write is
+                    # attempted, so these are the part of `applied` that produced NO actual free.
+                    "rid_stale": 0, "rid_not_live": 0,
+                    "load_blocks_pruned": 0}
 
         def _ff_build_group_layers(self, worker) -> None:
             """Map fusion group index → layer names + the set of fusion groups (full-attention,
@@ -933,6 +959,19 @@ if _ASCEND_AVAILABLE:
                     fusion_groups.add(gi)
                     if isinstance(spec, MLAAttentionSpec):
                         mla_groups.add(gi)
+            # BFF_FF_GROUPS restricts fusion to the groups that actually pay. Measured at con512:
+            # groups 1-3 produce 90.9% of all redirects while holding 23% of the LSH index; groups
+            # 4-6 produce 9.1% while holding 77% (deep layers are content-specific, so almost
+            # nothing matches, so nearly every block registers as a new rep — which then has to be
+            # probed against). Excluding a group skips its clustering/hash/probe/register entirely;
+            # its blocks still transfer normally, so the only cost is the lost (negligible)
+            # compression. Empty/unset = all eligible groups (previous behavior).
+            selected = _FF_GROUPS
+            if selected is not None:
+                skipped = sorted(fusion_groups - selected)
+                fusion_groups = fusion_groups & selected
+                if skipped:
+                    logger.info("BFF Mooncake: BFF_FF_GROUPS excludes fusion groups %s", skipped)
             self._ff_group_layers = group_layers
             self._ff_fusion_groups = fusion_groups
             self._ff_mla_groups = mla_groups
@@ -1069,9 +1108,28 @@ if _ASCEND_AVAILABLE:
                 res_ext2blocks[ext] = lb
                 res_hash2ext[_ext_hash(ext)] = ext
                 rid_by_ext.setdefault(ext, rid)
+            # Prune entries that are neither resident nor still expected: the request left
+            # runner.requests (finished/preempted) AND no redirect is pending for it, so nothing will
+            # ever resolve against it. Without this the overlay grows unboundedly and keeps handing
+            # out block tables for requests whose blocks have been recycled. The `ext not in pending`
+            # guard is what makes this safe — a queued redirect keeps its owner resolvable.
+            n_load_pruned = 0
+            for ext in [e for e, (rid, _lb) in self._ff_load_blocks.items()
+                        if rid not in getattr(runner, "requests", {}) and e not in pending]:
+                del self._ff_load_blocks[ext]
+                res_ext2blocks.pop(ext, None)
+                res_hash2ext.pop(_ext_hash(ext), None)
+                n_load_pruned += 1
+            if n_load_pruned and _FF_AUDIT:
+                logger.warning("BFF: pruned %d stale _ff_load_blocks entries (remaining=%d)",
+                               n_load_pruned, len(self._ff_load_blocks))
             just_recv_ext = {get_external_request_id(rid) for rid in recving}
             updated: dict[str, dict[int, list[int]]] = {}
             n_applied = n_unresolved = n_owner_missing = n_deferred = n_dropped = 0
+            # Rows that RESOLVED but were not written. These are invisible in `applied` (which is
+            # incremented by resolve_redirect_rows before the write is attempted), so without them a
+            # suppressed write looks like successful compression in the stats.
+            n_rid_stale = n_rid_not_live = 0
             leftover: dict[str, dict[int, list]] = {}
             # Rep-lifetime fix: resolve the REP only from LIVE runner state (ext2blocks/hash2ext), not the
             # load-metadata overlay (res_*), so a stale/recycled rep counts as unresolved (owner keeps its
@@ -1091,7 +1149,19 @@ if _ASCEND_AVAILABLE:
                         n_owner_missing += nom
                         if new_blocks is not None:
                             rid = rid_by_ext.get(ext_id)
-                            if rid is not None:
+                            # IDENTITY, not liveness. rid may come from the load-metadata overlay,
+                            # where it can be stale (slot recycled to another request) — repointing
+                            # then aliases someone else's block table. Requiring the rid to still
+                            # name THIS ext_id rules that out exactly.
+                            # Deliberately NOT `rid in runner.requests`: a just-landed owner (the
+                            # population this apply exists for) is not in runner.requests yet by
+                            # design, so that predicate would silently suppress the merge/free
+                            # below. Kept available as BFF_FF_RID_LIVE=1 for A/B.
+                            if rid is None or get_external_request_id(rid) != ext_id:
+                                n_rid_stale += 1
+                            elif _FF_RID_LIVE and rid not in getattr(runner, "requests", {}):
+                                n_rid_not_live += 1
+                            else:
                                 updated.setdefault(rid, {})[gi] = new_blocks
                                 self._ff_write_runner_block_table(runner, rid, gi, new_blocks)
                 elif ext_id not in ext2blocks:
@@ -1111,12 +1181,15 @@ if _ASCEND_AVAILABLE:
             if n_applied or n_unresolved or n_owner_missing or n_dropped or _PD_DEBUG or _FF_AUDIT:
                 logger.info("BFF Mooncake apply | redirects_applied=%d | owner_unresident=%d | "
                             "reps_unresolved=%d | owners_deferred=%d | owners_dropped_post_decode=%d | "
-                            "rep_safe=%d", n_applied, n_owner_missing, n_unresolved, n_deferred,
-                            n_dropped, int(_FF_REP_SAFE))
-            self._ff_record_apply(n_applied, n_unresolved, n_owner_missing, n_deferred, n_dropped)
+                            "rid_stale=%d | rid_not_live=%d | load_pruned=%d | rep_safe=%d",
+                            n_applied, n_owner_missing, n_unresolved, n_deferred,
+                            n_dropped, n_rid_stale, n_rid_not_live, n_load_pruned,
+                            int(_FF_REP_SAFE))
+            self._ff_record_apply(n_applied, n_unresolved, n_owner_missing, n_deferred, n_dropped,
+                                  n_rid_stale, n_rid_not_live, n_load_pruned)
 
         def _ff_record_apply(self, n_applied, n_unresolved, n_owner_missing, n_deferred,
-                             n_dropped) -> None:
+                             n_dropped, n_rid_stale=0, n_rid_not_live=0, n_load_pruned=0) -> None:
             """Accumulate this step's apply outcomes and periodically dump them, so the benchmark can
             attribute the gap between redirects shipped and blocks actually freed."""
             t = self._ff_apply_totals
@@ -1125,6 +1198,9 @@ if _ASCEND_AVAILABLE:
             t["owner_unresident"] += n_owner_missing
             t["owners_deferred"] += n_deferred
             t["owners_dropped_post_decode"] += n_dropped
+            t["rid_stale"] += n_rid_stale
+            t["rid_not_live"] += n_rid_not_live
+            t["load_blocks_pruned"] += n_load_pruned
             t["apply_calls"] += 1
             if not _PD_STATS_DIR:
                 return
