@@ -267,6 +267,37 @@ def test_lsh_probe_matches_bruteforce_oracle():
     assert sum(matched) >= N // 4, f"expected the planted near-duplicates to hit, got {sum(matched)}"
 
 
+def test_lsh_probe_bins_accepted_cosines():
+    """Every accepted merge must land in the accept-cosine histogram bin matching its verify cosine.
+    Bucket collision at cos~0.78 is unreliable (P~12% at 16 tables x 20 bits), so the probe REUSES
+    the reps' own sub-hashes — candidates guaranteed, and the verify cosine is exactly the crafted
+    one."""
+    from kv_fast_fusion_ascend.connectors import mooncake_layerwise_connector_ff as m
+    d = 64
+    prod = m.MooncakeFFProducer()
+    g = torch.Generator().manual_seed(5)
+    u = torch.randn(2, d, generator=g)
+    u = u / u.norm(dim=1, keepdim=True)
+    proj = m._lsh_get_proj(prod._lsh_proj, d, torch.device("cpu"))
+    sh_u = m._lsh_sub_hashes(u, proj)
+    prod._lsh_register(1, u, sh_u, ["repA", "repB"], [0, 1], [0, 1], [0, 1], [True, True])
+
+    def _at_cos(base, c):
+        # Unit vector at exact cosine c to unit `base`: c*base + sqrt(1-c^2)*w with w ⊥ base.
+        w = torch.randn(d, generator=g)
+        w = w - (w @ base) * base
+        w = w / w.norm()
+        return c * base + (1.0 - c * c) ** 0.5 * w
+
+    q = torch.stack([_at_cos(u[0], 0.99), _at_cos(u[1], 0.78)])
+    matched, hits = prod._lsh_probe(1, q, sh_u, ["own0", "own1"], [0, 1])
+    assert matched == [True, True] and len(hits) == 2, (matched, hits)
+    hist = dict(zip(m._ACCEPT_COS_LABELS, prod._accept_cos[1]))
+    assert hist["0.98-1.00"] == 1, hist
+    assert hist["0.75-0.80"] == 1, hist
+    assert sum(prod._accept_cos[1]) == len(hits)
+
+
 def test_lsh_evict_compacts_and_still_probes():
     """Over-cap registration LRU-drops the oldest half and compacts `mat`; survivors must still be
     found, and _lsh_size must track the compacted row count."""
@@ -653,6 +684,7 @@ if __name__ == "__main__":
     test_lsh_cross_request_across_steps_without_encoded_batch()
     test_intra_req_ff_disables_within_batch_cc()
     test_lsh_probe_matches_bruteforce_oracle()
+    test_lsh_probe_bins_accepted_cosines()
     test_lsh_evict_compacts_and_still_probes()
     test_redirect_channel_push_pull_contract()
     test_ff_groups_parsing()

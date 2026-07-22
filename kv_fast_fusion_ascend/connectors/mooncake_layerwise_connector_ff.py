@@ -116,6 +116,18 @@ _LSH_MAX_ENTRIES = int(os.environ.get("BFF_LSH_MAX_ENTRIES", "50000"))
 # table-collision count (multi-probe ranking); 0 = uncapped (verify every bucket candidate).
 _LSH_MAX_CAND = int(os.environ.get("BFF_LSH_MAX_CANDIDATES", "0"))
 _LSH_POWERS = (2 ** torch.arange(_LSH_BITS, dtype=torch.int64)).tolist()
+# Accepted-cosine histogram bins: where does the accepted-merge mass sit? _lsh_probe already pays
+# the .item() sync for the accept decision, so binning the value is free. The distribution answers,
+# from ONE run, whether BFF_THRESHOLD is the quality lever (mass near the threshold → raising it
+# trims exactly that mass; accepts at thr X = mass above X predicts the sweep) or the merges are
+# already near-identical in projected space (mass > 0.95 → the F1 cost is elsewhere, e.g. the JL
+# projection error). NOTE: within-batch cc/nr_tree merges bypass _lsh_probe, but the con512 runs are
+# 100% cross-batch, so this covers all emitted redirects in practice. Sub-threshold accepts are
+# clamped into the first bin (reachable only if BFF_THRESHOLD is lowered below 0.75).
+_ACCEPT_COS_BINS = (0.75, 0.80, 0.85, 0.90, 0.95, 0.98, 1.01)
+_ACCEPT_COS_LABELS = tuple(
+    f"{_ACCEPT_COS_BINS[i]:.2f}-{min(_ACCEPT_COS_BINS[i + 1], 1.0):.2f}"
+    for i in range(len(_ACCEPT_COS_BINS) - 1))
 # Dedicated FF ZMQ control channel: D binds (its side-channel base + this offset); P sends redirect
 # maps there. Kept separate from the connector's own handshake port so the stock recv thread is
 # untouched. TP=1 assumed for M1 (the new setup runs tp_size=1 on both P and D).
@@ -231,6 +243,8 @@ class MooncakeFFProducer:
         # alternative to the bounded _registry, O(N) probe.
         self._lsh: dict[int, dict] = {}
         self._lsh_proj = [None]                # lazy fixed-seed SimHash projection (per feature width)
+        # gi -> per-bin accept counts (see _ACCEPT_COS_BINS): the accepted-merge cosine distribution.
+        self._accept_cos: dict[int, list[int]] = {}
 
     def reset_step(self, step_id: int) -> None:
         if step_id != self._cur_step_id:
@@ -570,12 +584,21 @@ class MooncakeFFProducer:
             rows = torch.tensor(cand_rows, dtype=torch.long)
             sims = mat.index_select(0, rows) @ cur_cpu[i]          # [C]
             best_val, best_j = sims.max(dim=0)
-            if best_val.item() > THRESHOLD:
+            v = best_val.item()
+            if v > THRESHOLD:
                 row = cand_rows[int(best_j.item())]
                 rep_hash, rep_slot, _ = meta[row]
                 hits.append((i, rep_hash, rep_slot))
                 matched[i] = True
                 lru.move_to_end(row)                              # LRU touch
+                # Bin the accepted cosine (the .item() sync above already happened; this is free).
+                hist = self._accept_cos.setdefault(gi, [0] * len(_ACCEPT_COS_LABELS))
+                b = 0
+                for j in range(len(_ACCEPT_COS_LABELS) - 1, 0, -1):
+                    if v >= _ACCEPT_COS_BINS[j]:
+                        b = j
+                        break
+                hist[b] += 1
         return matched, hits
 
     def _lsh_register(self, gi, cur_cpu, sub_hashes, ext_ids, flat_req_local, flat_slot,
@@ -692,6 +715,13 @@ class MooncakeFFProducer:
                 "registry_blocks": {str(gi): self._registry_size(gi)
                                     for gi in sorted(self._registry)},
                 "lsh_index_blocks": {str(gi): self._lsh_size(gi) for gi in sorted(self._lsh)},
+                # Sweep support: the active threshold (self-describing runs) + where the accepted
+                # mass sits per group. Accepts at thr X = the mass above X, so this run PREDICTS the
+                # redirect count of any higher-threshold run before it happens.
+                "threshold": THRESHOLD,
+                "accept_cos_hist": {
+                    str(gi): dict(zip(_ACCEPT_COS_LABELS, hist))
+                    for gi, hist in sorted(self._accept_cos.items())},
             }
             path = os.path.join(stats_dir, f"bff_stats_{os.getpid()}.json")
             tmp = path + ".tmp"
