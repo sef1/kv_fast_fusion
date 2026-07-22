@@ -459,7 +459,8 @@ class _FakeSource:
         self.lock = threading.Lock()
         self.pending = pending
         self.promo_stats = {"promo_applied": 0, "promo_unresolved": 0, "promo_no_rows": 0,
-                            "promo_merge_calls": 0, "promo_pending_dropped": 0}
+                            "promo_merge_calls": 0, "promo_pending_dropped": 0,
+                            "promo_unres_rep_loading": 0, "promo_unres_rep_gone": 0}
 
 
 class _FakeBlock:
@@ -538,6 +539,62 @@ def test_promotion_apply_skips_still_loading_rep():
     assert sched.merge_calls == []
     assert src.promo_stats["promo_unresolved"] == 1
     assert src.promo_stats["promo_applied"] == 0
+    # Cause split: the rep IS present, just still loading — must land in the loading bucket only.
+    assert src.promo_stats["promo_unres_rep_loading"] == 1
+    assert src.promo_stats["promo_unres_rep_gone"] == 0
+
+
+def test_promotion_apply_classifies_rep_gone():
+    # The rep's request has already finished — no request in scheduler.requests carries its hash.
+    # The row must count unresolved AND land in the rep-gone bucket (rep-lifetime problem).
+    owner_rid = "own-abcd1234"
+    pending = {"own": {1: [[0, _ext_hash("rep"), 0]]}}
+    managers = [_FakeManager({}),
+                _FakeManager({owner_rid: [200, 201]})]
+    src = _FakeSource(pending)
+    sched = _FakeScheduler({}, managers)                       # rep nowhere to be found
+    prev = _bp_mod._FF_PENDING_SOURCE
+    _bp_mod._FF_PENDING_SOURCE = src
+    try:
+        owner = _FakeSchedReq(RequestStatus.WAITING)
+        owner.request_id = owner_rid
+        _bff_promotion_apply(sched, owner)
+    finally:
+        _bp_mod._FF_PENDING_SOURCE = prev
+    assert sched.merge_calls == []
+    assert src.promo_stats["promo_unresolved"] == 1
+    assert src.promo_stats["promo_unres_rep_gone"] == 1
+    assert src.promo_stats["promo_unres_rep_loading"] == 0
+
+
+def test_promotion_apply_mixed_split_sums_to_unresolved():
+    # Three rows in one promotion: one resolves (RUNNING rep), one hits a still-loading rep, one a
+    # finished rep. The split buckets must sum exactly to promo_unresolved, and the resolvable row
+    # must still be applied (partial merges are fed, unresolved slots keep the owner's own blocks).
+    owner_rid, rep_a, rep_b = "own-abcd1234", "repa-abcd1234", "repb-abcd1234"
+    pending = {"own": {1: [[0, _ext_hash("repa"), 0],
+                           [1, _ext_hash("repb"), 0],
+                           [2, _ext_hash("repc"), 0]]}}
+    managers = [_FakeManager({}),
+                _FakeManager({owner_rid: [200, 201, 202],
+                              rep_a: [100, 101], rep_b: [110, 111]})]
+    requests = {rep_a: _FakeSchedReq(RequestStatus.RUNNING),
+                rep_b: _FakeSchedReq(RequestStatus.WAITING_FOR_REMOTE_KVS)}
+    src = _FakeSource(pending)
+    sched = _FakeScheduler(requests, managers)
+    prev = _bp_mod._FF_PENDING_SOURCE
+    _bp_mod._FF_PENDING_SOURCE = src
+    try:
+        owner = _FakeSchedReq(RequestStatus.WAITING)
+        owner.request_id = owner_rid
+        _bff_promotion_apply(sched, owner)
+    finally:
+        _bp_mod._FF_PENDING_SOURCE = prev
+    assert sched.merge_calls == [{owner_rid: {1: [100, 201, 202]}}], sched.merge_calls
+    assert src.promo_stats["promo_applied"] == 1
+    assert src.promo_stats["promo_unresolved"] == 2
+    assert src.promo_stats["promo_unres_rep_loading"] == 1
+    assert src.promo_stats["promo_unres_rep_gone"] == 1
 
 
 def test_promotion_apply_no_rows_is_noop():
@@ -607,6 +664,8 @@ if __name__ == "__main__":
     test_classify_owner_miss_pruned()
     test_promotion_apply_rewrites_and_feeds_merge()
     test_promotion_apply_skips_still_loading_rep()
+    test_promotion_apply_classifies_rep_gone()
+    test_promotion_apply_mixed_split_sums_to_unresolved()
     test_promotion_apply_no_rows_is_noop()
     test_promotion_apply_skips_preempted_resume()
     test_promotion_apply_unpublished_source_is_noop()

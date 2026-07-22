@@ -170,14 +170,17 @@ def _bff_promotion_apply(scheduler, request) -> None:
     # Fetch block tables ONLY for the reps these rows actually reference (a promotion can touch a
     # handful of reps; materializing all ~max_num_seqs requests × groups every promotion would not).
     needed = {int(h) for rows in groups_rows.values() for (_o, h, _s) in rows}
+    loading_hashes: set[int] = set()
     for rid2, req2 in scheduler.requests.items():
-        if req2.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
-            continue                       # rep still loading → KV incomplete → not a valid target
         ext2 = _ext_of(rid2)
         h2 = _ext_hash(ext2)
-        if h2 in needed and ext2 not in ext2blocks:
-            ext2blocks[ext2] = _blocks_of(rid2)
-            hash2ext[h2] = ext2
+        if h2 not in needed or ext2 in ext2blocks:
+            continue
+        if req2.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+            loading_hashes.add(h2)         # rep present but KV incomplete → not a valid target (yet)
+            continue
+        ext2blocks[ext2] = _blocks_of(rid2)
+        hash2ext[h2] = ext2
     merged: dict[int, list[int]] = {}
     n_applied = n_unresolved = 0
     for gi, rows in groups_rows.items():
@@ -186,6 +189,22 @@ def _bff_promotion_apply(scheduler, request) -> None:
         n_unresolved += nu
         if new_blocks is not None:
             merged[int(gi)] = new_blocks
+    # Attribute every unresolved row to exactly one of the two possible causes — the fixes differ
+    # completely (rep finished → rep-lifetime work; rep still loading → defer/retry ordering work).
+    n_rep_loading = n_rep_gone = 0
+    for rows in groups_rows.values():
+        for (_o, h, _s) in rows:
+            if int(h) not in hash2ext:
+                if int(h) in loading_hashes:
+                    n_rep_loading += 1
+                else:
+                    n_rep_gone += 1
+    if n_rep_loading + n_rep_gone != n_unresolved:
+        # A third cause would mean resolve_redirect_rows rejects rows for a reason this
+        # classification doesn't model — surface it rather than letting it hide in either bucket.
+        logger.warning("BFF Ascend promotion: unresolved split mismatch for %s: loading=%d gone=%d "
+                       "!= unresolved=%d", request.request_id, n_rep_loading, n_rep_gone,
+                       n_unresolved)
     if merged:
         # Existing machinery: rewrites req_to_blocks, touches reps, frees orphans, marks
         # num_cached_block. Its _BFF_FREE_PRERUNNING gates pass exactly here (status WAITING,
@@ -194,6 +213,8 @@ def _bff_promotion_apply(scheduler, request) -> None:
     if stats is not None:
         stats["promo_applied"] += n_applied
         stats["promo_unresolved"] += n_unresolved
+        stats["promo_unres_rep_loading"] = stats.get("promo_unres_rep_loading", 0) + n_rep_loading
+        stats["promo_unres_rep_gone"] = stats.get("promo_unres_rep_gone", 0) + n_rep_gone
         if merged:
             stats["promo_merge_calls"] += 1
 
