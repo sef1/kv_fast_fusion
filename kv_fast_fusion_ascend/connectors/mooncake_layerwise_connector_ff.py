@@ -772,6 +772,19 @@ def _ff_write_runner_block_table(runner, rid, gi, new_blocks) -> bool:
     return True
 
 
+def _classify_owner_miss(ext_id: str, ever_snapshotted) -> str:
+    """Diagnostic (BFF_FF_AUDIT): why an owner whose recv just completed is unresolvable at apply.
+
+    ``owner_unresident`` fires when the owner is in ``just_recv_ext`` yet absent from the resolution
+    set (runner.requests ∪ the ``_ff_load_blocks`` overlay). Exactly two causes:
+      * "never_snap"  — its load metadata never put block ids into the overlay (a snapshot keying/
+                        timing gap); fix = snapshot more durably.
+      * "pruned"      — it WAS snapshotted, then removed before its recv landed (resident-delete or
+                        the stale-entry prune fired too early); fix = tighten the prune guard.
+    ``ever_snapshotted`` is the cumulative set of exts seen by ``_ff_snapshot_load_meta``."""
+    return "pruned" if ext_id in ever_snapshotted else "never_snap"
+
+
 # ---------------------------------------------------------------------------------------------
 # Ascend/NPU-only section: the connector subclass + ZMQ side-channel + block-table rewrite.
 # Guarded so the pure glue above stays importable on non-Ascend boxes (for unit tests).
@@ -954,6 +967,10 @@ if _ASCEND_AVAILABLE:
                 # a request's KV recv completes a LATER step; accumulate here so the owner is still
                 # resolvable when its recv finally lands. Pruned as requests become resident/finish.
                 self._ff_load_blocks: dict[str, tuple[str, list]] = {}
+                # Diagnostic (BFF_FF_AUDIT only): cumulative set of exts ever put into the overlay by
+                # _ff_snapshot_load_meta, so an owner-miss can be split into never-snapshotted vs
+                # snapshotted-then-pruned. Unbounded, so only populated under _FF_AUDIT.
+                self._ff_ever_snapshotted: set[str] = set()
                 # Cumulative apply outcomes. The producer only knows how many redirects it SHIPPED;
                 # these say how many actually landed and, when they didn't, why — which is what
                 # explains the emitted→freed gap in the benchmark report.
@@ -963,7 +980,9 @@ if _ASCEND_AVAILABLE:
                     # Resolved rows whose device write failed (owner not in input_batch) so the free
                     # was withheld — the part of `applied` that produced NO actual free.
                     "owner_not_written": 0,
-                    "load_blocks_pruned": 0}
+                    "load_blocks_pruned": 0,
+                    # BFF_FF_AUDIT split of owner_unresident (see _classify_owner_miss).
+                    "ownmiss_never_snap": 0, "ownmiss_pruned": 0}
 
         def _ff_build_group_layers(self, worker) -> None:
             """Map fusion group index → layer names + the set of fusion groups (full-attention,
@@ -1080,7 +1099,12 @@ if _ASCEND_AVAILABLE:
             for rid, rm in getattr(meta, "requests", {}).items():
                 lb = getattr(rm, "local_block_ids", None)
                 if lb:
-                    self._ff_load_blocks[get_external_request_id(rid)] = (rid, lb)
+                    ext = get_external_request_id(rid)
+                    self._ff_load_blocks[ext] = (rid, lb)
+                    if _FF_AUDIT:
+                        # Record that this ext DID enter the overlay, so a later owner-miss can be
+                        # attributed to a prune rather than a missing snapshot (see _classify_owner_miss).
+                        self._ff_ever_snapshotted.add(ext)
             for fid in finished_req_ids:
                 self._ff_load_blocks.pop(get_external_request_id(fid), None)
 
@@ -1156,6 +1180,7 @@ if _ASCEND_AVAILABLE:
             # resolve_redirect_rows before the write is attempted), so without this a withheld free
             # would look like successful compression. On a healthy run this is > 0.
             n_owner_not_written = 0
+            n_ownmiss_never_snap = n_ownmiss_pruned = 0
             leftover: dict[str, dict[int, list]] = {}
             # Rep-lifetime fix: resolve the REP only from LIVE runner state (ext2blocks/hash2ext), not the
             # load-metadata overlay (res_*), so a stale/recycled rep counts as unresolved (owner keeps its
@@ -1166,6 +1191,17 @@ if _ASCEND_AVAILABLE:
             for ext_id, groups in pending.items():
                 if ext_id in just_recv_ext:
                     # Owner's KV just landed and it has not decoded yet → safe to repoint + free.
+                    # Diagnostic: an owner in just_recv but not in the resolution set will owner-miss
+                    # on every group below; classify WHY once, before the per-group loop.
+                    if _FF_AUDIT and ext_id not in res_ext2blocks:
+                        cause = _classify_owner_miss(ext_id, self._ff_ever_snapshotted)
+                        if cause == "pruned":
+                            n_ownmiss_pruned += 1
+                        else:
+                            n_ownmiss_never_snap += 1
+                        if (n_ownmiss_pruned + n_ownmiss_never_snap) <= 8:
+                            logger.warning("BFF owner-miss | ext=%s | cause=%s | in_runner=%s",
+                                           ext_id, cause, ext_id in ext2blocks)
                     for gi, rows in groups.items():
                         new_blocks, na, nu, nom = resolve_redirect_rows(
                             res_ext2blocks, res_hash2ext, ext_id, gi, rows,
@@ -1206,15 +1242,18 @@ if _ASCEND_AVAILABLE:
             if n_applied or n_unresolved or n_owner_missing or n_dropped or _PD_DEBUG or _FF_AUDIT:
                 logger.info("BFF Mooncake apply | redirects_applied=%d | owner_unresident=%d | "
                             "reps_unresolved=%d | owners_deferred=%d | owners_dropped_post_decode=%d | "
-                            "owner_not_written=%d | load_pruned=%d | rep_safe=%d",
+                            "owner_not_written=%d | load_pruned=%d | ownmiss_never_snap=%d | "
+                            "ownmiss_pruned=%d | rep_safe=%d",
                             n_applied, n_owner_missing, n_unresolved, n_deferred,
                             n_dropped, n_owner_not_written, n_load_pruned,
-                            int(_FF_REP_SAFE))
+                            n_ownmiss_never_snap, n_ownmiss_pruned, int(_FF_REP_SAFE))
             self._ff_record_apply(n_applied, n_unresolved, n_owner_missing, n_deferred, n_dropped,
-                                  n_owner_not_written, n_load_pruned)
+                                  n_owner_not_written, n_load_pruned,
+                                  n_ownmiss_never_snap, n_ownmiss_pruned)
 
         def _ff_record_apply(self, n_applied, n_unresolved, n_owner_missing, n_deferred,
-                             n_dropped, n_owner_not_written=0, n_load_pruned=0) -> None:
+                             n_dropped, n_owner_not_written=0, n_load_pruned=0,
+                             n_ownmiss_never_snap=0, n_ownmiss_pruned=0) -> None:
             """Accumulate this step's apply outcomes and periodically dump them, so the benchmark can
             attribute the gap between redirects shipped and blocks actually freed."""
             t = self._ff_apply_totals
@@ -1225,6 +1264,8 @@ if _ASCEND_AVAILABLE:
             t["owners_dropped_post_decode"] += n_dropped
             t["owner_not_written"] += n_owner_not_written
             t["load_blocks_pruned"] += n_load_pruned
+            t["ownmiss_never_snap"] += n_ownmiss_never_snap
+            t["ownmiss_pruned"] += n_ownmiss_pruned
             t["apply_calls"] += 1
             if not _PD_STATS_DIR:
                 return

@@ -12,6 +12,7 @@ import torch
 
 from kv_fast_fusion_ascend.connectors.mooncake_layerwise_connector_ff import (
     MooncakeFFProducer,
+    _classify_owner_miss,
     _ext_hash,
     _ff_write_runner_block_table,
     resolve_redirect_rows,
@@ -421,6 +422,22 @@ def test_free_is_coupled_to_write_success():
     assert owner_not_written == 1
 
 
+# --------------------------------------------------------------------------------------------
+# owner-miss classifier (BFF_FF_AUDIT diagnostic): split owner_unresident into the two causes
+# so the pending run says which few-line fix to make. never_snap = the overlay never held it;
+# pruned = the overlay held it once and lost it before the recv landed.
+# --------------------------------------------------------------------------------------------
+
+def test_classify_owner_miss_never_snapshotted():
+    ever = set()                       # ext was never put into the overlay
+    assert _classify_owner_miss("reqZ", ever) == "never_snap"
+
+
+def test_classify_owner_miss_pruned():
+    ever = {"reqZ"}                     # ext DID enter the overlay, then was removed before landing
+    assert _classify_owner_miss("reqZ", ever) == "pruned"
+
+
 
 if __name__ == "__main__":
     test_producer_detects_duplicate_across_requests()
@@ -438,6 +455,8 @@ if __name__ == "__main__":
     test_write_returns_false_for_absent_rid()
     test_write_returns_true_and_repoints_resident_rid()
     test_free_is_coupled_to_write_success()
+    test_classify_owner_miss_never_snapshotted()
+    test_classify_owner_miss_pruned()
     print("OK: all mooncake layerwise FF glue tests passed")
 
 
