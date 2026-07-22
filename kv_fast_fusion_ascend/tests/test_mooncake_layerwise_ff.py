@@ -13,6 +13,7 @@ import torch
 from kv_fast_fusion_ascend.connectors.mooncake_layerwise_connector_ff import (
     MooncakeFFProducer,
     _ext_hash,
+    _ff_write_runner_block_table,
     resolve_redirect_rows,
 )
 
@@ -358,6 +359,68 @@ def test_ff_groups_filters_fusion_set():
     assert apply({0}) == set()                           # group 0 is warmup, never eligible
 
 
+# --------------------------------------------------------------------------------------------
+# Write-success coupling: the free MUST be withheld unless the device block table was rewritten.
+# This is the exact invariant the con512 corruption violated — a just-recv'd owner not yet in the
+# step's input_batch had its blocks freed while its table was never repointed, so it decoded
+# against freed-then-reallocated KV. _ff_write_runner_block_table returns whether it wrote; the
+# apply site frees only on True.
+# --------------------------------------------------------------------------------------------
+
+class _FakeBlockTable:
+    def __init__(self, rows, cols):
+        import numpy as np
+        self.num_blocks_per_row = [cols] * rows
+        self.block_table = type("BT", (), {})()
+        self.block_table.np = np.zeros((rows, cols), dtype=np.int64)
+        self.block_table.gpu = torch.zeros(rows, cols, dtype=torch.long)
+
+
+class _FakeReqState:
+    def __init__(self, ngroups, cols):
+        self.block_ids = [[0] * cols for _ in range(ngroups)]
+
+
+class _FakeRunner:
+    """Minimal stand-in for the NPU model runner: only what _ff_write_runner_block_table touches."""
+    def __init__(self, resident_rids, ngroups=2, cols=4):
+        self.input_batch = type("IB", (), {})()
+        self.input_batch.req_id_to_index = {rid: i for i, rid in enumerate(resident_rids)}
+        self.input_batch.block_table = [_FakeBlockTable(len(resident_rids), cols)
+                                        for _ in range(ngroups)]
+        self.requests = {rid: _FakeReqState(ngroups, cols) for rid in resident_rids}
+
+
+def test_write_returns_false_for_absent_rid():
+    """An owner not in this step's input_batch → no write, so the caller must withhold the free."""
+    runner = _FakeRunner(["reqA"])
+    assert _ff_write_runner_block_table(runner, "reqGHOST", 1, [100, 101]) is False
+
+
+def test_write_returns_true_and_repoints_resident_rid():
+    runner = _FakeRunner(["reqA"], ngroups=2, cols=4)
+    assert _ff_write_runner_block_table(runner, "reqA", 1, [100, 101]) is True
+    # device mirror (np + gpu) and the request's own block_ids all repointed
+    assert list(runner.input_batch.block_table[1].block_table.np[0, :2]) == [100, 101]
+    assert runner.input_batch.block_table[1].block_table.gpu[0, :2].tolist() == [100, 101]
+    assert runner.requests["reqA"].block_ids[1][:2] == [100, 101]
+
+
+def test_free_is_coupled_to_write_success():
+    """Replays the apply-site decision: `updated` (which drives the scheduler free) gets an entry
+    IFF the write returned True. A resident owner is freed; an absent one is not."""
+    runner = _FakeRunner(["live"])
+    updated = {}
+    owner_not_written = 0
+    for rid, new_blocks in (("live", [100, 101]), ("gone", [200, 201])):
+        if rid is not None and _ff_write_runner_block_table(runner, rid, 1, new_blocks):
+            updated.setdefault(rid, {})[1] = new_blocks
+        else:
+            owner_not_written += 1
+    assert updated == {"live": {1: [100, 101]}}, updated
+    assert owner_not_written == 1
+
+
 
 if __name__ == "__main__":
     test_producer_detects_duplicate_across_requests()
@@ -372,6 +435,9 @@ if __name__ == "__main__":
     test_redirect_channel_push_pull_contract()
     test_ff_groups_parsing()
     test_ff_groups_filters_fusion_set()
+    test_write_returns_false_for_absent_rid()
+    test_write_returns_true_and_repoints_resident_rid()
+    test_free_is_coupled_to_write_success()
     print("OK: all mooncake layerwise FF glue tests passed")
 
 

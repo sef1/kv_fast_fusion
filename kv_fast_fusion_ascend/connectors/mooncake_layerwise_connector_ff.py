@@ -93,15 +93,13 @@ def _parse_groups(raw: str | None):
 # the filter site in _ff_build_group_layers — so this trades a little potential for a lot of
 # producer overhead. Applies to the PRODUCER only; the consumer applies whatever it receives.
 _FF_GROUPS = _parse_groups(os.environ.get("BFF_FF_GROUPS"))
-# A/B knob for the redirect-write predicate. Default 0 = identity only (the rid must still name the
-# same external request). 1 additionally requires the rid to be in `runner.requests`, which is
-# stricter but rejects just-landed owners — see the apply site. Expect `rid_not_live` > 0 and
-# compression DOWN when this is on; it exists to measure that, not as a recommended setting.
-_FF_RID_LIVE = os.environ.get("BFF_FF_RID_LIVE", "0") == "1"
 # SimHash LSH config (ported from kv_fast_fusion/legacy): NUM_LSH_TABLES banded sub-hashes of
 # LSH_BITS_PER_TABLE bits each, from sign() of a fixed-seed random-hyperplane projection.
 _LSH_TABLES = int(os.environ.get("BFF_LSH_TABLES", "16"))
-_LSH_BITS = int(os.environ.get("BFF_LSH_BITS_PER_TABLE", "10"))
+# 16 tables x 20 bits: SimHash P(collision)=1-(1-(1-θ/π)^B)^T keeps ~87% recall at cos 0.95 while
+# random-pair collisions drop ~1000x vs the old 16/10 (1.5e-2 → 1.5e-5) — near-duplicates still
+# merge, dissimilar blocks (the con512 corruption source) no longer do. Retune analysis in the plan.
+_LSH_BITS = int(os.environ.get("BFF_LSH_BITS_PER_TABLE", "20"))
 # Max rep entries kept per fusion group in the LSH index before LRU-evicting the oldest half.
 _LSH_MAX_ENTRIES = int(os.environ.get("BFF_LSH_MAX_ENTRIES", "50000"))
 # Cap on candidates verified per block. Candidates/block grows as TABLES*MAX_ENTRIES/2**BITS, so a
@@ -747,6 +745,33 @@ def resolve_redirect_rows(
     return (owner_blocks if changed else None), n_applied, n_unresolved, 0
 
 
+def _ff_write_runner_block_table(runner, rid, gi, new_blocks) -> bool:
+    """Write the redirected per-group block table into the runner's worker-side mirror so the
+    forward reads the shared blocks. Ports the NCCL connector's ``_pd_write_runner_block_table``.
+
+    Returns True iff the device table was actually rewritten. The caller MUST couple the block
+    free to this return: a rid that is not in this step's ``input_batch`` early-returns here without
+    rewriting, and freeing its blocks anyway leaves the request pointing at freed-then-reallocated
+    KV (aliasing → ramble → F1 and throughput both collapse). Free only when this returns True.
+
+    Module-level (like ``resolve_redirect_rows``) so the coupling is unit-testable off-NPU with a
+    fake runner — this is the exact invariant the con512 corruption violated."""
+    ridx = runner.input_batch.req_id_to_index.get(rid)
+    if ridx is None:
+        return False
+    # NPU `MultiGroupBlockTable.__getitem__(gi)` → the per-group BlockTable (valid on GPU too).
+    bt_obj = runner.input_batch.block_table[gi]
+    n = min(len(new_blocks), int(bt_obj.num_blocks_per_row[ridx]))
+    row = new_blocks[:n]
+    bt_obj.block_table.np[ridx, :n] = row
+    bt_obj.block_table.gpu[ridx, :n] = torch.tensor(
+        row, device=bt_obj.block_table.gpu.device, dtype=bt_obj.block_table.gpu.dtype)
+    st = runner.requests.get(rid)
+    if st is not None and gi < len(st.block_ids):
+        st.block_ids[gi][:n] = row
+    return True
+
+
 # ---------------------------------------------------------------------------------------------
 # Ascend/NPU-only section: the connector subclass + ZMQ side-channel + block-table rewrite.
 # Guarded so the pure glue above stays importable on non-Ascend boxes (for unit tests).
@@ -935,9 +960,9 @@ if _ASCEND_AVAILABLE:
                 self._ff_apply_totals: dict[str, int] = {
                     "applied": 0, "reps_unresolved": 0, "owner_unresident": 0,
                     "owners_deferred": 0, "owners_dropped_post_decode": 0, "apply_calls": 0,
-                    # Resolved-but-not-written rows. `applied` counts a row before the write is
-                    # attempted, so these are the part of `applied` that produced NO actual free.
-                    "rid_stale": 0, "rid_not_live": 0,
+                    # Resolved rows whose device write failed (owner not in input_batch) so the free
+                    # was withheld — the part of `applied` that produced NO actual free.
+                    "owner_not_written": 0,
                     "load_blocks_pruned": 0}
 
         def _ff_build_group_layers(self, worker) -> None:
@@ -1126,10 +1151,11 @@ if _ASCEND_AVAILABLE:
             just_recv_ext = {get_external_request_id(rid) for rid in recving}
             updated: dict[str, dict[int, list[int]]] = {}
             n_applied = n_unresolved = n_owner_missing = n_deferred = n_dropped = 0
-            # Rows that RESOLVED but were not written. These are invisible in `applied` (which is
-            # incremented by resolve_redirect_rows before the write is attempted), so without them a
-            # suppressed write looks like successful compression in the stats.
-            n_rid_stale = n_rid_not_live = 0
+            # Rows that RESOLVED but whose device write failed (owner not in this step's input_batch),
+            # so the free was correctly withheld. Invisible in `applied` (incremented by
+            # resolve_redirect_rows before the write is attempted), so without this a withheld free
+            # would look like successful compression. On a healthy run this is > 0.
+            n_owner_not_written = 0
             leftover: dict[str, dict[int, list]] = {}
             # Rep-lifetime fix: resolve the REP only from LIVE runner state (ext2blocks/hash2ext), not the
             # load-metadata overlay (res_*), so a stale/recycled rep counts as unresolved (owner keeps its
@@ -1149,21 +1175,20 @@ if _ASCEND_AVAILABLE:
                         n_owner_missing += nom
                         if new_blocks is not None:
                             rid = rid_by_ext.get(ext_id)
-                            # IDENTITY, not liveness. rid may come from the load-metadata overlay,
-                            # where it can be stale (slot recycled to another request) — repointing
-                            # then aliases someone else's block table. Requiring the rid to still
-                            # name THIS ext_id rules that out exactly.
-                            # Deliberately NOT `rid in runner.requests`: a just-landed owner (the
-                            # population this apply exists for) is not in runner.requests yet by
-                            # design, so that predicate would silently suppress the merge/free
-                            # below. Kept available as BFF_FF_RID_LIVE=1 for A/B.
-                            if rid is None or get_external_request_id(rid) != ext_id:
-                                n_rid_stale += 1
-                            elif _FF_RID_LIVE and rid not in getattr(runner, "requests", {}):
-                                n_rid_not_live += 1
-                            else:
+                            # Free ONLY if the device block table was actually rewritten. An owner
+                            # whose recv just completed is often not yet in this step's input_batch
+                            # (recving ≠ running): the write early-returns, but freeing its blocks
+                            # anyway leaves it pointing at freed-then-reallocated KV → aliasing →
+                            # ramble → F1 and throughput both drop. Coupling free to write-success
+                            # is the correctness invariant. A not-written owner is dropped, not
+                            # re-queued: the apply window is "recv just completed" (just_recv_ext),
+                            # which will not recur for it, so retry is unsafe anyway — this row
+                            # costs compression, never correctness.
+                            if rid is not None and _ff_write_runner_block_table(
+                                    runner, rid, gi, new_blocks):
                                 updated.setdefault(rid, {})[gi] = new_blocks
-                                self._ff_write_runner_block_table(runner, rid, gi, new_blocks)
+                            else:
+                                n_owner_not_written += 1
                 elif ext_id not in ext2blocks:
                     # Redirect arrived before the owner's KV → keep for the step its recv completes.
                     leftover[ext_id] = groups
@@ -1181,15 +1206,15 @@ if _ASCEND_AVAILABLE:
             if n_applied or n_unresolved or n_owner_missing or n_dropped or _PD_DEBUG or _FF_AUDIT:
                 logger.info("BFF Mooncake apply | redirects_applied=%d | owner_unresident=%d | "
                             "reps_unresolved=%d | owners_deferred=%d | owners_dropped_post_decode=%d | "
-                            "rid_stale=%d | rid_not_live=%d | load_pruned=%d | rep_safe=%d",
+                            "owner_not_written=%d | load_pruned=%d | rep_safe=%d",
                             n_applied, n_owner_missing, n_unresolved, n_deferred,
-                            n_dropped, n_rid_stale, n_rid_not_live, n_load_pruned,
+                            n_dropped, n_owner_not_written, n_load_pruned,
                             int(_FF_REP_SAFE))
             self._ff_record_apply(n_applied, n_unresolved, n_owner_missing, n_deferred, n_dropped,
-                                  n_rid_stale, n_rid_not_live, n_load_pruned)
+                                  n_owner_not_written, n_load_pruned)
 
         def _ff_record_apply(self, n_applied, n_unresolved, n_owner_missing, n_deferred,
-                             n_dropped, n_rid_stale=0, n_rid_not_live=0, n_load_pruned=0) -> None:
+                             n_dropped, n_owner_not_written=0, n_load_pruned=0) -> None:
             """Accumulate this step's apply outcomes and periodically dump them, so the benchmark can
             attribute the gap between redirects shipped and blocks actually freed."""
             t = self._ff_apply_totals
@@ -1198,8 +1223,7 @@ if _ASCEND_AVAILABLE:
             t["owner_unresident"] += n_owner_missing
             t["owners_deferred"] += n_deferred
             t["owners_dropped_post_decode"] += n_dropped
-            t["rid_stale"] += n_rid_stale
-            t["rid_not_live"] += n_rid_not_live
+            t["owner_not_written"] += n_owner_not_written
             t["load_blocks_pruned"] += n_load_pruned
             t["apply_calls"] += 1
             if not _PD_STATS_DIR:
@@ -1214,25 +1238,6 @@ if _ASCEND_AVAILABLE:
                 os.replace(tmp, path)
             except Exception as e:  # pragma: no cover - defensive (must never break the transfer)
                 logger.warning("BFF Mooncake: could not dump apply stats: %s", e)
-
-        @staticmethod
-        def _ff_write_runner_block_table(runner, rid, gi, new_blocks) -> None:
-            """Write the redirected per-group block table into the runner's worker-side mirror so the
-            forward reads the shared blocks. Guarded; ports the NCCL connector's
-            ``_pd_write_runner_block_table`` (NPU tensors)."""
-            ridx = runner.input_batch.req_id_to_index.get(rid)
-            if ridx is None:
-                return
-            # NPU `MultiGroupBlockTable.__getitem__(gi)` → the per-group BlockTable (valid on GPU too).
-            bt_obj = runner.input_batch.block_table[gi]
-            n = min(len(new_blocks), int(bt_obj.num_blocks_per_row[ridx]))
-            row = new_blocks[:n]
-            bt_obj.block_table.np[ridx, :n] = row
-            bt_obj.block_table.gpu[ridx, :n] = torch.tensor(
-                row, device=bt_obj.block_table.gpu.device, dtype=bt_obj.block_table.gpu.dtype)
-            st = runner.requests.get(rid)
-            if st is not None and gi < len(st.block_ids):
-                st.block_ids[gi][:n] = row
 
 
     def register_mooncake_layerwise_ff() -> None:
