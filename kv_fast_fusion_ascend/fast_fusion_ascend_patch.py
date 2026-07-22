@@ -109,6 +109,121 @@ def _bff_apply_block_merge(scheduler, model_runner_output) -> None:
                          exc_info=True)
 
 
+def _ext_of(rid: str) -> str:
+    """External (cross-P/D stable) id of a request id. Uses vllm_ascend's canonical helper on the
+    NPU stack; falls back to stripping the per-server random ``-<8hex>`` suffix (the same transform)
+    off-NPU so the promotion apply is unit-testable."""
+    try:
+        from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
+            get_external_request_id,
+        )
+        return get_external_request_id(rid)
+    except ImportError:
+        return rid.rsplit("-", 1)[0]
+
+
+def _bff_promotion_apply(scheduler, request) -> None:
+    """Apply this request's pending fusion redirect at PROMOTION time — the instant it leaves
+    WAITING_FOR_REMOTE_KVS, before its first schedule.
+
+    Why here: the audit at con512 proved the worker-side apply window is structurally dead — a
+    redirect applied at the owner's recv-completion step fails its device block-table write because
+    the owner joins ``input_batch`` only at its NEXT schedule (owner_not_written ≈ applied), so no
+    blocks were actually freed. At promotion the scheduler still owns the block table: rewriting
+    ``req_to_blocks`` NOW means the worker receives the rewritten table as the request's FULL initial
+    block ids (a newly scheduled request ships complete ids, not a delta) — no device write, no
+    overlay, no write-success coupling. This is also the provably pre-decode window the original
+    apply-timing rule wanted.
+
+    The pending map is the consumer connector's redirect-recv thread, published via
+    ``fast_fusion_block_pool._FF_PENDING_SOURCE`` (same EngineCore process at TP=1 — the
+    ``_ACTIVE_RUNNER`` pattern in reverse). Reps are resolved from the scheduler's OWN state,
+    restricted to load-complete requests: a still-loading rep's blocks exist but its KV content is
+    incomplete, and repointing an owner at half-arrived KV is silent corruption."""
+    from kv_fast_fusion import fast_fusion_block_pool as _bp
+    src = getattr(_bp, "_FF_PENDING_SOURCE", None)
+    if src is None:
+        return
+    # Only plain promotions: a preempted-resume (num_preemptions > 0) re-enters with partial state
+    # and its redirect was computed for a lifetime that no longer exists.
+    if request.status != RequestStatus.WAITING:
+        return
+    ext = _ext_of(request.request_id)
+    with src.lock:
+        groups_rows = src.pending.pop(ext, None)
+    stats = getattr(src, "promo_stats", None)
+    if not groups_rows:
+        if stats is not None:
+            stats["promo_no_rows"] += 1
+        return
+    from kv_fast_fusion_ascend.connectors.mooncake_layerwise_connector_ff import (
+        _ext_hash,
+        resolve_redirect_rows,
+    )
+    managers = scheduler.kv_cache_manager.coordinator.single_type_managers
+
+    def _blocks_of(rid):
+        return [[b.block_id for b in m.req_to_blocks.get(rid, [])] for m in managers]
+
+    ext2blocks = {ext: _blocks_of(request.request_id)}
+    hash2ext = {_ext_hash(ext): ext}
+    # Fetch block tables ONLY for the reps these rows actually reference (a promotion can touch a
+    # handful of reps; materializing all ~max_num_seqs requests × groups every promotion would not).
+    needed = {int(h) for rows in groups_rows.values() for (_o, h, _s) in rows}
+    for rid2, req2 in scheduler.requests.items():
+        if req2.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+            continue                       # rep still loading → KV incomplete → not a valid target
+        ext2 = _ext_of(rid2)
+        h2 = _ext_hash(ext2)
+        if h2 in needed and ext2 not in ext2blocks:
+            ext2blocks[ext2] = _blocks_of(rid2)
+            hash2ext[h2] = ext2
+    merged: dict[int, list[int]] = {}
+    n_applied = n_unresolved = 0
+    for gi, rows in groups_rows.items():
+        new_blocks, na, nu, _nom = resolve_redirect_rows(ext2blocks, hash2ext, ext, int(gi), rows)
+        n_applied += na
+        n_unresolved += nu
+        if new_blocks is not None:
+            merged[int(gi)] = new_blocks
+    if merged:
+        # Existing machinery: rewrites req_to_blocks, touches reps, frees orphans, marks
+        # num_cached_block. Its _BFF_FREE_PRERUNNING gates pass exactly here (status WAITING,
+        # num_computed_tokens set and blocks cached by _update_waiting_for_remote_kv).
+        scheduler._handle_block_merging_with_counts({request.request_id: merged})
+    if stats is not None:
+        stats["promo_applied"] += n_applied
+        stats["promo_unresolved"] += n_unresolved
+        if merged:
+            stats["promo_merge_calls"] += 1
+
+
+def _wrap_scheduler_promotion(scheduler_cls) -> bool:
+    """Wrap ``_try_promote_blocked_waiting_request`` so a successful promotion immediately applies
+    the request's pending fusion redirect (see :func:`_bff_promotion_apply`). Promotion and first
+    schedule happen in the SAME ``schedule()`` iteration, so this is the only pre-first-schedule
+    hook. Idempotent."""
+    orig = scheduler_cls.__dict__.get("_try_promote_blocked_waiting_request")
+    if orig is None:
+        orig = scheduler_cls._try_promote_blocked_waiting_request
+    if getattr(orig, _WRAP_SENTINEL, False):
+        return False
+
+    def _promote(self, request, _orig=orig):
+        promoted = _orig(self, request)
+        if promoted:
+            try:
+                _bff_promotion_apply(self, request)
+            except Exception as e:  # pragma: no cover - never break scheduling
+                logger.warning("BFF Ascend promotion apply failed for %s: %s",
+                               request.request_id, e, exc_info=True)
+        return promoted
+
+    setattr(_promote, _WRAP_SENTINEL, True)
+    scheduler_cls._try_promote_blocked_waiting_request = _promote
+    return True
+
+
 def _wrap_scheduler_update_from_output(cls) -> bool:
     """Wrap ``cls.update_from_output`` (only if the class DEFINES it in its own __dict__) so the BFF
     merge hook runs before the original. Returns True if it wrapped. Idempotent."""
@@ -206,6 +321,11 @@ def apply_fast_fusion_ascend_patch() -> None:
     from vllm.v1.core.sched.scheduler import Scheduler
     from kv_fast_fusion.fast_fusion_scheduler import _handle_block_merging_with_counts
     Scheduler._handle_block_merging_with_counts = _handle_block_merging_with_counts
+    # Promotion-time redirect apply: rewrite the owner's req_to_blocks the instant it leaves
+    # WAITING_FOR_REMOTE_KVS (before first schedule). Consumes the pending map the FF consumer
+    # connector publishes via _FF_PENDING_SOURCE; a no-op on the producer / when unpublished.
+    if _wrap_scheduler_promotion(Scheduler):
+        logger.info("BFF Ascend: promotion-time redirect apply installed on Scheduler.")
 
     # --- 4. NPUModelRunner lean init ---
     try:

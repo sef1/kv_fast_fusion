@@ -93,6 +93,15 @@ def _parse_groups(raw: str | None):
 # the filter site in _ff_build_group_layers — so this trades a little potential for a lot of
 # producer overhead. Applies to the PRODUCER only; the consumer applies whatever it receives.
 _FF_GROUPS = _parse_groups(os.environ.get("BFF_FF_GROUPS"))
+# Promotion-time apply (default ON). The audit at con512 showed the worker-side apply window is
+# structurally dead: a redirect is applied at the owner's recv-completion step, but the owner joins
+# input_batch only at its NEXT schedule, so the device write fails (owner_not_written ≈ applied) and
+# no blocks are actually freed. With this on, the consumer publishes its pending-redirect map to the
+# scheduler (same EngineCore process at TP=1), which resolves + applies at the moment it promotes the
+# owner out of WAITING_FOR_REMOTE_KVS — before the first schedule, so the worker receives the
+# REWRITTEN block table as the request's full initial table. No device write, no overlay needed.
+# 0 = legacy worker-side apply (keep for TP>1, where the scheduler is in another process).
+_FF_PROMO_APPLY = os.environ.get("BFF_FF_PROMO_APPLY", "1") == "1"
 # SimHash LSH config (ported from kv_fast_fusion/legacy): NUM_LSH_TABLES banded sub-hashes of
 # LSH_BITS_PER_TABLE bits each, from sign() of a fixed-seed random-hyperplane projection.
 _LSH_TABLES = int(os.environ.get("BFF_LSH_TABLES", "16"))
@@ -962,6 +971,16 @@ if _ASCEND_AVAILABLE:
                 port = worker.side_channel_port + _FF_PORT_OFFSET + worker.tp_rank
                 self._ff_recv_thread = _FFRedirectRecvThread(host, port)
                 self._ff_recv_thread.start()
+                if _FF_PROMO_APPLY:
+                    # Publish the pending map to the scheduler's promotion hook (same process at
+                    # TP=1; the _ACTIVE_RUNNER pattern in reverse). The hook owns consumption; the
+                    # worker side keeps only the janitor + stats cadence (see get_finished).
+                    self._ff_recv_thread.promo_stats = {
+                        "promo_applied": 0, "promo_unresolved": 0, "promo_no_rows": 0,
+                        "promo_merge_calls": 0, "promo_pending_dropped": 0}
+                    from kv_fast_fusion import fast_fusion_block_pool as _bp
+                    _bp._FF_PENDING_SOURCE = self._ff_recv_thread
+                    logger.info("BFF Mooncake: promotion-time apply ON (pending map published).")
                 # Persistent load-metadata block tables (ext_id -> (rid, local_block_ids)). The
                 # consumer load metadata is transient (scheduler clears _reqs_need_recv each step) but
                 # a request's KV recv completes a LATER step; accumulate here so the owner is still
@@ -1076,18 +1095,38 @@ if _ASCEND_AVAILABLE:
             sending, recving = super().get_finished(finished_req_ids)
             if self._ff_enabled and self._ff_recv_thread is not None:
                 try:
-                    # Snapshot this step's (transient) load metadata EVERY step — the owner's recv
-                    # completes a later step, by which point its metadata has been cleared.
-                    self._ff_snapshot_load_meta(finished_req_ids)
-                    # `recving` = request ids whose KV *just* fully landed this step. Applying a
-                    # redirect only for those requests guarantees we repoint+free BEFORE the owner
-                    # decodes — mirroring the NCCL connector's load-time apply. Draining and applying
-                    # for already-decoding requests frees in-use blocks → pool aliasing → global KV
-                    # corruption (every request garbage → no EOS → runs to max_tokens).
-                    self._ff_apply_pending(recving)
+                    if _FF_PROMO_APPLY:
+                        # Promotion-time apply (scheduler side) owns consumption of the pending map.
+                        # Here: only drop entries whose owner finished (it will never promote) and
+                        # keep the stats-dump cadence. No overlay snapshot, no worker-side apply.
+                        self._ff_promo_janitor(finished_req_ids)
+                    else:
+                        # Legacy worker-side apply (TP>1 fallback). Snapshot this step's (transient)
+                        # load metadata EVERY step — the owner's recv completes a later step, by
+                        # which point its metadata has been cleared. Then apply for `recving` only:
+                        # repoint+free strictly BEFORE the owner decodes (draining for
+                        # already-decoding requests frees in-use blocks → global KV corruption).
+                        self._ff_snapshot_load_meta(finished_req_ids)
+                        self._ff_apply_pending(recving)
                 except Exception as e:  # pragma: no cover - defensive
                     logger.warning("BFF Mooncake consumer apply failed: %s", e)
             return sending, recving
+
+        def _ff_promo_janitor(self, finished_req_ids: set[str]) -> None:
+            """Bound the pending map while the scheduler promotion hook owns consumption: a redirect
+            whose owner FINISHED while loading (or arrived after it finished) has no promotion left
+            to pop it. Also ticks _ff_record_apply so the bff_apply_stats dump (which now carries the
+            promo_* counters) keeps its cadence."""
+            t = self._ff_recv_thread
+            dropped = 0
+            if finished_req_ids:
+                with t.lock:
+                    for fid in finished_req_ids:
+                        if t.pending.pop(get_external_request_id(fid), None) is not None:
+                            dropped += 1
+            if dropped:
+                t.promo_stats["promo_pending_dropped"] += dropped
+            self._ff_record_apply(0, 0, 0, 0, 0)
 
         def _ff_snapshot_load_meta(self, finished_req_ids: set[str]) -> None:
             """Accumulate this step's consumer load-metadata block tables into ``_ff_load_blocks``.
@@ -1157,14 +1196,18 @@ if _ASCEND_AVAILABLE:
                 res_ext2blocks[ext] = lb
                 res_hash2ext[_ext_hash(ext)] = ext
                 rid_by_ext.setdefault(ext, rid)
-            # Prune entries that are neither resident nor still expected: the request left
-            # runner.requests (finished/preempted) AND no redirect is pending for it, so nothing will
-            # ever resolve against it. Without this the overlay grows unboundedly and keeps handing
-            # out block tables for requests whose blocks have been recycled. The `ext not in pending`
-            # guard is what makes this safe — a queued redirect keeps its owner resolvable.
+            # Prune entries that are neither resident, nor still expected, NOR STILL IN FLIGHT.
+            # The audit run proved the in-flight guard is load-bearing (ownmiss_never_snap=0,
+            # ownmiss_pruned=709 of ~920 pruned): a still-RECEIVING request is not in runner.requests
+            # (never scheduled yet) and, if its redirect simply hasn't arrived, not in `pending`
+            # either — pruning it here destroys the only block table that can resolve it when its
+            # recv lands. The base worker's `request_map` (ext → rid; inserted at start_load_kv,
+            # popped at recv completion) is exactly the in-flight set.
+            in_flight = getattr(self.connector_worker, "request_map", {})
             n_load_pruned = 0
             for ext in [e for e, (rid, _lb) in self._ff_load_blocks.items()
-                        if rid not in getattr(runner, "requests", {}) and e not in pending]:
+                        if rid not in getattr(runner, "requests", {}) and e not in pending
+                        and e not in in_flight]:
                 del self._ff_load_blocks[ext]
                 res_ext2blocks.pop(ext, None)
                 res_hash2ext.pop(_ext_hash(ext), None)
@@ -1275,7 +1318,10 @@ if _ASCEND_AVAILABLE:
                 path = os.path.join(_PD_STATS_DIR, f"bff_apply_stats_{os.getpid()}.json")
                 tmp = path + ".tmp"
                 with open(tmp, "w") as f:
-                    json.dump({"pid": os.getpid(), **t}, f)
+                    # promo_* counters live on the recv thread (the scheduler promotion hook
+                    # increments them in-process); merge them into the same stats file.
+                    promo = getattr(self._ff_recv_thread, "promo_stats", None) or {}
+                    json.dump({"pid": os.getpid(), **t, **promo}, f)
                 os.replace(tmp, path)
             except Exception as e:  # pragma: no cover - defensive (must never break the transfer)
                 logger.warning("BFF Mooncake: could not dump apply stats: %s", e)

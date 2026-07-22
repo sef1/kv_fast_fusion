@@ -9,6 +9,13 @@ import os
 # EngineCore process for TP=1) can evict freed block IDs from the LSH dedup registry.
 _ACTIVE_RUNNER = None
 
+# Set by the Ascend mooncake FF consumer connector (worker side, same EngineCore process at TP=1)
+# to its redirect-recv thread, so the SCHEDULER's promotion hook can pop pending redirect rows for
+# a request the moment it leaves WAITING_FOR_REMOTE_KVS — before its first schedule, when its
+# req_to_blocks rewrite still reaches the worker as a full (not delta) block table. The mirror
+# image of _ACTIVE_RUNNER. None ⇒ promotion-time apply unavailable (e.g. TP>1: other process).
+_FF_PENDING_SOURCE = None
+
 # When set, do NOT eagerly evict a freed block from the prefix cache on ref-0 free — keep it
 # cached (stock vLLM does this lazy eviction) so a preempted request can recover it on resume
 # instead of recomputing the prefill. Safe in raw/ratio (KV is not mutated, so the cached block

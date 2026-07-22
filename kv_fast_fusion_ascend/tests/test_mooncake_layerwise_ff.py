@@ -438,6 +438,154 @@ def test_classify_owner_miss_pruned():
     assert _classify_owner_miss("reqZ", ever) == "pruned"
 
 
+# --------------------------------------------------------------------------------------------
+# Promotion-time apply (_bff_promotion_apply): the owner's req_to_blocks must be rewritten at the
+# instant it leaves WAITING_FOR_REMOTE_KVS — before its first schedule — via the existing
+# _handle_block_merging_with_counts machinery. The con512 audit proved the old recv-step window is
+# structurally dead (owner joins input_batch only at the NEXT schedule → device write fails →
+# nothing is ever freed).
+# --------------------------------------------------------------------------------------------
+import threading
+
+from vllm.v1.request import RequestStatus
+
+import kv_fast_fusion.fast_fusion_block_pool as _bp_mod
+from kv_fast_fusion_ascend.fast_fusion_ascend_patch import _bff_promotion_apply
+
+
+class _FakeSource:
+    """Stands in for the published _FFRedirectRecvThread: lock + pending + promo_stats."""
+    def __init__(self, pending):
+        self.lock = threading.Lock()
+        self.pending = pending
+        self.promo_stats = {"promo_applied": 0, "promo_unresolved": 0, "promo_no_rows": 0,
+                            "promo_merge_calls": 0, "promo_pending_dropped": 0}
+
+
+class _FakeBlock:
+    def __init__(self, bid):
+        self.block_id = bid
+
+
+class _FakeManager:
+    def __init__(self, req_to_blocks):
+        self.req_to_blocks = {rid: [_FakeBlock(b) for b in bids]
+                              for rid, bids in req_to_blocks.items()}
+
+
+class _FakeSchedReq:
+    def __init__(self, status):
+        self.status = status
+
+
+class _FakeScheduler:
+    """Only what _bff_promotion_apply touches; _handle_block_merging_with_counts is recorded."""
+    def __init__(self, requests, managers):
+        self.requests = requests
+        self.kv_cache_manager = type("KM", (), {})()
+        self.kv_cache_manager.coordinator = type("CO", (), {})()
+        self.kv_cache_manager.coordinator.single_type_managers = managers
+        self.merge_calls = []
+
+    def _handle_block_merging_with_counts(self, request_blocks):
+        self.merge_calls.append(request_blocks)
+
+
+def test_promotion_apply_rewrites_and_feeds_merge():
+    # Owner "own-abcd1234" (ext "own") promoted with a pending redirect: group1 slot0 -> rep slot0.
+    # Rep "rep-abcd1234" (ext "rep") is load-complete (RUNNING). Expect the merge machinery to be
+    # fed {owner_rid: {1: [rep_block, own_block1]}} and the pending entry consumed.
+    owner_rid, rep_rid = "own-abcd1234", "rep-abcd1234"
+    pending = {"own": {1: [[0, _ext_hash("rep"), 0]]}}
+    managers = [_FakeManager({}),                                            # group 0 (warmup)
+                _FakeManager({owner_rid: [200, 201], rep_rid: [100, 101]})]  # group 1
+    requests = {rep_rid: _FakeSchedReq(RequestStatus.RUNNING)}
+    src = _FakeSource(pending)
+    sched = _FakeScheduler(requests, managers)
+    prev = _bp_mod._FF_PENDING_SOURCE
+    _bp_mod._FF_PENDING_SOURCE = src
+    try:
+        owner = _FakeSchedReq(RequestStatus.WAITING)
+        owner.request_id = owner_rid
+        _bff_promotion_apply(sched, owner)
+    finally:
+        _bp_mod._FF_PENDING_SOURCE = prev
+    assert sched.merge_calls == [{owner_rid: {1: [100, 201]}}], sched.merge_calls
+    assert src.pending == {}                                   # consumed exactly once
+    assert src.promo_stats["promo_applied"] == 1
+    assert src.promo_stats["promo_merge_calls"] == 1
+    assert src.promo_stats["promo_unresolved"] == 0
+
+
+def test_promotion_apply_skips_still_loading_rep():
+    # The rep is still WAITING_FOR_REMOTE_KVS: its blocks exist but its KV is half-arrived.
+    # Repointing there would be silent corruption → the row must count unresolved, no merge fed.
+    owner_rid, rep_rid = "own-abcd1234", "rep-abcd1234"
+    pending = {"own": {1: [[0, _ext_hash("rep"), 0]]}}
+    managers = [_FakeManager({}),
+                _FakeManager({owner_rid: [200, 201], rep_rid: [100, 101]})]
+    requests = {rep_rid: _FakeSchedReq(RequestStatus.WAITING_FOR_REMOTE_KVS)}
+    src = _FakeSource(pending)
+    sched = _FakeScheduler(requests, managers)
+    prev = _bp_mod._FF_PENDING_SOURCE
+    _bp_mod._FF_PENDING_SOURCE = src
+    try:
+        owner = _FakeSchedReq(RequestStatus.WAITING)
+        owner.request_id = owner_rid
+        _bff_promotion_apply(sched, owner)
+    finally:
+        _bp_mod._FF_PENDING_SOURCE = prev
+    assert sched.merge_calls == []
+    assert src.promo_stats["promo_unresolved"] == 1
+    assert src.promo_stats["promo_applied"] == 0
+
+
+def test_promotion_apply_no_rows_is_noop():
+    owner = _FakeSchedReq(RequestStatus.WAITING)
+    owner.request_id = "own-abcd1234"
+    src = _FakeSource({})
+    sched = _FakeScheduler({}, [_FakeManager({})])
+    prev = _bp_mod._FF_PENDING_SOURCE
+    _bp_mod._FF_PENDING_SOURCE = src
+    try:
+        _bff_promotion_apply(sched, owner)
+    finally:
+        _bp_mod._FF_PENDING_SOURCE = prev
+    assert sched.merge_calls == []
+    assert src.promo_stats["promo_no_rows"] == 1
+
+
+def test_promotion_apply_skips_preempted_resume():
+    # A preempted-resume re-enters with partial state; its redirect targeted a dead lifetime.
+    # The pending entry must NOT be consumed (the janitor drops it on finish).
+    owner = _FakeSchedReq(RequestStatus.PREEMPTED)
+    owner.request_id = "own-abcd1234"
+    pending = {"own": {1: [[0, _ext_hash("rep"), 0]]}}
+    src = _FakeSource(pending)
+    sched = _FakeScheduler({}, [_FakeManager({})])
+    prev = _bp_mod._FF_PENDING_SOURCE
+    _bp_mod._FF_PENDING_SOURCE = src
+    try:
+        _bff_promotion_apply(sched, owner)
+    finally:
+        _bp_mod._FF_PENDING_SOURCE = prev
+    assert sched.merge_calls == []
+    assert src.pending == pending          # untouched
+
+
+def test_promotion_apply_unpublished_source_is_noop():
+    owner = _FakeSchedReq(RequestStatus.WAITING)
+    owner.request_id = "own-abcd1234"
+    sched = _FakeScheduler({}, [_FakeManager({})])
+    prev = _bp_mod._FF_PENDING_SOURCE
+    _bp_mod._FF_PENDING_SOURCE = None
+    try:
+        _bff_promotion_apply(sched, owner)     # must not raise
+    finally:
+        _bp_mod._FF_PENDING_SOURCE = prev
+    assert sched.merge_calls == []
+
+
 
 if __name__ == "__main__":
     test_producer_detects_duplicate_across_requests()
@@ -457,6 +605,11 @@ if __name__ == "__main__":
     test_free_is_coupled_to_write_success()
     test_classify_owner_miss_never_snapshotted()
     test_classify_owner_miss_pruned()
+    test_promotion_apply_rewrites_and_feeds_merge()
+    test_promotion_apply_skips_still_loading_rep()
+    test_promotion_apply_no_rows_is_noop()
+    test_promotion_apply_skips_preempted_resume()
+    test_promotion_apply_unpublished_source_is_noop()
     print("OK: all mooncake layerwise FF glue tests passed")
 
 
