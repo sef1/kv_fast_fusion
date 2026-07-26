@@ -234,6 +234,16 @@ class MooncakeFFProducer:
         self.steps = 0                        # scheduler steps seen (approximate; via metadata id())
         self.group_completions = 0            # group finishes seen (true denominator for overhead avg)
         self.dedup_ms = 0.0                   # cumulative clustering time (ms), for overhead avg
+        # Skip-transfer accounting (Stage 0 — prices the bandwidth bet with NO wire change).
+        # Everything in BLOCK-LAYER units (block_bytes is uniform in raw mode, so it cancels in the
+        # ratio). total_block_layers = every block × every layer actually transferred (all groups,
+        # the honest denominator). layers_per_group[gi] lets redirect COUNTS (per-block, decided at
+        # group completion) convert to block-layers a skip would save across the group's layers.
+        # skip_fraction = Σ redir[gi]×layers[gi] / total_block_layers = the GROSS bandwidth ceiling;
+        # multiply by the consumer's promo_applied/(applied+rep_gone) (from bff_apply_stats) for the
+        # SAFE realizable prize. No consumer/base-connector edit needed.
+        self.total_block_layers = 0
+        self.layers_per_group: dict[int, int] = {}
         # Cross-batch encoded registry (MATRIX backend only): gi -> rolling window of the last
         # _PD_ENCODED_BATCH distinct requests' representative block K-reps (raw mode). Empty/unused
         # under the "lsh" backend, whose pool is bounded by BFF_LSH_MAX_ENTRIES instead.
@@ -251,6 +261,12 @@ class MooncakeFFProducer:
             self._cur_step_id = step_id
             self._buf.clear()
             self.steps += 1
+
+    def note_transferred(self, n_block_layers: int) -> None:
+        """Skip-transfer accounting (Stage 0): tally the blocks transferred for ONE layer (any group,
+        fusion or not) so ``total_block_layers`` is the honest wire-bytes denominator. Called per
+        layer before the fusion-group filter — see ``_ff_producer_accumulate``."""
+        self.total_block_layers += n_block_layers
 
     def on_layer(
         self,
@@ -271,6 +287,7 @@ class MooncakeFFProducer:
         """
         if not isinstance(caches, (list, tuple)):
             caches = (caches,)
+        self.layers_per_group[gi] = len(group_layer_names)   # skip-transfer accounting (Stage 0)
         dev = caches[0].device
         buf = self._buf.get(gi)
         if buf is None:
@@ -722,6 +739,17 @@ class MooncakeFFProducer:
                 "accept_cos_hist": {
                     str(gi): dict(zip(_ACCEPT_COS_LABELS, hist))
                     for gi, hist in sorted(self._accept_cos.items())},
+                # Skip-transfer bandwidth ceiling (Stage 0), in block-layer units:
+                #   skip_block_layers = Σ redir[gi] × layers_per_group[gi]  (blocks a skip would
+                #     omit, across all their group's layers)
+                #   total_block_layers = every block × every layer actually transferred
+                #   skip_bandwidth_fraction = the GROSS ceiling; × (promo_applied/(applied+rep_gone))
+                #     from bff_apply_stats gives the SAFE realizable prize.
+                "skip_block_layers": (
+                    _skip_bl := sum(self.redir_total.get(gi, 0) * self.layers_per_group.get(gi, 1)
+                                    for gi in self.redir_total)),
+                "total_block_layers": self.total_block_layers,
+                "skip_bandwidth_fraction": _skip_bl / max(1, self.total_block_layers),
             }
             path = os.path.join(stats_dir, f"bff_stats_{os.getpid()}.json")
             tmp = path + ".tmp"
@@ -1080,6 +1108,12 @@ if _ASCEND_AVAILABLE:
             if self._ff_group_layers is None:
                 self._ff_build_group_layers(worker)
             gi = worker.layer_metadata[layer_name].tensor_group_idx[0]
+            # Skip-transfer accounting (Stage 0): tally THIS layer's transferred blocks across ALL
+            # groups (fusion or not) — the honest wire-bytes denominator — BEFORE the fusion filter.
+            n_block_layers = sum(
+                len(rm.local_block_ids[gi]) for rm in connector_metadata.requests.values()
+                if gi < len(rm.local_block_ids))
+            self._ff_producer.note_transferred(n_block_layers)
             if gi not in self._ff_fusion_groups:
                 return
             self._ff_producer.reset_step(id(connector_metadata))

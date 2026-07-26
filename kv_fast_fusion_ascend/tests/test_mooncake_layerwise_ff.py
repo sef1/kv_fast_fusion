@@ -674,6 +674,27 @@ def test_promotion_apply_unpublished_source_is_noop():
     assert sched.merge_calls == []
 
 
+def test_skip_transfer_bandwidth_accounting():
+    # Stage 0: the GROSS skip-transfer ceiling in block-layer units. Group 0 (warmup, non-fusion)
+    # contributes to the denominator only; group 1 (3 layers) redirects 3 blocks → each skip omits
+    # all 3 of its group's layers. fraction = Σ redir×layers / total = (3×3)/40.
+    import tempfile, os, json
+    from kv_fast_fusion_ascend.connectors import mooncake_layerwise_connector_ff as m
+    prod = m.MooncakeFFProducer()
+    for _ in range(2):
+        prod.note_transferred(8)             # group 0: 2 layers × 8 blocks (denominator only)
+    for _ in range(3):
+        prod.note_transferred(8)             # group 1: 3 layers × 8 blocks
+    prod.redir_total[1] = 3
+    prod.blk_total[1] = 8
+    prod.layers_per_group[1] = 3
+    d = tempfile.mkdtemp()
+    prod.dump_stats(d)
+    s = json.load(open(os.path.join(d, f"bff_stats_{os.getpid()}.json")))
+    assert s["total_block_layers"] == 40, s["total_block_layers"]
+    assert s["skip_block_layers"] == 9, s["skip_block_layers"]
+    assert abs(s["skip_bandwidth_fraction"] - 9 / 40) < 1e-9, s["skip_bandwidth_fraction"]
+
 
 if __name__ == "__main__":
     test_producer_detects_duplicate_across_requests()
@@ -698,6 +719,7 @@ if __name__ == "__main__":
     test_promotion_apply_skips_still_loading_rep()
     test_promotion_apply_classifies_rep_gone()
     test_promotion_apply_mixed_split_sums_to_unresolved()
+    test_skip_transfer_bandwidth_accounting()
     test_promotion_apply_no_rows_is_noop()
     test_promotion_apply_skips_preempted_resume()
     test_promotion_apply_unpublished_source_is_noop()
