@@ -491,7 +491,24 @@ class _FakeSource:
         self.pending = pending
         self.promo_stats = {"promo_applied": 0, "promo_unresolved": 0, "promo_no_rows": 0,
                             "promo_merge_calls": 0, "promo_pending_dropped": 0,
-                            "promo_unres_rep_loading": 0, "promo_unres_rep_gone": 0}
+                            "promo_unres_rep_loading": 0, "promo_unres_rep_gone": 0,
+                            "repgone_revive_live": 0, "repgone_revive_cached": 0,
+                            "repgone_truly_gone": 0, "repgone_no_history": 0}
+
+
+class _FakeKVBlock:
+    def __init__(self, ref_cnt=0, block_hash=None):
+        self.ref_cnt = ref_cnt
+        self.block_hash = block_hash
+
+
+class _FakePool:
+    """Minimal BlockPool stand-in: .blocks indexed by block_id (list, like the real pool)."""
+    def __init__(self, blocks_by_id):
+        n = max(blocks_by_id) + 1
+        self.blocks = [_FakeKVBlock() for _ in range(n)]
+        for bid, blk in blocks_by_id.items():
+            self.blocks[bid] = blk
 
 
 class _FakeBlock:
@@ -512,11 +529,12 @@ class _FakeSchedReq:
 
 class _FakeScheduler:
     """Only what _bff_promotion_apply touches; _handle_block_merging_with_counts is recorded."""
-    def __init__(self, requests, managers):
+    def __init__(self, requests, managers, block_pool=None):
         self.requests = requests
         self.kv_cache_manager = type("KM", (), {})()
         self.kv_cache_manager.coordinator = type("CO", (), {})()
         self.kv_cache_manager.coordinator.single_type_managers = managers
+        self.kv_cache_manager.coordinator.block_pool = block_pool
         self.merge_calls = []
 
     def _handle_block_merging_with_counts(self, request_blocks):
@@ -674,6 +692,60 @@ def test_promotion_apply_unpublished_source_is_noop():
     assert sched.merge_calls == []
 
 
+def test_promotion_repgone_revivability_buckets():
+    # Stage 1a: a rep-gone row (rep finished → absent from scheduler.requests) is classified by
+    # whether its OLD physical block still holds KV, via _REP_HISTORY + the pool. Owner block at
+    # group1 slot0 → rep "goner" slot0, whose old block id is 100. Vary the pool state of block 100.
+    import kv_fast_fusion_ascend.fast_fusion_ascend_patch as _fp
+    owner_rid = "own-abcd1234"
+    rep_ext, rep_bid = "goner", 100
+
+    def _run(block100):
+        _fp._REP_HISTORY.clear()
+        _fp._REP_HISTORY[_ext_hash(rep_ext)] = [[], [rep_bid]]     # rep's OLD blocks: gi1 slot0 = 100
+        pending = {"own": {1: [[0, _ext_hash(rep_ext), 0]]}}
+        managers = [_FakeManager({}), _FakeManager({owner_rid: [200, 201]})]  # rep NOT in managers
+        pool = _FakePool({rep_bid: block100})
+        src = _FakeSource(pending)
+        sched = _FakeScheduler({}, managers, block_pool=pool)       # rep absent from live requests
+        prev = _bp_mod._FF_PENDING_SOURCE
+        _bp_mod._FF_PENDING_SOURCE = src
+        try:
+            owner = _FakeSchedReq(RequestStatus.WAITING)
+            owner.request_id = owner_rid
+            _bff_promotion_apply(sched, owner)
+        finally:
+            _bp_mod._FF_PENDING_SOURCE = prev
+        return src.promo_stats
+
+    s = _run(_FakeKVBlock(ref_cnt=2, block_hash=None))
+    assert s["promo_unres_rep_gone"] == 1 and s["repgone_revive_live"] == 1, s
+
+    s = _run(_FakeKVBlock(ref_cnt=0, block_hash=("h",)))
+    assert s["repgone_revive_cached"] == 1 and s["repgone_revive_live"] == 0, s
+
+    s = _run(_FakeKVBlock(ref_cnt=0, block_hash=None))
+    assert s["repgone_truly_gone"] == 1, s
+
+    # No history for the rep → no_history bucket (window too small in the real run).
+    _fp._REP_HISTORY.clear()
+    pending = {"own": {1: [[0, _ext_hash("unknown"), 0]]}}
+    managers = [_FakeManager({}), _FakeManager({owner_rid: [200, 201]})]
+    src = _FakeSource(pending)
+    sched = _FakeScheduler({}, managers, block_pool=_FakePool({0: _FakeKVBlock()}))
+    prev = _bp_mod._FF_PENDING_SOURCE
+    _bp_mod._FF_PENDING_SOURCE = src
+    try:
+        owner = _FakeSchedReq(RequestStatus.WAITING)
+        owner.request_id = owner_rid
+        _bff_promotion_apply(sched, owner)
+    finally:
+        _bp_mod._FF_PENDING_SOURCE = prev
+    assert src.promo_stats["repgone_no_history"] == 1, src.promo_stats
+    # The owner recorded ITSELF into the ring (available as a rep for future owners).
+    assert _ext_hash("own") in _fp._REP_HISTORY
+
+
 def test_skip_transfer_bandwidth_accounting():
     # Stage 0: the GROSS skip-transfer ceiling in block-layer units. Group 0 (warmup, non-fusion)
     # contributes to the denominator only; group 1 (3 layers) redirects 3 blocks → each skip omits
@@ -720,6 +792,7 @@ if __name__ == "__main__":
     test_promotion_apply_classifies_rep_gone()
     test_promotion_apply_mixed_split_sums_to_unresolved()
     test_skip_transfer_bandwidth_accounting()
+    test_promotion_repgone_revivability_buckets()
     test_promotion_apply_no_rows_is_noop()
     test_promotion_apply_skips_preempted_resume()
     test_promotion_apply_unpublished_source_is_noop()

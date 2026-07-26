@@ -1038,7 +1038,10 @@ if _ASCEND_AVAILABLE:
                         "promo_merge_calls": 0, "promo_pending_dropped": 0,
                         # Split of promo_unresolved by cause (their sum should equal it):
                         # rep still WAITING_FOR_REMOTE_KVS vs rep no longer in scheduler.requests.
-                        "promo_unres_rep_loading": 0, "promo_unres_rep_gone": 0}
+                        "promo_unres_rep_loading": 0, "promo_unres_rep_gone": 0,
+                        # Stage 1a: revivability split of rep-gone (sum == promo_unres_rep_gone).
+                        "repgone_revive_live": 0, "repgone_revive_cached": 0,
+                        "repgone_truly_gone": 0, "repgone_no_history": 0}
                     from kv_fast_fusion import fast_fusion_block_pool as _bp
                     _bp._FF_PENDING_SOURCE = self._ff_recv_thread
                     logger.info("BFF Mooncake: promotion-time apply ON (pending map published).")

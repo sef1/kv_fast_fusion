@@ -31,6 +31,44 @@ _BFF_DEBUG = os.environ.get("BFF_PD_DEBUG", "0") == "1"
 # Marks a wrapped update_from_output / __init__ so re-applying the patch is a no-op.
 _WRAP_SENTINEL = "_bff_ascend_wrapped"
 
+# Stage 1a (skip-transfer): a bounded ring of recently-promoted requests' OWN per-group physical
+# block ids, keyed by _ext_hash(ext). When a later owner's rep has already FINISHED (rep-gone), its
+# live block table is gone — but this ring still holds the rep's OLD block ids, so we can look up
+# the physical block and ask the pool whether its KV is still intact (ref_cnt / cached) → split
+# rep-gone into revivable vs truly-gone. This MEASURES the revival opportunity before we build the
+# (cheap re-ref vs costly pin-at-arrival) mechanism. Read-only w.r.t. apply behavior. Scheduler
+# thread only (single-writer at TP=1) so a plain OrderedDict needs no lock.
+from collections import OrderedDict
+
+_REP_HISTORY: "OrderedDict[int, list[list[int]]]" = OrderedDict()
+_REP_HISTORY_CAP = int(os.environ.get("BFF_FF_REP_HISTORY_CAP", "4096"))
+
+
+def _rep_history_record(ext_hash: int, blocks_by_group: list[list[int]]) -> None:
+    """Record a promoted request's own per-group block ids, evicting the oldest past the cap."""
+    _REP_HISTORY[ext_hash] = blocks_by_group
+    _REP_HISTORY.move_to_end(ext_hash)
+    while len(_REP_HISTORY) > _REP_HISTORY_CAP:
+        _REP_HISTORY.popitem(last=False)
+
+
+def _rep_gone_bucket(block_pool, ext_hash: int, gi: int, rep_slot: int) -> str:
+    """Classify a rep-gone row by whether its old physical block still holds valid KV. Returns one
+    of: no_history | truly_gone | revive_live (ref_cnt>0) | revive_cached (freed but hash kept)."""
+    old = _REP_HISTORY.get(ext_hash)
+    if old is None or gi >= len(old) or not (0 <= rep_slot < len(old[gi])):
+        return "no_history"
+    bid = old[gi][rep_slot]
+    try:
+        blk = block_pool.blocks[bid]
+    except (IndexError, AttributeError, TypeError):
+        return "no_history"
+    if blk.ref_cnt > 0:
+        return "revive_live"        # something still references it → KV intact
+    if blk.block_hash is not None:
+        return "revive_cached"      # freed but not yet reused (hash kept) → optimistically revivable
+    return "truly_gone"             # ref_cnt 0 and hash dropped → reused/overwritten
+
 
 def _bff_apply_block_merge(scheduler, model_runner_output) -> None:
     """Run BFF's consumer-side block-merge for this step, then leave the rest of the scheduler's
@@ -167,6 +205,11 @@ def _bff_promotion_apply(scheduler, request) -> None:
 
     ext2blocks = {ext: _blocks_of(request.request_id)}
     hash2ext = {_ext_hash(ext): ext}
+    # Stage 1a: record THIS request's own blocks so it is a resolvable rep for future owners even
+    # after it finishes (see _rep_gone_bucket). Cheap; scheduler-thread only.
+    _rep_history_record(_ext_hash(ext), ext2blocks[ext])
+    block_pool = getattr(getattr(scheduler.kv_cache_manager, "coordinator", None),
+                         "block_pool", None)
     # Fetch block tables ONLY for the reps these rows actually reference (a promotion can touch a
     # handful of reps; materializing all ~max_num_seqs requests × groups every promotion would not).
     needed = {int(h) for rows in groups_rows.values() for (_o, h, _s) in rows}
@@ -191,14 +234,19 @@ def _bff_promotion_apply(scheduler, request) -> None:
             merged[int(gi)] = new_blocks
     # Attribute every unresolved row to exactly one of the two possible causes — the fixes differ
     # completely (rep finished → rep-lifetime work; rep still loading → defer/retry ordering work).
+    # For rep-gone, further split (Stage 1a) by whether the rep's old physical block is still
+    # revivable — this decides the Stage 1b mechanism (cheap re-ref vs costly pin-at-arrival).
     n_rep_loading = n_rep_gone = 0
-    for rows in groups_rows.values():
-        for (_o, h, _s) in rows:
+    rev = {"no_history": 0, "truly_gone": 0, "revive_live": 0, "revive_cached": 0}
+    for gi, rows in groups_rows.items():
+        for (_o, h, rep_slot) in rows:
             if int(h) not in hash2ext:
                 if int(h) in loading_hashes:
                     n_rep_loading += 1
                 else:
                     n_rep_gone += 1
+                    if block_pool is not None:
+                        rev[_rep_gone_bucket(block_pool, int(h), int(gi), int(rep_slot))] += 1
     if n_rep_loading + n_rep_gone != n_unresolved:
         # A third cause would mean resolve_redirect_rows rejects rows for a reason this
         # classification doesn't model — surface it rather than letting it hide in either bucket.
@@ -215,6 +263,12 @@ def _bff_promotion_apply(scheduler, request) -> None:
         stats["promo_unresolved"] += n_unresolved
         stats["promo_unres_rep_loading"] = stats.get("promo_unres_rep_loading", 0) + n_rep_loading
         stats["promo_unres_rep_gone"] = stats.get("promo_unres_rep_gone", 0) + n_rep_gone
+        # Stage 1a: revivability split of rep-gone (their sum == n_rep_gone). Names the Stage 1b
+        # mechanism: revive_live+revive_cached large → cheap re-ref; truly_gone large → pin-at-arrival.
+        stats["repgone_revive_live"] = stats.get("repgone_revive_live", 0) + rev["revive_live"]
+        stats["repgone_revive_cached"] = stats.get("repgone_revive_cached", 0) + rev["revive_cached"]
+        stats["repgone_truly_gone"] = stats.get("repgone_truly_gone", 0) + rev["truly_gone"]
+        stats["repgone_no_history"] = stats.get("repgone_no_history", 0) + rev["no_history"]
         if merged:
             stats["promo_merge_calls"] += 1
 
