@@ -380,7 +380,10 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
         )
 
         def inject_kv_into_layer(layer, kv_cache, block_ids, request_id, layer_attn_metadata):
-            if isinstance(layer_attn_metadata, MLACommonMetadata) or layer.shape[1] == 2:
+            # ndim==3 robustly identifies MLA (rank-3 latent) even if the per-layer isinstance
+            # doesn't hold; std attention is rank-5 so this OR never fires for it. See the stock
+            # p2p_nccl_connector patch (2026-07-23) for why isinstance alone silently dropped MLA KV.
+            if layer.ndim == 3 or isinstance(layer_attn_metadata, MLACommonMetadata) or layer.shape[1] == 2:
                 num_block = kv_cache.shape[0]
                 self.check_tensors_except_dim(layer, kv_cache, 0)
                 if len(block_ids) == num_block:
@@ -627,7 +630,7 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
 
         def extract_kv_from_layer(layer, block_ids):
             if _PD_DEBUG or _PD_TRACE:
-                dim = 0 if (isinstance(attn_metadata, MLACommonMetadata) or layer.shape[1] == 2) else 1
+                dim = 0 if (layer.ndim == 3 or isinstance(attn_metadata, MLACommonMetadata) or layer.shape[1] == 2) else 1
                 bound = layer.shape[dim]
                 bmin = int(block_ids.min().item()) if len(block_ids) else None
                 bmax = int(block_ids.max().item()) if len(block_ids) else None
@@ -637,10 +640,12 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
                     "block_ids=[%s,%s] | layer.shape=%s | bound(dim%d)=%d | OOB=%s",
                     layer_name, gi, len(block_ids), bmin, bmax,
                     tuple(layer.shape), dim, bound, oob)
-            if isinstance(attn_metadata, MLACommonMetadata) or layer.shape[1] == 2:
+            if layer.ndim == 3 or isinstance(attn_metadata, MLACommonMetadata) or layer.shape[1] == 2:
                 return layer[block_ids, ...]
             if layer.shape[0] == 2:  # FlashAttention
                 return layer[:, block_ids, ...]
+            logger.error("🚧BFF P/D: unsupported KV layout shape=%s ndim=%d — KV not sent",
+                         tuple(layer.shape), layer.ndim)
             return None
 
         connector_metadata = self._get_connector_metadata()
@@ -670,7 +675,7 @@ class P2pNcclConnectorFF(P2pNcclConnector, SupportsHMA):
         # map. KV data is still sent per-layer above (no wire-dedup yet); D applies the map to
         # share physical blocks and free the redundant copies.
         if self._pd_fuse and gi > 0:
-            is_mla = isinstance(attn_metadata, MLACommonMetadata) or kv_layer.shape[1] == 2
+            is_mla = kv_layer.ndim == 3 or isinstance(attn_metadata, MLACommonMetadata) or kv_layer.shape[1] == 2
             self._pd_producer_accumulate(gi, layer_name, kv_layer, connector_metadata, is_mla)
 
     # ------------------------------------------------------------------

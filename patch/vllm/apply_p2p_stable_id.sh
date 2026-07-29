@@ -163,6 +163,54 @@ sub(
     "B2/2 consumer resume tolerates new_block_ids=None",
 )
 
+# ---------------------------------------------------------------- Part C: MLA layout dispatch
+# The stock connector dispatches KV layout via `isinstance(attn_metadata, MLACommonMetadata)`. On
+# the CONSUMER path attn_metadata is forward_context.attn_metadata — a dict[str, AttentionMetadata]
+# — so that check is ALWAYS False, and an MLA cache (rank-3 [num_blocks, block_size, head_dim] with
+# both block_size and num_blocks ≠ 2) matches NEITHER branch → KV is silently never injected →
+# decode runs on empty blocks (DeepSeek-V2-Lite: F1 0.05 P/D vs 0.72 single-server, 2026-07-23).
+# Dispatch by tensor RANK instead: ndim==3 uniquely identifies MLA (std attention is rank-5);
+# FlashInfer keeps shape[1]==2. Both index dim 0.
+
+sub(
+    '''            if (
+                isinstance(attn_metadata, MLACommonMetadata) or layer.shape[1] == 2
+            ):  # MLA or FlashInfer
+                num_block = kv_cache.shape[0]''',
+    '''            if (
+                layer.ndim == 3 or layer.shape[1] == 2
+            ):  # MLA (rank-3) or FlashInfer  [C: was dead isinstance(attn_metadata,...)]
+                num_block = kv_cache.shape[0]''',
+    "C1/2 inject_kv_into_layer dispatches MLA by rank",
+)
+
+sub(
+    '''            if (
+                isinstance(attn_metadata, MLACommonMetadata) or layer.shape[1] == 2
+            ):  # MLA or FlashInfer
+                return layer[block_ids, ...]
+
+            if layer.shape[0] == 2:  # FlashAttention
+                return layer[:, block_ids, ...]
+
+            return None''',
+    '''            if (
+                layer.ndim == 3 or layer.shape[1] == 2
+            ):  # MLA (rank-3) or FlashInfer  [C: was dead isinstance(attn_metadata,...)]
+                return layer[block_ids, ...]
+
+            if layer.shape[0] == 2:  # FlashAttention
+                return layer[:, block_ids, ...]
+
+            logger.error(
+                "🚧BFF/P2P: unsupported KV layer layout shape=%s ndim=%d — cannot extract KV "
+                "for transfer; decode will be corrupt. Add a layout branch.",
+                tuple(layer.shape), layer.ndim,
+            )
+            return None''',
+    "C2/2 extract_kv_from_layer dispatches MLA by rank + loud fallthrough",
+)
+
 if failed:
     print("\nERROR: anchors did not match — vLLM has changed. NOT writing.", file=sys.stderr)
     for f_ in failed:
