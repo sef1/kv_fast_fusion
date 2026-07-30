@@ -743,8 +743,31 @@ def test_promotion_repgone_revivability_buckets():
     finally:
         _bp_mod._FF_PENDING_SOURCE = prev
     assert src.promo_stats["repgone_no_history"] == 1, src.promo_stats
+    # ...and the split attributes it to the specific cause (rep never recorded here).
+    assert src.promo_stats["repgone_nohist_missing"] == 1, src.promo_stats
     # The owner recorded ITSELF into the ring (available as a rep for future owners).
     assert _ext_hash("own") in _fp._REP_HISTORY
+
+
+def test_repgone_nohist_split_distinguishes_causes():
+    """The three nohist_* causes must be told apart: a rep that was never recorded is a rep-LIFETIME
+    miss (content-hash naming fixes it), whereas a rep recorded with a shorter block list for this
+    group is a P/D block-table SHAPE mismatch (it does not). They were one label until the con128
+    run made the combined bucket the largest loss category at 768 of 1574 rows."""
+    from kv_fast_fusion_ascend import fast_fusion_ascend_patch as p
+    pool = _FakePool({0: _FakeKVBlock(ref_cnt=1)})
+    h = _ext_hash("rep")
+    p._REP_HISTORY.clear()
+    assert p._rep_gone_bucket(pool, h, 1, 0) == "nohist_missing"
+    # Recorded, but only group 0 exists → the row references a group the rep never had.
+    p._REP_HISTORY[h] = [[0]]
+    assert p._rep_gone_bucket(pool, h, 1, 0) == "nohist_gi_oob"
+    # Group exists but is SHORTER than rep_slot → shape mismatch, not a lifetime problem.
+    p._REP_HISTORY[h] = [[0], [0]]
+    assert p._rep_gone_bucket(pool, h, 1, 5) == "nohist_slot_oob"
+    # In range and live → revivable, not a nohist case at all.
+    assert p._rep_gone_bucket(pool, h, 1, 0) == "revive_live"
+    p._REP_HISTORY.clear()
 
 
 def test_skip_transfer_bandwidth_accounting():
@@ -898,6 +921,62 @@ def test_worker_queue_drops_instead_of_blocking():
     assert prod.worker_dropped == 5, prod.worker_dropped
 
 
+def test_forward_work_moves_off_the_forward_thread():
+    """The Step 1 deliverable, asserted directly: on the async path the clustering cost must land on
+    the WORKER side of the split, not the forward side. Measured structurally rather than by wall
+    clock (which is far too noisy at these sizes): after _prepare_fusion_task returns, no probe or
+    register work has happened yet; it only happens once run_fusion_task is called."""
+    prod = MooncakeFFProducer()
+    shared = _make_k(1, seed=5)[0]
+    cache = _cache_with_blocks({10: shared, 11: shared}, seed=2)
+    reqs = [("reqA", [10], True), ("reqB", [11], True)]
+    with _async_config():
+        prod.reset_step(1)
+        for ln in ("L0", "L1"):
+            task = prod.on_layer(1, ln, cache, {"L0", "L1"}, reqs, want_task=True)
+        assert isinstance(task, FusionTask)
+        # Forward thread is done: it did the device prep and the copies, and nothing else.
+        assert prod.probe_ms == 0.0 and prod.register_ms == 0.0, \
+            f"probe/register leaked onto the forward thread: {prod.probe_ms}/{prod.register_ms}"
+        assert prod.dedup_ms == 0.0, f"clustering ran on the forward thread: {prod.dedup_ms}"
+        assert prod.group_completions == 0, "group counted before the worker ran it"
+        prod.run_fusion_task(task)
+    assert prod.register_ms > 0.0, "register never ran on the worker"
+    assert prod.dedup_ms > 0.0, "worker did not account its clustering time"
+    assert prod.group_completions == 1
+
+
+def test_forward_ms_accumulates_per_hook():
+    prod = MooncakeFFProducer()
+    prod.note_forward(1.5)
+    prod.note_forward(2.5)
+    assert prod.forward_calls == 2 and abs(prod.forward_ms - 4.0) < 1e-9
+
+
+def test_stats_dump_fires_on_wall_clock_and_at_exit():
+    """A run that ends before its next step-cadence multiple must still emit real cumulative numbers.
+    The first async-worker run did not, and every derived metric in it was measured against a step-1
+    snapshot with a 17-entry LSH index."""
+    import tempfile, os, json, time as _time
+    from kv_fast_fusion_ascend.connectors import mooncake_layerwise_connector_ff as m
+    d = tempfile.mkdtemp()
+    path = os.path.join(d, f"bff_stats_{os.getpid()}.json")
+    prod = MooncakeFFProducer()
+    prod.steps = 7                      # not 1, not a multiple of the step cadence
+    prod.blk_total[1] = 123
+    prod._last_dump_t = _time.monotonic()
+    prod.maybe_dump_stats(d)
+    assert not os.path.exists(path), "dumped despite neither cadence being due"
+    prod._last_dump_t = _time.monotonic() - (m._PD_STATS_MAX_AGE_S + 1)
+    prod.maybe_dump_stats(d)
+    assert json.load(open(path))["total_blocks"] == 123, "wall-clock trigger did not dump"
+    # And the exit hook writes the final cumulative state regardless of cadence.
+    os.remove(path)
+    prod.blk_total[1] = 456
+    prod._dump_at_exit(d)
+    assert json.load(open(path))["total_blocks"] == 456, "atexit dump did not write"
+
+
 def test_late_map_after_promotion_is_counted_and_dropped():
     """A redirect map arriving AFTER its owner's promotion must be counted as late and discarded.
     It cannot be applied: once a request has been scheduled the scheduler ships only newly allocated
@@ -995,6 +1074,10 @@ if __name__ == "__main__":
     test_worker_queue_drops_instead_of_blocking()
     test_worker_thread_ships_redirects_end_to_end()
     test_late_map_after_promotion_is_counted_and_dropped()
+    test_forward_work_moves_off_the_forward_thread()
+    test_forward_ms_accumulates_per_hook()
+    test_stats_dump_fires_on_wall_clock_and_at_exit()
+    test_repgone_nohist_split_distinguishes_causes()
     print("OK: all mooncake layerwise FF glue tests passed")
 
 

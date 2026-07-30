@@ -24,6 +24,7 @@ The module top level imports nothing Ascend/NPU-specific, so the pure fusion glu
 box. The connector subclass + ZMQ wiring are defined only when ``vllm_ascend`` is importable.
 """
 
+import atexit
 import hashlib
 import itertools
 import json
@@ -143,6 +144,10 @@ _FF_PORT_OFFSET = int(os.environ.get("BFF_MOONCAKE_FF_PORT_OFFSET", "20000"))
 # decode side never writes a bff_stats_ file even though the dir is now set there too.
 _PD_STATS_DIR = os.environ.get("BFF_PD_STATS_DIR")
 _PD_STATS_EVERY = int(os.environ.get("BFF_PD_STATS_EVERY", "50"))
+# Wall-clock backstop for the stats dump. The step cadence alone loses a run that ends before its
+# next multiple of _PD_STATS_EVERY — which is how the first async-worker run produced two step-1
+# snapshots and no usable numbers. Bounds staleness however the run ends.
+_PD_STATS_MAX_AGE_S = float(os.environ.get("BFF_PD_STATS_MAX_AGE_S", "30"))
 
 # Step 0 phase timing: split the measured ~5.5ms/group dedup cost into device-compute / D2H transfer
 # / host-probe / host-register, to decide whether moving the fusion check off the forward thread
@@ -337,6 +342,15 @@ class MooncakeFFProducer:
         self.d2h_ms = 0.0                     # host transfers: packed hashes + rep vectors
         self.probe_ms = 0.0                   # _lsh_probe (host: bucket union + exact cosine verify)
         self.register_ms = 0.0                # _lsh_register (host: index append + evict/compact)
+        # THE headline metric: wall time BFF adds to the prefill forward thread, measured around the
+        # whole save_kv_layer hook (so it includes the per-layer accounting and the enqueue, not just
+        # clustering). Sync path: ~= dedup_ms, since the clustering runs inline. Async path: should
+        # collapse to device prep + the two copies, with dedup_ms moving onto the worker thread.
+        # Comparing forward_ms/group_completions across BFF_FF_ASYNC=0 vs 1 IS the Step 1 result.
+        self.forward_ms = 0.0
+        self.forward_calls = 0                # save_kv_layer hooks seen (all groups, fusion or not)
+        self._last_dump_t = time.monotonic()  # wall-clock stats cadence (see maybe_dump_stats)
+        self._atexit_registered = False
         # Skip-transfer accounting (Stage 0 — prices the bandwidth bet with NO wire change).
         # Everything in BLOCK-LAYER units (block_bytes is uniform in raw mode, so it cancels in the
         # ratio). total_block_layers = every block × every layer actually transferred (all groups,
@@ -368,6 +382,11 @@ class MooncakeFFProducer:
             self._cur_step_id = step_id
             self._buf.clear()
             self.steps += 1
+
+    def note_forward(self, dt_ms: float) -> None:
+        """Record one save_kv_layer hook's cost on the prefill forward thread (see ``forward_ms``)."""
+        self.forward_ms += dt_ms
+        self.forward_calls += 1
 
     def note_transferred(self, n_block_layers: int) -> None:
         """Skip-transfer accounting (Stage 0): tally the blocks transferred for ONE layer (any group,
@@ -477,11 +496,19 @@ class MooncakeFFProducer:
         """
         if not buf["flat_bids"] or not buf["k_layers"]:
             return None
+        _t = time.perf_counter()
         cur_concat = torch.cat([Kg.float() for Kg in buf["k_layers"]], dim=1)   # [N, G*D]
         cur_norm = cur_concat / cur_concat.norm(dim=1, keepdim=True).clamp(min=1e-6)
         proj = _lsh_get_proj(self._lsh_proj, cur_concat.shape[1], cur_concat.device)
         packed_dev = _lsh_sub_hashes_device(cur_norm, proj)
         cur_norm = cur_norm.detach()
+        if _FF_TIMING:
+            # Mirrors the inline branch so BFF_FF_TIMING=1 is usable with the worker enabled —
+            # without this the async path bypasses all dev/d2h accounting and reports zeros, which
+            # is exactly what made the first hardware run unable to answer the D2H question.
+            _dev_sync(cur_norm.device)
+            self.dev_ms += (time.perf_counter() - _t) * 1e3
+            _t = time.perf_counter()
         event = None
         if _FF_ASYNC_D2H and cur_norm.device.type != "cpu":
             reps_cpu = self._pinned_like(cur_norm)
@@ -494,6 +521,10 @@ class MooncakeFFProducer:
         else:
             reps_cpu = cur_norm.cpu().float()
             hashes_cpu = packed_dev.cpu()
+        if _FF_TIMING:
+            # Under _FF_ASYNC_D2H this is only the copy ISSUE cost (the wait moved to the worker), so
+            # a near-zero d2h here with a healthy dev is the signal that the handoff is working.
+            self.d2h_ms += (time.perf_counter() - _t) * 1e3
         return FusionTask(
             gi=gi,
             reps_cpu=reps_cpu,
@@ -942,6 +973,36 @@ class MooncakeFFProducer:
         idx["tables"] = tables
         idx["n_rows"] = len(survivors)
 
+    def maybe_dump_stats(self, stats_dir: str) -> None:
+        """Dump on the step cadence, on a wall-clock cadence, and once at process exit.
+
+        The step cadence alone loses whole runs: the first hardware run of the async worker ended
+        before step 50, so both producer files held the ``steps == 1`` snapshot (85 blocks, 0
+        redirects, a 17-entry LSH index) and every derived number — the phase split, the accepted
+        cosine histogram, the harness's ``producer_avg_group_dedup_ms`` — was measured against an
+        essentially empty index. The wall-clock trigger bounds that staleness regardless of how the
+        run ends; the atexit hook catches a clean shutdown. Both are needed: a worker killed by
+        SIGKILL runs no atexit handler, which is exactly when the timer is the only thing that saved
+        the data."""
+        if not stats_dir:
+            return
+        if not self._atexit_registered:
+            self._atexit_registered = True
+            atexit.register(self._dump_at_exit, stats_dir)
+        now = time.monotonic()
+        steps = self.steps
+        due = (steps and (steps % _PD_STATS_EVERY == 0 or steps == 1)) or \
+              (now - self._last_dump_t >= _PD_STATS_MAX_AGE_S)
+        if due:
+            self._last_dump_t = now
+            self.dump_stats(stats_dir)
+
+    def _dump_at_exit(self, stats_dir: str) -> None:
+        try:
+            self.dump_stats(stats_dir)
+        except Exception:                     # pragma: no cover - interpreter teardown is hostile
+            pass
+
     def dump_stats(self, stats_dir: str) -> None:
         """Write this producer's cumulative fusion counters to ``bff_stats_<pid>.json`` in
         ``stats_dir``. The benchmark's collect_bff_stats() merges these after the run.
@@ -983,6 +1044,16 @@ class MooncakeFFProducer:
                     for k, v in (("dev", self.dev_ms), ("d2h", self.d2h_ms),
                                  ("probe", self.probe_ms), ("register", self.register_ms))},
                 "phase_timing_enabled": _FF_TIMING,
+                # THE Step 1 result. Wall time BFF adds to the prefill FORWARD thread, same
+                # denominator as overhead_avg_group_dedup_ms so the two are directly comparable:
+                #   BFF_FF_ASYNC=0 → forward ~= dedup (clustering runs inline)
+                #   BFF_FF_ASYNC=1 → forward collapses to device prep + copies; dedup moves to the
+                #                    worker thread, where it costs prefill nothing.
+                # Compare forward_avg_per_group_ms across the two arms; that difference is the win.
+                "forward_avg_per_group_ms": (self.forward_ms / self.group_completions
+                                             if self.group_completions else 0.0),
+                "forward_total_ms": self.forward_ms,
+                "forward_calls": self.forward_calls,
                 # Step 1: with the worker live, the per-group cost above is paid OFF the prefill
                 # forward thread. worker_dropped > 0 means fusion is outrunning its queue and some
                 # groups shipped no map (compression lost, correctness unaffected) — the signal to
@@ -1365,8 +1436,13 @@ if _ASCEND_AVAILABLE:
                     orig_save(layer_name, kv_layer, attn_metadata, connector_metadata, **kw)
                     try:
                         if resolved:
+                            # Timed OUTSIDE the accumulate so it captures everything BFF adds to the
+                            # forward thread — the per-layer accounting and the worker enqueue too,
+                            # not just clustering. This is the number Step 1 has to move.
+                            _t0 = time.perf_counter()
                             self._ff_producer_accumulate(
                                 worker, resolved, kv_layer, connector_metadata)
+                            self._ff_producer.note_forward((time.perf_counter() - _t0) * 1e3)
                     except Exception as e:  # pragma: no cover - never break the transfer
                         logger.warning("BFF Mooncake producer fusion failed: %s", e)
 
@@ -1392,8 +1468,12 @@ if _ASCEND_AVAILABLE:
                         # async fusion worker is on: nonzero means fusion is lagging the transfer.
                         "promo_rows_late": 0, "promo_maps_late": 0,
                         # Stage 1a: revivability split of rep-gone (sum == promo_unres_rep_gone).
+                        # The nohist_* keys split what used to be one "no_history" label — see
+                        # _rep_gone_bucket; repgone_no_history is kept as their total.
                         "repgone_revive_live": 0, "repgone_revive_cached": 0,
-                        "repgone_truly_gone": 0, "repgone_no_history": 0}
+                        "repgone_truly_gone": 0, "repgone_no_history": 0,
+                        "repgone_nohist_missing": 0, "repgone_nohist_gi_oob": 0,
+                        "repgone_nohist_slot_oob": 0, "repgone_nohist_badblock": 0}
                     from kv_fast_fusion import fast_fusion_block_pool as _bp
                     _bp._FF_PENDING_SOURCE = self._ff_recv_thread
                     logger.info("BFF Mooncake: promotion-time apply ON (pending map published).")
@@ -1508,11 +1588,9 @@ if _ASCEND_AVAILABLE:
                     if not rows:
                         continue
                     self._ff_ship_redirect(rm.remote_host, rm.remote_port, ext_id, gi, rows)
-            # Periodically dump fusion stats so the benchmark's collect_bff_stats() can report real
-            # compression (mirrors the NCCL cadence: step 1, then every _PD_STATS_EVERY steps).
-            steps = self._ff_producer.steps
-            if _PD_STATS_DIR and steps and (steps % _PD_STATS_EVERY == 0 or steps == 1):
-                self._ff_producer.dump_stats(_PD_STATS_DIR)
+            # Dump fusion stats on the step cadence, a wall-clock cadence, and at exit — see
+            # maybe_dump_stats for why the step cadence alone silently loses short runs.
+            self._ff_producer.maybe_dump_stats(_PD_STATS_DIR)
 
         def _ff_ship_redirect(self, host, base_port, ext_id, gi, rows) -> None:
             """Enqueue one request's redirect rows for group ``gi`` to the background sender (the

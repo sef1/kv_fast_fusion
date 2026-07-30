@@ -38,7 +38,7 @@ _WRAP_SENTINEL = "_bff_ascend_wrapped"
 # rep-gone into revivable vs truly-gone. This MEASURES the revival opportunity before we build the
 # (cheap re-ref vs costly pin-at-arrival) mechanism. Read-only w.r.t. apply behavior. Scheduler
 # thread only (single-writer at TP=1) so a plain OrderedDict needs no lock.
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 
 _REP_HISTORY: "OrderedDict[int, list[list[int]]]" = OrderedDict()
 _REP_HISTORY_CAP = int(os.environ.get("BFF_FF_REP_HISTORY_CAP", "4096"))
@@ -99,16 +99,33 @@ def _bff_sweep_late_maps(scheduler) -> None:
 
 
 def _rep_gone_bucket(block_pool, ext_hash: int, gi: int, rep_slot: int) -> str:
-    """Classify a rep-gone row by whether its old physical block still holds valid KV. Returns one
-    of: no_history | truly_gone | revive_live (ref_cnt>0) | revive_cached (freed but hash kept)."""
+    """Classify a rep-gone row by whether its old physical block still holds valid KV. Returns one of:
+    nohist_missing | nohist_gi_oob | nohist_slot_oob | nohist_badblock | truly_gone |
+    revive_live (ref_cnt>0) | revive_cached (freed but hash kept).
+
+    The four nohist_* buckets were one "no_history" label until the con128 run made it the LARGEST
+    loss category (768 of 1574 rep-gone rows). They mean completely different things and have
+    different fixes, so lumping them hid the actual bug:
+      nohist_missing  — the rep never promoted here (or was evicted from _REP_HISTORY): a genuine
+                        rep-LIFETIME miss, which content-hash naming (V2) would fix.
+      nohist_gi_oob   — the rep's recorded history has fewer groups than the row references.
+      nohist_slot_oob — the rep's block list for this group is SHORTER than rep_slot: a P/D
+                        block-table SHAPE mismatch. V2 does not fix this; the redirect itself is
+                        describing a block layout the decode side never had.
+    With only 200 prompts against a 4096-entry cap, eviction cannot explain 768 rows — so if this
+    split comes back dominated by slot_oob, the shape mismatch is the real target."""
     old = _REP_HISTORY.get(ext_hash)
-    if old is None or gi >= len(old) or not (0 <= rep_slot < len(old[gi])):
-        return "no_history"
+    if old is None:
+        return "nohist_missing"
+    if gi >= len(old):
+        return "nohist_gi_oob"
+    if not (0 <= rep_slot < len(old[gi])):
+        return "nohist_slot_oob"
     bid = old[gi][rep_slot]
     try:
         blk = block_pool.blocks[bid]
     except (IndexError, AttributeError, TypeError):
-        return "no_history"
+        return "nohist_badblock"
     if blk.ref_cnt > 0:
         return "revive_live"        # something still references it → KV intact
     if blk.block_hash is not None:
@@ -286,7 +303,7 @@ def _bff_promotion_apply(scheduler, request) -> None:
     # For rep-gone, further split (Stage 1a) by whether the rep's old physical block is still
     # revivable — this decides the Stage 1b mechanism (cheap re-ref vs costly pin-at-arrival).
     n_rep_loading = n_rep_gone = 0
-    rev = {"no_history": 0, "truly_gone": 0, "revive_live": 0, "revive_cached": 0}
+    rev = defaultdict(int)      # bucket name -> count; see _rep_gone_bucket for the taxonomy
     for gi, rows in groups_rows.items():
         for (_o, h, rep_slot) in rows:
             if int(h) not in hash2ext:
@@ -312,12 +329,16 @@ def _bff_promotion_apply(scheduler, request) -> None:
         stats["promo_unresolved"] += n_unresolved
         stats["promo_unres_rep_loading"] = stats.get("promo_unres_rep_loading", 0) + n_rep_loading
         stats["promo_unres_rep_gone"] = stats.get("promo_unres_rep_gone", 0) + n_rep_gone
-        # Stage 1a: revivability split of rep-gone (their sum == n_rep_gone). Names the Stage 1b
-        # mechanism: revive_live+revive_cached large → cheap re-ref; truly_gone large → pin-at-arrival.
-        stats["repgone_revive_live"] = stats.get("repgone_revive_live", 0) + rev["revive_live"]
-        stats["repgone_revive_cached"] = stats.get("repgone_revive_cached", 0) + rev["revive_cached"]
-        stats["repgone_truly_gone"] = stats.get("repgone_truly_gone", 0) + rev["truly_gone"]
-        stats["repgone_no_history"] = stats.get("repgone_no_history", 0) + rev["no_history"]
+        # Stage 1a: revivability split of rep-gone (their sum == n_rep_gone). Names the fix:
+        # revive_live+revive_cached large → content-hash naming (V2) recovers them;
+        # nohist_slot_oob large → a P/D block-table shape mismatch, which V2 does NOT fix.
+        for bucket, n in rev.items():
+            key = "repgone_" + bucket
+            stats[key] = stats.get(key, 0) + n
+        # Keep the pre-split key populated so older dashboards//harness readers don't silently
+        # report zero for what is currently the largest loss category.
+        stats["repgone_no_history"] = stats.get("repgone_no_history", 0) + sum(
+            n for b, n in rev.items() if b.startswith("nohist_"))
         if merged:
             stats["promo_merge_calls"] += 1
 
