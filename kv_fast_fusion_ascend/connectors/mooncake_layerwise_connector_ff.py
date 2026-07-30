@@ -30,9 +30,11 @@ import json
 import os
 import queue
 import struct
+import sys
 import threading
 import time
 from collections import Counter, OrderedDict
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -142,7 +144,95 @@ _FF_PORT_OFFSET = int(os.environ.get("BFF_MOONCAKE_FF_PORT_OFFSET", "20000"))
 _PD_STATS_DIR = os.environ.get("BFF_PD_STATS_DIR")
 _PD_STATS_EVERY = int(os.environ.get("BFF_PD_STATS_EVERY", "50"))
 
+# Step 0 phase timing: split the measured ~5.5ms/group dedup cost into device-compute / D2H transfer
+# / host-probe / host-register, to decide whether moving the fusion check off the forward thread
+# needs pinned async D2H or only needs the host phases moved.
+#
+# The attribution is only meaningful with an explicit device sync between the device phase and the
+# first .cpu(): without one, `packed.cpu()` bills the ENTIRE queued device pipeline (concat, norm,
+# projection matmul, bit-pack) as transfer time. That sync is itself a perturbation — it serializes
+# work the forward pass would otherwise overlap — so it is OFF by default and must never be enabled
+# in a run whose latency numbers are being quoted. probe/register are pure host work and are timed
+# unconditionally (no sync, no cost).
+_FF_TIMING = os.environ.get("BFF_FF_TIMING", "0") == "1"
+
+# Run the fusion check on a background worker instead of the prefill forward thread (Step 1). The
+# forward thread then only does the device-side prep (concat/normalize/project/pack), copies two
+# small host tensors, and enqueues — the LSH probe, index register and row build move off-path.
+# 0 = the original fully-synchronous path (also the automatic fallback whenever the async gate below
+# does not hold, so this flag only ever picks between two supported paths).
+_FF_ASYNC = os.environ.get("BFF_FF_ASYNC", "1") == "1"
+# Bounded queue: fusion must never throttle prefill. On overflow the task is DROPPED (counted as
+# worker_dropped) rather than blocking the forward thread — the redirect channel is already
+# fire-and-forget, so a lost map costs compression, never correctness.
+_FF_WORKER_QUEUE = int(os.environ.get("BFF_FF_WORKER_QUEUE", "8"))
+# Issue the two host copies non-blocking into pinned buffers and let the WORKER await the event,
+# so the forward thread never syncs at all. Off by default: whether this is worth the pinned-buffer
+# machinery depends on the BFF_FF_TIMING d2h/probe split, and on whether torch.npu actually honours
+# pinned non-blocking D2H (a silent fallback to a sync copy would make it pure overhead). Turn on
+# only after the Step 0 measurement says d2h dominates.
+_FF_ASYNC_D2H = os.environ.get("BFF_FF_ASYNC_D2H", "0") == "1"
+
 _FF_REDIRECT_MSG = b"bff_redirect_msg"
+
+
+@dataclass
+class FusionTask:
+    """One fusion group's completed step, packaged for off-forward-thread processing.
+
+    Everything here is HOST-resident by construction: the paged-KV gather and the SimHash projection
+    already happened on the forward thread, and the LSH probe/verify/register path is pure host work
+    (it matmuls against the host-side index). That is what makes the hand-off safe — the worker holds
+    no reference to the paged KV cache, whose blocks are recycled as soon as the step ends.
+
+    ``wait_event`` is a recorded device Event when the copies were issued non-blocking
+    (``_FF_ASYNC_D2H``); the worker must ``synchronize()`` it before touching ``reps_cpu`` /
+    ``sub_hashes_dev``. It is None when the copies were already blocking, in which case the tensors
+    are immediately readable. Mirrors ``SendTask.wait_event`` in the base connector's send thread.
+    """
+
+    gi: int
+    reps_cpu: torch.Tensor                  # [N, G*D] normalized rep vectors, host
+    sub_hashes_dev: torch.Tensor            # [N, _LSH_TABLES] packed bucket ids, host after sync
+    flat_req_local: list[int]
+    flat_slot: list[int]
+    ext_ids: list[str]
+    ext_has_remote: list[bool]
+    n_blocks: int
+    # ext_id -> (remote_host, remote_base_port); snapshotted on the forward thread because the
+    # connector metadata object is reused across steps.
+    targets: dict[str, tuple] = field(default_factory=dict)
+    wait_event: Any = None
+
+
+def _dev_sync(device) -> None:
+    """Block until ``device``'s queued work is done, so the next timer measures only what follows.
+    No-op off-accelerator (the module is unit-testable on CPU). Used by the Step 0 timing probe
+    only — see ``_FF_TIMING``."""
+    try:
+        if device is None or device.type == "cpu":
+            return
+        mod = getattr(torch, device.type, None)          # torch.npu / torch.cuda
+        if mod is not None and hasattr(mod, "synchronize"):
+            mod.synchronize()
+    except Exception:                                     # pragma: no cover - defensive
+        pass
+
+
+def _dev_event(device):
+    """A recorded device Event marking the work queued on ``device`` so far, or None if this backend
+    has no Event type (then the caller must fall back to a blocking copy). Same handoff the base
+    connector's send thread uses via ``SendTask.wait_event``."""
+    try:
+        mod = getattr(torch, device.type, None)           # torch.npu / torch.cuda
+        ev_cls = getattr(mod, "Event", None) if mod is not None else None
+        if ev_cls is None:
+            return None
+        ev = ev_cls()
+        ev.record()
+        return ev
+    except Exception:                                     # pragma: no cover - defensive
+        return None
 
 
 def _ext_hash(external_id: str) -> int:
@@ -199,18 +289,23 @@ def _lsh_get_proj(jl_holder: list, d: int, device) -> torch.Tensor:
     return m
 
 
-def _lsh_sub_hashes(vecs_norm: torch.Tensor, proj: torch.Tensor) -> list:
-    """Per-row list of ``_LSH_TABLES`` banded sub-hashes (each an int in ``[0, 2**_LSH_BITS)``) from
-    the sign bits of ``vecs_norm @ proj``. ``vecs_norm`` is ``[M, d]``; returns a length-M list of
-    length-``_LSH_TABLES`` int lists. Mirrors legacy ``_lsh_fingerprint`` (batched).
+def _lsh_sub_hashes_device(vecs_norm: torch.Tensor, proj: torch.Tensor) -> torch.Tensor:
+    """Banded SimHash bucket ids ``[M, _LSH_TABLES]`` from the sign bits of ``vecs_norm @ proj``,
+    left ON ``vecs_norm``'s device. ``vecs_norm`` is ``[M, d]``.
 
-    Packs on ``vecs_norm``'s device and only then copies: the host only ever needs the ``[M, T]``
-    bucket ids, so transferring the unpacked ``[M, T*B]`` bits would move _LSH_BITS x more bytes
-    across a device sync that stalls the forward pass."""
+    Packs before any transfer: the host only ever needs the ``[M, T]`` bucket ids, so copying the
+    unpacked ``[M, T*B]`` bits would move _LSH_BITS x more bytes. The copy is the CALLER's, so it can
+    choose when to pay the sync — the forward thread issues it non-blocking and the fusion worker
+    awaits it (see ``_FFFusionWorkerThread``)."""
     bits = (vecs_norm.float() @ proj > 0).to(torch.int64)                # [M, T*B] (on device)
     powers = torch.tensor(_LSH_POWERS, dtype=torch.int64, device=bits.device)
-    packed = (bits.view(-1, _LSH_TABLES, _LSH_BITS) * powers).sum(dim=2)  # [M, T] (on device)
-    return packed.cpu().tolist()
+    return (bits.view(-1, _LSH_TABLES, _LSH_BITS) * powers).sum(dim=2)   # [M, T] (on device)
+
+
+def _lsh_sub_hashes(vecs_norm: torch.Tensor, proj: torch.Tensor) -> list:
+    """Blocking convenience wrapper over :func:`_lsh_sub_hashes_device`: returns a length-M list of
+    length-``_LSH_TABLES`` int lists. Mirrors legacy ``_lsh_fingerprint`` (batched)."""
+    return _lsh_sub_hashes_device(vecs_norm, proj).cpu().tolist()
 
 
 class MooncakeFFProducer:
@@ -234,6 +329,14 @@ class MooncakeFFProducer:
         self.steps = 0                        # scheduler steps seen (approximate; via metadata id())
         self.group_completions = 0            # group finishes seen (true denominator for overhead avg)
         self.dedup_ms = 0.0                   # cumulative clustering time (ms), for overhead avg
+        # Step 0 phase split of dedup_ms — which phase actually owns the ~5.5ms/group, and therefore
+        # what an async fusion worker has to move to recover it. dev/d2h are attributed only under
+        # _FF_TIMING (they need an explicit sync to be separable); probe/register are host-only and
+        # always timed. dev+d2h+probe+register < dedup_ms by the untimed remainder (concat/cluster).
+        self.dev_ms = 0.0                     # device prep: concat, normalize, project, bit-pack
+        self.d2h_ms = 0.0                     # host transfers: packed hashes + rep vectors
+        self.probe_ms = 0.0                   # _lsh_probe (host: bucket union + exact cosine verify)
+        self.register_ms = 0.0                # _lsh_register (host: index append + evict/compact)
         # Skip-transfer accounting (Stage 0 — prices the bandwidth bet with NO wire change).
         # Everything in BLOCK-LAYER units (block_bytes is uniform in raw mode, so it cancels in the
         # ratio). total_block_layers = every block × every layer actually transferred (all groups,
@@ -253,6 +356,10 @@ class MooncakeFFProducer:
         # alternative to the bounded _registry, O(N) probe.
         self._lsh: dict[int, dict] = {}
         self._lsh_proj = [None]                # lazy fixed-seed SimHash projection (per feature width)
+        # Recycled pinned host buffers for the async D2H handoff, keyed (shape, dtype). Forward
+        # thread only; see _pinned_like for the in-flight-reuse guard.
+        self._pinned_pool: dict[tuple, torch.Tensor] = {}
+        self.worker_dropped = 0                # tasks shed because the worker queue was full
         # gi -> per-bin accept counts (see _ACCEPT_COS_BINS): the accepted-merge cosine distribution.
         self._accept_cos: dict[int, list[int]] = {}
 
@@ -276,14 +383,20 @@ class MooncakeFFProducer:
         group_layer_names: set[str],
         requests: list[tuple],
         tp_group=None,
-    ) -> dict[str, list[tuple[int, int, int]]] | None:
+        want_task: bool = False,
+    ) -> "dict[str, list[tuple[int, int, int]]] | FusionTask | None":
         """Accumulate one layer of fusion group ``gi``. ``caches`` is the layer's paged cache tensor —
         a single K tensor for standard attention, or the ``[nope, rope]`` pair for MLA (a bare tensor
         is also accepted). ``requests`` is the ordered list of
         ``(external_id, local_block_ids_for_gi[, has_remote])`` for this step's batch (``has_remote``
         defaults to True when omitted; it gates cross-batch registration to decode-bound requests).
-        Returns ``None`` until the group completes, then a dict
-        ``{owner_external_id: [(owner_slot, rep_hash, rep_slot), ...]}``.
+
+        Returns ``None`` until the group completes. On completion:
+        - ``want_task=False`` → the redirect dict ``{owner_external_id: [(owner_slot, rep_hash,
+          rep_slot), ...]}``, computed inline (the original synchronous path).
+        - ``want_task=True`` → a :class:`FusionTask` for :meth:`run_fusion_task` to finish on a
+          worker thread, but ONLY when the async gate holds (see :meth:`_can_defer`); otherwise it
+          still returns the dict, so the caller must branch on the type.
         """
         if not isinstance(caches, (list, tuple)):
             caches = (caches,)
@@ -327,11 +440,132 @@ class MooncakeFFProducer:
 
         if len(buf["seen"]) < len(group_layer_names):
             return None                                # group not complete yet
-        # --- group complete: cluster + build redirect rows ---
+        # --- group complete: either hand off a host-resident task, or cluster inline ---
         try:
+            if want_task and self._can_defer(tp_group):
+                return self._prepare_fusion_task(gi, buf)
             return self._build_send_rows(gi, buf, tp_group)
         finally:
             self._buf.pop(gi, None)
+
+    @staticmethod
+    def _can_defer(tp_group) -> bool:
+        """Whether this group's fusion work can be finished off the forward thread.
+
+        Requires the LSH cross-request backend with within-batch clustering disabled — i.e. exactly
+        the path whose post-projection work is pure host compute (the production con512 config).
+        The alternatives stay inline:
+        - ``tp_group is not None``: the matrix backend runs ``all_reduce`` inside
+          ``concat_cosine_cc_labels``. A collective on a side thread would interleave with the
+          model's own collectives and deadlock. This is the hard constraint on the whole design.
+        - ``_PD_INTRA_REQ_FF`` / ``matrix`` backend: both cluster with DEVICE matmuls over
+          ``buf["k_layers"]``. Those tensors are safe to hold (``_block_repr``'s ``c[idx]`` gather
+          copies rather than viewing the paged cache), so this is not a correctness limit — but
+          issuing device work from a side thread contends with the forward pass on the same device
+          and would need its own stream to be worth doing. Out of scope here.
+        """
+        return _PD_CROSS_INDEX == "lsh" and tp_group is None and not _PD_INTRA_REQ_FF
+
+    def _prepare_fusion_task(self, gi, buf) -> "FusionTask | None":
+        """Forward-thread half of a deferred group: device prep + host copies, no clustering.
+
+        Everything that must see the paged KV cache happens here; the returned task is host-resident
+        and safe to hold across steps. Under ``_FF_ASYNC_D2H`` the copies are issued non-blocking
+        into pinned buffers with a recorded event, so this returns without the forward thread ever
+        syncing — the worker pays the wait. Otherwise the copies block here, and only the host
+        probe/register work is deferred (still the bulk of the cost when d2h is not the bottleneck).
+        """
+        if not buf["flat_bids"] or not buf["k_layers"]:
+            return None
+        cur_concat = torch.cat([Kg.float() for Kg in buf["k_layers"]], dim=1)   # [N, G*D]
+        cur_norm = cur_concat / cur_concat.norm(dim=1, keepdim=True).clamp(min=1e-6)
+        proj = _lsh_get_proj(self._lsh_proj, cur_concat.shape[1], cur_concat.device)
+        packed_dev = _lsh_sub_hashes_device(cur_norm, proj)
+        cur_norm = cur_norm.detach()
+        event = None
+        if _FF_ASYNC_D2H and cur_norm.device.type != "cpu":
+            reps_cpu = self._pinned_like(cur_norm)
+            hashes_cpu = self._pinned_like(packed_dev)
+            reps_cpu.copy_(cur_norm, non_blocking=True)
+            hashes_cpu.copy_(packed_dev, non_blocking=True)
+            event = _dev_event(cur_norm.device)         # None if the backend has no Event type
+            if event is None:                           # can't prove the copies landed → block now
+                _dev_sync(cur_norm.device)
+        else:
+            reps_cpu = cur_norm.cpu().float()
+            hashes_cpu = packed_dev.cpu()
+        return FusionTask(
+            gi=gi,
+            reps_cpu=reps_cpu,
+            sub_hashes_dev=hashes_cpu,
+            flat_req_local=list(buf["flat_req_local"]),
+            flat_slot=list(buf["flat_slot"]),
+            ext_ids=list(buf["ext_ids"]),
+            ext_has_remote=list(buf["ext_has_remote"]),
+            n_blocks=len(buf["flat_bids"]),
+            wait_event=event,
+        )
+
+    def _pinned_like(self, t: torch.Tensor) -> torch.Tensor:
+        """A recycled pinned host buffer shaped like ``t``. Pinning per step would cost more than the
+        sync it is meant to avoid, so buffers are pooled per (shape, dtype) and reused. Only ever
+        touched from the forward thread; the worker reads the tensor it was handed, and a buffer is
+        not reissued until a later step of the SAME shape — with the bounded queue that is a real
+        (if unlikely) reuse hazard, so a task that is still queued keeps its buffer by construction:
+        the pool hands out a fresh buffer whenever the cached one is still referenced elsewhere."""
+        key = (tuple(t.shape), t.dtype)
+        buf = self._pinned_pool.get(key)
+        # sys.getrefcount: pool ref + local ref + arg = 3 when nobody else holds it.
+        if buf is None or sys.getrefcount(buf) > 3:
+            try:
+                buf = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
+            except (RuntimeError, NotImplementedError):   # no pinned memory on this backend
+                buf = torch.empty(t.shape, dtype=t.dtype)
+            self._pinned_pool[key] = buf
+        return buf
+
+    def run_fusion_task(self, task: "FusionTask") -> dict[str, list[tuple[int, int, int]]]:
+        """Worker-thread half: await the copies, then probe / register / build rows on the host.
+
+        Byte-for-byte the same computation the ``use_lsh`` branch of :meth:`_build_send_rows` does
+        inline — the golden-equivalence test pins that. Counter updates land on the same producer
+        fields, which is safe because this runs on exactly ONE worker thread (see
+        ``_FFFusionWorkerThread``): the LSH index stays single-writer, and probe-then-register
+        ordering within a step is preserved by the FIFO queue."""
+        if task.wait_event is not None:
+            task.wait_event.synchronize()
+        t0 = time.perf_counter()
+        self.group_completions += 1
+        send_rows: dict[str, list[tuple[int, int, int]]] = {}
+        ext_ids, flat_req_local, flat_slot = task.ext_ids, task.flat_req_local, task.flat_slot
+        gi = task.gi
+        cur_cpu = task.reps_cpu
+        sub_hashes = task.sub_hashes_dev.tolist()
+        _t = time.perf_counter()
+        matched, hits = self._lsh_probe(gi, cur_cpu, sub_hashes, ext_ids, flat_req_local)
+        self.probe_ms += (time.perf_counter() - _t) * 1e3
+        n_cross = 0
+        for (i, rep_hash, rep_slot) in hits:
+            owner_ext = ext_ids[flat_req_local[i]]
+            send_rows.setdefault(owner_ext, []).append(
+                (int(flat_slot[i]), int(rep_hash), int(rep_slot)))
+            n_cross += 1
+        # Within-batch clustering is off on this path (_can_defer), so every unmatched block becomes
+        # its own rep — the cross-request index still grows, exactly as in the inline path.
+        reps_to_register = [i for i in range(len(flat_req_local)) if not matched[i]]
+        _t = time.perf_counter()
+        self._lsh_register(gi, cur_cpu, sub_hashes, ext_ids, flat_req_local, flat_slot,
+                           reps_to_register, task.ext_has_remote)
+        self.register_ms += (time.perf_counter() - _t) * 1e3
+        self.dedup_ms += (time.perf_counter() - t0) * 1e3
+        self.blk_total[gi] = self.blk_total.get(gi, 0) + task.n_blocks
+        self.redir_total[gi] = self.redir_total.get(gi, 0) + n_cross
+        self.cross_redir_total += n_cross
+        if n_cross or _PD_DEBUG:
+            logger.info("BFF Mooncake fuse group gi=%d (async) | repr=%s | reqs=%d | blocks=%d | "
+                        "redirects=%d (cross=%d within=0) | lsh=%d", gi, _PD_REPR, len(ext_ids),
+                        task.n_blocks, n_cross, n_cross, self._lsh_size(gi))
+        return send_rows
 
     def _build_send_rows(self, gi, buf, tp_group) -> dict[str, list[tuple[int, int, int]]]:
         """Cluster the completed group's blocks and build ``{owner_ext: [(owner_slot, rep_hash,
@@ -387,17 +621,29 @@ class MooncakeFFProducer:
                 # "matrix" (or any tp>1): the dense concat_cosine_cross_match over the FIFO window.
                 cur_concat = cur_sq = cur_cpu = sub_hashes = None
                 if use_lsh:
+                    _t = time.perf_counter()
                     cur_concat = torch.cat([Kg.float() for Kg in buf["k_layers"]], dim=1)  # [N, G*D]
                     cur_norm = cur_concat / cur_concat.norm(dim=1, keepdim=True).clamp(min=1e-6)
                     proj = _lsh_get_proj(self._lsh_proj, cur_concat.shape[1], cur_concat.device)
-                    sub_hashes = _lsh_sub_hashes(cur_norm, proj)
+                    packed_dev = _lsh_sub_hashes_device(cur_norm, proj)
+                    if _FF_TIMING:
+                        # Drain the queued device work so the .cpu() calls below time as transfer,
+                        # not as the backlog they would otherwise absorb. Perturbing — see _FF_TIMING.
+                        _dev_sync(cur_norm.device)
+                        self.dev_ms += (time.perf_counter() - _t) * 1e3
+                        _t = time.perf_counter()
+                    sub_hashes = packed_dev.cpu().tolist()
                     # ONE host copy of the rep vectors per group, reused by probe AND register (both
                     # verify/store against the host-side index). Each .cpu() drains the device
                     # pipeline, so a second copy of the same tensor costs a full sync for nothing.
-                    # _lsh_sub_hashes just synced, so this transfer lands on an already-idle device.
+                    # The hash copy just synced, so this transfer lands on an already-idle device.
                     cur_cpu = cur_norm.detach().cpu().float()
+                    if _FF_TIMING:
+                        self.d2h_ms += (time.perf_counter() - _t) * 1e3
+                    _t = time.perf_counter()
                     matched, hits = self._lsh_probe(
                         gi, cur_cpu, sub_hashes, ext_ids, flat_req_local)
+                    self.probe_ms += (time.perf_counter() - _t) * 1e3
                     for (i, rep_hash, rep_slot) in hits:
                         owner_ext = ext_ids[flat_req_local[i]]
                         send_rows.setdefault(owner_ext, []).append(
@@ -445,8 +691,10 @@ class MooncakeFFProducer:
                     reps_to_register = list(unmatched)
                 # Register this step's new reps into the chosen cross-request index.
                 if use_lsh:
+                    _t = time.perf_counter()
                     self._lsh_register(gi, cur_cpu, sub_hashes, ext_ids, flat_req_local,
                                        flat_slot, reps_to_register, buf["ext_has_remote"])
+                    self.register_ms += (time.perf_counter() - _t) * 1e3
                 else:
                     self._register_reps(gi, buf, reps_to_register, cur_concat, cur_sq)
             self.dedup_ms += (time.perf_counter() - t0) * 1e3
@@ -706,8 +954,15 @@ class MooncakeFFProducer:
         try:
             def _factor(b, r):
                 return b / max(1, b - r)
-            tot_b = sum(self.blk_total.values())
-            tot_r = sum(self.redir_total.values())
+            # Snapshot the per-group dicts: with the async worker these are written by the fusion
+            # thread while this runs on the forward thread, and iterating them live would raise
+            # "dictionary changed size during iteration". The counters are diagnostics, so a torn
+            # read across dicts is acceptable; a crash in the stats path is not.
+            blk_total = dict(self.blk_total)
+            redir_total = dict(self.redir_total)
+            layers_per_group = dict(self.layers_per_group)
+            tot_b = sum(blk_total.values())
+            tot_r = sum(redir_total.values())
             stats = {
                 "pid": os.getpid(),
                 "steps": self.steps,
@@ -715,12 +970,32 @@ class MooncakeFFProducer:
                 # divides by group_completions (not steps, which id()-collisions undercount).
                 "overhead_avg_group_dedup_ms": (self.dedup_ms / self.group_completions
                                                 if self.group_completions else 0.0),
+                # Step 0: per-group phase split of the above, same denominator. Decides what an async
+                # fusion worker must move. dev/d2h are 0 unless BFF_FF_TIMING=1 (they need a
+                # perturbing sync to separate); probe/register are always real. They sum to LESS than
+                # the total — the remainder is the untimed concat/cluster/emit work.
+                #   d2h dominates      → the forward thread is stalling on transfers; the worker
+                #                        needs pinned non-blocking D2H + an event handoff.
+                #   probe+register     → pure host work; moving it to the worker is the whole win
+                #     dominate           and the plain blocking .cpu() can stay on the forward thread.
+                "overhead_phase_ms": {
+                    k: (v / self.group_completions if self.group_completions else 0.0)
+                    for k, v in (("dev", self.dev_ms), ("d2h", self.d2h_ms),
+                                 ("probe", self.probe_ms), ("register", self.register_ms))},
+                "phase_timing_enabled": _FF_TIMING,
+                # Step 1: with the worker live, the per-group cost above is paid OFF the prefill
+                # forward thread. worker_dropped > 0 means fusion is outrunning its queue and some
+                # groups shipped no map (compression lost, correctness unaffected) — the signal to
+                # raise BFF_FF_WORKER_QUEUE or narrow BFF_FF_GROUPS.
+                "async_worker": _FF_ASYNC,
+                "async_d2h": _FF_ASYNC_D2H,
+                "worker_dropped": self.worker_dropped,
                 "total_blocks": tot_b,
                 "redirects_emitted": tot_r,
                 "compression_potential_factor": _factor(tot_b, tot_r),
                 "compression_potential_per_group": {
-                    str(gi): _factor(self.blk_total[gi], self.redir_total.get(gi, 0))
-                    for gi in sorted(self.blk_total)},
+                    str(gi): _factor(blk_total[gi], redir_total.get(gi, 0))
+                    for gi in sorted(blk_total)},
                 # Cross-batch lift: how many redirects came from the rolling registry (earlier
                 # batches) vs the within-step batch, plus the window size and current registry size.
                 "encoded_batch_size": _PD_ENCODED_BATCH,
@@ -730,15 +1005,15 @@ class MooncakeFFProducer:
                 "cross_batch_redirects": self.cross_redir_total,
                 "within_batch_redirects": self.within_redir_total,
                 "registry_blocks": {str(gi): self._registry_size(gi)
-                                    for gi in sorted(self._registry)},
-                "lsh_index_blocks": {str(gi): self._lsh_size(gi) for gi in sorted(self._lsh)},
+                                    for gi in sorted(list(self._registry))},
+                "lsh_index_blocks": {str(gi): self._lsh_size(gi) for gi in sorted(list(self._lsh))},
                 # Sweep support: the active threshold (self-describing runs) + where the accepted
                 # mass sits per group. Accepts at thr X = the mass above X, so this run PREDICTS the
                 # redirect count of any higher-threshold run before it happens.
                 "threshold": THRESHOLD,
                 "accept_cos_hist": {
                     str(gi): dict(zip(_ACCEPT_COS_LABELS, hist))
-                    for gi, hist in sorted(self._accept_cos.items())},
+                    for gi, hist in sorted(dict(self._accept_cos).items())},
                 # Skip-transfer bandwidth ceiling (Stage 0), in block-layer units:
                 #   skip_block_layers = Σ redir[gi] × layers_per_group[gi]  (blocks a skip would
                 #     omit, across all their group's layers)
@@ -746,8 +1021,8 @@ class MooncakeFFProducer:
                 #   skip_bandwidth_fraction = the GROSS ceiling; × (promo_applied/(applied+rep_gone))
                 #     from bff_apply_stats gives the SAFE realizable prize.
                 "skip_block_layers": (
-                    _skip_bl := sum(self.redir_total.get(gi, 0) * self.layers_per_group.get(gi, 1)
-                                    for gi in self.redir_total)),
+                    _skip_bl := sum(redir_total.get(gi, 0) * layers_per_group.get(gi, 1)
+                                    for gi in redir_total)),
                 "total_block_layers": self.total_block_layers,
                 "skip_bandwidth_fraction": _skip_bl / max(1, self.total_block_layers),
             }
@@ -758,6 +1033,70 @@ class MooncakeFFProducer:
             os.replace(tmp, path)   # atomic — the reader never sees a half-written file
         except Exception as e:  # pragma: no cover - defensive (must never break the transfer)
             logger.warning("BFF Mooncake: could not dump fuse stats: %s", e)
+
+
+class _FFFusionWorkerThread(threading.Thread):
+    """Producer-side fusion worker: finishes deferred :class:`FusionTask`s off the prefill
+    forward thread, then ships the resulting redirect rows.
+
+    Modelled on the base connector's ``KVCacheSendingLayerThread`` — daemon thread, device set in
+    ``run()``, a ready ``threading.Event``, a bounded task queue, and a per-task try/except so a
+    bad step never kills the thread.
+
+    EXACTLY ONE of these. The LSH index it drives is mutable shared state and probe-then-register
+    is order-dependent within a step; a single FIFO consumer keeps it single-writer (stricter than
+    the status quo, where the forward thread mutated it). Never widen this to a pool.
+
+    It also owns the ZMQ send, so a completed task goes straight out with no second queue hop.
+    """
+
+    def __init__(self, producer, ship):
+        super().__init__(daemon=True, name="BFF-FFFusionWorker")
+        self._producer = producer
+        self._ship = ship                     # (host, base_port, ext_id, gi, rows) -> None
+        self._q: "queue.Queue" = queue.Queue(maxsize=max(1, _FF_WORKER_QUEUE))
+        self.ready = threading.Event()
+
+    def submit(self, task: "FusionTask") -> bool:
+        """Enqueue a task. Returns False (and counts it) if the queue is full — NEVER blocks:
+        fusion is an optimization and must not throttle prefill."""
+        try:
+            self._q.put_nowait(task)
+            return True
+        except queue.Full:
+            self._producer.worker_dropped += 1
+            return False
+
+    def run(self):
+        # Same device derivation as the base connector's KVCacheSendingLayerThread.run(), so the
+        # worker's event waits refer to this rank's device. Imported lazily and guarded so this
+        # class stays in the portable half of the module (unit-testable off-NPU).
+        try:
+            from vllm.distributed.parallel_state import get_world_group
+            torch.npu.set_device(torch.device(f"npu:{get_world_group().local_rank}"))
+        except Exception as e:                # pragma: no cover - non-NPU test/dev environments
+            logger.debug("BFF fusion worker: set_device skipped: %s", e)
+        self.ready.set()
+        while True:
+            task = self._q.get()
+            if task is None:
+                break
+            try:
+                send_rows = self._producer.run_fusion_task(task)
+                for ext_id, rows in send_rows.items():
+                    target = task.targets.get(ext_id)
+                    if target:
+                        self._ship(target[0], target[1], ext_id, task.gi, rows)
+            except Exception as e:
+                # Never propagate: a failed fusion step costs compression, not correctness.
+                logger.warning("BFF fusion worker task failed (gi=%s): %s", task.gi, e,
+                               exc_info=_PD_DEBUG)
+            finally:
+                self._q.task_done()
+
+    def join_queue(self) -> None:
+        """Block until every submitted task has been processed. Test-only determinism hook."""
+        self._q.join()
 
 
 def resolve_redirect_rows(
@@ -988,6 +1327,7 @@ if _ASCEND_AVAILABLE:
             self._ff_mla_groups: set[int] | None = None
             self._ff_recv_thread: _FFRedirectRecvThread | None = None
             self._ff_send_thread: _FFRedirectSendThread | None = None
+            self._ff_worker_thread: _FFFusionWorkerThread | None = None
             if self._ff_enabled and self.connector_worker is not None:
                 self._ff_install_worker_hooks()
             if self._ff_enabled:
@@ -1004,6 +1344,14 @@ if _ASCEND_AVAILABLE:
             if is_producer:
                 self._ff_send_thread = _FFRedirectSendThread()
                 self._ff_send_thread.start()
+                if _FF_ASYNC:
+                    # Started unconditionally on the producer; whether a given group actually defers
+                    # is decided per group by MooncakeFFProducer._can_defer (TP>1 and the non-LSH
+                    # backends stay inline), so an idle thread is the worst case.
+                    self._ff_worker_thread = _FFFusionWorkerThread(
+                        self._ff_producer, self._ff_ship_redirect)
+                    self._ff_worker_thread.start()
+                    self._ff_worker_thread.ready.wait(timeout=10)
                 orig_save = worker.save_kv_layer
 
                 def _wrapped_save(layer_name, kv_layer, attn_metadata, connector_metadata, **kw):
@@ -1039,6 +1387,10 @@ if _ASCEND_AVAILABLE:
                         # Split of promo_unresolved by cause (their sum should equal it):
                         # rep still WAITING_FOR_REMOTE_KVS vs rep no longer in scheduler.requests.
                         "promo_unres_rep_loading": 0, "promo_unres_rep_gone": 0,
+                        # Maps that arrived after their owner was promoted — unappliable by
+                        # construction (see _bff_sweep_late_maps). The metric to watch when the
+                        # async fusion worker is on: nonzero means fusion is lagging the transfer.
+                        "promo_rows_late": 0, "promo_maps_late": 0,
                         # Stage 1a: revivability split of rep-gone (sum == promo_unres_rep_gone).
                         "repgone_revive_live": 0, "repgone_revive_cached": 0,
                         "repgone_truly_gone": 0, "repgone_no_history": 0}
@@ -1135,16 +1487,27 @@ if _ASCEND_AVAILABLE:
                 caches = [kv_layer[0], kv_layer[1]]
             else:
                 caches = [kv_layer[0]]
-            send_rows = self._ff_producer.on_layer(
-                gi, layer_name, caches, self._ff_group_layers[gi], requests)
-            if send_rows is None:
+            want_task = self._ff_worker_thread is not None
+            result = self._ff_producer.on_layer(
+                gi, layer_name, caches, self._ff_group_layers[gi], requests, want_task=want_task)
+            if result is None:
                 return
-            for rid, rm in connector_metadata.requests.items():
-                ext_id = get_external_request_id(rid)
-                rows = send_rows.get(ext_id)
-                if not rows:
-                    continue
-                self._ff_ship_redirect(rm.remote_host, rm.remote_port, ext_id, gi, rows)
+            if isinstance(result, FusionTask):
+                # Deferred: attach this step's ship targets (the metadata object is reused, so the
+                # worker must not read it later) and hand off. On a full queue the task is dropped —
+                # prefill is never throttled by fusion.
+                result.targets = {
+                    get_external_request_id(rid): (rm.remote_host, rm.remote_port)
+                    for rid, rm in connector_metadata.requests.items()
+                }
+                self._ff_worker_thread.submit(result)
+            else:
+                for rid, rm in connector_metadata.requests.items():
+                    ext_id = get_external_request_id(rid)
+                    rows = result.get(ext_id)
+                    if not rows:
+                        continue
+                    self._ff_ship_redirect(rm.remote_host, rm.remote_port, ext_id, gi, rows)
             # Periodically dump fusion stats so the benchmark's collect_bff_stats() can report real
             # compression (mirrors the NCCL cadence: step 1, then every _PD_STATS_EVERY steps).
             steps = self._ff_producer.steps

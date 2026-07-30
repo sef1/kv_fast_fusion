@@ -11,6 +11,7 @@ or standalone:
 import torch
 
 from kv_fast_fusion_ascend.connectors.mooncake_layerwise_connector_ff import (
+    FusionTask,
     MooncakeFFProducer,
     _classify_owner_miss,
     _ext_hash,
@@ -768,6 +769,197 @@ def test_skip_transfer_bandwidth_accounting():
     assert abs(s["skip_bandwidth_fraction"] - 9 / 40) < 1e-9, s["skip_bandwidth_fraction"]
 
 
+# --------------------------------------------------------------------------------------------
+# Step 1: the fusion check moved off the prefill forward thread. The whole safety argument is that
+# deferring changes WHERE the work runs and nothing else, so these pin exactly that.
+# --------------------------------------------------------------------------------------------
+class _async_config:
+    """Force the production con512 fusion config (lsh cross-index, within-batch cc off) for the
+    duration of a test, since the MODULE defaults leave intra_req_ff on and would otherwise close
+    the async gate and silently skip these."""
+
+    def __enter__(self):
+        from kv_fast_fusion_ascend.connectors import mooncake_layerwise_connector_ff as m
+        self._m = m
+        self._saved = (m._PD_CROSS_INDEX, m._PD_INTRA_REQ_FF)
+        m._PD_CROSS_INDEX, m._PD_INTRA_REQ_FF = "lsh", False
+        return m
+
+    def __exit__(self, *exc):
+        self._m._PD_CROSS_INDEX, self._m._PD_INTRA_REQ_FF = self._saved
+        return False
+
+
+def _run_fusion_steps(prod, use_task, steps, group_layers=("L0", "L1"), gi=1):
+    """Drive ``steps`` (each a list of (ext_id, cache, block_ids)) through a producer, either
+    inline or via the prepare/run task split, and collect the per-step redirect dicts."""
+    group_layers = set(group_layers)
+    out = []
+    for si, reqs in enumerate(steps):
+        prod.reset_step(si + 1)
+        req_tuples = [(ext, list(bids), True) for (ext, _c, bids) in reqs]
+        cache = reqs[0][1]
+        res = None
+        for ln in sorted(group_layers):
+            res = prod.on_layer(gi, ln, cache, group_layers, req_tuples, want_task=use_task)
+        if use_task and isinstance(res, FusionTask):
+            res = prod.run_fusion_task(res)
+        out.append(res)
+    return out
+
+
+def test_async_task_matches_inline_send_rows():
+    """GOLDEN EQUIVALENCE: prepare-task + run_fusion_task must produce byte-identical redirect rows
+    to the inline path, over a multi-step sequence that exercises cross-step LSH matching (so the
+    index state, not just one step's output, is compared). This is the regression guard for the
+    whole async move: if it ever diverges, the worker is not doing the same computation."""
+    shared = _make_k(1, seed=5)[0]
+    other = _make_k(1, seed=77)[0]
+    # reqA registers a rep; reqB/reqC match it in later steps; reqD is dissimilar (no redirect).
+    steps = [
+        [("reqA", _cache_with_blocks({10: shared}), [10])],
+        [("reqB", _cache_with_blocks({20: shared}, seed=9), [20])],
+        [("reqC", _cache_with_blocks({28: shared, 29: other}, seed=3), [28, 29])],
+        [("reqD", _cache_with_blocks({30: other}, seed=11), [30])],
+    ]
+    with _async_config():
+        inline = _run_fusion_steps(MooncakeFFProducer(), False, steps)
+        viatask = _run_fusion_steps(MooncakeFFProducer(), True, steps)
+    assert inline == viatask, f"async diverged from inline:\n  inline={inline}\n  task  ={viatask}"
+    # Guard against the comparison passing vacuously (both all-empty).
+    assert sum(len(v) for d in inline for v in d.values()) >= 2, f"expected redirects, got {inline}"
+
+
+def test_async_task_is_host_resident_after_prepare():
+    """The task handed to the worker must not reference the paged KV cache — those blocks are
+    recycled once the step ends, so a retained view would read another request's KV later."""
+    prod = MooncakeFFProducer()
+    cache = _cache_with_blocks({10: _make_k(1, seed=5)[0]})
+    with _async_config() as m:
+        prod.reset_step(1)
+        prod.on_layer(1, "L0", cache, {"L0", "L1"}, [("reqA", [10], True)], want_task=True)
+        task = prod.on_layer(1, "L1", cache, {"L0", "L1"}, [("reqA", [10], True)], want_task=True)
+    assert isinstance(task, m.FusionTask), f"expected a FusionTask, got {type(task)}"
+    assert task.reps_cpu.device.type == "cpu", task.reps_cpu.device
+    assert task.sub_hashes_dev.device.type == "cpu", task.sub_hashes_dev.device
+    # Mutating the cache after prepare must not change what the worker sees.
+    snapshot = task.reps_cpu.clone()
+    cache.zero_()
+    assert torch.equal(task.reps_cpu, snapshot), "task tensors alias the paged cache"
+
+
+def test_can_defer_refuses_tp_group_and_intra_req():
+    """The async gate must refuse every path that is not pure host work. tp_group is the critical
+    one: the matrix backend all_reduces, and a collective on a side thread deadlocks against the
+    model's own collectives."""
+    with _async_config() as m:
+        assert MooncakeFFProducer._can_defer(None), "production config must be deferrable"
+        assert not MooncakeFFProducer._can_defer(object()), "must refuse to defer under TP>1"
+        m._PD_INTRA_REQ_FF = True
+        assert not MooncakeFFProducer._can_defer(None), "must refuse when within-batch cc is on"
+        m._PD_INTRA_REQ_FF = False
+        m._PD_CROSS_INDEX = "matrix"
+        assert not MooncakeFFProducer._can_defer(None), "must refuse the matrix backend"
+
+
+def test_on_layer_falls_back_to_inline_when_gate_closed():
+    """want_task=True with a closed gate must still return the redirect dict, so the caller's type
+    branch degrades to the synchronous path rather than silently dropping fusion. Closed here via
+    intra_req_ff (the other gate, TP>1, would need a real process group — the inline path really
+    does all_reduce, which is exactly why it can never be deferred)."""
+    from kv_fast_fusion_ascend.connectors import mooncake_layerwise_connector_ff as m
+    prod = MooncakeFFProducer()
+    shared = _make_k(1, seed=5)[0]
+    cache = _cache_with_blocks({10: shared, 11: shared}, seed=2)
+    prod.reset_step(1)
+    reqs = [("reqA", [10], True), ("reqB", [11], True)]
+    orig = m._PD_INTRA_REQ_FF
+    try:
+        m._PD_INTRA_REQ_FF = True
+        prod.on_layer(1, "L0", cache, {"L0", "L1"}, reqs, want_task=True)
+        out = prod.on_layer(1, "L1", cache, {"L0", "L1"}, reqs, want_task=True)
+    finally:
+        m._PD_INTRA_REQ_FF = orig
+    assert isinstance(out, dict), f"closed gate must return the inline dict, got {type(out)}"
+    assert sum(len(v) for v in out.values()) == 1, f"within-batch merge expected, got {out}"
+
+
+def test_worker_queue_drops_instead_of_blocking():
+    """A full queue must shed the task and count it — fusion may lose compression under load, but it
+    must never block the prefill forward thread."""
+    from kv_fast_fusion_ascend.connectors import mooncake_layerwise_connector_ff as m
+    prod = MooncakeFFProducer()
+    worker = m._FFFusionWorkerThread(prod, lambda *a: None)   # not started: queue cannot drain
+    task = FusionTask(gi=1, reps_cpu=torch.zeros(1, 4), sub_hashes_dev=torch.zeros(1, 2),
+                      flat_req_local=[0], flat_slot=[0], ext_ids=["r"], ext_has_remote=[True],
+                      n_blocks=1)
+    accepted = sum(worker.submit(task) for _ in range(m._FF_WORKER_QUEUE + 5))
+    assert accepted == m._FF_WORKER_QUEUE, f"accepted {accepted}, cap {m._FF_WORKER_QUEUE}"
+    assert prod.worker_dropped == 5, prod.worker_dropped
+
+
+def test_late_map_after_promotion_is_counted_and_dropped():
+    """A redirect map arriving AFTER its owner's promotion must be counted as late and discarded.
+    It cannot be applied: once a request has been scheduled the scheduler ships only newly allocated
+    blocks, so a later req_to_blocks rewrite never reaches the worker's device table — freeing the
+    owner's original block then would be a use-after-free."""
+    from kv_fast_fusion_ascend import fast_fusion_ascend_patch as p
+    owner_rid = "own-abcd1234"
+    src = _FakeSource({})
+    sched = _FakeScheduler({}, [_FakeManager({}), _FakeManager({owner_rid: [200]})])
+    prev = _bp_mod._FF_PENDING_SOURCE
+    p._PROMOTED_SEEN.clear()
+    _bp_mod._FF_PENDING_SOURCE = src
+    try:
+        # Promote with nothing pending → recorded as seen, counted as no_rows.
+        owner = _FakeSchedReq(RequestStatus.WAITING)
+        owner.request_id = owner_rid
+        _bff_promotion_apply(sched, owner)
+        assert src.promo_stats["promo_no_rows"] == 1, src.promo_stats
+        # The map shows up one step too late.
+        src.pending["own"] = {1: [[0, _ext_hash("rep"), 0], [1, _ext_hash("rep"), 1]]}
+        p._bff_sweep_late_maps(sched)
+        assert src.promo_stats["promo_rows_late"] == 2, src.promo_stats
+        assert src.promo_stats["promo_maps_late"] == 1, src.promo_stats
+        assert "own" not in src.pending, "late map must be dropped, not left to accumulate"
+        # A map for a request that has NOT been promoted must be left alone for its promotion.
+        src.pending["other"] = {1: [[0, _ext_hash("rep"), 0]]}
+        p._bff_sweep_late_maps(sched)
+        assert "other" in src.pending, "un-promoted owner's map must survive the sweep"
+        assert src.promo_stats["promo_rows_late"] == 2, src.promo_stats
+    finally:
+        _bp_mod._FF_PENDING_SOURCE = prev
+        p._PROMOTED_SEEN.clear()
+
+
+def test_worker_thread_ships_redirects_end_to_end():
+    """The running worker must finish a real task and ship each owner's rows to that owner's target,
+    with the gi it was computed for."""
+    from kv_fast_fusion_ascend.connectors import mooncake_layerwise_connector_ff as m
+    shipped = []
+    prod = MooncakeFFProducer()
+    worker = m._FFFusionWorkerThread(prod, lambda *a: shipped.append(a))
+    worker.start()
+    assert worker.ready.wait(timeout=5), "worker never signalled ready"
+    shared = _make_k(1, seed=5)[0]
+    with _async_config():
+        # Step 1 registers reqA's rep; step 2's reqB matches it and must ship one redirect.
+        for si, (ext, bid, seed) in enumerate([("reqA", 10, 0), ("reqB", 20, 9)]):
+            cache = _cache_with_blocks({bid: shared}, seed=seed)
+            prod.reset_step(si + 1)
+            reqs = [(ext, [bid], True)]
+            for ln in ("L0", "L1"):
+                task = prod.on_layer(1, ln, cache, {"L0", "L1"}, reqs, want_task=True)
+            assert isinstance(task, FusionTask)
+            task.targets = {ext: ("10.0.0.1", 5000)}
+            assert worker.submit(task)
+            worker.join_queue()      # deterministic: this task is fully processed before the next
+    assert len(shipped) == 1, f"expected exactly one shipped map, got {shipped}"
+    host, port, ext_id, gi, rows = shipped[0]
+    assert (host, port, ext_id, gi) == ("10.0.0.1", 5000, "reqB", 1), shipped[0]
+    assert rows == [(0, _ext_hash("reqA"), 0)], rows
+
+
 if __name__ == "__main__":
     test_producer_detects_duplicate_across_requests()
     test_producer_no_merge_when_dissimilar()
@@ -796,6 +988,13 @@ if __name__ == "__main__":
     test_promotion_apply_no_rows_is_noop()
     test_promotion_apply_skips_preempted_resume()
     test_promotion_apply_unpublished_source_is_noop()
+    test_async_task_matches_inline_send_rows()
+    test_async_task_is_host_resident_after_prepare()
+    test_can_defer_refuses_tp_group_and_intra_req()
+    test_on_layer_falls_back_to_inline_when_gate_closed()
+    test_worker_queue_drops_instead_of_blocking()
+    test_worker_thread_ships_redirects_end_to_end()
+    test_late_map_after_promotion_is_counted_and_dropped()
     print("OK: all mooncake layerwise FF glue tests passed")
 
 

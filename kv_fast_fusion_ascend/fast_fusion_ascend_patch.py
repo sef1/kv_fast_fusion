@@ -52,6 +52,52 @@ def _rep_history_record(ext_hash: int, blocks_by_group: list[list[int]]) -> None
         _REP_HISTORY.popitem(last=False)
 
 
+_PROMOTED_SEEN: "OrderedDict[str, None]" = OrderedDict()
+_PROMOTED_SEEN_CAP = int(os.environ.get("BFF_FF_PROMOTED_SEEN_CAP", "4096"))
+
+
+def _note_promoted(ext: str) -> None:
+    """Remember that ``ext`` has been through the promotion hook, so a redirect map that shows up
+    afterwards can be recognized as LATE rather than sitting in ``pending`` unexplained."""
+    _PROMOTED_SEEN[ext] = None
+    _PROMOTED_SEEN.move_to_end(ext)
+    while len(_PROMOTED_SEEN) > _PROMOTED_SEEN_CAP:
+        _PROMOTED_SEEN.popitem(last=False)
+
+
+def _bff_sweep_late_maps(scheduler) -> None:
+    """Count and discard redirect maps that arrived after their owner was already promoted.
+
+    These CANNOT be applied, and the reason is structural rather than a missing guard. The promotion
+    window is the only safe one in this mode: a newly scheduled request ships its FULL block table to
+    the worker, so rewriting ``req_to_blocks`` before its first schedule propagates for free. Once a
+    request has been scheduled, the scheduler sends only NEWLY allocated blocks
+    (``_make_cached_request_data`` → ``req_to_new_blocks[req_id].get_block_ids()``), so a later
+    rewrite never reaches the worker's device block table — it would keep reading the owner's
+    original block while this frees it. That is a use-after-free, not a missed optimization, which is
+    why the legacy worker-side path coupled every free to a successful device write.
+
+    So the only correct handling is to drop them and make them visible: ``promo_rows_late`` is the
+    metric to watch when the async fusion worker is enabled, since deferring the fusion check is what
+    could push maps past their owner's promotion.
+    """
+    from kv_fast_fusion import fast_fusion_block_pool as _bp
+    src = getattr(_bp, "_FF_PENDING_SOURCE", None)
+    if src is None or not _PROMOTED_SEEN:
+        return
+    stats = getattr(src, "promo_stats", None)
+    with src.lock:
+        late = [e for e in src.pending if e in _PROMOTED_SEEN]
+        n_rows = sum(len(rows) for e in late for rows in src.pending[e].values())
+        for e in late:
+            src.pending.pop(e, None)
+    if late and stats is not None:
+        stats["promo_rows_late"] = stats.get("promo_rows_late", 0) + n_rows
+        stats["promo_maps_late"] = stats.get("promo_maps_late", 0) + len(late)
+        logger.warning("BFF Ascend: %d redirect map(s) (%d rows) arrived after promotion and were "
+                       "dropped — fusion is lagging its owner's KV transfer.", len(late), n_rows)
+
+
 def _rep_gone_bucket(block_pool, ext_hash: int, gi: int, rep_slot: int) -> str:
     """Classify a rep-gone row by whether its old physical block still holds valid KV. Returns one
     of: no_history | truly_gone | revive_live (ref_cnt>0) | revive_cached (freed but hash kept)."""
@@ -189,6 +235,9 @@ def _bff_promotion_apply(scheduler, request) -> None:
     ext = _ext_of(request.request_id)
     with src.lock:
         groups_rows = src.pending.pop(ext, None)
+    # Mark AFTER the pop: anything that lands for this ext from here on is provably late (see
+    # _bff_sweep_late_maps for why late maps cannot be applied).
+    _note_promoted(ext)
     stats = getattr(src, "promo_stats", None)
     if not groups_rows:
         if stats is not None:
@@ -308,6 +357,10 @@ def _wrap_scheduler_update_from_output(cls) -> bool:
 
     def wrapped(self, scheduler_output, model_runner_output, _orig=orig):
         _bff_apply_block_merge(self, model_runner_output)
+        try:
+            _bff_sweep_late_maps(self)
+        except Exception as e:      # pragma: no cover - diagnostics must never break the step
+            logger.warning("BFF Ascend late-map sweep failed: %s", e)
         return _orig(self, scheduler_output, model_runner_output)
 
     setattr(wrapped, _WRAP_SENTINEL, True)
