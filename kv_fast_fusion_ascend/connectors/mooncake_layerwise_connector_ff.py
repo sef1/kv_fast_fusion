@@ -84,9 +84,17 @@ _FF_AUDIT = os.environ.get("BFF_FF_AUDIT", "0") == "1"
 def _parse_groups(raw: str | None):
     """Parse BFF_FF_GROUPS ("1,2,3") into a set of group indices, or None for "all eligible".
     Unset/empty/whitespace → None. Ignores blanks so "1, 2," is accepted; a value that parses to
-    nothing (e.g. ",,") also yields None rather than silently disabling fusion entirely."""
+    nothing (e.g. ",,") also yields None rather than silently disabling fusion entirely.
+
+    ``"none"``/``"off"`` → an EMPTY set, which is different from None: it keeps the KV-cache group
+    split and every other BFF patch in place while selecting no fusion groups, so nothing is ever
+    clustered or redirected. That is the control arm that separates the cost of the group split from
+    the cost of fusion — without it, a comparison against BASELINE=layerwise moves both variables at
+    once and no throughput delta can be attributed to either."""
     if not raw or not raw.strip():
         return None
+    if raw.strip().lower() in ("none", "off"):
+        return frozenset()
     out = {int(p) for p in raw.split(",") if p.strip()}
     return out or None
 
@@ -1443,6 +1451,13 @@ if _ASCEND_AVAILABLE:
                             self._ff_producer_accumulate(
                                 worker, resolved, kv_layer, connector_metadata)
                             self._ff_producer.note_forward((time.perf_counter() - _t0) * 1e3)
+                            # Dump from HERE, not from inside _ff_producer_accumulate: that function
+                            # returns early for every non-fusion group and for every layer that
+                            # doesn't complete a group, so under BFF_FF_GROUPS=1 it reaches its tail
+                            # on ~1 layer in 28. A backstop gated behind the conditions it exists to
+                            # survive is not a backstop — it froze a prefill node's ledger at its
+                            # step-1 snapshot for a whole run. Cost here is a clock read per hook.
+                            self._ff_producer.maybe_dump_stats(_PD_STATS_DIR)
                     except Exception as e:  # pragma: no cover - never break the transfer
                         logger.warning("BFF Mooncake producer fusion failed: %s", e)
 
@@ -1531,6 +1546,9 @@ if _ASCEND_AVAILABLE:
                 fusion_groups = fusion_groups & selected
                 if skipped:
                     logger.info("BFF Mooncake: BFF_FF_GROUPS excludes fusion groups %s", skipped)
+                if not fusion_groups:
+                    logger.info("BFF Mooncake: BFF_FF_GROUPS selects NO fusion groups — group split "
+                                "and patches stay active, no clustering or redirects (control arm).")
             self._ff_group_layers = group_layers
             self._ff_fusion_groups = fusion_groups
             self._ff_mla_groups = mla_groups
@@ -1588,9 +1606,8 @@ if _ASCEND_AVAILABLE:
                     if not rows:
                         continue
                     self._ff_ship_redirect(rm.remote_host, rm.remote_port, ext_id, gi, rows)
-            # Dump fusion stats on the step cadence, a wall-clock cadence, and at exit — see
-            # maybe_dump_stats for why the step cadence alone silently loses short runs.
-            self._ff_producer.maybe_dump_stats(_PD_STATS_DIR)
+            # NOTE: the stats dump is driven from _wrapped_save, not from here — every early return
+            # above would otherwise gate the wall-clock backstop out of existence.
 
         def _ff_ship_redirect(self, host, base_port, ext_id, gi, rows) -> None:
             """Enqueue one request's redirect rows for group ``gi`` to the background sender (the

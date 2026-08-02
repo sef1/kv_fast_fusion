@@ -977,6 +977,40 @@ def test_stats_dump_fires_on_wall_clock_and_at_exit():
     assert json.load(open(path))["total_blocks"] == 456, "atexit dump did not write"
 
 
+def test_ff_groups_none_selects_no_fusion_groups():
+    """BFF_FF_GROUPS=none must yield an EMPTY selection, distinct from unset (=all). That is the
+    control arm which keeps the KV-cache group split and every patch active while doing no fusion,
+    so a throughput comparison against stock can separate the split's cost from fusion's."""
+    from kv_fast_fusion_ascend.connectors.mooncake_layerwise_connector_ff import _parse_groups
+    assert _parse_groups(None) is None, "unset means all eligible groups"
+    assert _parse_groups("  ") is None
+    assert _parse_groups(",,") is None, "a value parsing to nothing must not disable fusion"
+    assert _parse_groups("1,2") == {1, 2}
+    for raw in ("none", "NONE", " off "):
+        got = _parse_groups(raw)
+        assert got is not None and len(got) == 0, f"{raw!r} must select no groups, got {got!r}"
+
+
+def test_stats_dump_is_not_gated_behind_the_fusion_filter():
+    """The wall-clock backstop must be reachable on EVERY layer hook, not only when a fusion group
+    completes. It was originally called from the tail of _ff_producer_accumulate, behind four early
+    returns — under BFF_FF_GROUPS=1 that tail runs on ~1 layer in 28, so a prefill node's ledger
+    froze at its step-1 snapshot for an entire run and under-reported its shipped redirects."""
+    # Read the source text rather than the class: the connector is Ascend-gated and does not import
+    # off-NPU, but this invariant is exactly the kind that regresses unnoticed on a dev box.
+    import ast
+    from kv_fast_fusion_ascend.connectors import mooncake_layerwise_connector_ff as m
+    tree = ast.parse(open(m.__file__.replace(".pyc", ".py")).read())
+    bodies = {n.name: ast.unparse(n) for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef)
+              and n.name in ("_ff_producer_accumulate", "_ff_install_worker_hooks")}
+    assert set(bodies) == {"_ff_producer_accumulate", "_ff_install_worker_hooks"}, sorted(bodies)
+    assert "maybe_dump_stats" not in bodies["_ff_producer_accumulate"], \
+        "dump must NOT be called from _ff_producer_accumulate — its early returns (non-fusion group, "
+    assert "maybe_dump_stats" in bodies["_ff_install_worker_hooks"], \
+        "dump must be driven from the save_kv_layer hook so it runs on every layer"
+
+
 def test_decode_free_ledger_survives_a_short_run():
     """The decode ledger is the GROUND TRUTH for compression, and its event cadence silently
     truncated it: a con32 run had 38 merge events, so only event 1 was ever written and the file
@@ -1113,6 +1147,8 @@ if __name__ == "__main__":
     test_stats_dump_fires_on_wall_clock_and_at_exit()
     test_repgone_nohist_split_distinguishes_causes()
     test_decode_free_ledger_survives_a_short_run()
+    test_ff_groups_none_selects_no_fusion_groups()
+    test_stats_dump_is_not_gated_behind_the_fusion_filter()
     print("OK: all mooncake layerwise FF glue tests passed")
 
 
