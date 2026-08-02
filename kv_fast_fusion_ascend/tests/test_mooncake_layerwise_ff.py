@@ -977,6 +977,40 @@ def test_stats_dump_fires_on_wall_clock_and_at_exit():
     assert json.load(open(path))["total_blocks"] == 456, "atexit dump did not write"
 
 
+def test_decode_free_ledger_survives_a_short_run():
+    """The decode ledger is the GROUND TRUTH for compression, and its event cadence silently
+    truncated it: a con32 run had 38 merge events, so only event 1 was ever written and the file
+    reported blocks_freed_total=16 against a real 785 — turning ~1.7x compression into a reported
+    1.007x. A run must leave the true cumulative totals on disk however it ends."""
+    import tempfile, os, json, time as _time
+    import kv_fast_fusion.fast_fusion_scheduler as fs
+    d = tempfile.mkdtemp()
+    path = os.path.join(d, f"bff_decode_stats_{os.getpid()}.json")
+    saved = (fs._PD_STATS_DIR, dict(fs._bff_decode_stats), dict(fs._bff_decode_dump_state))
+    try:
+        fs._PD_STATS_DIR = d
+        fs._bff_decode_stats.update(blocks_freed_total=0, merge_events=0)
+        fs._bff_decode_dump_state.update(last_t=_time.monotonic(), atexit=False)
+        for _ in range(38):                      # fewer events than the dump cadence (50)
+            fs._bff_record_decode_free(20)
+        got = json.load(open(path))
+        assert got["merge_events"] == 1, "event-1 snapshot expected before any backstop fires"
+        # Wall-clock backstop: the next event must publish the true cumulative totals.
+        fs._bff_decode_dump_state["last_t"] = _time.monotonic() - (fs._PD_STATS_MAX_AGE_S + 1)
+        fs._bff_record_decode_free(20)
+        got = json.load(open(path))
+        assert got["merge_events"] == 39 and got["blocks_freed_total"] == 780, got
+        # ...and the exit hook publishes whatever accumulated after the last dump.
+        fs._bff_record_decode_free(5)
+        fs._bff_dump_decode_stats()
+        got = json.load(open(path))
+        assert got["merge_events"] == 40 and got["blocks_freed_total"] == 785, got
+    finally:
+        fs._PD_STATS_DIR = saved[0]
+        fs._bff_decode_stats.clear(); fs._bff_decode_stats.update(saved[1])
+        fs._bff_decode_dump_state.clear(); fs._bff_decode_dump_state.update(saved[2])
+
+
 def test_late_map_after_promotion_is_counted_and_dropped():
     """A redirect map arriving AFTER its owner's promotion must be counted as late and discarded.
     It cannot be applied: once a request has been scheduled the scheduler ships only newly allocated
@@ -1078,6 +1112,7 @@ if __name__ == "__main__":
     test_forward_ms_accumulates_per_hook()
     test_stats_dump_fires_on_wall_clock_and_at_exit()
     test_repgone_nohist_split_distinguishes_causes()
+    test_decode_free_ledger_survives_a_short_run()
     print("OK: all mooncake layerwise FF glue tests passed")
 
 

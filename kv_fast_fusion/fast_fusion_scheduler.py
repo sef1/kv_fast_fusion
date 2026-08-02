@@ -1,5 +1,7 @@
+import atexit
 import json
 import os
+import time
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from vllm.logger import init_logger
@@ -13,7 +15,13 @@ logger = init_logger("vllm.patched_scheduler")
 # from matching it. This module is shared with the NCCL/legacy patches, hence the env gate.
 _PD_STATS_DIR = os.environ.get("BFF_PD_STATS_DIR")
 _PD_STATS_EVERY = int(os.environ.get("BFF_PD_STATS_EVERY", "50"))
+# Wall-clock backstop for the dump, mirroring the producer side. The event cadence alone silently
+# truncates the ground truth: a con32 run produced 38 merge events, so only event 1 was ever written
+# and the file reported blocks_freed_total=16 when the real figure was 785. Every derived compression
+# number (the harness's "1.008x smaller ... realized 4.3%") was wrong by ~50x as a result.
+_PD_STATS_MAX_AGE_S = float(os.environ.get("BFF_PD_STATS_MAX_AGE_S", "30"))
 _bff_decode_stats = {"blocks_freed_total": 0, "merge_events": 0}
+_bff_decode_dump_state = {"last_t": 0.0, "atexit": False}
 
 
 # Per-merge freed-block-id trace. Gated: it appends to a JSONL file on EVERY merge event, which is
@@ -45,13 +53,30 @@ def _bff_record_decode_free(freed: int, freed_ids: list | None = None) -> None:
                 }) + "\n")
         except Exception as e:  # pragma: no cover - defensive
             logger.warning("BFF: could not write free audit log: %s", e)
-    if s["merge_events"] != 1 and s["merge_events"] % _PD_STATS_EVERY:
+    st = _bff_decode_dump_state
+    if not st["atexit"]:
+        st["atexit"] = True
+        atexit.register(_bff_dump_decode_stats)
+    now = time.monotonic()
+    # Event cadence OR wall-clock backstop. A run whose merge count never reaches _PD_STATS_EVERY
+    # would otherwise leave the event-1 snapshot on disk as if it were the final total.
+    if (s["merge_events"] != 1 and s["merge_events"] % _PD_STATS_EVERY
+            and now - st["last_t"] < _PD_STATS_MAX_AGE_S):
+        return
+    st["last_t"] = now
+    _bff_dump_decode_stats()
+
+
+def _bff_dump_decode_stats() -> None:
+    """Write the cumulative decode-side free ledger. Also the atexit hook, so a clean shutdown always
+    leaves the true totals on disk regardless of where the event cadence landed."""
+    if not _PD_STATS_DIR:
         return
     try:
         path = os.path.join(_PD_STATS_DIR, f"bff_decode_stats_{os.getpid()}.json")
         tmp = path + ".tmp"
         with open(tmp, "w") as f:
-            json.dump({"pid": os.getpid(), **s}, f)
+            json.dump({"pid": os.getpid(), **_bff_decode_stats}, f)
         os.replace(tmp, path)   # atomic — the reader never sees a half-written file
     except Exception as e:  # pragma: no cover - defensive (must never break scheduling)
         logger.warning("BFF: could not dump decode fuse stats: %s", e)
