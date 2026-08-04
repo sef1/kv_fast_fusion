@@ -13,11 +13,25 @@ whose control plane is a ZMQ side-channel (there is no NCCL ``recv_tensor`` to i
 
 Milestone 1 (raw, byte-exact): the producer still pushes every block over RDMA; after a fusion
 group's ``BFF_GROUP_SIZE`` layers have streamed through ``save_kv_layer``, the producer clusters the
-group's per-block K (concat cosine), builds a per-request redirect map (owner-slot → representative
-request's block-slot), and ships it to the decode node over a **dedicated FF ZMQ channel**. The
-decode node applies the map post-transfer: it repoints owner block-table slots at the representative's
-physical block and frees the redundant copies (BFF merge channel). No wire-dedup and no per-block
-scales are shipped (``BFF_SCALE_MODE=raw`` only — ratio mode needs a CUDA Triton kernel).
+group's per-block K (concat cosine) and builds a per-request redirect map (owner-slot →
+representative request's block-slot). The decode node applies the map before the owner decodes: it
+repoints owner block-table slots at the representative's physical block and frees the redundant
+copies (BFF merge channel). No wire-dedup and no per-block scales are shipped
+(``BFF_SCALE_MODE=raw`` only — ratio mode needs a CUDA Triton kernel).
+
+Redirect maps reach D over TWO paths, in priority order:
+
+  1. **Piggyback on the base connector's ``DONE_SENDING_MSG``** (primary). The map rides the very
+     message that tells D the KV landed, so it is stored by the base listener thread BEFORE
+     ``update_task()`` marks the request received — which means it is in ``pending`` before the
+     scheduler can promote the owner out of ``WAITING_FOR_REMOTE_KVS``. Ordering stops being a race:
+     on the synchronous path (``BFF_FF_ASYNC=0``) a map can never be late. The wire format extends
+     the base 3-tuple to ``(DONE_SENDING_MSG, external_req_id, trans_count, ff_data)`` — an
+     unpatched consumer reads ``msg[2]`` and ignores the tail, so it stays backward compatible.
+  2. **The dedicated FF PUSH/PULL side channel** (fallback). A map finished by the async fusion
+     worker AFTER its owner's done-signal already went out has missed path 1; it is pushed here
+     instead and counted as ``ff_shipped_late``. Both paths converge on the same consumer store
+     (``_FFRedirectRecvThread.pending``), so the apply side sees one channel.
 
 The module top level imports nothing Ascend/NPU-specific, so the pure fusion glue
 (:class:`MooncakeFFProducer`, :func:`resolve_redirect_rows`) is importable and unit-testable on any
@@ -139,10 +153,15 @@ _ACCEPT_COS_BINS = (0.75, 0.80, 0.85, 0.90, 0.95, 0.98, 1.01)
 _ACCEPT_COS_LABELS = tuple(
     f"{_ACCEPT_COS_BINS[i]:.2f}-{min(_ACCEPT_COS_BINS[i + 1], 1.0):.2f}"
     for i in range(len(_ACCEPT_COS_BINS) - 1))
-# Dedicated FF ZMQ control channel: D binds (its side-channel base + this offset); P sends redirect
-# maps there. Kept separate from the connector's own handshake port so the stock recv thread is
-# untouched. TP=1 assumed for M1 (the new setup runs tp_size=1 on both P and D).
+# Dedicated FF ZMQ control channel: D binds (its side-channel base + this offset); P pushes maps
+# that missed the DONE_SENDING_MSG piggyback (see the module docstring, path 2). Kept separate from
+# the connector's own handshake port so the stock recv thread is untouched. TP=1 assumed for M1.
 _FF_PORT_OFFSET = int(os.environ.get("BFF_MOONCAKE_FF_PORT_OFFSET", "20000"))
+# Cap on staged (not-yet-shipped) redirect maps held on the producer, oldest evicted first. The
+# staging dict is drained by each request's done-signal, so it only ever holds in-flight prefills —
+# but a request that is ABORTED never sends one, and a map finished after its owner's done-signal is
+# routed to the fallback channel rather than staged. Without a cap those leak for the process's life.
+_FF_MAP_CAP = int(os.environ.get("BFF_FF_MAP_CAP", "8192"))
 
 # Fusion-stats dump dir, now exported for BOTH roles. Each side drops a per-process file the
 # benchmark's collect_bff_stats() merges: the producer's ``bff_stats_<pid>.json`` (blocks seen +
@@ -253,12 +272,6 @@ def _ext_hash(external_id: str) -> int:
     to match the connector's own ``string_to_int64_hash``; keyed on the external id so P and D
     (whose full request ids differ by a 9-char suffix) agree."""
     return struct.unpack("<q", hashlib.sha256(external_id.encode("utf-8")).digest()[:8])[0] & 0x7FFFFFFFFFFFFFFF
-
-
-def _external_id(request_id: str) -> str:
-    """Strip the 9-char EngineCore suffix (vLLM PR #27987) to recover the proxy-assigned external id.
-    Mirrors the connector's ``get_external_request_id`` without importing the NPU-only module."""
-    return request_id[:-9]
 
 
 def _block_repr(caches, idx: torch.Tensor, jl_holder: list) -> torch.Tensor:
@@ -382,6 +395,17 @@ class MooncakeFFProducer:
         # thread only; see _pinned_like for the in-flight-reuse guard.
         self._pinned_pool: dict[tuple, torch.Tensor] = {}
         self.worker_dropped = 0                # tasks shed because the worker queue was full
+        # Redirect-delivery accounting (see the module docstring's two paths). done_with/without_map
+        # split the done-signals by whether a map rode along; shipped_late counts ROWS that missed the
+        # piggyback and went out on the fallback channel. On BFF_FF_ASYNC=0 fusion completes inline at
+        # the group's last save_kv_layer, which always precedes that request's last-layer transfer
+        # callback — so shipped_late MUST be 0 there, and a nonzero value is a real ordering bug, not
+        # a tuning knob. On BFF_FF_ASYNC=1 it is the honest cost of deferring the fusion check, and
+        # pairs with the consumer's promo_rows_late (how many of those still missed promotion).
+        self.ff_done_with_map = 0
+        self.ff_done_without_map = 0
+        self.ff_shipped_late = 0
+        self.ff_map_evicted = 0                # staged maps dropped by the _FF_MAP_CAP ring
         # gi -> per-bin accept counts (see _ACCEPT_COS_BINS): the accepted-merge cosine distribution.
         self._accept_cos: dict[int, list[int]] = {}
 
@@ -1069,6 +1093,12 @@ class MooncakeFFProducer:
                 "async_worker": _FF_ASYNC,
                 "async_d2h": _FF_ASYNC_D2H,
                 "worker_dropped": self.worker_dropped,
+                # Redirect delivery split (see the counters' definition). ff_shipped_late > 0 with
+                # BFF_FF_ASYNC=0 is a BUG, not a tuning signal; with =1 it is the price of deferral.
+                "ff_done_with_map": self.ff_done_with_map,
+                "ff_done_without_map": self.ff_done_without_map,
+                "ff_shipped_late": self.ff_shipped_late,
+                "ff_map_evicted": self.ff_map_evicted,
                 "total_blocks": tot_b,
                 "redirects_emitted": tot_r,
                 "compression_potential_factor": _factor(tot_b, tot_r),
@@ -1270,6 +1300,100 @@ def _classify_owner_miss(ext_id: str, ever_snapshotted) -> str:
     return "pruned" if ext_id in ever_snapshotted else "never_snap"
 
 
+class FFRedirectStaging:
+    """Producer-side staging for the DONE_SENDING_MSG piggyback (delivery path 1, module docstring).
+
+    A completed fusion group ``stage()``s its rows; that request's done-signal ``take()``s the whole
+    accumulated map and attaches it to the wire message. ``stage()`` returns False once the map has
+    already been taken — those rows missed the piggyback and the caller must ship them on the
+    fallback channel instead.
+
+    Bounded on both sides. ``_maps`` is drained by every done-signal so it normally holds only
+    in-flight prefills, but an ABORTED request never sends one, and without a cap those entries live
+    as long as the process. ``_taken`` must outlive each request's last late fusion group, not the
+    request itself, so the same cap is generous for it.
+
+    Lives in the portable half of the module (no ZMQ, no NPU) so the ordering rule it encodes —
+    "staged before the done-signal, or late" — is unit-testable off-Ascend."""
+
+    def __init__(self, cap: int = _FF_MAP_CAP, producer: "MooncakeFFProducer | None" = None):
+        self._cap = max(1, cap)
+        self._producer = producer
+        self._maps: "OrderedDict[str, dict[int, list]]" = OrderedDict()
+        self._taken: "OrderedDict[str, None]" = OrderedDict()
+        self._lock = threading.Lock()
+
+    def stage(self, ext_id: str, gi: int, rows: list) -> bool:
+        """Hold ``rows`` for ``ext_id``'s group ``gi`` until its done-signal. False ⇒ already taken
+        (the caller must use the fallback channel and count the rows as late)."""
+        with self._lock:
+            if ext_id in self._taken:
+                return False
+            groups = self._maps.get(ext_id)
+            if groups is None:
+                groups = {}
+                self._maps[ext_id] = groups
+            self._maps.move_to_end(ext_id)
+            groups[int(gi)] = rows
+            while len(self._maps) > self._cap:
+                self._maps.popitem(last=False)
+                if self._producer is not None:
+                    self._producer.ff_map_evicted += 1
+            return True
+
+    def take(self, ext_id: str) -> dict:
+        """Pop ``ext_id``'s staged map for its done-signal and mark the ext taken.
+
+        A single non-blocking pop by design. An earlier iteration polled here for up to 50ms hoping a
+        straggling fusion group would land — on the Mooncake SEND thread, and for EVERY request,
+        including the (common) ones that produced no redirects at all. That serialized 50ms per
+        request onto the one thread that owns every KV transfer. Lateness is now measured
+        (``ff_shipped_late``) and rerouted, never waited on."""
+        with self._lock:
+            groups = self._maps.pop(ext_id, None)
+            self._taken[ext_id] = None
+            self._taken.move_to_end(ext_id)
+            while len(self._taken) > self._cap:
+                self._taken.popitem(last=False)
+        return groups or {}
+
+    def sizes(self) -> tuple[int, int]:
+        with self._lock:
+            return len(self._maps), len(self._taken)
+
+
+def build_done_payload(msg_tag: bytes, ext_id: str, trans_count, ff_data: dict) -> tuple:
+    """The DONE_SENDING_MSG wire tuple, extended with the redirect map.
+
+    The base connector sends ``(tag, external_id, trans_count)``; appending a 4th element keeps a
+    stock decode node working (it reads ``msg[2]`` and ignores the tail) while giving a BFF-aware one
+    the map on the very message that reports the transfer complete."""
+    return (msg_tag, ext_id, trans_count, ff_data)
+
+
+def store_done_msg_redirects(sink, msg: tuple, ext_of) -> int:
+    """Consumer half of the piggyback: store ``msg``'s redirect map into ``sink`` (an object with
+    ``.lock`` and ``.pending``), returning the number of rows stored.
+
+    Called from the recv listener BEFORE ``update_task``, which is the ordering that makes the whole
+    design work: ``update_task`` is what eventually surfaces the request in ``done_recving``, and the
+    scheduler promotes its owner only after that — so the map is always in ``pending`` before the
+    promotion hook looks for it. Tolerates a 3-tuple from a stock producer (returns 0)."""
+    if sink is None or len(msg) <= 3:
+        return 0
+    ff_data = msg[3]
+    if not isinstance(ff_data, dict) or not ff_data:
+        return 0
+    ext_id = ext_of(msg[1])
+    n_rows = 0
+    with sink.lock:
+        groups = sink.pending.setdefault(ext_id, {})
+        for gi, rows in ff_data.items():
+            groups[int(gi)] = rows
+            n_rows += len(rows)
+    return n_rows
+
+
 # ---------------------------------------------------------------------------------------------
 # Ascend/NPU-only section: the connector subclass + ZMQ side-channel + block-table rewrite.
 # Guarded so the pure glue above stays importable on non-Ascend boxes (for unit tests).
@@ -1290,9 +1414,13 @@ try:
     )
 
     from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
+        DONE_SENDING_MSG,
+        GET_META_MSG,
+        KVCacheRecvingLayerThread,
         MooncakeLayerwiseConnector,
         MooncakeLayerwiseConnectorMetadata,
         MooncakeLayerwiseConnectorWorker,
+        ensure_zmq_send,
         get_external_request_id,
         zmq_ctx,
     )
@@ -1307,11 +1435,15 @@ except Exception as _imp_err:  # pragma: no cover - only importable on the Ascen
 if _ASCEND_AVAILABLE:
 
     class _FFRedirectRecvThread(threading.Thread):
-        """Decode-side listener for the dedicated FF redirect channel. Binds a ``zmq.PULL`` socket and
-        records each arrived redirect map as ``{external_id: {gi: rows}}`` for the connector to apply
-        at ``get_finished`` (post-transfer). Fire-and-forget: no ACK is sent, so the producer never
-        blocks — a dropped map just means that request keeps per-request copies on D (less compression,
-        never incorrect). Kept separate from the stock ``KVCacheRecvingLayerThread`` (untouched)."""
+        """Decode-side listener for the FF redirect channel (delivery path 2 — the FALLBACK for maps
+        that missed the DONE_SENDING_MSG piggyback). Binds a ``zmq.PULL`` socket and records each
+        arrived map as ``{external_id: {gi: rows}}``. Fire-and-forget: no ACK is sent, so the producer
+        never blocks — a dropped map just means that request keeps per-request copies on D (less
+        compression, never incorrect).
+
+        This object is ALSO the sink for the piggyback path: ``_ff_patched_recv_run`` stores into the
+        same ``pending``/``lock`` pair, so both channels converge here and everything downstream (the
+        ``drain``, ``_FF_PENDING_SOURCE``, the scheduler promotion hook) sees exactly one store."""
 
         def __init__(self, host: str, port: int):
             super().__init__(daemon=True, name="BFF-FFRedirectRecvThread")
@@ -1393,6 +1525,89 @@ if _ASCEND_AVAILABLE:
                     self._ctx.destroy(linger=0)
 
 
+    # The consumer-side sink for piggybacked redirect maps: the SAME _FFRedirectRecvThread the
+    # fallback PUSH channel writes to, so both delivery paths converge on one store and the apply
+    # side (and fast_fusion_ascend_patch's _FF_PENDING_SOURCE) sees a single channel. Module-level
+    # rather than closed over: the listener patch is installed on the CLASS, and a closure over one
+    # connector instance would silently bind to whichever instance was constructed last.
+    _FF_CONSUMER_SINK: "_FFRedirectRecvThread | None" = None
+    _FF_RUN_PATCHED = "_bff_recv_run_patched"
+
+
+    def _ff_patched_recv_run(self) -> None:
+        """Vendored copy of ``KVCacheRecvingLayerThread.run`` that also stores BFF redirect maps.
+
+        Two additions to the base body, and nothing else:
+          * ``ff_data = msg[3]`` — the map that rode the DONE_SENDING_MSG (see the module docstring).
+            It is stored BEFORE ``update_task``, which is the whole point: ``update_task`` is what
+            eventually reports the request in ``done_recving``, and the scheduler promotes the owner
+            only after that. Storing first makes "map present at promotion" an ordering invariant
+            instead of a race.
+          * the ``len(msg) > 3`` / ``isinstance`` guards, so a stock producer's 3-tuple still works.
+
+        ``trans_count`` is read from ``msg[2]`` exactly as the base does. It must NOT be hardcoded:
+        it is ``tp_size // remote_tp_size``, so at ``pd_head_ratio > 1`` a fixed 1 would mark the
+        request received after the FIRST of N per-rank transfers and hand decode a partially
+        populated KV cache.
+
+        This is a copy of vendored code — re-check it against the base on every vllm-ascend bump."""
+        handshake_port = self.side_channel_port + self.tp_rank
+        path = make_zmq_path("tcp", self.side_channel_host, handshake_port)
+        logger.info("Starting listening on path: %s (BFF redirect-aware)", path)
+        encoder = msgspec.msgpack.Encoder()
+        encoded_data = encoder.encode(self.metadata)
+        with zmq_ctx(zmq.ROUTER, path) as sock:
+            self.ready_event.set()
+            decoder = msgspec.msgpack.Decoder(type=tuple)
+            while True:
+                try:
+                    frames = sock.recv_multipart()
+                    if len(frames) < 2:
+                        logger.error("Invalid message format: %s", frames)
+                        continue
+
+                    identity = frames[0]
+                    payload = [f for f in frames[1:] if f != b""]
+                    if len(payload) != 1:
+                        logger.error("Invalid message format: %s", frames)
+                        continue
+
+                    msg = decoder.decode(payload[0])
+                    if msg[0] == GET_META_MSG:
+                        logger.info("Got GET META INFO for request %s", msg[0])
+                        sock.send_multipart((identity, b"", encoded_data))
+                    elif msg[0] == DONE_SENDING_MSG:
+                        logger.debug("Got DONE_RECVING_MSG for request %s", msg[1])
+                        request_id = msg[1]
+                        trans_count = msg[2]
+                        # --- BFF: store the piggybacked redirect map before signalling completion.
+                        store_done_msg_redirects(
+                            _FF_CONSUMER_SINK, msg, get_external_request_id)
+                        # --- end BFF
+                        self.update_task(request_id, trans_count)
+                        sock.send_multipart((identity, b"", b"ACK"))
+                    else:
+                        logger.error("Connection listener got unexpected message %s", msg)
+                except Exception as e:
+                    logger.error("Failed to decode message: %s", e)
+
+
+    def _ff_install_recv_listener(sink: "_FFRedirectRecvThread") -> None:
+        """Publish ``sink`` and patch the recv listener once. Must run BEFORE the thread starts —
+        it is created in ``register_kv_caches``, which is called after the connector's ``__init__``,
+        so installing from ``__init__`` is in time."""
+        global _FF_CONSUMER_SINK
+        if _FF_CONSUMER_SINK is not None and _FF_CONSUMER_SINK is not sink:
+            logger.warning("BFF Mooncake: replacing the consumer redirect sink — more than one FF "
+                           "connector in this process; only the newest will receive maps.")
+        _FF_CONSUMER_SINK = sink
+        if getattr(KVCacheRecvingLayerThread.run, _FF_RUN_PATCHED, False):
+            return
+        setattr(_ff_patched_recv_run, _FF_RUN_PATCHED, True)
+        KVCacheRecvingLayerThread.run = _ff_patched_recv_run
+        logger.info("BFF Mooncake: redirect-aware recv listener installed.")
+
+
     class MooncakeLayerwiseConnectorFF(MooncakeLayerwiseConnector, SupportsHMA):
         """Group-aware, fusion-adding subclass of the Ascend layerwise connector (see module doc)."""
 
@@ -1407,22 +1622,49 @@ if _ASCEND_AVAILABLE:
             self._ff_recv_thread: _FFRedirectRecvThread | None = None
             self._ff_send_thread: _FFRedirectSendThread | None = None
             self._ff_worker_thread: _FFFusionWorkerThread | None = None
+            # Staging for the DONE_SENDING_MSG piggyback. Per-INSTANCE (not class-level): a class
+            # dict would alias across connectors in one process and could never be reasoned about
+            # per rank.
+            self._ff_staging = FFRedirectStaging(producer=self._ff_producer)
             if self._ff_enabled and self.connector_worker is not None:
                 self._ff_install_worker_hooks()
             if self._ff_enabled:
                 logger.info("MooncakeLayerwiseConnectorFF: fusion enabled (raw, role=%s).", role)
+                if not _FF_PROMO_APPLY:
+                    # The legacy worker-side apply window is structurally dead at TP=1: the owner
+                    # joins input_batch only at its NEXT schedule, so _ff_write_runner_block_table
+                    # early-returns, the free is (correctly) withheld, and NO blocks are ever freed —
+                    # the run looks healthy in the producer stats and frees nothing. At TP>1 the
+                    # promotion hook can't work either (_FF_PENDING_SOURCE is in-process only), so
+                    # this flag has no configuration in which it actually compresses.
+                    logger.warning(
+                        "BFF Mooncake: BFF_FF_PROMO_APPLY=0 selects the legacy worker-side apply, "
+                        "which frees NO blocks at TP=1 (owner not yet in input_batch → "
+                        "owner_not_written ~= applied in bff_apply_stats). Set BFF_FF_PROMO_APPLY=1 "
+                        "unless you are deliberately measuring that dead window.")
 
         # -- worker (producer + consumer) integration --------------------------------------
         def _ff_install_worker_hooks(self) -> None:
-            """Wrap the inner worker's ``save_kv_layer`` (producer accumulate/ship) without editing
-            the vendored connector. The consumer apply is driven from ``get_finished`` below."""
+            """Install the fusion hooks on the inner worker without editing the vendored connector.
+
+            Producer: wrap ``save_kv_layer`` (accumulate + ship) and REPLACE ``send_done_send_signal``
+            so the done-signal carries the redirect map. The replacement must be installed here, in
+            ``__init__``: the send thread captures ``callback_func=self.send_done_send_signal`` in
+            ``register_kv_caches``, which runs later, so it picks this up. Same timing argument for
+            the consumer's listener patch — its thread is constructed in ``register_kv_caches`` too.
+
+            Consumer: bind the redirect sink and the apply path (driven from ``get_finished``)."""
             worker = self.connector_worker
-            is_producer = self.vllm_config.kv_transfer_config.is_kv_producer
-            is_consumer = self.vllm_config.kv_transfer_config.is_kv_consumer
+            # NOTE `_vllm_config`, not `vllm_config`: KVConnectorBase_V1 stores only the private
+            # name and MooncakeLayerwiseConnector never re-exports it, so the public spelling is an
+            # AttributeError that would abort __init__ (and with it the engine).
+            is_producer = self._vllm_config.kv_transfer_config.is_kv_producer
+            is_consumer = self._vllm_config.kv_transfer_config.is_kv_consumer
 
             if is_producer:
                 self._ff_send_thread = _FFRedirectSendThread()
                 self._ff_send_thread.start()
+                worker.send_done_send_signal = self._ff_make_send_done(worker)
                 if _FF_ASYNC:
                     # Started unconditionally on the producer; whether a given group actually defers
                     # is decided per group by MooncakeFFProducer._can_defer (TP>1 and the non-LSH
@@ -1468,6 +1710,9 @@ if _ASCEND_AVAILABLE:
                 port = worker.side_channel_port + _FF_PORT_OFFSET + worker.tp_rank
                 self._ff_recv_thread = _FFRedirectRecvThread(host, port)
                 self._ff_recv_thread.start()
+                # Piggybacked maps land in the SAME store as the fallback channel's, so everything
+                # downstream (drain, _FF_PENDING_SOURCE, the promotion hook) is unchanged.
+                _ff_install_recv_listener(self._ff_recv_thread)
                 if _FF_PROMO_APPLY:
                     # Publish the pending map to the scheduler's promotion hook (same process at
                     # TP=1; the _ACTIVE_RUNNER pattern in reverse). The hook owns consumption; the
@@ -1560,6 +1805,10 @@ if _ASCEND_AVAILABLE:
                 return
             if self._ff_group_layers is None:
                 self._ff_build_group_layers(worker)
+            if layer_name not in worker.layer_metadata:
+                # The resolved name came from index_to_name (empty layer_name path); a layer the
+                # connector never registered has no group and nothing to accumulate.
+                return
             gi = worker.layer_metadata[layer_name].tensor_group_idx[0]
             # Skip-transfer accounting (Stage 0): tally THIS layer's transferred blocks across ALL
             # groups (fusion or not) — the honest wire-bytes denominator — BEFORE the fusion filter.
@@ -1610,18 +1859,100 @@ if _ASCEND_AVAILABLE:
             # above would otherwise gate the wall-clock backstop out of existence.
 
         def _ff_ship_redirect(self, host, base_port, ext_id, gi, rows) -> None:
-            """Enqueue one request's redirect rows for group ``gi`` to the background sender (the
-            decode node's FF PULL channel). Non-blocking: NOTHING here runs on the prefill hot path
-            beyond a queue append. Rows are normalized to plain ints for msgpack."""
+            """Route one request's redirect rows for group ``gi`` to D.
+
+            Preferred path is the DONE_SENDING_MSG piggyback: stage the rows and let this request's
+            done-signal carry them, which puts the map on D strictly before its owner can be promoted.
+            If that request's map was ALREADY taken by a done-signal (only reachable when the async
+            fusion worker finishes a group after the transfer completed), fall back to the dedicated
+            PUSH channel and count the rows as late.
+
+            Non-blocking on both paths: NOTHING here runs on the prefill hot path beyond a dict write
+            or a queue append. Rows are normalized to plain ints for msgpack."""
+            data = [[int(o), int(h), int(s)] for (o, h, s) in rows]
+            if self._ff_staging.stage(ext_id, gi, data):
+                return
+            if self._ff_producer is not None:
+                self._ff_producer.ff_shipped_late += len(data)
             if host is None or base_port is None or self._ff_send_thread is None:
                 return
-            data = [[int(o), int(h), int(s)] for (o, h, s) in rows]
             self._ff_send_thread.submit(host, base_port + _FF_PORT_OFFSET, ext_id, gi, data)
+
+        def _ff_make_send_done(self, worker):
+            """Build the replacement ``worker.send_done_send_signal`` that carries the redirect map.
+
+            This is a faithful copy of the base worker's method (vllm_ascend
+            ``MooncakeLayerwiseConnectorWorker.send_done_send_signal``) with ONE change: the payload
+            gains a 4th element, ``ff_data``. Replacing it wholesale rather than wrapping it is
+            deliberate — a wrapper that sends its own extra DONE_SENDING_MSG costs a second REQ/ACK
+            round trip per request on the send thread, and keys that message differently from the
+            base's (full request id vs external id), which desynchronizes D's task tracker.
+
+            Everything else here — ``ensure_zmq_send``, the RCVTIMEO, the ``zmq.Again`` branch, the
+            error text — is preserved verbatim. The RCVTIMEO in particular is load-bearing: without
+            it a decode node that fails to reply parks ``KVCacheSendingLayerThread`` forever and ALL
+            KV transfers stop. Re-check this copy against the base on every vllm-ascend bump."""
+            connector = self
+
+            def _send_done_send_signal(req_id, req_meta, group_idx):
+                external_req_id = get_external_request_id(req_id)
+                ff_data = connector._ff_staging.take(external_req_id)
+                if connector._ff_producer is not None:
+                    if ff_data:
+                        connector._ff_producer.ff_done_with_map += 1
+                    else:
+                        connector._ff_producer.ff_done_without_map += 1
+                logger.info(
+                    "Sending done sending signal for request %s to %s:%d",
+                    external_req_id,
+                    req_meta.remote_host,
+                    req_meta.remote_port,
+                )
+                try:
+                    path = make_zmq_path("tcp", req_meta.remote_host, req_meta.remote_port)
+                    msg_encoder = msgspec.msgpack.Encoder()
+                    # 4-tuple extends the base 3-tuple: a consumer that does not know about BFF
+                    # reads msg[2] (trans_count) and ignores the tail, so this stays wire-compatible
+                    # with a stock decode node.
+                    encoded_data = msg_encoder.encode(build_done_payload(
+                        DONE_SENDING_MSG, external_req_id,
+                        req_meta.trans_count[group_idx], ff_data))
+                    with zmq_ctx(zmq.REQ, path) as sock:
+                        ensure_zmq_send(sock, encoded_data,
+                                        f"{req_meta.remote_host}:{req_meta.remote_port}")
+                        # Avoid blocking forever waiting for the REQ/ACK response.
+                        sock.setsockopt(zmq.RCVTIMEO, int(worker.timeout * 1000))
+                        try:
+                            ack = sock.recv()
+                        except zmq.Again:
+                            logger.warning(
+                                "Timeout waiting ACK for request %s from %s:%d (timeout=%.3fs)",
+                                external_req_id,
+                                req_meta.remote_host,
+                                req_meta.remote_port,
+                                worker.timeout,
+                            )
+                            return
+                        if ack != b"ACK":
+                            raise ValueError(f"Unexpected ACK response: {ack}")
+                except Exception as e:
+                    logger.error(
+                        f"Sending done sending signal for request {external_req_id} to "
+                        f"{req_meta.remote_host}:{req_meta.remote_port} fail with error: {e}"
+                    )
+
+            return _send_done_send_signal
 
         # -- consumer apply -----------------------------------------------------------------
         def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
             sending, recving = super().get_finished(finished_req_ids)
-            if self._ff_enabled and self._ff_recv_thread is not None:
+            # Consumer-only. `_ff_recv_thread is not None` already implies the consumer role, but say
+            # so explicitly: running the apply/janitor path on the PRODUCER makes it write
+            # bff_apply_stats_<pid>.json into the shared stats dir (which the benchmark's
+            # collect_bff_stats then merges as if it were decode-side data) and, under
+            # BFF_FF_PROMO_APPLY=0, grows _ff_load_blocks from send metadata that is never applied.
+            if self._ff_enabled and self._ff_recv_thread is not None and \
+                    self._vllm_config.kv_transfer_config.is_kv_consumer:
                 try:
                     if _FF_PROMO_APPLY:
                         # Promotion-time apply (scheduler side) owns consumption of the pending map.
