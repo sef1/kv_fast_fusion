@@ -1287,6 +1287,33 @@ def _classify_owner_miss(ext_id: str, ever_snapshotted) -> str:
     return "pruned" if ext_id in ever_snapshotted else "never_snap"
 
 
+# The three ``save_kv_layer`` arguments the producer hook needs, in the order it wants them.
+_SAVE_KV_ARGS = ("layer_name", "kv_layer", "connector_metadata")
+
+
+def resolve_save_kv_positions(fn) -> "tuple[int, ...] | None":
+    """Positional indices of :data:`_SAVE_KV_ARGS` in ``fn``'s signature, or None if ``fn`` does not
+    expose all three under those names.
+
+    Resolved ONCE, at hook-install time, so the per-layer path is plain tuple indexing. The obvious
+    alternative — ``Signature.bind()`` inside the wrapper — costs ~5-20us on EVERY attention layer of
+    EVERY prefill step, i.e. on precisely the thread whose latency ``forward_ms`` exists to measure.
+    Binding by name still matters (the vendored base has drifted between environments, and a
+    reordered or inserted parameter must never silently hand fusion the wrong tensor), but the name
+    lookup belongs at install time, not in the hot path.
+
+    ``fn`` is expected to be the BOUND worker method, so ``self`` is already excluded and the indices
+    line up with what the caller passes."""
+    try:
+        params = list(inspect.signature(fn).parameters)
+    except (TypeError, ValueError):        # pragma: no cover - builtins / C callables
+        return None
+    try:
+        return tuple(params.index(name) for name in _SAVE_KV_ARGS)
+    except ValueError:
+        return None
+
+
 # ---------------------------------------------------------------------------------------------
 # Ascend/NPU-only section: the connector subclass + ZMQ side-channel + block-table rewrite.
 # Guarded so the pure glue above stays importable on non-Ascend boxes (for unit tests).
@@ -1480,43 +1507,34 @@ if _ASCEND_AVAILABLE:
                     self._ff_worker_thread.start()
                     self._ff_worker_thread.ready.wait(timeout=10)
                 orig_save = worker.save_kv_layer
-                # Bind the base's parameters by NAME, not by position. This is the only base method
-                # still wrapped, and the base HAS drifted between environments (see the module
-                # docstring), so a positional signature is a latent break: a reordered or inserted
-                # parameter would silently hand fusion the wrong tensor. inspect resolves the three
-                # values we need from whatever the caller passed; if any is missing we pass the call
-                # through untouched rather than guess.
-                _save_params = None
-                try:
-                    _save_params = inspect.signature(orig_save)
-                except (TypeError, ValueError):  # pragma: no cover - builtins/C callables
-                    logger.warning("BFF Mooncake: save_kv_layer signature unavailable; fusion will "
-                                   "fall back to positional binding.")
-
-                def _bind_save_args(args, kw):
-                    """(layer_name, kv_layer, connector_metadata) from this call, or None if the
-                    base's signature no longer provides them under those names."""
-                    if _save_params is None:
-                        if len(args) >= 4:
-                            return args[0], args[1], args[3]
-                        return None
-                    try:
-                        bound = _save_params.bind(*args, **kw)
-                    except TypeError:
-                        return None
-                    a = bound.arguments
-                    if not {"layer_name", "kv_layer", "connector_metadata"} <= a.keys():
-                        return None
-                    return a["layer_name"], a["kv_layer"], a["connector_metadata"]
+                # Positions of (layer_name, kv_layer, connector_metadata), resolved by NAME but
+                # exactly ONCE — see resolve_save_kv_positions for why the name lookup must not
+                # happen per layer. None ⇒ the base no longer exposes them and fusion goes inert.
+                _save_pos = resolve_save_kv_positions(orig_save)
+                _i_ln, _i_kv, _i_cm = _save_pos if _save_pos else (-1, -1, -1)
+                _save_argc = (max(_save_pos) + 1) if _save_pos else 0
 
                 def _wrapped_save(*args, **kw):
-                    bound = _bind_save_args(args, kw)
-                    # Resolve the layer name the SAME way the connector does (empty → index_to_name),
-                    # but BEFORE orig_save runs, since orig_save increments worker.current_layer.
+                    # Hot path: the base calls this with every argument positional, so this is three
+                    # tuple indexes and nothing else. The kw fallback exists only for a caller that
+                    # passes some of them by keyword.
+                    kv_layer = connector_metadata = None
                     resolved = None
-                    if bound is not None:
-                        layer_name, kv_layer, connector_metadata = bound
-                        resolved = layer_name
+                    if _save_pos is not None:
+                        if len(args) >= _save_argc:
+                            resolved = args[_i_ln]
+                            kv_layer = args[_i_kv]
+                            connector_metadata = args[_i_cm]
+                        else:
+                            resolved = (args[_i_ln] if len(args) > _i_ln
+                                        else kw.get(_SAVE_KV_ARGS[0]))
+                            kv_layer = (args[_i_kv] if len(args) > _i_kv
+                                        else kw.get(_SAVE_KV_ARGS[1]))
+                            connector_metadata = (args[_i_cm] if len(args) > _i_cm
+                                                  else kw.get(_SAVE_KV_ARGS[2]))
+                        # Resolve the layer name the SAME way the connector does (empty →
+                        # index_to_name), but BEFORE orig_save runs, since orig_save increments
+                        # worker.current_layer.
                         if resolved == "" and worker.current_layer < worker.total_layers:
                             names = worker.index_to_name.get(worker.current_layer)
                             if names:
@@ -1542,15 +1560,13 @@ if _ASCEND_AVAILABLE:
                         logger.warning("BFF Mooncake producer fusion failed: %s", e)
 
                 worker.save_kv_layer = _wrapped_save
-                if _save_params is not None and not (
-                        {"layer_name", "kv_layer", "connector_metadata"}
-                        <= set(_save_params.parameters)):
+                if _save_pos is None:
                     # Fail LOUD and early rather than per-layer: fusion is inert for the whole run,
                     # and a silent inert producer is what makes a benchmark look like "BFF doesn't
                     # help" instead of "BFF never ran".
-                    logger.error("BFF Mooncake: save_kv_layer(%s) does not expose layer_name/"
-                                 "kv_layer/connector_metadata — vllm-ascend has drifted and PRODUCER "
-                                 "FUSION IS DISABLED for this run.", list(_save_params.parameters))
+                    logger.error("BFF Mooncake: save_kv_layer does not expose %s — vllm-ascend has "
+                                 "drifted and PRODUCER FUSION IS DISABLED for this run.",
+                                 list(_SAVE_KV_ARGS))
 
             if is_consumer:
                 host = worker.side_channel_host

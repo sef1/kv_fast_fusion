@@ -424,6 +424,41 @@ class _FakeRunner:
         self.requests = {rid: _FakeReqState(ngroups, cols) for rid in resident_rids}
 
 
+def test_save_kv_positions_resolve_by_name_once():
+    """The producer hook binds save_kv_layer's arguments by NAME but must resolve them exactly once,
+    at install time — a Signature.bind() per call would land on the prefill forward thread for every
+    attention layer of every step, which is the latency this project exists to measure.
+
+    So the resolver returns positional indices. They must track the name through an appended
+    parameter and through a reordering, and must return None (fusion goes inert, transfer untouched)
+    when the base no longer exposes the names at all."""
+    from kv_fast_fusion_ascend.connectors.mooncake_layerwise_connector_ff import (
+        resolve_save_kv_positions,
+    )
+
+    # The signature the connector ships today (bound method → no self).
+    def current(layer_name, kv_layer, attn_metadata, connector_metadata, **kwargs): pass
+    assert resolve_save_kv_positions(current) == (0, 1, 3)
+
+    # A drifted base that APPENDS a parameter — exactly the class of change that broke the vendored
+    # listener (update_task gained side_channel_path). Indices must be unaffected.
+    def appended(layer_name, kv_layer, attn_metadata, connector_metadata, side_channel_path=None): pass
+    assert resolve_save_kv_positions(appended) == (0, 1, 3)
+
+    # A drifted base that REORDERS: positional binding would silently hand fusion the wrong tensor.
+    def reordered(kv_layer, layer_name, connector_metadata, attn_metadata): pass
+    assert resolve_save_kv_positions(reordered) == (1, 0, 2)
+
+    # Names gone entirely → None, so the caller disables fusion loudly instead of guessing.
+    def unrecognized(a, b, c): pass
+    assert resolve_save_kv_positions(unrecognized) is None
+
+    # And the indices must agree with what the values actually are for a real call.
+    i_ln, i_kv, i_cm = resolve_save_kv_positions(reordered)
+    args = ("KV", "L0", "CM", "AM")          # reordered(kv_layer, layer_name, connector_metadata, ...)
+    assert (args[i_ln], args[i_kv], args[i_cm]) == ("L0", "KV", "CM")
+
+
 def test_write_returns_false_for_absent_rid():
     """An owner not in this step's input_batch → no write, so the caller must withhold the free."""
     runner = _FakeRunner(["reqA"])
@@ -1149,6 +1184,7 @@ if __name__ == "__main__":
     test_decode_free_ledger_survives_a_short_run()
     test_ff_groups_none_selects_no_fusion_groups()
     test_stats_dump_is_not_gated_behind_the_fusion_filter()
+    test_save_kv_positions_resolve_by_name_once()
     print("OK: all mooncake layerwise FF glue tests passed")
 
 
