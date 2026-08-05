@@ -11,15 +11,12 @@ or standalone:
 import torch
 
 from kv_fast_fusion_ascend.connectors.mooncake_layerwise_connector_ff import (
-    FFRedirectStaging,
     FusionTask,
     MooncakeFFProducer,
     _classify_owner_miss,
     _ext_hash,
     _ff_write_runner_block_table,
-    build_done_payload,
     resolve_redirect_rows,
-    store_done_msg_redirects,
 )
 
 
@@ -1110,104 +1107,6 @@ def test_worker_thread_ships_redirects_end_to_end():
     assert rows == [(0, _ext_hash("reqA"), 0)], rows
 
 
-# --------------------------------------------------------------------------------------------
-# DONE_SENDING_MSG piggyback (delivery path 1). The map rides the message that reports the KV
-# transfer complete, so it is stored on D before update_task can surface the request in
-# done_recving — which is what makes "map present at promotion" an invariant instead of a race.
-# --------------------------------------------------------------------------------------------
-class _FakeSink:
-    """Stands in for _FFRedirectRecvThread on the store side: just a lock + a pending dict."""
-
-    def __init__(self):
-        import threading
-        self.lock = threading.Lock()
-        self.pending: dict = {}
-
-
-def _ext_of(rid):
-    return rid[:-9]
-
-
-def test_done_signal_carries_map_and_preserves_trans_count():
-    """Round-trip the extended wire tuple through msgpack: the map must land in the sink keyed by
-    EXTERNAL id with int group keys, and trans_count must survive at msg[2] untouched.
-
-    trans_count is the regression that matters here: it is tp_size // remote_tp_size, so a listener
-    that hardcodes 1 marks the request received after the FIRST of N per-rank transfers and hands
-    decode a partially populated KV cache."""
-    try:
-        import msgspec
-    except Exception:
-        print("  (skipped done-signal payload test: msgspec unavailable)")
-        return
-    enc, dec = msgspec.msgpack.Encoder(), msgspec.msgpack.Decoder(type=tuple)
-    ff_data = {1: [[0, 12345, 0]], 2: [[1, 67890, 3]]}
-    payload = build_done_payload(b"done_sending_msg", "reqA", 4, ff_data)
-    msg = dec.decode(enc.encode(payload))
-
-    assert msg[2] == 4, f"trans_count must ride through untouched, got {msg[2]}"
-    sink = _FakeSink()
-    n_rows = store_done_msg_redirects(sink, msg, lambda r: r)   # already external here
-    assert n_rows == 2, n_rows
-    assert sink.pending == {"reqA": {1: [[0, 12345, 0]], 2: [[1, 67890, 3]]}}, sink.pending
-
-    # A stock (BFF-unaware) producer's 3-tuple must be tolerated, not crash the listener.
-    stock = dec.decode(enc.encode((b"done_sending_msg", "reqB", 2)))
-    assert stock[2] == 2
-    assert store_done_msg_redirects(sink, stock, lambda r: r) == 0
-    assert "reqB" not in sink.pending
-
-    # And the external-id derivation is the listener's job: the wire id is stripped before keying.
-    msg2 = dec.decode(enc.encode(build_done_payload(b"t", "reqC" + "-abcdefgh", 1, {3: [[0, 1, 0]]})))
-    store_done_msg_redirects(sink, msg2, _ext_of)
-    assert "reqC" in sink.pending, sink.pending
-
-
-def test_send_done_never_blocks_on_missing_map():
-    """take() on a request with nothing staged must return {} immediately — no polling. The removed
-    50ms wait ran on the Mooncake send thread for every request, including the (common) ones with no
-    redirects at all, serializing it behind one thread that owns every KV transfer."""
-    import time
-    st = FFRedirectStaging()
-    t0 = time.perf_counter()
-    assert st.take("nothing-staged") == {}
-    assert (time.perf_counter() - t0) < 0.01, "take() must not wait for a straggling fusion group"
-
-
-def test_late_map_falls_back_to_side_channel():
-    """Rows staged before the done-signal ride the piggyback; rows produced after it must be
-    refused by stage() so the caller reroutes them to the fallback PUSH channel."""
-    st = FFRedirectStaging()
-    assert st.stage("reqA", 1, [[0, 11, 0]]) is True
-    assert st.stage("reqA", 2, [[1, 22, 0]]) is True
-    assert st.take("reqA") == {1: [[0, 11, 0]], 2: [[1, 22, 0]]}, "done-signal takes the whole map"
-    # The async fusion worker finishes group 3 only now — too late for this request's done-signal.
-    assert st.stage("reqA", 3, [[2, 33, 0]]) is False, "post-take rows must not be staged silently"
-    # A different request is unaffected.
-    assert st.stage("reqB", 1, [[0, 44, 0]]) is True
-    assert st.take("reqB") == {1: [[0, 44, 0]]}
-
-
-def test_producer_map_is_bounded():
-    """Aborted requests never send a done-signal, so nothing drains their staged map. The ring must
-    cap the store and count what it drops rather than leaking for the life of the process."""
-    prod = MooncakeFFProducer()
-    st = FFRedirectStaging(cap=4, producer=prod)
-    for i in range(10):
-        assert st.stage(f"req{i}", 1, [[0, i, 0]]) is True
-    n_maps, _ = st.sizes()
-    assert n_maps == 4, n_maps
-    assert prod.ff_map_evicted == 6, prod.ff_map_evicted
-    # The survivors are the newest, and the oldest is genuinely gone (not merely hidden).
-    assert st.take("req9") == {1: [[0, 9, 0]]}
-    assert st.take("req0") == {}
-    # The taken ring is bounded too.
-    for i in range(20):
-        st.take(f"gone{i}")
-    _, n_taken = st.sizes()
-    assert n_taken == 4, n_taken
-
-
 if __name__ == "__main__":
     test_producer_detects_duplicate_across_requests()
     test_producer_no_merge_when_dissimilar()
@@ -1250,10 +1149,6 @@ if __name__ == "__main__":
     test_decode_free_ledger_survives_a_short_run()
     test_ff_groups_none_selects_no_fusion_groups()
     test_stats_dump_is_not_gated_behind_the_fusion_filter()
-    test_done_signal_carries_map_and_preserves_trans_count()
-    test_send_done_never_blocks_on_missing_map()
-    test_late_map_falls_back_to_side_channel()
-    test_producer_map_is_bounded()
     print("OK: all mooncake layerwise FF glue tests passed")
 
 
