@@ -58,6 +58,8 @@ from kv_fast_fusion.pd_dedup_v2 import (
     SENTINEL,
     AliasApplier,
     DedupEngine,
+    DedupStats,
+    KVLayoutError,
     SignatureCodec,
     signature_matrix,
 )
@@ -106,15 +108,19 @@ def filter_sentinels(remote_ids, local_ids):
             [local_ids[i] for i in kept if i < n_local])
 
 
-def signatures_for_group(kv_caches: dict, layer_names, block_ids, is_mla, jl_holder):
+def signatures_for_group(kv_caches: dict, layer_names, block_ids, is_mla, jl_holder,
+                         num_blocks=None):
     """Producer-side signature payload for one group's blocks.
 
     ``layer_names`` is however much of the group has been written when the transport wants to send
-    it — one layer under ``BFF_SIG_LAYERS=first``, all of them under ``group``."""
+    it — one layer under ``BFF_SIG_LAYERS=first``, all of them under ``group``. Returns ``None``
+    when there is nothing to describe; raises :class:`~kv_fast_fusion.pd_dedup_v2.KVLayoutError` if
+    the cache cannot be indexed by connector block ids, which the caller must count rather than
+    swallow."""
     layers = [kv_caches[ln] for ln in layer_names if ln in kv_caches]
     if not layers or not block_ids:
         return None
-    sig, norms = signature_matrix(layers, block_ids, is_mla, jl_holder)
+    sig, norms = signature_matrix(layers, block_ids, is_mla, jl_holder, num_blocks=num_blocks)
     if sig is None:
         return None
     proj = pd_lsh.get_proj([None], sig.shape[1], sig.device)
@@ -268,6 +274,12 @@ if _ASCEND_AVAILABLE:
             self._skip: dict[tuple, tuple] = {}     # (ext_id, gi) -> (remote_kept, local_kept)
             self._asked: set[tuple] = set()         # (send-task key, gi) already exchanged
             self._ff_step = 0
+            # The producer has no DedupEngine (it does not decide), but it still has to be able to
+            # say why it never asked — see _exchange_for and _warn_if_inert.
+            self._stats = DedupStats()
+            self._kv_caches: dict = {}
+            self._send_tasks = 0
+            self._inert_warned = False
             cfg = self._vllm_config.kv_transfer_config
             self.is_producer = cfg.is_kv_producer
             if self._v2_enabled and self.connector_worker is not None:
@@ -301,6 +313,11 @@ if _ASCEND_AVAILABLE:
 
         def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
             super().register_kv_caches(kv_caches)
+            # Keep the tensors ourselves. The vendored worker declares `self.kv_caches` and never
+            # assigns it — it walks these tensors for their base addresses and drops them — so
+            # reading `worker.kv_caches` yields {} forever, which is exactly what made the first
+            # Ascend v2 run inert for a whole benchmark with an all-zero stats file and no warning.
+            self._kv_caches = dict(kv_caches)
             if not self._v2_enabled or not self.is_producer:
                 return
             worker = self.connector_worker
@@ -346,14 +363,21 @@ if _ASCEND_AVAILABLE:
 
         # -- producer: ask before writing --------------------------------------------------
         def _exchange_for(self, worker, thread, send_task) -> None:
-            """One exchange per (send task, fusion group), covering every request in the task."""
+            """One exchange per (send task, fusion group), covering every request in the task.
+
+            Every path that declines to ask increments a named counter. An exchange that never
+            happens is otherwise indistinguishable in the stats from one that happened and found
+            nothing, and that ambiguity cost a whole benchmark run."""
+            self._send_tasks += 1
+            stats = self._stats
             layer_name = send_task.layer_name
             meta = worker.layer_metadata.get(layer_name)
             if meta is None:
-                return
+                stats.note_skip("empty_group")
+                return self._warn_if_inert()
             gi = int(meta.tensor_group_idx[0])
             if gi <= 0:
-                return          # group 0 is the warmup group — never fused
+                return          # group 0 is the warmup group — never fused, and not a problem
             key = (id(send_task.send_request), gi)
             if key in self._asked:
                 return          # later layers of the same group reuse the first answer
@@ -361,21 +385,39 @@ if _ASCEND_AVAILABLE:
             if len(self._asked) > 4096:
                 self._asked = {key}
 
+            if not self._kv_caches:
+                stats.note_skip("no_kv_tensors")
+                return self._warn_if_inert()
+
             layer_names = self._signature_layers(worker, gi, layer_name)
-            is_mla = self._is_mla(worker, layer_name)
+            is_mla = bool(getattr(worker, "use_mla", False))
+            num_blocks = getattr(getattr(worker, "kv_cache_config", None), "num_blocks", None)
             by_host: dict[tuple, dict] = {}
             for req_id, req_meta in send_task.send_request.items():
                 if gi >= len(req_meta.local_block_ids) or gi >= len(req_meta.remote_block_ids):
+                    stats.note_skip("empty_group")
                     continue
                 local_ids = list(req_meta.local_block_ids[gi])
                 remote_ids = list(req_meta.remote_block_ids[gi])
                 if not local_ids or len(remote_ids) != len(local_ids):
                     # Mismatched lengths mean the base is doing something (chunking, TP resharding)
                     # this decision cannot reason about. Send it whole.
+                    stats.note_skip("length_mismatch")
                     continue
-                payload = signatures_for_group(worker.kv_caches, layer_names, local_ids,
-                                               is_mla, self._jl)
+                try:
+                    payload = signatures_for_group(self._kv_caches, layer_names, local_ids,
+                                                   is_mla, self._jl, num_blocks=num_blocks)
+                except KVLayoutError as e:
+                    # Refusing is the point: a mis-indexed signature does not fail, it merges
+                    # blocks that are not alike. Once per run is enough noise.
+                    stats.note_skip("kv_layout_refused")
+                    if not self._inert_warned:
+                        self._inert_warned = True
+                        logger.error("BFF v2: cannot index the KV cache by block id (%s) — dedup "
+                                     "is DISABLED for this run.", e)
+                    return
                 if payload is None:
+                    stats.note_skip("no_signature")
                     continue
                 ext = get_external_request_id(req_id)
                 slot = by_host.setdefault((req_meta.remote_host, req_meta.remote_port),
@@ -384,30 +426,57 @@ if _ASCEND_AVAILABLE:
                 slot["sigs"][ext] = payload
                 slot["meta"][ext] = (req_id, local_ids, remote_ids)
 
+            if not by_host:
+                return self._warn_if_inert()
+
             for (host, port), slot in by_host.items():
                 if port is None:
+                    stats.note_skip("no_peer")
                     continue
+                stats.exchanges += 1
                 answer = self._client.ask(host, int(port) + FF_V2_PORT_OFFSET + worker.tp_rank,
                                           gi, slot["blocks"], slot["sigs"])
+                if not answer:
+                    stats.sig_phase_failed += 1
                 for ext, sentinels in (answer or {}).items():
                     entry = slot["meta"].get(ext)
                     if entry is None or len(sentinels) != len(entry[2]):
+                        stats.note_skip("length_mismatch")
                         continue    # D answered about something else; send that request whole
                     _rid, local_ids, _remote = entry
                     keep_remote, keep_local = filter_sentinels(list(sentinels), local_ids)
                     if len(keep_remote) != len(entry[2]):
                         self._skip[(ext, gi)] = (keep_remote, keep_local)
+                        stats.blocks_withheld += len(entry[2]) - len(keep_remote)
+                    # Deliberately does NOT count planned/dropped blocks: the decode already counts
+                    # those authoritatively (it is the side that decides), and both processes dump
+                    # into the same stats directory, so counting here would double every figure the
+                    # collector sums. The producer's job in the stats is only to say whether it
+                    # asked — and blocks_withheld, which is its own independent check that the two
+                    # sides agree about what was skipped.
+
+        def _warn_if_inert(self) -> None:
+            """Say it out loud, once, when v2 is installed but has never asked anything.
+
+            The first Ascend run produced a perfectly healthy-looking benchmark and an all-zero
+            stats file; nothing in either said "this feature did not run"."""
+            if self._inert_warned or self._send_tasks < 64 or self._stats.exchanges:
+                return
+            self._inert_warned = True
+            reasons = " ".join(f"{k}={v}" for k, v in self._stats.skip_reasons.items() if v)
+            logger.warning(
+                "BFF v2 is INERT: %d send tasks and not one signature exchange (%s). No block will "
+                "ever be deduplicated in this run.", self._send_tasks, reasons or "no reason "
+                "recorded — this is a bug in the accounting, not a quiet success")
+
+        def dump_producer_stats(self) -> None:
+            self._stats.dump()
 
         def _signature_layers(self, worker, gi: int, layer_name: str) -> list[str]:
             if SIG_LAYERS != "group":
                 return [layer_name]
             return [ln for ln, m in worker.layer_metadata.items()
-                    if int(m.tensor_group_idx[0]) == gi and ln in worker.kv_caches]
-
-        @staticmethod
-        def _is_mla(worker, layer_name: str) -> bool:
-            kv = worker.kv_caches.get(layer_name)
-            return kv is not None and kv.ndim == 3
+                    if int(m.tensor_group_idx[0]) == gi and ln in self._kv_caches]
 
         # -- consumer: apply the aliases ---------------------------------------------------
         @staticmethod
@@ -438,9 +507,13 @@ if _ASCEND_AVAILABLE:
 
         def start_load_kv(self, forward_context, **kwargs) -> None:
             super().start_load_kv(forward_context, **kwargs)
-            if self._applier is None:
-                return
             self._ff_step += 1
+            if self._applier is None:
+                # Producer: no aliases to apply, but its skip counters are the only record of
+                # whether the exchange ever ran, so they still have to reach the stats file.
+                if self._v2_enabled and self._stats.should_dump(self._ff_step):
+                    self._stats.dump()
+                return
             try:
                 from kv_fast_fusion import fast_fusion_block_pool as _bp
                 self._applier.apply(getattr(_bp, "_ACTIVE_RUNNER", None))

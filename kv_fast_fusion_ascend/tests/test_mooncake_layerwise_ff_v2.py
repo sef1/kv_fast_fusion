@@ -12,6 +12,7 @@ file exists to pin it.
 CPU only: no NPU, no Transfer Engine, no vllm_ascend import needed.
 """
 
+import pytest
 import torch
 
 from kv_fast_fusion import pd_dedup_v2, pd_lsh
@@ -229,3 +230,123 @@ def test_the_decode_reply_survives_the_round_trip_into_a_transfer_plan():
 
     assert reply["rB"] == [50, SENTINEL, 52], "rB's middle block matched rA's"
     assert pairs == {900: 40, 910: 50, 912: 52}, "911 is not transferred; the rest are unmoved"
+
+
+# =====================================================================================
+# the KV layout — the bug that made the first NPU run inert
+# =====================================================================================
+# The Ascend worker hands each layer as a (K, V) pair of tensors with the block dim at 0. The GPU
+# connector hands one stacked [2, num_blocks, ...] tensor. Indexing one as if it were the other does
+# not raise — it silently reads inside block 0 — so this is stated as an equivalence between the two
+# layouts rather than a smoke test.
+def _gpu_stacked(vectors):
+    """GPU layout: one tensor [2, nblocks, block, heads, dim]; dim 0 selects K vs V."""
+    n = len(vectors)
+    k = torch.zeros(n + 1, 1, 1, len(vectors[0]))
+    for i, v in enumerate(vectors):
+        k[i + 1, 0, 0] = torch.tensor(v, dtype=torch.float32)
+    v_cache = torch.full_like(k, -7.0)      # deliberately different, so picking V would show
+    return torch.stack([k, v_cache])
+
+
+def _ascend_pair(vectors):
+    """Ascend layout: [K, V] as separate tensors, each [nblocks, block, heads, dim]."""
+    stacked = _gpu_stacked(vectors)
+    return [stacked[0].clone(), stacked[1].clone()]
+
+
+def test_the_two_kv_layouts_give_the_same_signature():
+    """The equivalence the layout fix exists to guarantee."""
+    rows = [[1.0, 0.0, 0.5, 0.25], [0.0, 1.0, 0.25, 0.5]]
+    gpu = a2.signatures_for_group({"l0": _gpu_stacked(rows)}, ["l0"], [1, 2], False, [None])
+    npu = a2.signatures_for_group({"l0": _ascend_pair(rows)}, ["l0"], [1, 2], False, [None])
+
+    g_sig, g_norms, g_hashes = SignatureCodec.decode(gpu)
+    n_sig, n_norms, n_hashes = SignatureCodec.decode(npu)
+    assert torch.allclose(g_sig, n_sig, atol=1e-6)
+    assert g_norms == n_norms and g_hashes == n_hashes
+
+
+def test_the_ascend_layout_reads_k_not_v():
+    """A (K, V) pair indexed as if it were stacked would read V, or block 0's interior. Both are
+    wrong and neither raises, so pin the content."""
+    rows = [[1.0, 0.0], [0.0, 1.0]]
+    pair = _ascend_pair(rows)
+    idx = torch.tensor([1, 2])
+
+    got = pd_dedup_v2.key_blocks(pair, idx, is_mla=False)
+
+    assert torch.equal(got, pair[0].index_select(0, idx))
+    assert not torch.equal(got, pair[1].index_select(0, idx)), "read V instead of K"
+
+
+def test_a_block_id_that_cannot_index_the_cache_is_refused():
+    """block_size_scale != 1 means the tensor holds a multiple of the connector's blocks, so a
+    connector block id addresses the wrong memory. Refusing beats merging blocks that are not
+    alike, which is what a plausible-looking wrong signature would do."""
+    caches = {"l0": _ascend_pair([[1.0, 0.0]] * 4)}       # 5 rows incl. the null block
+    with pytest.raises(pd_dedup_v2.KVLayoutError):
+        a2.signatures_for_group(caches, ["l0"], [1], False, [None], num_blocks=2)
+
+    # ...and the matching count is accepted.
+    assert a2.signatures_for_group(caches, ["l0"], [1], False, [None], num_blocks=5) is not None
+
+
+def test_a_non_tensor_cache_entry_is_refused_not_guessed_at():
+    with pytest.raises(pd_dedup_v2.KVLayoutError):
+        pd_dedup_v2.key_blocks(["not a tensor"], torch.tensor([0]), is_mla=False)
+    with pytest.raises(pd_dedup_v2.KVLayoutError):
+        pd_dedup_v2.key_blocks([], torch.tensor([0]), is_mla=False)
+
+
+# =====================================================================================
+# inertness has to be loud
+# =====================================================================================
+def test_an_inert_run_is_reported_as_inert_not_as_zero_saving():
+    """The whole point of the skip counters. A connector that never asked produces the same
+    '0.0% saving' as one that asked and found nothing; only these tell them apart."""
+    from kv_fast_fusion.pd_dedup_v2 import DedupStats
+    inert = DedupStats()
+    inert.note_skip("no_kv_tensors", 12)
+
+    asked_and_found_nothing = DedupStats()
+    asked_and_found_nothing.exchanges = 12
+    asked_and_found_nothing.planned[1] = 900
+
+    assert inert.is_inert() and inert.stats_dict()["inert"] is True
+    assert not asked_and_found_nothing.is_inert()
+    assert inert.stats_dict()["wire_saving_pct"] == 0.0
+    assert asked_and_found_nothing.stats_dict()["wire_saving_pct"] == 0.0, (
+        "identical headline — the reason is the only thing that distinguishes them")
+    assert inert.stats_dict()["exchange_skip_reasons"]["no_kv_tensors"] == 12
+
+
+def test_an_empty_kv_cache_is_the_reason_recorded():
+    """The exact first-run bug: worker.kv_caches was permanently {}."""
+    assert a2.signatures_for_group({}, ["l0"], [1, 2], False, [None]) is None
+
+
+def test_ascend_shaped_kv_all_the_way_to_a_transfer_plan():
+    """The end-to-end path, from tensors in the shape the NPU worker actually hands over to the
+    (local, remote) pairs the RDMA write would use.
+
+    Every earlier test exercises one hop with a synthetic payload; this one starts from real
+    Ascend-layout KV, which is the hop the first NPU run got wrong — `worker.kv_caches` was empty,
+    so nothing downstream ever ran and every stat was a truthful-looking zero."""
+    dup = [1.0, 0.0, 0.0, 0.0]
+    caches = {"l0": _ascend_pair([[0.0, 1.0, 0.0, 0.0], dup, [0.0, 0.0, 1.0, 0.0]])}
+    engine = DedupEngine(resident=False)
+
+    # P: signatures for its own blocks 1..3, plus a separate request holding a copy of `dup`.
+    sig_b = a2.signatures_for_group(caches, ["l0"], [1, 2, 3], False, [None])
+    sig_a = a2.signatures_for_group({"l0": _ascend_pair([dup])}, ["l0"], [1], False, [None])
+
+    # D: decides, in the arrival order P sent them.
+    reply = _answer(engine, 1, {"rA": [40], "rB": [50, 51, 52]}, {"rA": sig_a, "rB": sig_b})
+
+    # P: turns the answer into what it will actually write.
+    keep_remote, keep_local = a2.filter_sentinels(list(reply["rB"]), [910, 911, 912])
+
+    assert reply["rB"] == [50, SENTINEL, 52], "rB's middle block is rA's block again"
+    assert dict(zip(keep_local, keep_remote)) == {910: 50, 912: 52}
+    assert 911 not in keep_local, "the duplicate is never transferred"

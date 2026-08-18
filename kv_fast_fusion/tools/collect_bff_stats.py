@@ -311,8 +311,29 @@ def collect(result_file: str, stats_dir: str, logs: list[str]) -> dict:
                           "per_decode": v2_per}
         landed = 100.0 * applied / max(1, applied + recomp)
         data["bff_v2"]["pct_landed"] = landed
+        # "0.0% saving" means two completely different things: asked and found nothing, or never
+        # asked at all. The first Ascend run was the second for a whole benchmark and looked
+        # identical to the first. Say which.
+        exchanges = sum(s.get("exchanges", 0) for s in v2_per.values())
+        skips: dict = {}
+        for s in v2_per.values():
+            for k, v in (s.get("exchange_skip_reasons") or {}).items():
+                skips[k] = skips.get(k, 0) + v
+        data["bff_v2"]["exchanges"] = exchanges
+        data["bff_v2"]["skip_reasons"] = skips
+        if exchanges == 0 and any(skips.values()):
+            data["bff_v2"]["inert"] = True
+            print("  ! bff v2 INERT: not one signature exchange was attempted, so no block could "
+                  "ever be deduplicated. Reasons: "
+                  + " ".join(f"{k}={v}" for k, v in sorted(skips.items(), key=lambda kv: -kv[1])
+                             if v))
         print(f"  bff v2 (DECODE DECIDES): {dropped} of {planned} blocks never requested "
-              f"= {pct:.1f}% of the wire | resident={resident} same-pull={same}")
+              f"= {pct:.1f}% of the wire | resident={resident} same-pull={same} "
+              f"| exchanges={exchanges}")
+        if exchanges and any(skips.values()):
+            print("    exchanges skipped: "
+                  + " ".join(f"{k}={v}" for k, v in sorted(skips.items(), key=lambda kv: -kv[1])
+                             if v))
         print(f"    aliases applied={applied} ({landed:.1f}% landed) | recompute (never-written "
               f"block, see the connector docstring)={recomp} | signature phase unavailable="
               f"{sigfail} pulls")
@@ -546,7 +567,10 @@ def summarize(data: dict) -> None:
     # unrequested block is an untransferred block — so this number cannot be inflated.
     v2 = data.get("bff_v2")
     dc = data.get("bff_decode_compression")
-    if v2:
+    if v2 and v2.get("inert"):
+        print("  ! bff v2 did not run: no signature exchange was ever attempted "
+              + " ".join(f"{k}={n}" for k, n in (v2.get("skip_reasons") or {}).items() if n))
+    elif v2:
         print(f"  bff v2: {v2['wire_saving_pct']:.1f}% of the wire not requested "
               f"({v2['blocks_not_requested']} of {v2['blocks_planned']} blocks; "
               f"resident={v2['from_resident']} same-pull={v2['from_same_pull']})")

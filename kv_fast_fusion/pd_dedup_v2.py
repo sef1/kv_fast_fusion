@@ -75,6 +75,12 @@ STATS_DIR = os.environ.get("BFF_PD_STATS_DIR", ".")
 FAIL_REASONS = ("owner_never_batched", "rep_not_resident", "victim_not_in_table",
                 "block_table_write_refused")
 
+# Why an exchange did not happen at all. A connector that never ASKS produces exactly the same
+# all-zero stats as one that asked and found nothing, and the first Ascend run was the former for
+# an entire benchmark before a log dive found it. Silence is not an acceptable report.
+SKIP_REASONS = ("no_kv_tensors", "no_signature", "length_mismatch", "kv_layout_refused",
+                "no_peer", "empty_group")
+
 
 def threshold_for(gi: int) -> float:
     """Cosine bar for a group (``BFF_THRESHOLD`` / ``BFF_THRESHOLD_G``).
@@ -87,7 +93,42 @@ def threshold_for(gi: int) -> float:
     return _THRESHOLD_G.get(gi, float(THRESHOLD))
 
 
-def signature_matrix(kv_layers: list, block_ids: list[int], is_mla: bool, jl_holder: list):
+class KVLayoutError(ValueError):
+    """The per-layer cache is not a shape this can index blocks out of.
+
+    Raised rather than guessed at: a mis-indexed signature is worse than no signature, because it
+    does not fail — it merges blocks that are not alike."""
+
+
+def key_blocks(kv, idx: "torch.Tensor", is_mla: bool) -> "torch.Tensor":
+    """Select the K rows for ``idx`` from one layer's cache entry, whatever shape it arrives in.
+
+    The two transports genuinely differ, and the difference is invisible until it corrupts:
+
+    * **GPU Mooncake** hands one stacked tensor per layer, ``[2, num_blocks, block, heads, dim]``,
+      where dim 0 selects K vs V — so blocks are ``kv[0, idx]``.
+    * **Ascend layerwise** hands a ``(K, V)`` list/tuple of separate tensors, each with the block
+      dim at 0 — so blocks are ``K[idx]``. Applying the GPU form here would index *inside block 0*
+      and silently return the wrong content.
+    * **MLA** has a single latent cache with the block dim at 0 — ``kv[idx]``.
+    """
+    if isinstance(kv, (list, tuple)):
+        if not kv:
+            raise KVLayoutError("empty per-layer cache entry")
+        k = kv[0]                       # Ascend: [K, V], each [num_blocks, ...]
+    elif is_mla:
+        k = kv                          # single latent cache, block dim 0
+    elif kv.ndim >= 4 and kv.shape[0] == 2:
+        return kv[0].index_select(0, idx)   # GPU stacked [2, num_blocks, ...]
+    else:
+        k = kv                          # already a bare K tensor with block dim 0
+    if not hasattr(k, "index_select"):
+        raise KVLayoutError(f"per-layer cache is a {type(k).__name__}, not a tensor")
+    return k.index_select(0, idx)
+
+
+def signature_matrix(kv_layers: list, block_ids: list[int], is_mla: bool, jl_holder: list,
+                     num_blocks: int | None = None):
     """Concatenate the given layers' per-block K and project to :data:`SIG_DIM`.
 
     Mirrors ``FFProducerFusion.block_repr`` + the concat the v1 clustering used, so a v2 signature
@@ -95,13 +136,27 @@ def signature_matrix(kv_layers: list, block_ids: list[int], is_mla: bool, jl_hol
     whichever layers of the group are available — all of them on a whole-request transport, possibly
     only the first on a layerwise one that streams a layer the moment it is computed.
 
+    ``num_blocks``, when given, is the block count the *connector* speaks. Ascend allows a cache
+    tensor whose block count is an integer multiple of it (``block_size_scale``), in which case a
+    connector block id does not index the tensor and the only safe answer is to refuse.
+
     Returns ``(normalised [N, d], norms [N])`` on the caller's device."""
     if not block_ids or not kv_layers:
         return None, None
-    idx = torch.as_tensor(block_ids, dtype=torch.long, device=kv_layers[0].device)
+    first = kv_layers[0]
+    probe = first[0] if isinstance(first, (list, tuple)) else first
+    if num_blocks is not None and getattr(probe, "shape", None) is not None:
+        rows = int(probe.shape[1] if (not isinstance(first, (list, tuple)) and not is_mla
+                                      and probe.ndim >= 4 and probe.shape[0] == 2)
+                   else probe.shape[0])
+        if rows != int(num_blocks):
+            raise KVLayoutError(
+                f"cache holds {rows} blocks but the connector addresses {num_blocks} "
+                "(block_size_scale != 1); a connector block id does not index this tensor")
+    idx = torch.as_tensor(block_ids, dtype=torch.long, device=probe.device)
     parts = []
     for kv in kv_layers:
-        blk = (kv[idx] if is_mla else kv[0, idx]).float()
+        blk = key_blocks(kv, idx, is_mla).float()
         parts.append(blk.reshape(idx.shape[0], -1))
     full = torch.cat(parts, dim=1)
     if jl_holder[0] is None or jl_holder[0].shape[0] != full.shape[1]:
@@ -153,6 +208,12 @@ class DedupStats:
         self.recomputed = 0         # aliases that could not be applied -> local recompute
         self.fail_reasons = dict.fromkeys(FAIL_REASONS, 0)
         self.sig_phase_failed = 0   # exchanges that fell back to a full transfer
+        self.exchanges = 0          # exchanges actually attempted
+        self.skip_reasons = dict.fromkeys(SKIP_REASONS, 0)
+        # Producer-side only: blocks the decode told it to skip. An independent cross-check that
+        # the two sides agree — it should track the decode's blocks_not_requested, and a divergence
+        # means the sentinel list and the alias map have come apart.
+        self.blocks_withheld = 0
         self.accept_cos: dict[int, list] = {}
         self.accept_rel_err: dict[int, list] = {}
         self.rejected_by_rel_err: dict[int, int] = {}
@@ -178,6 +239,14 @@ class DedupStats:
     def note_failure(self, reason: str, n: int = 1) -> None:
         self.recomputed += n
         self.fail_reasons[reason] = self.fail_reasons.get(reason, 0) + n
+
+    def note_skip(self, reason: str, n: int = 1) -> None:
+        """Record that an exchange did NOT happen, and why. See :data:`SKIP_REASONS`."""
+        self.skip_reasons[reason] = self.skip_reasons.get(reason, 0) + n
+
+    def is_inert(self) -> bool:
+        """True when v2 is installed but has never once asked the decode anything."""
+        return self.exchanges == 0 and any(self.skip_reasons.values())
 
     def should_dump(self, step: int) -> bool:
         now = time.monotonic()
@@ -226,6 +295,12 @@ class DedupStats:
             "aliases_recomputed": self.recomputed,
             "alias_failure_reasons": dict(self.fail_reasons),
             "signature_phase_failed": self.sig_phase_failed,
+            # An all-zero saving means one of two very different things. These separate them:
+            # exchanges>0 with no drops = nothing worth merging; exchanges==0 = v2 never ran.
+            "exchanges": self.exchanges,
+            "exchange_skip_reasons": dict(self.skip_reasons),
+            "blocks_withheld": self.blocks_withheld,
+            "inert": self.is_inert(),
             "dedup_index_blocks": dict(sorted(self.index_blocks.items())),
             "lsh_accept_cos": {str(g): dict(zip(pd_lsh.ACCEPT_COS_LABELS, v))
                                for g, v in sorted(self.accept_cos.items())},
