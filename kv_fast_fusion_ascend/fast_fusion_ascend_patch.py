@@ -479,8 +479,21 @@ def apply_fast_fusion_ascend_patch() -> None:
 
     # --- 3. Block-merge handler on the base Scheduler (inherited by the ascend schedulers) ---
     from vllm.v1.core.sched.scheduler import Scheduler
-    from kv_fast_fusion.fast_fusion_scheduler import _handle_block_merging_with_counts
+    from kv_fast_fusion.fast_fusion_scheduler import (
+        _handle_block_merging_with_counts,
+        _update_requests_with_invalid_blocks,
+    )
     Scheduler._handle_block_merging_with_counts = _handle_block_merging_with_counts
+    # KV-load-failure recovery must understand the BFF multi-group layout, exactly as on CUDA.
+    # Stock unpacks a 1-tuple from get_block_ids ("TODO: add support for hybrid memory
+    # allocator"); with BFF's 7 groups that raises `ValueError: too many values to unpack` and
+    # kills EngineCore the first time a connector reports a failed KV load. v2 reports those
+    # routinely (a declined block that never gets an alias applied is a recompute), so on the
+    # NPU this fires as soon as dedup does any work at all.
+    # Only the base class is patched: vllm_ascend's RecomputeScheduler/AsyncRecomputeScheduler
+    # call _handle_invalid_blocks but do not define _update_requests_with_invalid_blocks, so
+    # they inherit this replacement.
+    Scheduler._update_requests_with_invalid_blocks = _update_requests_with_invalid_blocks
     # Promotion-time redirect apply: rewrite the owner's req_to_blocks the instant it leaves
     # WAITING_FOR_REMOTE_KVS (before first schedule). Consumes the pending map the FF consumer
     # connector publishes via _FF_PENDING_SOURCE; a no-op on the producer / when unpublished.
