@@ -118,6 +118,13 @@ BFF_MAX_REL_ERR=${BFF_MAX_REL_ERR:-1.0}
 # transfer overlap. "group" matches the GPU signature exactly but holds the group's transfer until
 # its last layer is written.
 BFF_SIG_LAYERS=${BFF_SIG_LAYERS:-first}
+# What vLLM does when a connector reports blocks whose KV never arrived. v2 reports these BY DESIGN:
+# a block the decode declined and could not then alias holds nothing, so it must be recomputed.
+# vLLM's own default is "fail", which ERRORS those requests instead — turning the designed fallback
+# into lost requests (and, because a request failed before promotion still carries the
+# num_cached_tokens=-1 sentinel, into a negative Prometheus counter that takes down the API server's
+# output handler). The GPU script has always passed "recompute"; this one silently inherited "fail".
+KV_LOAD_FAILURE_POLICY=${KV_LOAD_FAILURE_POLICY:-recompute}
 
 # ---- Benchmark knobs ----
 NUM_PROMPTS=${NUM_PROMPTS:-1024}
@@ -386,6 +393,7 @@ build_kv_transfer_config() {
 {
   "kv_connector": "MultiConnector",
   "kv_role": "${role}",
+  "kv_load_failure_policy": "${KV_LOAD_FAILURE_POLICY}",
   "kv_connector_extra_config": {
     "connectors": [
       {
@@ -413,6 +421,7 @@ JSON
   "kv_connector": "${CONNECTOR}",
   "kv_role": "${role}",
   "kv_port": ${kv_port},
+  "kv_load_failure_policy": "${KV_LOAD_FAILURE_POLICY}",
   "kv_connector_extra_config": {
     "use_ascend_direct": true,
     "prefill": { "dp_size": ${DP_SIZE}, "tp_size": ${TP_SIZE} },

@@ -108,6 +108,21 @@ def filter_sentinels(remote_ids, local_ids):
             [local_ids[i] for i in kept if i < n_local])
 
 
+def to_external_request_id(request_id: str) -> str:
+    """This node's local request id → the id both nodes agree on.
+
+    vLLM PR #27987 appends a 9-character per-EngineCore suffix, so P's local id, D's local id and
+    the wire id are three different strings for one request. The vendored connector strips it with
+    ``request_id[:-9]``; this mirrors that exactly so the pure glue (and its tests) do not need the
+    NPU stack to talk about ids. It is deliberately NOT injective — two live requests could share an
+    external id — which is why the applier resolves through the runner's own batch rather than
+    assuming a unique inverse.
+
+    Kept in lockstep with ``vllm_ascend...mooncake_layerwise_connector.get_external_request_id``;
+    the NPU-only section below asserts the two agree at import time."""
+    return request_id[:-9]
+
+
 def signatures_for_group(kv_caches: dict, layer_names, block_ids, is_mla, jl_holder,
                          num_blocks=None):
     """Producer-side signature payload for one group's blocks.
@@ -143,6 +158,14 @@ try:
         MooncakeLayerwiseConnector,
         get_external_request_id,
     )
+
+    # The pure helper above must strip exactly what the vendored one strips: it is what the unit
+    # tests reason about, and a drift here would move aliases onto the wrong request.
+    _probe = "chatcmpl-0123-456789ab"
+    if get_external_request_id(_probe) != to_external_request_id(_probe):
+        raise RuntimeError(
+            "get_external_request_id changed shape upstream; to_external_request_id must follow "
+            f"({get_external_request_id(_probe)!r} != {to_external_request_id(_probe)!r})")
 
     _ASCEND_AVAILABLE = True
 except Exception as _e:  # pragma: no cover - optional dependency
@@ -295,8 +318,13 @@ if _ASCEND_AVAILABLE:
                 self._patch_sender(worker)
             else:
                 self._engine = DedupEngine()
+                # The engine is keyed by EXTERNAL request id (that is what crosses the wire, see
+                # _exchange_for); the runner is keyed by this node's local id, which carries a
+                # 9-char per-EngineCore suffix. Without this the applier matches nothing and every
+                # alias ages out as owner_never_batched.
                 self._applier = AliasApplier(
-                    self._engine, self._write_block_table, self._note_failed_blocks)
+                    self._engine, self._write_block_table, self._note_failed_blocks,
+                    normalize_req_id=get_external_request_id)
                 host = worker.side_channel_host
                 port = worker.side_channel_port + FF_V2_PORT_OFFSET + worker.tp_rank
                 self._server = _SigReplyServer(host, port, self._engine)

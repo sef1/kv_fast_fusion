@@ -73,7 +73,7 @@ STATS_DIR = os.environ.get("BFF_PD_STATS_DIR", ".")
 # reported a single number for all four and the root cause (maps staged a whole transfer too early)
 # had to be inferred from the step rate instead of read off the run.
 FAIL_REASONS = ("owner_never_batched", "rep_not_resident", "victim_not_in_table",
-                "block_table_write_refused")
+                "block_table_write_refused", "owner_id_ambiguous")
 
 # Why an exchange did not happen at all. A connector that never ASKS produces exactly the same
 # all-zero stats as one that asked and found nothing, and the first Ascend run was the former for
@@ -508,12 +508,25 @@ class AliasApplier:
     wrote, so it goes to the KV-load-failure path rather than being quietly dropped.
 
     ``write_block_table(runner, rid, gi, blocks) -> bool`` is injected because each connector already
-    owns a copy of it."""
+    owns a copy of it.
 
-    def __init__(self, engine: DedupEngine, write_block_table, note_failed_blocks) -> None:
+    ``normalize_req_id`` bridges two ID SPACES that are not interchangeable. The engine is keyed by
+    whatever id the two nodes agreed on over the wire; the runner is keyed by this node's own
+    EngineCore request id. On CUDA (with the stable-id patch) they are the same string and the
+    default identity is correct. On Ascend they are not: vLLM PR #27987 appends a per-EngineCore
+    9-character suffix, so the transport talks in ``get_external_request_id(rid) == rid[:-9]`` while
+    ``runner.input_batch.req_id_to_index`` holds the full local id. Matching one against the other
+    finds nothing, every alias ages out, and the whole run reports ``owner_never_batched`` — which
+    is exactly what the first working NPU run did, 5216 of 5216. Normalising the RUNNER's ids into
+    the engine's space (and writing back through the local id we came from) is what keeps the two
+    joined."""
+
+    def __init__(self, engine: DedupEngine, write_block_table, note_failed_blocks,
+                 normalize_req_id=None) -> None:
         self._engine = engine
         self._write = write_block_table
         self._note_failed = note_failed_blocks
+        self._norm = normalize_req_id or (lambda rid: rid)
         self.pending: dict[str, tuple[dict, int]] = {}
         self.pending_merges: dict | None = None
         self.step = 0
@@ -534,18 +547,39 @@ class AliasApplier:
         batched = getattr(getattr(runner, "input_batch", None), "req_id_to_index", None)
         if batched is None:
             return
+        # Keyed in the ENGINE's id space (see _norm); rid2local carries the way back, because the
+        # block-table write and the merge channel both address the runner/scheduler by local id.
         rid2blocks: dict[str, Any] = {}
+        rid2local: dict[str, str] = {}
+        # Normalisation only has to be injective ACROSS THIS BATCH, and the transport's own keying
+        # already assumes that. If it ever is not, the alias map cannot be attributed to a request
+        # and resolving it anyway would rewrite the wrong request's block table — the one failure in
+        # this file that is silent and unrecoverable. Refuse the key instead, and say so.
+        ambiguous: set[str] = set()
         for rid_r in batched:
             st = getattr(runner, "requests", {}).get(rid_r)
             bids = getattr(st, "block_ids", None) if st is not None else None
             if bids is not None:
-                rid2blocks[rid_r] = bids
+                key = self._norm(rid_r)
+                if key in rid2blocks or key in ambiguous:
+                    ambiguous.add(key)
+                    rid2blocks.pop(key, None)
+                    rid2local.pop(key, None)
+                    continue
+                rid2blocks[key] = bids
+                rid2local[key] = rid_r
 
         updated: dict[str, dict[int, list[int]]] = {}
         failed: set[int] = set()
         n_applied = 0
         done: list[str] = []
         for rid, (by_group, first_step) in self.pending.items():
+            if rid in ambiguous:
+                done.append(rid)
+                for m in by_group.values():
+                    failed.update(m)
+                    stats.note_failure("owner_id_ambiguous", len(m))
+                continue
             if rid not in rid2blocks:
                 if self.step - first_step > APPLY_MAX_AGE:
                     # It never came back. Those blocks hold nothing. Reaching this in bulk means
@@ -555,12 +589,13 @@ class AliasApplier:
                         failed.update(m)
                         stats.note_failure("owner_never_batched", len(m))
                 continue
+            local_rid = rid2local[rid]
             for gi, mapping in by_group.items():
                 new_blocks, why = self._substitute(rid2blocks, rid, gi, mapping)
                 # Free ONLY when the device table was really rewritten — and recompute whenever it
                 # was not, because unlike v1 the victim block holds nothing.
-                if why is None and self._write(runner, rid, int(gi), new_blocks):
-                    updated.setdefault(rid, {})[int(gi)] = new_blocks
+                if why is None and self._write(runner, local_rid, int(gi), new_blocks):
+                    updated.setdefault(local_rid, {})[int(gi)] = new_blocks
                     n_applied += len(mapping)
                 else:
                     failed.update(mapping)

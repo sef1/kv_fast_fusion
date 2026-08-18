@@ -350,3 +350,124 @@ def test_ascend_shaped_kv_all_the_way_to_a_transfer_plan():
     assert reply["rB"] == [50, SENTINEL, 52], "rB's middle block is rA's block again"
     assert dict(zip(keep_local, keep_remote)) == {910: 50, 912: 52}
     assert 911 not in keep_local, "the duplicate is never transferred"
+
+
+# =====================================================================================
+# the two request-id spaces
+# =====================================================================================
+# vLLM PR #27987 appends a 9-character per-EngineCore suffix to the request id, so P's local id, D's
+# local id and the id they agree on over the wire are three different strings. The engine is keyed
+# by the wire (external) id; the runner and scheduler are keyed by this node's local id. The first
+# NPU run that got as far as planning matched one against the other and applied 0 of 5216 aliases,
+# every one of them ageing out as `owner_never_batched` — a counter that reads as "the scheduler was
+# slow", which is why it is worth a test that names the real cause.
+SUFFIX = "-8d919ad3"        # len 9, the shape get_external_request_id strips
+
+
+def _applier_runner(req_blocks, batched=None):
+    """A runner keyed the way the NPU keys it: LOCAL ids, suffix and all."""
+    import types
+    reqs = {rid: types.SimpleNamespace(block_ids=[list(g) for g in groups])
+            for rid, groups in req_blocks.items()}
+    names = list(req_blocks) if batched is None else batched
+    return types.SimpleNamespace(
+        requests=reqs,
+        input_batch=types.SimpleNamespace(
+            req_id_to_index={rid: i for i, rid in enumerate(names)}))
+
+
+def _applier(engine, normalize=None):
+    """AliasApplier with a recording writer that mimics _ff_write_runner_block_table: it refuses
+    (returns False) for a rid that is not in this step's input_batch, which is the coupling the
+    whole apply path depends on."""
+    written, failed = [], set()
+
+    def write(runner, rid, gi, blocks):
+        if rid not in runner.input_batch.req_id_to_index:
+            return False
+        runner.requests[rid].block_ids[gi] = list(blocks)
+        written.append((rid, gi, list(blocks)))
+        return True
+
+    a = pd_dedup_v2.AliasApplier(engine, write, failed.update, normalize_req_id=normalize)
+    return a, written, failed
+
+
+def test_the_applier_finds_the_owner_through_the_local_id_suffix():
+    """The fix. Engine keyed by external id, runner keyed by local id, and the write must still go
+    out under the LOCAL id — the block table and the merge channel are both addressed that way."""
+    ext_a, ext_b = "chatcmpl-aaa", "chatcmpl-bbb"
+    engine = DedupEngine(resident=False)
+    engine._alias_ready = {ext_b: {1: {51: (41, ext_a)}}}
+    engine._planner._resident.setdefault(1, set()).add(41)
+    runner = _applier_runner({ext_a + SUFFIX: [[], [41]], ext_b + SUFFIX: [[], [50, 51]]})
+    applier, written, failed = _applier(engine, normalize=a2.to_external_request_id)
+
+    applier.apply(runner)
+
+    assert written == [(ext_b + SUFFIX, 1, [50, 41])], "written under the LOCAL id"
+    assert applier.pending_merges == {ext_b + SUFFIX: {1: [50, 41]}}, \
+        "the merge channel is keyed by the id the scheduler knows"
+    assert failed == set(), "nothing had to be recomputed"
+    assert engine.stats.applied == 1
+
+
+def test_an_id_space_mismatch_ages_every_alias_out_as_owner_never_batched():
+    """The bug, pinned as the symptom it actually produced, so this exact reading of the stats can
+    never again be mistaken for a scheduling problem. Identity normalisation (the default) against
+    suffixed runner ids finds nothing at all."""
+    ext_a, ext_b = "chatcmpl-aaa", "chatcmpl-bbb"
+    engine = DedupEngine(resident=False)
+    engine._alias_ready = {ext_b: {1: {51: (41, ext_a)}}}
+    engine._planner._resident.setdefault(1, set()).add(41)
+    runner = _applier_runner({ext_a + SUFFIX: [[], [41]], ext_b + SUFFIX: [[], [50, 51]]})
+    applier, written, failed = _applier(engine)          # no normalizer
+
+    for _ in range(pd_dedup_v2.APPLY_MAX_AGE + 2):
+        applier.apply(runner)
+
+    assert written == []
+    assert engine.stats.applied == 0
+    assert failed == {51}, "the never-written block still has to reach the recompute path"
+    assert engine.stats.fail_reasons["owner_never_batched"] == 1
+
+
+def test_the_default_normalizer_is_identity():
+    """CUDA runs with matching ids (the stable-id patch) and must be untouched by this change."""
+    rid = "chatcmpl-aaa"
+    engine = DedupEngine(resident=False)
+    engine._alias_ready = {rid: {1: {51: (41, "owner")}}}
+    engine._planner._resident.setdefault(1, set()).add(41)
+    runner = _applier_runner({"owner": [[], [41]], rid: [[], [50, 51]]})
+    applier, written, failed = _applier(engine)
+
+    applier.apply(runner)
+
+    assert written == [(rid, 1, [50, 41])]
+    assert failed == set()
+
+
+def test_two_batched_requests_sharing_an_external_id_are_refused_not_guessed_at():
+    """Normalisation only has to be injective across the batch, and the vendored transport already
+    assumes that (its request_map is keyed by external id). But if it ever is not, an alias map
+    cannot be attributed to a request, and picking one would rewrite the WRONG request's block
+    table — the only silent, unrecoverable failure in this path. It must refuse and recompute."""
+    ext = "chatcmpl-aaa"
+    locals_ = [ext + "-11111111", ext + "-22222222"]
+    assert len({a2.to_external_request_id(r) for r in locals_}) == 1, "the collision under test"
+
+    engine = DedupEngine(resident=False)
+    engine._alias_ready = {ext: {1: {51: (41, "owner")}}}
+    engine._planner._resident.setdefault(1, set()).add(41)
+    runner = _applier_runner({"owner" + SUFFIX: [[], [41]],
+                              locals_[0]: [[], [50, 51]], locals_[1]: [[], [60, 51]]})
+    before = [list(g) for g in runner.requests[locals_[1]].block_ids]
+    applier, written, failed = _applier(engine, normalize=a2.to_external_request_id)
+
+    applier.apply(runner)
+
+    assert written == [], "no table was rewritten on a guess"
+    assert runner.requests[locals_[1]].block_ids == before, "the other request is untouched"
+    assert failed == {51}, "the unwritten block goes to the recompute path instead"
+    assert engine.stats.fail_reasons["owner_id_ambiguous"] == 1
+    assert applier.pending == {}, "and it is not left to age out under a misleading reason"
