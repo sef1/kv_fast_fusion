@@ -28,6 +28,7 @@ from kv_fast_fusion.fast_fusion_core import _initialize_kv_caches
 from kv_fast_fusion.fast_fusion_block_pool import patched_free_blocks
 from kv_fast_fusion.fast_fusion_scheduler import (
     _handle_block_merging_with_counts,
+    _update_requests_with_invalid_blocks,
     update_from_output,
 )
 
@@ -111,6 +112,10 @@ def apply_fast_fusion_pd_patch():
     # --- 3. Merge channel (D-side block freeing) ---
     Scheduler._handle_block_merging_with_counts = _handle_block_merging_with_counts
     Scheduler.update_from_output = update_from_output
+    # KV-load-failure recovery must understand the BFF multi-group layout. Stock unpacks a 1-tuple
+    # from get_block_ids ("TODO: add support for hybrid memory allocator") and raises ValueError
+    # with BFF's groups, killing EngineCore the first time a KV pull fails. See the docstring.
+    Scheduler._update_requests_with_invalid_blocks = _update_requests_with_invalid_blocks
 
     # --- 4. Dedup-before-decrement free (LSH evict is guarded → no-op here) ---
     BlockPool.free_blocks = patched_free_blocks
@@ -157,6 +162,28 @@ def apply_fast_fusion_pd_patch():
             logger.info("Fast fusion P/D patch: registered P2pNcclConnectorFF.")
     except Exception as e:  # pragma: no cover - optional dependency
         logger.warning("Fast fusion P/D patch: connector registration skipped: %s", e)
+
+    # Mooncake transport for the same GPU P/D setup (RDMA pull instead of NCCL push). Registered
+    # by module path, so this does NOT import the mooncake package — a box without it only fails
+    # when a run actually selects the connector.
+    try:
+        from kv_fast_fusion.connectors.mooncake_connector_ff import (
+            register_mooncake_connector_ff,
+        )
+        register_mooncake_connector_ff()
+    except Exception as e:  # pragma: no cover - optional dependency
+        logger.warning("Fast fusion P/D patch: MooncakeConnectorFF registration skipped: %s", e)
+
+    # v2 of the same transport: the producer ships per-block signatures and the DECODE decides what
+    # not to pull, so a deduplicated block is never transferred at all. Registered alongside v1
+    # rather than replacing it, so the two are one --kv-transfer-config apart in an A/B.
+    try:
+        from kv_fast_fusion.connectors.mooncake_connector_ff_v2 import (
+            register_mooncake_connector_ff_v2,
+        )
+        register_mooncake_connector_ff_v2()
+    except Exception as e:  # pragma: no cover - optional dependency
+        logger.warning("Fast fusion P/D patch: MooncakeConnectorFFv2 registration skipped: %s", e)
 
     # --- 6. ratio mode: re-enable the minimal norm-scaling kernel infra on D ---
     if _PD_SCALE_MODE == "ratio":

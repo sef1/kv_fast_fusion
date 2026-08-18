@@ -50,7 +50,7 @@
 # =============================================================================
 
 # ---- Model / topology --------------------------------------------------------
-MODEL=${MODEL:-Qwen/Qwen2.5-7B-Instruct} #{MODEL:-NousResearch/Hermes-3-Llama-3.1-8B} #{MODEL:-zai-org/glm-4-9b-chat-hf}
+MODEL=${MODEL:-Qwen/Qwen2.5-7B-Instruct} #{MODEL:-deepseek-ai/DeepSeek-V2-Lite} #{MODEL:-Qwen/Qwen2.5-7B-Instruct} #{MODEL:-NousResearch/Hermes-3-Llama-3.1-8B} #{MODEL:-zai-org/glm-4-9b-chat-hf}
 TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-1200}
 PROXY_PORT=${PROXY_PORT:-30001}      # ZMQ service-discovery port (matches proxy_port in connector cfg)
 PROXY_HTTP_PORT=${PROXY_HTTP_PORT:-10001}   # proxy HTTP serving port (benchmark target)
@@ -67,7 +67,7 @@ HF_HUB_CACHE=${HF_HUB_CACHE:-"/data/models/huggingface/hub"}
 # directly (comma-separated lists) — those win over the NUM_*-derived defaults.
 NUM_PREFILL=${NUM_PREFILL:-1}        # n
 NUM_DECODE=${NUM_DECODE:-1}          # m
-TP=${TP:-1}                          # tensor-parallel size PER instance (each P/D gets TP GPUs)
+TP=${TP:-2}                          # tensor-parallel size PER instance (each P/D gets TP GPUs)
 HTTP_PORT_BASE=${HTTP_PORT_BASE:-20003}
 
 # Build "start,start+1,...,start+count-1".
@@ -146,7 +146,7 @@ BFF_THRESHOLD=${BFF_THRESHOLD:-0.75}       # BFF fusion threshold (0.0-1.0, 0.75
 # >0 = also match each prefill batch against a rolling registry of the last N requests' rep blocks
 # (frees more on D → compression can exceed ~2×). Set N near the decode-resident request count;
 # proj repr recommended to bound registry memory.
-BFF_PD_ENCODED_BATCH_SIZE=${BFF_PD_ENCODED_BATCH_SIZE:-32}
+BFF_PD_ENCODED_BATCH_SIZE=${BFF_PD_ENCODED_BATCH_SIZE:-16}
 # ---- GPU memory / recv-buffer tuning -----------------------------------------
 # P only SENDS, so its recv-buffer threshold (kv_buffer_size) can be tiny (1e1).
 # P only SENDS, so its recv-buffer threshold (kv_buffer_size) can be tiny (1e1).
@@ -168,7 +168,7 @@ F1_SPLIT=${F1_SPLIT:-train}
 F1_INPUT_KEY=${F1_INPUT_KEY:-query}
 F1_OUTPUT_KEY=${F1_OUTPUT_KEY:-answer}
 NUM_PROMPTS=${NUM_PROMPTS:-500}
-MAX_CONCURRENCY=${MAX_CONCURRENCY:-300}  # max inflight requests (stress test)
+MAX_CONCURRENCY=${MAX_CONCURRENCY:-100}  # max inflight requests (stress test)
 REQUEST_RATE=${REQUEST_RATE:-300}      # arrivals/s (stress test). 'inf' = fire all at once (cap by MAX_CONCURRENCY)
 BURSTINESS=${BURSTINESS:-0.3}          # gamma shape: <1 burstier (spiky), 1=Poisson, >1 more uniform
 MIN_TOKENS=${MIN_TOKENS:-512}            # skip prompts shorter than this many input tokens (0=off)
@@ -199,11 +199,18 @@ export VLLM_WORKER_MULTIPROC_METHOD=${VLLM_WORKER_MULTIPROC_METHOD:-spawn}
 export VLLM_USE_V1=1
 export PYTHONPATH=${REPO_ROOT}:${PYTHONPATH}
 
-# The P2P NCCL engine loads "libnccl.so.2" by bare name. The venv ships
-# nvidia-nccl 2.28.9+cuda13.0 (needs driver >=580); this host runs driver
-# 575.51.03 (CUDA 12.9). Pin the engine to the system 2.28.3+cuda12.9 build,
-# which inits a comm cleanly under this driver.
-export VLLM_NCCL_SO_PATH=${VLLM_NCCL_SO_PATH:-/lib/x86_64-linux-gnu/libnccl.so.2}
+# NCCL library selection [updated 2026-07-23, second revision]. Driver is 610.43.02 (CUDA 13.3
+# UMD). EVERY CUDA-12.9 NCCL build (system 2.30.7+cuda12.9 AND the old 2.28.3 pin) leaves the
+# cross-process P<->D data plane DEAD on this driver: comms init, SHM channels connect, but no
+# tensor ever delivers (TP=1 and TP=2 alike, cuMem 0 or 1). The one CUDA-13 build on the box —
+# the venv's original nvidia-nccl 2.28.9+cuda13.0, parked as libnccl.so.2.cuda13.bak when driver
+# 575 couldn't run it — is now the CORRECT one (needs driver >=580; we have 610). The venv
+# symlink nvidia/nccl/lib/libnccl.so.2 now points at that .bak (covers torch's TP>1 RPATH load),
+# and the pin below makes the P2P engine's ctypes load deterministic too.
+# NOTE: pip reinstall of torch / nvidia-nccl-cu12 clobbers the symlink — re-create with:
+#   ln -sfn libnccl.so.2.cuda13.bak \
+#     $REPO_ROOT/.venv/lib/python3.12/site-packages/nvidia/nccl/lib/libnccl.so.2
+export VLLM_NCCL_SO_PATH=${VLLM_NCCL_SO_PATH:-${REPO_ROOT:-/data/users/sefi/from_git/vllm_013/vllm_ff}/.venv/lib/python3.12/site-packages/nvidia/nccl/lib/libnccl.so.2}
 
 # P↔D KV transfer runs over NCCL between GPUs in DISJOINT per-instance
 # CUDA_VISIBLE_DEVICES namespaces. The crash needs TWO things together:
@@ -218,6 +225,14 @@ export VLLM_NCCL_SO_PATH=${VLLM_NCCL_SO_PATH:-/lib/x86_64-linux-gnu/libnccl.so.2
 # NCCL caches the param + it must be set before any NCCL init. Override by
 # exporting NCCL_P2P_DISABLE yourself.
 export NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-1}  # see _p2p_needs_disable() above
+# [2026-07-23] TP>1 wedge on this host (driver 610.43.02): vLLM's CUSTOM all-reduce is its own
+# cross-GPU CUDA-IPC spin-flag kernel — NOT NCCL, so no NCCL_* env touches it — and its IPC
+# delivery is unreliable under this driver (py-spy: both TP workers blocked launching a trivial
+# kernel behind a never-completing device kernel; NCCL itself healthy on SHM/direct). Disable it
+# so TP collectives go through NCCL over SHM — validated end-to-end at TP=2 on 2026-07-23.
+# TP=1 never invokes custom AR (no TP collective), so this is a no-op there.
+# Set DISABLE_CUSTOM_AR=0 to re-enable (e.g., after a driver/CUDA realignment).
+DISABLE_CUSTOM_AR=${DISABLE_CUSTOM_AR:-1}
 _p2p_needs_disable() {
     python3 - "$PREFILL_GPUS" "$DECODE_GPUS" "$TP" <<'PY' 2>/dev/null
 import subprocess, sys, re
@@ -303,10 +318,55 @@ check_num_gpus() {
     echo "Found $num_gpus GPUs (using $need: (${NUM_PREFILL}P + ${NUM_DECODE}D) × TP=$TP)."
 }
 
+_kill_stale_gpu_procs() {
+    # vLLM WorkerProcs (TP>1, spawn) can survive `kill -- -$$` once their parent dies first —
+    # they end up reparented to init, squatting GPU memory, and the NEXT launch fails its
+    # startup free-memory check ("Free memory on device cuda:0 (4.17/39.52 GiB) ...").
+    # Scope strictly to THIS repo: this box is shared, and other users' vLLM servers (also
+    # named VLLM::*) must never be touched — no pkill by name. Match /proc/<pid>/exe OR cwd
+    # under $REPO_ROOT: servers launched as `python3 -m vllm ...` can run the SYSTEM python
+    # (venv via PYTHONPATH), so exe alone misses them — cwd (this script's dir) catches those.
+    local pid exe cwd killed=""
+    for pid in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null); do
+        exe=$(readlink "/proc/$pid/exe" 2>/dev/null)
+        cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null)
+        if [[ "$exe" == "$REPO_ROOT"/* || "$cwd" == "$REPO_ROOT"/* ]]; then
+            echo "Killing stale GPU process $pid (exe=$exe cwd=$cwd)"
+            kill -9 "$pid" 2>/dev/null
+            killed+=" $pid"
+        fi
+    done
+    # kill -9 returns before the driver tears down the CUDA context — releasing a ~35 GiB
+    # allocation takes seconds. Launching immediately races vLLM's startup free-memory check
+    # (seen 2026-07-23: GLM launch right after killing a live run → "Free memory on device
+    # cuda:0 (2.2/39.52 GiB)" on prefill while decode's GPUs happened to free in time).
+    # Wait until the killed pids vanish from the compute-apps list, then let allocations settle.
+    if [ -n "$killed" ]; then
+        local waited=0 live still=""
+        while [ "$waited" -lt 30 ]; do
+            live=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null)
+            still=""
+            for pid in $killed; do
+                grep -qw "$pid" <<< "$live" && still+=" $pid"
+            done
+            [ -z "$still" ] && break
+            sleep 1
+            waited=$((waited + 1))
+        done
+        if [ -n "$still" ]; then
+            echo "WARNING: GPU memory of killed pids not released after ${waited}s:${still}"
+        fi
+        sleep 2   # settle: context teardown can trail the pid's disappearance briefly
+    fi
+}
+
 cleanup() {
     echo "Stopping everything…"
     trap - INT TERM
     pkill -9 -f "disagg_proxy_p2p_nccl_xpyd.py"
+    # Sweep BEFORE the group kill: `kill -- -$$` also SIGTERMs this script (trap was just
+    # reset), so nothing after it is guaranteed to run.
+    _kill_stale_gpu_procs
     kill -- -$$
     wait
     exit 0
@@ -344,6 +404,7 @@ common_args() {
         --max-model-len $MAX_MODEL_LEN \
         --max-num-batched-tokens $MAX_NUM_BATCHED_TOKENS \
         ${ATTENTION_BACKEND:+--attention-backend $ATTENTION_BACKEND} \
+        $([ "$DISABLE_CUSTOM_AR" = "1" ] && echo --disable-custom-all-reduce) \
         --max-num-seqs $MAX_CONCURRENCY"
 }
 
@@ -357,6 +418,16 @@ main() {
 
     echo "Launching BFF disaggregated serving components..."
     echo "Logs: prefill*.log / decode*.log / proxy.log"
+
+    # A previous run's orphaned workers would fail this run's startup free-memory check.
+    _kill_stale_gpu_procs
+
+    # Rotate last run's logs instead of truncating them — a crashed run's root cause must
+    # survive one relaunch (the 11:59 TP=2 failure was lost exactly this way).
+    local f
+    for f in prefill*.log decode*.log proxy.log; do
+        [ -f "$f" ] && mv -f "$f" "$f.prev"
+    done
 
     # ---- Proxy ----------------------------------------------------------------
     echo ""

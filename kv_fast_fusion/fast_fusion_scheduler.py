@@ -860,3 +860,97 @@ def update_from_output(
 
         return engine_core_outputs
 
+
+
+def _update_requests_with_invalid_blocks(
+    self,
+    requests: Iterable[Request],
+    invalid_block_ids: set[int],
+    evict_blocks: bool = True,
+) -> tuple[set[str], int, set[int]]:
+    """Hybrid-memory-allocator-aware replacement for the stock scheduler method.
+
+    vLLM's version opens with an explicit single-group assumption (and says so):
+
+        # TODO (davidb): add support for hybrid memory allocator
+        (req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)
+
+    Under BFF the request has one block list PER KV-cache group (7 for the default split), so that
+    unpack raises `ValueError: too many values to unpack (expected 1)` and kills EngineCore — which
+    is exactly what happened the first time a Mooncake pull failed on 2026-08-13, turning a
+    recoverable transport hiccup into a fatal crash.
+
+    The algorithm below is the stock one; only the block axis is generalised. All groups are indexed
+    by the same token positions (BFF uses a uniform page size), so position `idx` is affected if ANY
+    group's block there failed to load, the truncation point is the earliest such position, and the
+    eviction tail is taken from every group. With a single group this reduces to the stock function
+    line for line.
+    """
+    affected_req_ids: set[str] = set()
+    total_affected_tokens = 0
+    blocks_to_evict: set[int] = set()
+    # If a block is invalid and shared by multiple requests in the batch, these requests must be
+    # rescheduled, but only the first will recompute it. This tracks blocks already marked.
+    marked_invalid_block_ids: set[int] = set()
+
+    for request in requests:
+        is_affected = False
+        marked_invalid_block = False
+        req_id = request.request_id
+        # Per-group block lists (stock unpacked a 1-tuple here).
+        groups = self.kv_cache_manager.get_block_ids(req_id)
+
+        # We iterate only over blocks that may contain externally computed tokens.
+        if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+            # Async loading. num_computed_tokens does not include new tokens.
+            req_num_computed_tokens = request.num_computed_tokens
+        else:
+            # Sync loading. num_computed_tokens includes new tokens.
+            req_num_computed_tokens = request.num_cached_tokens
+
+        req_num_computed_blocks = (
+            req_num_computed_tokens + self.block_size - 1
+        ) // self.block_size
+
+        for idx in range(req_num_computed_blocks):
+            bad = [g[idx] for g in groups
+                   if idx < len(g) and g[idx] in invalid_block_ids]
+            if not bad:
+                continue
+
+            is_affected = True
+
+            if all(b in marked_invalid_block_ids for b in bad):
+                # Every invalid block at this position is shared with a previous request and was
+                # already marked for recomputation, so this request may still treat it as computed.
+                continue
+
+            marked_invalid_block_ids.update(bad)
+
+            if marked_invalid_block:
+                # Already truncated this request at an earlier position.
+                continue
+
+            marked_invalid_block = True
+            # Truncate the computed tokens at the first failed block.
+            request.num_computed_tokens = idx * self.block_size
+            num_affected_tokens = req_num_computed_tokens - request.num_computed_tokens
+            total_affected_tokens += num_affected_tokens
+            request.num_external_computed_tokens -= num_affected_tokens
+            # Collect the invalid block and all downstream dependent blocks, in EVERY group.
+            if evict_blocks:
+                for g in groups:
+                    blocks_to_evict.update(g[idx:])
+
+        if is_affected:
+            if not marked_invalid_block:
+                # All invalid blocks of this request are shared with previous requests and will be
+                # recomputed by them. Revert to considering only cached tokens as computed.
+                total_affected_tokens += (
+                    request.num_computed_tokens - request.num_cached_tokens
+                )
+                request.num_computed_tokens = request.num_cached_tokens
+
+            affected_req_ids.add(request.request_id)
+
+    return affected_req_ids, total_affected_tokens, blocks_to_evict

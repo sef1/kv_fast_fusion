@@ -510,10 +510,11 @@ run_benchmark() {
 # capacity never binds, fusion cannot improve throughput no matter how well it compresses. Printed for
 # every run (vanilla included) so this precondition is never invisible again.
 report_capacity_bound() {
-  python3 - "$logs_root" <<'PY' || true
+  python3 - "$logs_root" "${MAX_CONCURRENCY:-0}" <<'PY' || true
 import glob, os, re, sys
 
 d = sys.argv[1]
+max_conc = int(sys.argv[2]) if len(sys.argv) > 2 else 0
 files = sorted(glob.glob(os.path.join(d, "decode-*.txt")))
 if not files:
     print("  capacity: no decode logs found"); raise SystemExit
@@ -542,11 +543,30 @@ for fp in files:
 if not samples:
     print("  capacity: no scheduler stats in decode logs (is log-stats disabled?)"); raise SystemExit
 
-bound = preempt_samples > 0 or pk >= 90.0
-verdict = "YES" if bound else ("MARGINAL" if pk >= 70.0 else "NO")
+# A full KV cache is NOT by itself evidence that KV is the binding constraint. If `Running` is
+# pinned at MAX_CONCURRENCY with zero preemptions, the client's concurrency cap is what limits the
+# system: the scheduler had exactly enough KV, and freeing more cannot admit a single extra request.
+# The old rule (pk >= 90 => YES) reported "capacity-bound: YES" for a con32 run with 99.9% KV,
+# preemptions 0 and running pinned at 32 — a regime where fusion's 614 freed blocks provably could
+# not raise throughput. Distinguish the two, because only one of them can demonstrate value.
+conc_capped = max_conc > 0 and pr >= max_conc and preempt_samples == 0
+if preempt_samples > 0:
+    verdict = "YES"
+elif conc_capped:
+    verdict = "NO (concurrency-capped)"
+elif pk >= 90.0:
+    verdict = "YES"
+else:
+    verdict = "MARGINAL" if pk >= 70.0 else "NO"
 print(f"  capacity-bound: {verdict} (peak KV {pk:.1f}%, peak waiting {int(pw)}, "
-      f"peak running {int(pr)}, preemptions {preempt_max} in {preempt_samples} samples)")
-if verdict == "NO":
+      f"peak running {int(pr)}, preemptions {preempt_max} in {preempt_samples} samples"
+      + (f", MAX_CONCURRENCY={max_conc}" if max_conc else "") + ")")
+if conc_capped:
+    print(f"    -> Running is pinned at MAX_CONCURRENCY={max_conc} with 0 preemptions: the "
+          f"CLIENT's concurrency cap binds, not KV — even at {pk:.1f}% KV usage.")
+    print(f"    -> freeing blocks cannot raise throughput here no matter how well fusion works. "
+          f"Raise MAX_CONCURRENCY (and/or lower GPU_MEM_UTIL) until preemptions > 0.")
+elif verdict.startswith("NO"):
     print(f"    -> KV cache never filled ({pk:.1f}%): capacity is NOT the bottleneck, so freeing "
           f"blocks cannot raise throughput here.")
     print(f"    -> to make fusion matter: lower GPU_MEM_UTIL (shrink the pool) or raise "
@@ -578,8 +598,30 @@ if not prod:
     print("  bff stats: none found (fusion may not have engaged)"); raise SystemExit
 
 B = sum(s.get("total_blocks", 0) for s in prod)
-ov = [s.get("overhead_avg_group_dedup_ms", 0.0) for s in prod if s.get("steps")]
-ov_s = f" | fusion overhead {sum(ov)/len(ov):.3f} ms/group" if ov else ""
+
+# Fusion overhead MUST be reported from the forward-thread counters. overhead_avg_group_dedup_ms is
+# accumulated inside run_fusion_task when the async worker is on, i.e. on the WORKER thread — so
+# across BFF_FF_ASYNC=0/1 it measures two different regions and comparing it is meaningless. It read
+# 23.693 -> 2.241 ms/group across an A/B in which the real per-hook forward cost was flat at
+# 9.11 -> 9.13 ms. forward_* is the honest cost of BFF to prefill; dedup is shown separately and
+# labelled by where it ran.
+live = [s for s in prod if s.get("steps")]
+fwd = [s["forward_total_ms"] / s["forward_calls"] for s in live
+       if s.get("forward_calls") and "forward_total_ms" in s]
+fwd_g = [s["forward_avg_per_group_ms"] for s in live if s.get("forward_avg_per_group_ms")]
+ov = [s.get("overhead_avg_group_dedup_ms", 0.0) for s in live]
+_async = any(s.get("async_worker") for s in live)
+if fwd:
+    ov_s = (f" | fusion overhead {sum(fwd)/len(fwd):.3f} ms/layer-hook"
+            + (f", {sum(fwd_g)/len(fwd_g):.3f} ms/group" if fwd_g else "") + " [forward thread]")
+    if ov:
+        ov_s += (f" (+{sum(ov)/len(ov):.3f} ms/group "
+                 + ("on the fusion worker, off the critical path)" if _async else "clustering, inline)"))
+elif ov:
+    ov_s = (f" | fusion overhead {sum(ov)/len(ov):.3f} ms/group [dedup only"
+            + (" — WORKER thread, not comparable to the sync arm]" if _async else " — inline]"))
+else:
+    ov_s = ""
 
 
 def emitted(s):
@@ -605,11 +647,31 @@ E = sum(vals)
 if dec:
     # MEASURED: blocks the decode block-pool actually reclaimed.
     R = sum(s.get("blocks_freed_total", 0) for s in dec)
-    print(f"  bff compression: {B/max(1,B-R):.3f}x smaller (blocks={B} freed={R}) "
-          f"[measured, decode-side]{ov_s}")
-    rate = f"{100.0*R/E:.1f}%" if E else "n/a"
-    print(f"    producer potential: {B/max(1,B-E):.3f}x (redirects_emitted={E}) "
-          f"→ realized {rate}")
+    ME = sum(s.get("merge_events", 0) for s in dec)
+    # Cross-check against the apply side. Each applied redirect frees ~1 block, and merge_events
+    # should equal promo_merge_calls — so a large shortfall means the decode ledger was TRUNCATED by
+    # its dump cadence, not that fusion failed. This exact case reported freed=16 / 1 event against a
+    # real 785 / 38, turning a ~1.8x compression into a reported 1.007x.
+    MC = sum(s.get("promo_merge_calls", 0) for s in app)
+    PA = sum(s.get("promo_applied", 0) for s in app)
+    if MC and ME < MC:
+        print(f"  bff compression: NOT REPORTED — decode ledger looks truncated "
+              f"(merge_events={ME} but promo_merge_calls={MC}; freed={R} vs promo_applied={PA}).")
+        print(f"    -> bff_decode_stats_*.json is stale; grep 'Block merging freed' in the decode "
+              f"log for the true total. Overhead below is still valid.{ov_s}")
+    else:
+        print(f"  bff compression: {B/max(1,B-R):.3f}x smaller (blocks={B} freed={R}) "
+              f"[measured, decode-side]{ov_s}")
+        if R > E:
+            # A decode side that freed more blocks than the producer says it shipped means the
+            # PRODUCER ledger is short — its own dump cadence stopped before the run did. Printing
+            # "realized 212%" instead of saying so is how a truncated ledger passes for a result.
+            print(f"    producer potential: NOT REPORTED — producer ledger looks truncated "
+                  f"(redirects_emitted={E} < freed={R}); blocks={B} is short for the same reason.")
+        else:
+            rate = f"{100.0*R/E:.1f}%" if E else "n/a"
+            print(f"    producer potential: {B/max(1,B-E):.3f}x (redirects_emitted={E}) "
+                  f"→ realized {rate}")
 else:
     print(f"  bff compression: {B/max(1,B-E):.3f}x POTENTIAL only (blocks={B} redirects_emitted={E}) "
           f"over {len(prod)} producer(s){ov_s}")
@@ -619,7 +681,25 @@ if app:
     a = {k: sum(s.get(k, 0) for s in app) for k in
          ("applied", "reps_unresolved", "owner_unresident", "owners_deferred",
           "owners_dropped_post_decode")}
-    print("    apply: " + " ".join(f"{k}={v}" for k, v in a.items()))
+    print("    apply (legacy worker-side path): " + " ".join(f"{k}={v}" for k, v in a.items()))
+    # The promotion-time path is the live one (BFF_FF_PROMO_APPLY=1), so the legacy counters above
+    # are all zero in a normal run and say nothing. These are the ones that matter.
+    p = {k: sum(s.get(k, 0) for s in app) for k in
+         ("promo_applied", "promo_unresolved", "promo_unres_rep_loading", "promo_unres_rep_gone",
+          "promo_rows_late", "promo_merge_calls")}
+    tot = p["promo_applied"] + p["promo_unresolved"]
+    res = f"{100.0*p['promo_applied']/tot:.1f}%" if tot else "n/a"
+    print(f"    apply (promotion path): resolution {res} of {tot} rows | "
+          + " ".join(f"{k[6:]}={v}" for k, v in p.items()))
+    if p["promo_rows_late"]:
+        print(f"    WARNING: {p['promo_rows_late']} redirect rows arrived after their owner was "
+              f"promoted and could not be applied — fusion is lagging the KV transfer.")
+    rg = {k[8:]: sum(s.get(k, 0) for s in app) for k in
+          ("repgone_revive_live", "repgone_revive_cached", "repgone_truly_gone",
+           "repgone_nohist_missing", "repgone_nohist_gi_oob", "repgone_nohist_slot_oob",
+           "repgone_nohist_badblock")}
+    if any(rg.values()):
+        print("    rep-gone causes: " + " ".join(f"{k}={v}" for k, v in rg.items() if v))
 PY
 }
 

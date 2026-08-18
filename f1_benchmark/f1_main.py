@@ -3,33 +3,102 @@ import asyncio
 import json
 import os
 import time
+import ast
 import aiohttp
 import numpy as np
 from collections import Counter
 from tqdm import tqdm
 from typing import AsyncGenerator, List, Dict, Any, Tuple
-  
-# standalone evaluation 
-  
-def f1_score(prediction, ground_truth, **kwargs):
+
+
+# ==========================================
+# Evaluation Metrics
+# ==========================================
+
+def f1_score(prediction: str, ground_truth: str, **kwargs) -> float:
+    """Token-level F1 score overlap."""
     common = Counter(prediction) & Counter(ground_truth)
     num_same = sum(common.values())
     if num_same == 0:
-        return 0
+        return 0.0
     precision = 1.0 * num_same / len(prediction)
     recall = 1.0 * num_same / len(ground_truth)
     f1 = (2 * precision * recall) / (precision + recall)
     return f1
-  
+
+
+import ast
+import re
+import textwrap
+
+def extract_code(text: str) -> str:
+    """Strips Markdown backticks and conversational prose."""
+    if "```" in text:
+        blocks = re.findall(r"```(?:python)?\n?(.*?)```", text, re.DOTALL)
+        if blocks:
+            return blocks[0].strip()
+    return text.strip()
+
+def check_syntax_validity(prompt: str, prediction: str) -> bool:
+    """Checks syntax by combining prompt + prediction or dedenting the fragment."""
+    clean_pred = extract_code(prediction)
+    if not clean_pred:
+        return False
+    
+    # 1. Try parsing full concatenated script
+    try:
+        ast.parse(prompt + "\n" + clean_pred)
+        return True
+    except SyntaxError:
+        pass
+        
+    # 2. Try parsing prediction alone after dedenting
+    try:
+        ast.parse(textwrap.dedent(clean_pred))
+        return True
+    except SyntaxError:
+        return False
+
+def normalized_exact_match(prediction: str, ground_truth: str) -> bool:
+    """Exact match comparison ignoring extra blank lines and trailing whitespace."""
+    norm_pred = "\n".join([line.strip() for line in prediction.splitlines() if line.strip()])
+    norm_gt = "\n".join([line.strip() for line in ground_truth.splitlines() if line.strip()])
+    return norm_pred == norm_gt
+def compute_codebleu_safe(predictions: List[str], references: List[str], lang: str = "python") -> Dict[str, float]:
+    """Safely computes CodeBLEU if `codebleu` package is available."""
+    try:
+        from codebleu import calc_codebleu
+        results = calc_codebleu(
+            references=[[ref] for ref in references],
+            predictions=predictions,
+            lang=lang,
+            weights=(0.25, 0.25, 0.25, 0.25)
+        )
+        return {
+            "codebleu": float(results["codebleu"]),
+            "ngram_match": float(results.get("ngram_match_score", 0.0)),
+            "weighted_ngram_match": float(results.get("weighted_ngram_match_score", 0.0)),
+            "syntax_match": float(results.get("syntax_match_score", 0.0)),
+            "dataflow_match": float(results.get("dataflow_match_score", 0.0)),
+        }
+    except (ImportError, ModuleNotFoundError, NameError):
+        print("Notice: `codebleu` package is not installed or imported. Skipping CodeBLEU.")
+        return None
+    except Exception as e:
+        print(f"Warning: CodeBLEU computation encountered an error: {e}")
+        return None
+
+
+# ==========================================
+# Async Request Generators & Parser
+# ==========================================
+
 async def get_request(
     prompts: List[str],
     request_rate: float,
     burstiness: float = 1.0,
 ) -> AsyncGenerator[Tuple[int, str], None]:
-    """Asynchronously yield (index, prompt) paced by the request rate, mirroring
-    `vllm.benchmarks.serve.get_request`: inter-arrival times follow a gamma distribution
-    (shape=`burstiness`, scale=1/(rate·burstiness)) — `burstiness`==1 is a Poisson
-    process, <1 burstier, >1 more uniform. `request_rate`==inf fires everything at once."""
+    """Asynchronously yield (index, prompt) paced by the request rate."""
     assert burstiness > 0, f"A positive burstiness factor is expected, but given {burstiness}."
     for i, prompt in enumerate(prompts):
         yield i, prompt
@@ -42,11 +111,7 @@ async def get_request(
 
 
 async def _parse_stream(response, st: float) -> Dict[str, Any]:
-    """Parse an OpenAI chat-completions SSE stream, timestamping tokens for latency metrics.
-
-    Mirrors `vllm.benchmarks.serve`: TTFT = first-token arrival − send time; ITL = gaps
-    between successive token chunks; output_tokens from the `include_usage` final chunk
-    (falls back to the chunk count). Returns the per-request record."""
+    """Parse an OpenAI chat-completions SSE stream, timestamping tokens for latency metrics."""
     ttft = 0.0
     most_recent = st
     itl: List[float] = []
@@ -65,7 +130,7 @@ async def _parse_stream(response, st: float) -> Dict[str, Any]:
         except json.JSONDecodeError:
             continue
         usage = chunk.get("usage")
-        if usage:  # the include_usage chunk carries the authoritative token count
+        if usage:
             completion_tokens = usage.get("completion_tokens")
         choices = chunk.get("choices") or []
         if not choices:
@@ -110,17 +175,7 @@ async def run_api_inference(
     disable_tqdm: bool = False,
     stream: bool = True,
 ) -> List[Dict[str, Any]]:
-    """Async inference against an OpenAI-compatible server (same arrival/concurrency model
-    as `vllm bench serve`).
-
-    Requests are *dispatched* at `request_rate` req/s with gamma-distributed inter-arrival
-    times; an `asyncio.Semaphore(max_concurrency)` caps in-flight requests to the server so
-    fusion actually sees many concurrent prefills. A tqdm bar advances as each request
-    completes. Result order matches `prompts` (F1 pairing stays correct).
-
-    When `stream` (default), requests use SSE streaming so per-request TTFT / ITL / TPOT are
-    captured (see `_parse_stream`); `--no-stream` falls back to a single non-streamed JSON
-    response (no latency breakdown, only F1 + throughput)."""
+    """Async inference against an OpenAI-compatible server."""
     if gen_config is None:
         gen_config = {}
 
@@ -138,7 +193,6 @@ async def run_api_inference(
     n = len(prompts)
     results: List[Any] = [None] * n
     pbar = None if disable_tqdm else tqdm(total=n)
-    # Cap in-flight requests; default to the pre-async behavior (min(n, 16)) when unset.
     effective_concurrency = max_concurrency if max_concurrency else min(n, 16)
     semaphore = asyncio.Semaphore(effective_concurrency)
 
@@ -158,10 +212,6 @@ async def run_api_inference(
                         rec["success"] = bool(rec["generated_text"])
                         results[idx] = rec
                     else:
-                        # The disagg proxy streams the model JSON via make_response(generator),
-                        # which Quart labels text/html — so aiohttp's default .json() rejects the
-                        # mimetype even though the body is valid JSON. content_type=None skips the
-                        # check. Harmless against a direct vLLM server (application/json).
                         data = await response.json(content_type=None)
                         if "choices" in data and data["choices"]:
                             choice = data["choices"][0]
@@ -184,7 +234,7 @@ async def run_api_inference(
                     pbar.update(1)
 
     timeout = aiohttp.ClientTimeout(total=request_timeout)
-    connector = aiohttp.TCPConnector(limit=0)  # don't let the client throttle below max_concurrency
+    connector = aiohttp.TCPConnector(limit=0)
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         tasks: List[asyncio.Task] = []
         async for idx, prompt in get_request(prompts, request_rate, burstiness):
@@ -194,24 +244,22 @@ async def run_api_inference(
     if pbar is not None:
         pbar.close()
     return results
-  
+
+
 def load_dataset_simple(dataset_path: str, split: str, input_key: str, output_key: str,
                         num_samples: int, model: str = None, min_tokens: int = 0):
-    """Load dataset without vLLM dependencies.
-
-    When `min_tokens > 0`, each prompt is tokenized with the model's HF tokenizer and
-    samples shorter than `min_tokens` input tokens are skipped; we keep scanning the
-    split until `num_samples` qualifying samples are collected (or it is exhausted).
-    `references` keys stay positionally aligned with `prompts` so F1 pairing is correct.
-    """
+    """Load dataset from Hugging Face or local JSONL file."""
     from datasets import load_dataset
 
-    dataset = load_dataset(dataset_path, split=split)
+    if dataset_path.endswith(".jsonl") or os.path.isfile(dataset_path):
+        dataset = load_dataset("json", data_files=dataset_path, split=split)
+    else:
+        dataset = load_dataset(dataset_path, split=split)
 
     tokenizer = None
     if min_tokens > 0:
         from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(model)
+        tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
 
     prompts = []
     references = {}
@@ -237,52 +285,50 @@ def load_dataset_simple(dataset_path: str, split: str, input_key: str, output_ke
               f"tokens (skipped {n_skipped} shorter ones)")
 
     return prompts, references
-  
+
+
+# ==========================================
+# Main Async Driver
+# ==========================================
+
 async def main():
-    parser = argparse.ArgumentParser(description="Run F1 Score Benchmark")
-    parser.add_argument("--model", type=str, default="NousResearch/Hermes-3-Llama-3.1-8B")  
-    parser.add_argument("--dataset-path", type=str, default="nvidia/OpenMathInstruct-2")  
-    parser.add_argument("--hf-split", type=str, default="train")  
-    parser.add_argument("--input-key", type=str, default="problem")  
-    parser.add_argument("--output-key", type=str, default="generated_solution")  
-    parser.add_argument("--num-prompts", type=int, default=30)  
-    parser.add_argument("--host", type=str, default="localhost")  
-    parser.add_argument("--port", type=int, default=8000)  
-    parser.add_argument("--compute-f1", action="store_true")
+    parser = argparse.ArgumentParser(description="Run LLM Inference & Code Benchmarks")
+    parser.add_argument("--model", type=str, default="NousResearch/Hermes-3-Llama-3.1-8B")
+    parser.add_argument("--dataset-path", type=str, default="codeparrot_f1_benchmark.jsonl")
+    parser.add_argument("--hf-split", type=str, default="train")
+    parser.add_argument("--input-key", type=str, default="query")
+    parser.add_argument("--output-key", type=str, default="reference")
+    parser.add_argument("--num-prompts", type=int, default=30)
+    parser.add_argument("--host", type=str, default="localhost")
+    parser.add_argument("--port", type=int, default=8000)
+    
+    # Evaluation Toggles
+    parser.add_argument("--compute-f1", action="store_true", help="Compute token-level F1 score")
+    parser.add_argument("--compute-code-metrics", action="store_true", help="Compute AST Syntax validity, Normalized EM, and CodeBLEU")
+    parser.add_argument("--lang", type=str, default="python", help="Language for CodeBLEU and syntax checks")
+
     parser.add_argument("--result-dir", type=str, default="./results")
-    parser.add_argument("--request-rate", type=float, default=float("inf"),
-                        help="Arrival rate (req/s). 'inf' fires all at once.")
-    parser.add_argument("--burstiness", type=float, default=1.0,
-                        help="Arrival burstiness (gamma shape): 1=Poisson, <1 burstier, >1 uniform.")
-    parser.add_argument("--max-concurrency", type=int, default=None,
-                        help="Cap on in-flight requests (drives concurrent prefills for fusion).")
-    parser.add_argument("--request-timeout", type=float, default=600.0,
-                        help="Per-request HTTP timeout (s); raise it under heavy load.")
-    parser.add_argument("--min-tokens", type=int, default=0,
-                        help="Skip samples whose prompt has fewer than this many input "
-                             "tokens (0 = no filter). Uses the model's HF tokenizer.")
-    parser.add_argument("--disable-tqdm", action="store_true",
-                        help="Disable the tqdm progress bar.")
-    parser.add_argument("--no-stream", dest="stream", action="store_false",
-                        help="Use a single non-streamed response (disables TTFT/ITL/TPOT).")
-    parser.add_argument("--max-tokens", type=int, default=4096,
-                        help="Max generated tokens per request (maps to OpenAI max_tokens).")
-    parser.add_argument("--result-file", type=str, default=None,
-                        help="Path for the summary JSON (default <result-dir>/f1_results.json). "
-                             "Use a config-tagged name to compare runs.")
-    parser.add_argument("--label", type=str, default="",
-                        help="Free-form run label stored in the summary (e.g. the BFF config).")
+    parser.add_argument("--request-rate", type=float, default=float("inf"))
+    parser.add_argument("--burstiness", type=float, default=1.0)
+    parser.add_argument("--max-concurrency", type=int, default=None)
+    parser.add_argument("--request-timeout", type=float, default=600.0)
+    parser.add_argument("--min-tokens", type=int, default=0)
+    parser.add_argument("--disable-tqdm", action="store_true")
+    parser.add_argument("--no-stream", dest="stream", action="store_false")
+    parser.add_argument("--max-tokens", type=int, default=6000)
+    parser.add_argument("--result-file", type=str, default=None)
+    parser.add_argument("--label", type=str, default="")
     parser.set_defaults(stream=True)
 
     args = parser.parse_args()
-      
-    # Load dataset   
-    print(f"Loading dataset from {args.dataset_path}...")  
+
+    # Load dataset
+    print(f"Loading dataset from {args.dataset_path}...")
     prompts, references = load_dataset_simple(
         args.dataset_path, args.hf_split, args.input_key, args.output_key, args.num_prompts,
         model=args.model, min_tokens=args.min_tokens,
     )
-      
+
     # Run inference
     api_url = f"http://{args.host}:{args.port}/v1/chat/completions"
     gen_config = {"max_new_tokens": args.max_tokens}
@@ -305,10 +351,6 @@ async def main():
     print(f"Inference completed in {elapsed:.2f} s  |  {n_ok}/{len(outputs)} ok  |  "
           f"achieved {len(outputs)/elapsed:.2f} req/s")
 
-    # Output-length / termination diagnostics — the decisive check for whether a config
-    # (e.g. fusion) generates longer / non-terminating outputs vs baseline. If many requests
-    # have finish_reason="length", they hit max_tokens (no EOS) → that, not the script,
-    # explains a low req/s at equal token-throughput.
     ok_outs = [o for o in outputs if o.get("success")]
     n_len = sum(1 for o in ok_outs if o.get("finish_reason") == "length")
     n_stop = sum(1 for o in ok_outs if o.get("finish_reason") == "stop")
@@ -317,13 +359,11 @@ async def main():
         ctoks = [o["completion_tokens"] for o in ok_outs if o.get("completion_tokens") is not None]
         chars = [o.get("gen_chars", 0) for o in ok_outs]
         tok_str = (f"completion_tokens mean={np.mean(ctoks):.0f} median={np.median(ctoks):.0f} "
-                   f"max={max(ctoks)}" if ctoks else "completion_tokens n/a (no usage in response)")
+                   f"max={max(ctoks)}" if ctoks else "completion_tokens n/a")
         print(f"  output: {tok_str} | chars mean={np.mean(chars):.0f} median={np.median(chars):.0f}")
         print(f"  finish_reason: length(=max_tokens)={n_len}/{len(ok_outs)} "
               f"({length_pct:.1f}%)  stop(=EOS)={n_stop}/{len(ok_outs)}")
 
-    # Latency metrics (streaming only): TTFT / TPOT / ITL + output throughput, mirroring
-    # `vllm bench serve`. TPOT = (e2e − TTFT) / (output_tokens − 1).
     def _stats_ms(xs):
         if not xs:
             return None
@@ -358,39 +398,71 @@ async def main():
             print(f"  throughput: {metrics['output_throughput_toks_s']:.1f} output tok/s "
                   f"({total_out} toks) | {len(outputs)/elapsed:.2f} req/s")
 
-    # Print sample output
     if outputs:
         print("\nSample Output [0]:")
-        print(f"Prompt: {outputs[0].get('prompt', '')}")
-        print(f"Generated Text: {outputs[0].get('generated_text', '')}")
+        print(f"Prompt: {outputs[0].get('prompt', '')[:200]}...")
+        print(f"Generated Text: {outputs[0].get('generated_text', '')[:200]}...")
 
-    # Compute F1 scores
-    mean_f1 = None
-    f1_scores: List[float] = []
-    if args.compute_f1:
+    # ==========================================
+    # Evaluation Block
+    # ==========================================
+    eval_results: Dict[str, Any] = {}
+
+    if args.compute_f1 or args.compute_code_metrics:
         sample_ids = list(references.keys())
+        eval_preds = []
+        eval_refs = []
+        f1_scores = []
+        ast_valid_scores = []
+        em_scores = []
+
         for output, sample_id in zip(outputs, sample_ids):
-            if output.get('success') and output.get('generated_text'):
-                ground_truth = references[sample_id]
-                if ground_truth:
-                    f1_scores.append(f1_score(output['generated_text'], ground_truth))
+            if output.get('success') and output.get('generated_text') is not None:
+                gt = references[sample_id]
+                pred = output['generated_text']
+                if gt:
+                    eval_preds.append(pred)
+                    eval_refs.append(gt)
+                    
+                    if args.compute_f1:
+                        f1_scores.append(f1_score(pred, gt))
 
-        n_excluded = len(outputs) - len(f1_scores)
-        if n_excluded:
-            print(f"  note: {n_excluded}/{len(outputs)} samples excluded from F1 "
-                  f"(failed request or empty output/reference) — mean is over the rest")
-        if f1_scores:
+                    if args.compute_code_metrics:
+                        ast_valid_scores.append(1.0 if check_syntax_validity(output.get("prompt", ""), pred) else 0.0)
+                        em_scores.append(1.0 if normalized_exact_match(pred, gt) else 0.0)
+
+        print("\n=== Evaluation Results ===")
+        if args.compute_f1 and f1_scores:
             mean_f1 = float(np.mean(f1_scores))
-            print(f"\nMean F1 score: {mean_f1:.4f}  (over {len(f1_scores)} samples)")
+            eval_results["mean_f1"] = mean_f1
+            eval_results["per_sample_f1"] = f1_scores
+            print(f"  Mean F1 Score: {mean_f1:.4f} (over {len(f1_scores)} samples)")
 
-    # Always save a summary: accuracy + throughput + end-to-end time + latency, tagged by
-    # --label so a sweep (cc/nr_tree × THRESHOLD × BFF_GROUP_SIZE) is easy to tabulate.
+        if args.compute_code_metrics and eval_preds:
+            mean_ast = float(np.mean(ast_valid_scores)) * 100
+            mean_em = float(np.mean(em_scores)) * 100
+            eval_results["ast_syntax_validity_pct"] = mean_ast
+            eval_results["normalized_exact_match_pct"] = mean_em
+            print(f"  AST Syntax Validity: {mean_ast:.2f}%")
+            print(f"  Normalized Exact Match: {mean_em:.2f}%")
+
+            codebleu_res = compute_codebleu_safe(eval_preds, eval_refs, lang=args.lang)
+            if codebleu_res:
+                eval_results["codebleu"] = codebleu_res
+                print(f"  CodeBLEU Score: {codebleu_res['codebleu'] * 100:.2f}")
+                print(f"    - N-gram Match: {codebleu_res['ngram_match'] * 100:.2f}")
+                print(f"    - Weighted N-gram: {codebleu_res['weighted_ngram_match'] * 100:.2f}")
+                print(f"    - Syntax Match: {codebleu_res['syntax_match'] * 100:.2f}")
+                print(f"    - Dataflow Match: {codebleu_res['dataflow_match'] * 100:.2f}")
+            else:
+                print("  CodeBLEU: Skipped (install via `pip install codebleu` to enable)")
+
+    # Save output summary
     summary = {
         "label": args.label,
         "config": {
             "model": args.model, "dataset_path": args.dataset_path,
             "num_prompts": len(prompts), "max_concurrency": args.max_concurrency,
-            # store "inf" (not float inf → invalid JSON Infinity) when firing all at once
             "request_rate": (args.request_rate if np.isfinite(args.request_rate) else "inf"),
             "burstiness": args.burstiness,
             "max_tokens": args.max_tokens, "stream": args.stream,
@@ -399,15 +471,15 @@ async def main():
         "elapsed_s": elapsed,
         "request_throughput_rps": (len(outputs) / elapsed) if elapsed else None,
         "finish_length_pct": length_pct,
-        "mean_f1": mean_f1,
-        "num_f1_samples": len(f1_scores),
+        "evaluation": eval_results,
         **metrics,
     }
-    result_file = args.result_file or os.path.join(args.result_dir, "f1_results.json")
+    result_file = args.result_file or os.path.join(args.result_dir, "benchmark_results.json")
     os.makedirs(os.path.dirname(result_file) or ".", exist_ok=True)
     with open(result_file, "w") as f:
-        json.dump({**summary, "per_sample_f1": f1_scores}, f, indent=2)
+        json.dump(summary, f, indent=2)
     print(f"\nSummary saved to {result_file}")
+
 
 if __name__ == "__main__":
     asyncio.run(main())

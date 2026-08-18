@@ -35,6 +35,9 @@ _KEEP_FUSED_HASH = os.environ.get(
 _ALIAS_ENABLED = os.environ.get("BFF_ALIAS_FUSED", "1") == "1"
 # rep_block_id -> {alias keys (BlockHashWithGroupId) that point at this block}
 _BLOCK_ALIASES: dict = {}
+# Callbacks invoked with the block ids whose ref count just hit zero (see patched_free_blocks).
+# Registered by anything that must stop pointing at a block before it is reallocated.
+_ON_BLOCKS_FREED: list = []
 # Set once at patch time to the original BlockPool._maybe_evict_cached_block.
 _ORIG_MAYBE_EVICT = None
 # Set once at patch time to the original BlockPool.cache_full_blocks.
@@ -98,6 +101,13 @@ def add_block_alias(block_pool, key, rep_block) -> None:
     _alias_inserts += 1
 
 
+def on_blocks_freed(hook) -> None:
+    """Register ``hook(freed_block_ids)``, called after every release that hits ref_cnt 0.
+    Idempotent, so a connector may register on each worker construction."""
+    if hook not in _ON_BLOCKS_FREED:
+        _ON_BLOCKS_FREED.append(hook)
+
+
 def patched_maybe_evict_cached_block(self, block) -> bool:
     """Wrap BlockPool._maybe_evict_cached_block: when a block is about to be recycled or
     evicted, first drop ANY alias keys that pointed at it (keyed by block_id, so this fires
@@ -145,6 +155,17 @@ def patched_free_blocks(self, ordered_blocks):
             _ACTIVE_RUNNER.evict_lsh_blocks(freed_ids)
         except Exception:
             pass
+
+    # Same guarantee for any other index that hands out block ids as substitution targets — the
+    # P/D v2 connector's decode-side dedup index registers here. This is the ONLY point that sees
+    # every release, preemption included, which is what makes such an index safe to trust: a block
+    # leaves it strictly before it can be handed to another request.
+    if freed_ids and _ON_BLOCKS_FREED:
+        for hook in tuple(_ON_BLOCKS_FREED):
+            try:
+                hook(freed_ids)
+            except Exception:
+                pass
 
   
 #   def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
