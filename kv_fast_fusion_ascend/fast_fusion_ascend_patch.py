@@ -433,6 +433,17 @@ def apply_fast_fusion_ascend_patch() -> None:
     except Exception as e:  # pragma: no cover
         logger.warning("BFF Ascend: MooncakeLayerwiseConnectorFF registration skipped: %s", e)
 
+    # v2 of the same transport: P ships per-block signatures and the DECODE decides which blocks are
+    # worth sending, so a deduplicated block is never written. Registered alongside v1 rather than
+    # replacing it, so the two are one --kv-transfer-config apart in an A/B.
+    try:
+        from kv_fast_fusion_ascend.connectors.mooncake_layerwise_connector_ff_v2 import (
+            register_mooncake_layerwise_ff_v2,
+        )
+        register_mooncake_layerwise_ff_v2()
+    except Exception as e:  # pragma: no cover
+        logger.warning("BFF Ascend: MooncakeLayerwiseConnectorFFv2 registration skipped: %s", e)
+
     if os.environ.get("BFF_PD_FUSE", "0") != "1":
         logger.info("BFF Ascend: BFF_PD_FUSE!=1 → stock (no KV-cache group split, no patches).")
         return

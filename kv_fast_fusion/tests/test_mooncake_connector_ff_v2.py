@@ -29,15 +29,12 @@ def _worker():
     w = v2.MooncakeConnectorWorkerFFv2.__new__(v2.MooncakeConnectorWorkerFFv2)
     import threading
 
-    from kv_fast_fusion.pd_dedup_plan import DedupPlanner
+    from kv_fast_fusion.pd_dedup_v2 import DedupEngine
     w._jl = [None]
     w._ff_lock = threading.Lock()
-    w._planner = DedupPlanner()
-    w._dedup = v2.DedupStats()
-    w._pending_alias = {}
-    w._alias_ready = {}
-    w._pending_resident = {}
-    w._resident_owner = {}
+    # The decision state moved into the shared, transport-free engine (pd_dedup_v2), which the
+    # Ascend connectors use too; the worker is now transport only.
+    w._engine = DedupEngine(lock=w._ff_lock)
     w._ff_failed_blocks = set()
     w._group_layers = {1: {"l0"}}
     return w
@@ -122,7 +119,7 @@ def test_a_duplicate_is_dropped_from_the_pull_request():
     assert planned["rA"][1] == [41], "the first copy is still pulled"
     assert planned["rB"][1] == [v2._SENTINEL], "the second is not requested"
     assert w.take_pending_alias("rB") == {1: {42: (41, "rA")}}
-    assert w._dedup.dropped_batch == {1: 1} and w._dedup.planned == {1: 2}
+    assert w._engine.stats.dropped_batch == {1: 1} and w._engine.stats.planned == {1: 2}
 
 
 @requires_mooncake
@@ -202,7 +199,8 @@ def test_a_block_count_mismatch_pulls_the_request_in_full():
 @requires_mooncake
 def test_dedup_can_be_switched_off(monkeypatch):
     """The control arm: v2 plumbing active, no blocks withheld."""
-    monkeypatch.setattr(v2, "_V2_ENABLED", False)
+    from kv_fast_fusion import pd_dedup_v2
+    monkeypatch.setattr(pd_dedup_v2, "V2_ENABLED", False)
     w = _worker()
     v = [1.0, 0.0, 0.5, 0.25]
     req_blocks = {"rA": [[], [41]], "rB": [[], [42]]}
@@ -226,7 +224,7 @@ def test_a_resident_block_serves_a_later_pull():
 
     assert planned["rA"][1] == [v2._SENTINEL], "served entirely from a block already on D"
     assert w.take_pending_alias("rA") == {1: {41: (900, "old")}}
-    assert w._dedup.dropped_resident == {1: 1}
+    assert w._engine.stats.dropped_resident == {1: 1}
 
 
 @requires_mooncake
@@ -282,7 +280,7 @@ def test_an_alias_is_not_appliable_until_its_transfer_completes():
     w.plan_pull({"rA": [[], [41]], "rB": [[], [42]]},
                 {"rA": {1: _payload([v])}, "rB": {1: _payload([v])}}, threshold=0.75)
 
-    assert w._pending_alias.get("rB"), "the decision was taken"
+    assert w._engine._pending_alias.get("rB"), "the decision was taken"
     assert w.drain_pending_alias() == {}, "but nothing is appliable while the KV is in flight"
 
     pull_metas = {"rB": types.SimpleNamespace(
@@ -300,11 +298,11 @@ def test_a_failed_pull_discards_its_aliases():
     v = [1.0, 0.0, 0.5, 0.25]
     w.plan_pull({"rA": [[], [41]], "rB": [[], [42]]},
                 {"rA": {1: _payload([v])}, "rB": {1: _payload([v])}}, threshold=0.75)
-    assert w._pending_alias.get("rB")
+    assert w._engine._pending_alias.get("rB")
 
     w._forget_pending(["rA", "rB"])
 
-    assert w._pending_alias == {} and w._pending_resident == {}
+    assert w._engine._pending_alias == {} and w._engine._pending_resident == {}
 
 
 # =====================================================================================
@@ -480,8 +478,8 @@ def _connector(worker):
 def test_an_alias_is_applied_and_its_orphan_staged_for_free(monkeypatch):
     from kv_fast_fusion import fast_fusion_block_pool as bp
     w = _worker()
-    w._alias_ready = {"rB": {1: {51: (41, "rA")}}}
-    w._planner._resident.setdefault(1, set()).add(41)      # rep landed and is still held
+    w._engine._alias_ready = {"rB": {1: {51: (41, "rA")}}}
+    w._engine._planner._resident.setdefault(1, set()).add(41)      # rep landed and is still held
     runner = _fake_runner({"rA": [[], [41]], "rB": [[], [50, 51]]})
     monkeypatch.setattr(bp, "_ACTIVE_RUNNER", runner, raising=False)
 
@@ -490,7 +488,7 @@ def test_an_alias_is_applied_and_its_orphan_staged_for_free(monkeypatch):
     assert runner._updated_block_tables == {"rB": {1: [50, 41]}}
     assert runner.requests["rB"].block_ids[1] == [50, 41], "the runner table really was rewritten"
     assert w._ff_failed_blocks == set(), "nothing to recompute"
-    assert w._dedup.applied == 1
+    assert w._engine.stats.applied == 1
 
 
 @requires_mooncake
@@ -499,7 +497,7 @@ def test_an_alias_to_a_freed_representative_forces_a_recompute(monkeypatch):
     cannot mean 'keep your own copy' the way it did in v1 — it has to mean recompute."""
     from kv_fast_fusion import fast_fusion_block_pool as bp
     w = _worker()
-    w._alias_ready = {"rB": {1: {51: (41, "rA")}}}       # 41 deliberately NOT resident
+    w._engine._alias_ready = {"rB": {1: {51: (41, "rA")}}}       # 41 deliberately NOT resident
     runner = _fake_runner({"rA": [[], [41]], "rB": [[], [50, 51]]})
     monkeypatch.setattr(bp, "_ACTIVE_RUNNER", runner, raising=False)
 
@@ -507,7 +505,7 @@ def test_an_alias_to_a_freed_representative_forces_a_recompute(monkeypatch):
 
     assert runner._updated_block_tables is None, "no table rewrite"
     assert w._ff_failed_blocks == {51}, "the never-written block goes to the load-failure path"
-    assert w._dedup.recomputed == 1
+    assert w._engine.stats.recomputed == 1
 
 
 @requires_mooncake
@@ -515,24 +513,24 @@ def test_an_owner_that_never_gets_batched_forces_a_recompute(monkeypatch):
     """The map is held for a while — a request can complete its recv a step before it is scheduled —
     but it must not be held forever, and dropping it silently would strand unwritten blocks."""
     from kv_fast_fusion import fast_fusion_block_pool as bp
-    from kv_fast_fusion.connectors import mooncake_connector_ff as ff
+    from kv_fast_fusion import pd_dedup_v2
     w = _worker()
-    w._alias_ready = {"rB": {1: {51: (41, "rA")}}}
-    w._planner._resident.setdefault(1, set()).add(41)
+    w._engine._alias_ready = {"rB": {1: {51: (41, "rA")}}}
+    w._engine._planner._resident.setdefault(1, set()).add(41)
     runner = _fake_runner({"rA": [[], [41]], "rB": [[], [50, 51]]}, batched=["rA"])
     monkeypatch.setattr(bp, "_ACTIVE_RUNNER", runner, raising=False)
     conn = _connector(w)
 
     conn._ff_consumer_apply()
     assert w._ff_failed_blocks == set(), "still waiting for it to be scheduled"
-    assert "rB" in conn._ff_pending
+    assert "rB" in conn._applier().pending
 
-    conn._ff_step += ff._FF_APPLY_MAX_AGE + 1
-    conn._ff_consumer_apply()
+    for _ in range(pd_dedup_v2.APPLY_MAX_AGE + 1):
+        conn._ff_consumer_apply()      # steps pass; the owner never appears in input_batch
 
     assert w._ff_failed_blocks == {51}
-    assert "rB" not in conn._ff_pending
-    assert w._dedup.fail_reasons["owner_never_batched"] == 1
+    assert "rB" not in conn._applier().pending
+    assert w._engine.stats.fail_reasons["owner_never_batched"] == 1
 
 
 @requires_mooncake
@@ -545,16 +543,16 @@ def test_each_failure_names_its_own_cause(monkeypatch, scenario, reason):
     from kv_fast_fusion import fast_fusion_block_pool as bp
     w = _worker()
     victim = 51 if scenario == "rep_freed" else 99      # 99 is not in rB's table
-    w._alias_ready = {"rB": {1: {victim: (41, "rA")}}}
+    w._engine._alias_ready = {"rB": {1: {victim: (41, "rA")}}}
     if scenario == "victim_gone":
-        w._planner._resident.setdefault(1, set()).add(41)
+        w._engine._planner._resident.setdefault(1, set()).add(41)
     runner = _fake_runner({"rA": [[], [41]], "rB": [[], [50, 51]]})
     monkeypatch.setattr(bp, "_ACTIVE_RUNNER", runner, raising=False)
 
     _connector(w)._ff_consumer_apply()
 
-    assert w._dedup.fail_reasons[reason] == 1
-    assert sum(w._dedup.fail_reasons.values()) == 1, "exactly one cause is charged"
+    assert w._engine.stats.fail_reasons[reason] == 1
+    assert sum(w._engine.stats.fail_reasons.values()) == 1, "exactly one cause is charged"
     assert w._ff_failed_blocks == {victim}
 
 
@@ -570,7 +568,7 @@ def test_stats_report_wire_saving_not_a_producer_claim():
     w.plan_pull({"rA": [[], [41]], "rB": [[], [42]]},
                 {"rA": {1: _payload([v])}, "rB": {1: _payload([v])}}, 0.75)
 
-    s = w._dedup.stats_dict()
+    s = w._engine.stats.stats_dict()
     assert s["bff_version"] == 2
     assert s["blocks_planned"] == 2 and s["blocks_not_requested"] == 1
     assert s["blocks_not_requested_same_pull"] == 1
@@ -596,7 +594,7 @@ def test_the_reported_saving_equals_the_holes_in_the_pull_request():
     planned = w.plan_pull(req_blocks, sigs, threshold=0.75)
 
     holes = sum(1 for g in planned.values() for b in g[1] if b == v2._SENTINEL)
-    s = w._dedup.stats_dict()
+    s = w._engine.stats.stats_dict()
     assert holes == 2, "the two duplicates, and nothing else"
     assert s["blocks_not_requested"] == holes
     assert s["blocks_planned"] == 10
