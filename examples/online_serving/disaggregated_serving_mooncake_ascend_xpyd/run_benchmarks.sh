@@ -12,6 +12,9 @@
 #
 # BASELINE selects the mover:
 #   bff        (default) → MooncakeLayerwiseConnectorFF + BFF_PD_FUSE=1 (fusion + D-side sharing)
+#   bff_v2               → MooncakeLayerwiseConnectorFFv2: P ships per-block signatures, the DECODE
+#                          replies with what it does not need, and those blocks are never written.
+#                          Tune with BFF_THRESHOLD + BFF_MAX_REL_ERR (see the v2 knobs below).
 #   layerwise            → stock MooncakeLayerwiseConnector (layerwise transfer, no fusion)
 #   mooncakev1           → stock MooncakeConnectorV1 (whole-request transfer)
 #   vanilla              → true stock: launches via `vllm.entrypoints.cli.main`, so
@@ -65,13 +68,14 @@ BASELINE=${BASELINE:-bff}             # bff | layerwise | mooncakev1 | vanilla
 VANILLA_CONNECTOR=${VANILLA_CONNECTOR:-MooncakeLayerwiseConnector}  # vanilla only: MooncakeLayerwiseConnector | MooncakeConnectorV1
 case "$BASELINE" in
   bff)         CONNECTOR="MooncakeLayerwiseConnectorFF"; LAYER_WISE=true;  BFF_ON=1; LAUNCHER="kv_fast_fusion.fast_fusion_main" ;;
+  bff_v2)      CONNECTOR="MooncakeLayerwiseConnectorFFv2"; LAYER_WISE=true; BFF_ON=1; LAUNCHER="kv_fast_fusion.fast_fusion_main" ;;
   layerwise)   CONNECTOR="MooncakeLayerwiseConnector";   LAYER_WISE=true;  BFF_ON=0; LAUNCHER="kv_fast_fusion.fast_fusion_main" ;;
   mooncakev1)  CONNECTOR="MooncakeConnectorV1";          LAYER_WISE=false; BFF_ON=0; LAUNCHER="kv_fast_fusion.fast_fusion_main" ;;
   vanilla)
     CONNECTOR="$VANILLA_CONNECTOR"
     [[ "$CONNECTOR" == "MooncakeLayerwiseConnector" ]] && LAYER_WISE=true || LAYER_WISE=false
     BFF_ON=0; LAUNCHER="vllm.entrypoints.cli.main" ;;
-  *) echo "Unknown BASELINE=$BASELINE (use bff|layerwise|mooncakev1|vanilla)"; exit 1 ;;
+  *) echo "Unknown BASELINE=$BASELINE (use bff|bff_v2|layerwise|mooncakev1|vanilla)"; exit 1 ;;
 esac
 
 # Wrap the mover in MultiConnector + AscendStoreConnector (external KV pool)?
@@ -79,7 +83,7 @@ esac
 # AscendMultiConnector/AscendStoreConnector may not implement SupportsHMA — so bff runs the FF mover
 # standalone (it IS HMA-capable). For an apples-to-apples comparison set USE_ASCEND_STORE=0 on the
 # stock baselines too.
-if [[ "$BASELINE" == "bff" ]]; then
+if [[ "$BASELINE" == "bff" || "$BASELINE" == "bff_v2" ]]; then
   USE_ASCEND_STORE=${USE_ASCEND_STORE:-0}
 else
   USE_ASCEND_STORE=${USE_ASCEND_STORE:-1}
@@ -93,6 +97,27 @@ BFF_PD_REPR=${BFF_PD_REPR:-proj}         # block repr for similarity: full | pro
 BFF_THRESHOLD=${BFF_THRESHOLD:-0.75}     # cosine merge threshold (0..1)
 BFF_GROUP_SIZE=${BFF_GROUP_SIZE:-4}      # fusion layers packed per KV-cache group
 BFF_PD_ENCODED_BATCH_SIZE=${BFF_PD_ENCODED_BATCH_SIZE:-128}   # cross-batch registry window (0=within-batch only)
+
+# ---- v2 knobs (BASELINE=bff_v2 only) ----
+# v2 moves the merge decision to the DECODE: P ships per-block signatures, D replies with the blocks
+# it does not need, and those are never written. On GPU this took throughput 1.13 -> 1.42 req/s with
+# ngram_match inside the undamaged band, at BFF_THRESHOLD=0.8 BFF_MAX_REL_ERR=0.3.
+BFF_V2_DEDUP=${BFF_V2_DEDUP:-1}          # 0 disables the whole mechanism (signature exchange too)
+BFF_V2_RESIDENT=${BFF_V2_RESIDENT:-1}    # alias to blocks left over from earlier transfers
+BFF_SIG_DIM=${BFF_SIG_DIM:-128}          # signature width; ~256 B/block against ~1.6 MB of KV
+BFF_V2_MAX_RESIDENT=${BFF_V2_MAX_RESIDENT:-32768}
+BFF_V2_SIG_TIMEOUT=${BFF_V2_SIG_TIMEOUT:-2}   # no answer in this long -> send the group whole
+# Ceiling on the relative substitution error a merge may inject:
+#   rel_err = ||k_owner - k_rep|| / ||k_owner|| = sqrt(1 + r^2 - 2*r*cos),  r = |k_rep|/|k_owner|
+# This, not BFF_THRESHOLD, governs accuracy — cosine is scale-free, so a pair can clear any cosine
+# bar and still be a bad substitution. 1.0 is inert. Note min_r rel_err = sqrt(1-cos^2), so a 0.3
+# budget implies cos >= 0.954 whatever the norms do.
+BFF_MAX_REL_ERR=${BFF_MAX_REL_ERR:-1.0}
+# Which layers of a fusion group feed the signature. "first" (default) uses only the group's first
+# layer, which is all that exists when layerwise wants to send it, and preserves the compute/
+# transfer overlap. "group" matches the GPU signature exactly but holds the group's transfer until
+# its last layer is written.
+BFF_SIG_LAYERS=${BFF_SIG_LAYERS:-first}
 
 # ---- Benchmark knobs ----
 NUM_PROMPTS=${NUM_PROMPTS:-1024}
@@ -339,6 +364,12 @@ export_bff_env() {
   export BFF_PD_FUSE=$BFF_PD_FUSE BFF_SCALE_MODE=$BFF_SCALE_MODE BFF_PD_MERGE=$BFF_PD_MERGE \
          BFF_PD_REPR=$BFF_PD_REPR BFF_THRESHOLD=$BFF_THRESHOLD BFF_GROUP_SIZE=$BFF_GROUP_SIZE \
          BFF_PD_ENCODED_BATCH_SIZE=$BFF_PD_ENCODED_BATCH_SIZE
+  # v2 knobs. Exported for every BFF arm, not just bff_v2: BFF_MAX_REL_ERR also gates v1's merges
+  # (both go through pd_lsh.probe), so an A/B at the same error budget is one variable apart.
+  export BFF_MAX_REL_ERR=$BFF_MAX_REL_ERR BFF_V2_DEDUP=$BFF_V2_DEDUP \
+         BFF_V2_RESIDENT=$BFF_V2_RESIDENT BFF_SIG_DIM=$BFF_SIG_DIM \
+         BFF_V2_MAX_RESIDENT=$BFF_V2_MAX_RESIDENT BFF_V2_SIG_TIMEOUT=$BFF_V2_SIG_TIMEOUT \
+         BFF_SIG_LAYERS=$BFF_SIG_LAYERS
   # BOTH roles dump fuse stats: the producer counts blocks + redirects shipped, the decode side counts
   # the redirects that actually landed and the REAL freed-block delta (the measured compression).
   export BFF_PD_STATS_DIR="$results_root"
@@ -717,7 +748,8 @@ main() {
   if [ "$KILL_ONLY" = true ]; then kill_all_nodes; echo "Cleanup done."; exit 0; fi
 
   echo "BFF Ascend config: BASELINE=$BASELINE launcher=$LAUNCHER connector=$CONNECTOR ${NUM_PREFILL}Px${NUM_DECODE}D tp=$TP_SIZE use_ascend_store=$USE_ASCEND_STORE"
-  [[ "$BFF_ON" == "1" ]] && echo "  BFF: fuse=$BFF_PD_FUSE scale=$BFF_SCALE_MODE merge=$BFF_PD_MERGE repr=$BFF_PD_REPR thr=$BFF_THRESHOLD gs=$BFF_GROUP_SIZE eb=$BFF_PD_ENCODED_BATCH_SIZE"
+  [[ "$BFF_ON" == "1" ]] && echo "  BFF: fuse=$BFF_PD_FUSE scale=$BFF_SCALE_MODE merge=$BFF_PD_MERGE repr=$BFF_PD_REPR thr=$BFF_THRESHOLD gs=$BFF_GROUP_SIZE eb=$BFF_PD_ENCODED_BATCH_SIZE max_rel_err=$BFF_MAX_REL_ERR"
+  [[ "$BASELINE" == "bff_v2" ]] && echo "  BFF v2: dedup=$BFF_V2_DEDUP resident=$BFF_V2_RESIDENT sig_dim=$BFF_SIG_DIM sig_layers=$BFF_SIG_LAYERS sig_timeout=${BFF_V2_SIG_TIMEOUT}s"
 
   rm -rf "${logs_root}" "${results_root}"; mkdir -p "${logs_root}" "${results_root}"
   rm -f "${results_root}"/bff_stats_*.json
