@@ -444,6 +444,16 @@ def apply_fast_fusion_ascend_patch() -> None:
     except Exception as e:  # pragma: no cover
         logger.warning("BFF Ascend: MooncakeLayerwiseConnectorFFv2 registration skipped: %s", e)
 
+    # The non-layerwise (pull) transport, taught BFF's multi-group layout. No dedup — it exists so
+    # the NPU can be measured on the SAME transport the GPU numbers were taken on.
+    try:
+        from kv_fast_fusion_ascend.connectors.mooncake_connector_ff import (
+            register_mooncake_connector_ff,
+        )
+        register_mooncake_connector_ff()
+    except Exception as e:  # pragma: no cover
+        logger.warning("BFF Ascend: MooncakeConnectorFF registration skipped: %s", e)
+
     if os.environ.get("BFF_PD_FUSE", "0") != "1":
         logger.info("BFF Ascend: BFF_PD_FUSE!=1 → stock (no KV-cache group split, no patches).")
         return

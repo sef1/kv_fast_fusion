@@ -15,6 +15,13 @@
 #   bff_v2               → MooncakeLayerwiseConnectorFFv2: P ships per-block signatures, the DECODE
 #                          replies with what it does not need, and those blocks are never written.
 #                          Tune with BFF_THRESHOLD + BFF_MAX_REL_ERR (see the v2 knobs below).
+#   bff_pull             → MooncakeConnectorFF: the NON-layerwise (pull) transport with BFF's
+#                          multi-group KV layout and NO dedup. This is the transport the GPU
+#                          numbers were measured on, so it is what makes NPU and GPU comparable.
+#                          Its control arm is `mooncakev1` (same transport, no BFF), and the gate
+#                          is ACCURACY, not throughput: a wrong per-group block table does not
+#                          raise, it silently transfers the wrong KV. Compare CodeBLEU/N-gram
+#                          against mooncakev1 before reading a single req/s figure.
 #   layerwise            → stock MooncakeLayerwiseConnector (layerwise transfer, no fusion)
 #   mooncakev1           → stock MooncakeConnectorV1 (whole-request transfer)
 #   vanilla              → true stock: launches via `vllm.entrypoints.cli.main`, so
@@ -71,11 +78,12 @@ case "$BASELINE" in
   bff_v2)      CONNECTOR="MooncakeLayerwiseConnectorFFv2"; LAYER_WISE=true; BFF_ON=1; LAUNCHER="kv_fast_fusion.fast_fusion_main" ;;
   layerwise)   CONNECTOR="MooncakeLayerwiseConnector";   LAYER_WISE=true;  BFF_ON=0; LAUNCHER="kv_fast_fusion.fast_fusion_main" ;;
   mooncakev1)  CONNECTOR="MooncakeConnectorV1";          LAYER_WISE=false; BFF_ON=0; LAUNCHER="kv_fast_fusion.fast_fusion_main" ;;
+  bff_pull)    CONNECTOR="MooncakeConnectorFF";          LAYER_WISE=false; BFF_ON=1; LAUNCHER="kv_fast_fusion.fast_fusion_main" ;;
   vanilla)
     CONNECTOR="$VANILLA_CONNECTOR"
     [[ "$CONNECTOR" == "MooncakeLayerwiseConnector" ]] && LAYER_WISE=true || LAYER_WISE=false
     BFF_ON=0; LAUNCHER="vllm.entrypoints.cli.main" ;;
-  *) echo "Unknown BASELINE=$BASELINE (use bff|bff_v2|layerwise|mooncakev1|vanilla)"; exit 1 ;;
+  *) echo "Unknown BASELINE=$BASELINE (use bff|bff_v2|bff_pull|layerwise|mooncakev1|vanilla)"; exit 1 ;;
 esac
 
 # Wrap the mover in MultiConnector + AscendStoreConnector (external KV pool)?
@@ -83,7 +91,7 @@ esac
 # AscendMultiConnector/AscendStoreConnector may not implement SupportsHMA — so bff runs the FF mover
 # standalone (it IS HMA-capable). For an apples-to-apples comparison set USE_ASCEND_STORE=0 on the
 # stock baselines too.
-if [[ "$BASELINE" == "bff" || "$BASELINE" == "bff_v2" ]]; then
+if [[ "$BASELINE" == "bff" || "$BASELINE" == "bff_v2" || "$BASELINE" == "bff_pull" ]]; then
   USE_ASCEND_STORE=${USE_ASCEND_STORE:-0}
 else
   USE_ASCEND_STORE=${USE_ASCEND_STORE:-1}
