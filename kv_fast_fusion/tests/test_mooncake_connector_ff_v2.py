@@ -18,7 +18,7 @@ import types
 import pytest
 import torch
 
-from kv_fast_fusion import pd_lsh
+from kv_fast_fusion import pd_dedup_v2, pd_lsh
 from kv_fast_fusion.connectors import mooncake_connector_ff_v2 as v2
 
 requires_mooncake = pytest.mark.skipif(
@@ -628,3 +628,50 @@ def test_registration_is_idempotent(monkeypatch):
     v2.register_mooncake_connector_ff_v2()
     v2.register_mooncake_connector_ff_v2()
     assert calls == ["MooncakeConnectorFFv2"]
+
+
+# =====================================================================================
+# the GPU path must not move when the shared core is changed for Ascend
+# =====================================================================================
+# `signature_matrix` grew a layout dispatch (`key_blocks`) and a `num_blocks` guard so the Ascend
+# (K, V) tuple layout could use the same core. Both are additions for a shape the GPU never sends,
+# but "should be inert" is not a property you get to assert without a test — a silent change here
+# moves every merge decision, and the symptom would be a throughput number, not an error.
+def test_the_gpu_indexing_form_is_bitwise_unchanged():
+    """`kv[0, idx]` was the GPU formulation before the Ascend port; `kv[0].index_select(0, idx)` is
+    what key_blocks does now. Pinned as bitwise equality, including a repeated index."""
+    torch.manual_seed(0)
+    kv = torch.randn(2, 64, 8, 4, 16)                 # [2, num_blocks, block, heads, dim]
+    idx = torch.tensor([3, 17, 0, 63, 17], dtype=torch.long)
+
+    assert torch.equal(kv[0, idx], pd_dedup_v2.key_blocks(kv, idx, is_mla=False))
+
+
+def test_the_num_blocks_guard_is_inert_when_the_caller_omits_it():
+    """The GPU connector calls signature_matrix WITHOUT num_blocks, so the Ascend block_size_scale
+    refusal must not be reachable from it — with or without a shape that would trip the check."""
+    torch.manual_seed(0)
+    layers = [torch.randn(2, 8, 4, 2, 8)]
+    sig_a, norms_a = pd_dedup_v2.signature_matrix(layers, [1, 2, 3], False, [None])
+    sig_b, norms_b = pd_dedup_v2.signature_matrix(layers, [1, 2, 3], False, [None], num_blocks=None)
+
+    assert torch.equal(sig_a, sig_b) and torch.equal(norms_a, norms_b)
+
+
+def test_the_default_applier_never_reaches_the_ambiguity_branch():
+    """`normalize_req_id` defaults to identity and the runner's batch is a dict, so two entries can
+    never collide. The GPU stats reporting owner_id_ambiguous=0 is not luck — it is unreachable."""
+    engine = pd_dedup_v2.DedupEngine(resident=False)
+    engine._alias_ready = {"rB": {1: {51: (41, "rA")}}}
+    engine._planner._resident.setdefault(1, set()).add(41)
+    runner = _fake_runner({"rA": [[], [41]], "rB": [[], [50, 51]]})
+    written = []
+    applier = pd_dedup_v2.AliasApplier(
+        engine,
+        lambda r, rid, gi, blocks: (written.append((rid, gi, list(blocks))) or True),
+        set().update)
+
+    applier.apply(runner)
+
+    assert written == [("rB", 1, [50, 41])]
+    assert engine.stats.fail_reasons["owner_id_ambiguous"] == 0
