@@ -158,6 +158,71 @@ def flatten_group_lists(groups) -> list[int]:
     return [int(b) for g in groups for b in g]
 
 
+def resolve_kv_cache_groups(kv_cache_config, runner):
+    """The BFF group layout, from whichever source actually has it.
+
+    Two sources, in this order:
+
+    * ``kv_cache_config`` — what ``KVConnectorFactory.create_connector`` passes every REGISTERED
+      connector, and what ``NPUWorker.initialize_from_config`` hands to
+      ``ensure_kv_transfer_initialized`` *before* ``initialize_kv_cache``. Always the live
+      post-split layout, and independent of import order.
+    * ``runner.kv_cache_config`` — the original path, via the ``_ACTIVE_RUNNER`` the patched
+      ``NPUModelRunner.__init__`` publishes. Only populated when the BFF patch was imported before
+      the runner was constructed in this process, which is NOT the case when the connector module
+      itself is what first drags in ``kv_fast_fusion`` (the factory loads it lazily, during
+      ``ensure_kv_transfer_initialized``, long after the runner exists). That is the
+      ``no active BFF runner`` failure this ordering fixes.
+
+    Raises :class:`KVGroupLayoutError` when neither yields groups. Returning a default here is not
+    an option: every downstream index is derived from this list, and a wrong one transfers real KV
+    against the wrong block table."""
+    groups = getattr(kv_cache_config, "kv_cache_groups", None)
+    if not groups:
+        groups = getattr(getattr(runner, "kv_cache_config", None), "kv_cache_groups", None)
+    if not groups:
+        raise KVGroupLayoutError(
+            "the KV-cache group layout is unreadable: the connector was given no kv_cache_config "
+            "and there is no active BFF runner. Serving now would transfer every layer with the "
+            "wrong block table and silently corrupt the decode's KV. Launch via "
+            "`python -m kv_fast_fusion.fast_fusion_main serve`, or use the stock "
+            "MooncakeConnectorV1.")
+    return groups
+
+
+def dedup_registration_regions(ptrs, sizes) -> tuple[list[int], list[int]]:
+    """Drop repeated base pointers from a transfer-engine registration list, first occurrence wins.
+
+    BFF's group split makes vLLM emit a SHARED-tensor layout: ``get_kv_cache_config_from_groups``
+    sizes the pool by ``max_layers_per_group`` (``BFF_GROUP_SIZE``) and hands one ``KVCacheTensor``
+    to one layer of *every* group, so a 28-layer model with 7 groups has 4 allocations, not 28. The
+    NPU allocator honours that ``shared_by`` list, so the 7 layers sharing an allocation all report
+    the SAME ``data_ptr()``.
+
+    The vendored pull connector's ``register_kv_caches`` then appends one entry per ``(layer, K/V)``
+    unconditionally, i.e. 56 pointers of which only 8 are distinct, and Mooncake refuses the 2nd
+    registration of a region it already holds: *"Transfer Engine does not support overlapped memory
+    region"*. The sibling LAYERWISE connector — the transport BFF already runs on NPU — guards the
+    same append with ``if data_ptr() not in ptrs``, which is precisely why it survives the split and
+    this one does not. This helper is that guard, applied from the outside.
+
+    Only the REGISTRATION list is shortened. ``kv_caches_base_addr`` keeps all of its entries: it is
+    indexed by layer in ``_transfer_kv_cache`` and shipped to the peer in the handshake metadata.
+    Registering a region once and then reading at offsets inside it is exactly what
+    ``batch_transfer_sync_read`` does, so per-layer registration was never required.
+    """
+    seen: set[int] = set()
+    out_ptrs: list[int] = []
+    out_sizes: list[int] = []
+    for ptr, size in zip(ptrs, sizes):
+        if ptr in seen:
+            continue
+        seen.add(ptr)
+        out_ptrs.append(ptr)
+        out_sizes.append(size)
+    return out_ptrs, out_sizes
+
+
 # =================================================================================================
 # Ascend/NPU-only section. Guarded so the pure helpers above stay importable for unit tests.
 # =================================================================================================
@@ -426,6 +491,14 @@ if _ASCEND_AVAILABLE:
 
         _RECV_THREAD_CLS = KVCacheRecvingThreadFF
 
+        def __init__(self, vllm_config, engine_id, kv_cache_config=None):
+            # Keep the post-split layout handed to us by the factory. Reading it here rather than
+            # from _ACTIVE_RUNNER is what makes this connector independent of whether the BFF patch
+            # happened to be imported before NPUModelRunner was constructed in THIS process — see
+            # _build_base_addr_groups.
+            self._kv_cache_config = kv_cache_config
+            super().__init__(vllm_config, engine_id)
+
         def register_kv_caches(self, kv_caches):
             # The base class constructs and STARTS the recv thread inside this call, so the class
             # swap has to be in place before it runs.
@@ -434,9 +507,30 @@ if _ASCEND_AVAILABLE:
             if self.kv_role != "kv_producer":
                 _orig_cls = _mc.KVCacheRecvingThread
                 _mc.KVCacheRecvingThread = self._RECV_THREAD_CLS
+
+            # BFF's shared-tensor layout makes several layers report the same data_ptr(), and the
+            # base registers one entry per (layer, K/V) without dedup → Mooncake rejects the region
+            # as overlapped. Wrap the singleton's register_buffer for the duration of the super()
+            # call; see dedup_registration_regions for why only the registration list shrinks.
+            from vllm_ascend.distributed.kv_transfer.utils import (
+                mooncake_transfer_engine as _mte,
+            )
+            _orig_register = _mte.global_te.register_buffer
+
+            def _dedup_register(ptrs, sizes, _orig=_orig_register):
+                kept_ptrs, kept_sizes = dedup_registration_regions(ptrs, sizes)
+                logger.info(
+                    "MooncakeConnectorFF: registering %d of %d KV regions (%d dropped as duplicates "
+                    "of BFF's shared-tensor layout), %.2f GiB total.",
+                    len(kept_ptrs), len(ptrs), len(ptrs) - len(kept_ptrs),
+                    sum(kept_sizes) / (1024 ** 3))
+                return _orig(kept_ptrs, kept_sizes)
+
+            _mte.global_te.register_buffer = _dedup_register
             try:
                 super().register_kv_caches(kv_caches)
             finally:
+                _mte.global_te.register_buffer = _orig_register
                 if _orig_cls is not None:
                     _mc.KVCacheRecvingThread = _orig_cls
 
@@ -451,14 +545,7 @@ if _ASCEND_AVAILABLE:
                         len(self._layer_names), self._caches_per_layer)
 
         def _build_base_addr_groups(self) -> list[list[int]]:
-            runner = _active_runner()
-            if runner is None:
-                raise KVGroupLayoutError(
-                    "no active BFF runner, so the KV-cache group layout is unreadable. Serving now "
-                    "would transfer every layer with the wrong block table and silently corrupt "
-                    "the decode's KV. Launch via `python -m kv_fast_fusion.fast_fusion_main serve`, "
-                    "or use the stock MooncakeConnectorV1.")
-            groups = runner.kv_cache_config.kv_cache_groups
+            groups = resolve_kv_cache_groups(self._kv_cache_config, _active_runner())
             layer_group = build_layer_group_map(groups)
             return build_base_addr_groups(
                 self.kv_caches_base_addr, self._layer_names, layer_group,
@@ -486,14 +573,17 @@ if _ASCEND_AVAILABLE:
             assert vllm_config.kv_transfer_config is not None
             self.engine_id = vllm_config.kv_transfer_config.engine_id
             self._connector_metadata = MooncakeConnectorMetadataFF()
+            self._kv_cache_config = kv_cache_config
             if role == KVConnectorRole.SCHEDULER:
                 self.connector_scheduler = MooncakeConnectorSchedulerFF(
                     vllm_config, str(self.engine_id))
                 self.connector_worker = None
             else:
                 self.connector_scheduler = None
+                # The worker is where the group layout is read; hand it the config the factory gave
+                # us so it never has to depend on _ACTIVE_RUNNER being published in this process.
                 self.connector_worker = MooncakeConnectorWorkerFF(
-                    vllm_config, str(self.engine_id))
+                    vllm_config, str(self.engine_id), kv_cache_config)
             if os.environ.get("BFF_PD_FUSE", "0") != "1":
                 logger.warning(
                     "MooncakeConnectorFF selected with BFF_PD_FUSE!=1. This connector requires the "

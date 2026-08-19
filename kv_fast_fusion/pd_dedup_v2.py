@@ -206,6 +206,14 @@ class DedupStats:
         self.dropped_batch: dict[int, int] = {}      # served by another block in the same transfer
         self.applied = 0            # aliases that reached the block table
         self.recomputed = 0         # aliases that could not be applied -> local recompute
+        # Wall time spent inside AliasApplier.apply, which runs on the decode's critical path once
+        # per forward step. Measured because the 2026-08-19 A/B showed the current connector paying
+        # ~15% more TPOT than the legacy one AT MATCHED CONCURRENCY (80.6ms vs 94.3ms at ~101
+        # running), and static diffing twice failed to explain it. This separates the two possible
+        # homes for that cost: our Python here, or the GPU work the resulting block tables imply.
+        # If apply_ms stays far below the step budget, the cost is not in this file.
+        self.apply_ms = 0.0
+        self.apply_calls = 0
         self.fail_reasons = dict.fromkeys(FAIL_REASONS, 0)
         self.sig_phase_failed = 0   # exchanges that fell back to a full transfer
         self.exchanges = 0          # exchanges actually attempted
@@ -291,6 +299,9 @@ class DedupStats:
                                      + self.dropped_batch.get(g, 0)) / self.planned[g])
                     if self.planned.get(g) else 0.0,
                 } for g in groups},
+            "apply_ms_total": round(self.apply_ms, 1),
+            "apply_calls": self.apply_calls,
+            "apply_us_mean": round(self.apply_ms * 1000 / self.apply_calls, 1) if self.apply_calls else 0,
             "aliases_applied": self.applied,
             "aliases_recomputed": self.recomputed,
             "alias_failure_reasons": dict(self.fail_reasons),
@@ -532,6 +543,16 @@ class AliasApplier:
         self.step = 0
 
     def apply(self, runner) -> None:
+        """Timed wrapper; the work is in :meth:`_apply`. See ``DedupStats.apply_ms``."""
+        t0 = time.perf_counter()
+        try:
+            return self._apply(runner)
+        finally:
+            s = self._engine.stats
+            s.apply_ms += (time.perf_counter() - t0) * 1000.0
+            s.apply_calls += 1
+
+    def _apply(self, runner) -> None:
         engine, stats = self._engine, self._engine.stats
         self.pending_merges = None
         self.step += 1

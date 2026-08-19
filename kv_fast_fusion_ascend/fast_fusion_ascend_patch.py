@@ -415,6 +415,30 @@ def _patch_npu_model_runner() -> None:
     logger.info("BFF Ascend: patched NPUModelRunner.__init__.")
 
 
+def _registration_failed(name: str, exc: Exception) -> None:
+    """A connector failed to register. Fatal iff this run actually selected it.
+
+    Ascend mirror of ``kv_fast_fusion.fast_fusion_pd_patch._registration_failed``, reusing its argv
+    parser. Registration stays in try/except so a box without mooncake can still run the other
+    transports, but swallowing the failure for the connector the run REQUIRES turns an ImportError
+    into ``Unsupported connector type`` raised much later inside config validation, naming neither
+    the module nor the cause. When the selected set cannot be determined (no --kv-transfer-config on
+    this process) we warn rather than raise."""
+    try:
+        from kv_fast_fusion.fast_fusion_pd_patch import _selected_connector_names
+        selected = _selected_connector_names()
+    except Exception:  # pragma: no cover - GPU module unimportable on this box
+        selected = set()
+    if name in selected:
+        raise RuntimeError(
+            f"{name} is selected by --kv-transfer-config but failed to register: {exc!r}. "
+            "Refusing to continue — serving would fail later with an unrelated 'Unsupported "
+            "connector type' error."
+        ) from exc
+    logger.warning("BFF Ascend: %s registration skipped (not selected by this process): %s",
+                   name, exc)
+
+
 def apply_fast_fusion_ascend_patch() -> None:
     """Apply the Ascend/NPU BFF patch (see module docstring). Raw mode only.
 
@@ -424,6 +448,33 @@ def apply_fast_fusion_ascend_patch() -> None:
     ``_connector_finished`` (``assert len(kv_cache_groups)==1``) whenever the top connector isn't taken
     as ``SupportsHMA`` — and reshaping the layout for a stock run is wrong regardless. The FF connector
     name is still registered (harmless; it self-disables fusion when ``BFF_PD_FUSE!=1``)."""
+    # --- 0. NPUModelRunner lean init, FIRST ---
+    # This publishes _ACTIVE_RUNNER, which the connectors and the scheduler merge channel read. It
+    # ran as step 4 (after the registrations, behind the BFF_PD_FUSE gate) until 2026-08-19, and
+    # that cost a debugging cycle on the NPU pull connector: anything raising between here and there
+    # skipped it, and kv_fast_fusion/__init__ swallows the exception into a bare print(), so the
+    # only symptom was `KVGroupLayoutError: no active BFF runner` several hundred lines later.
+    # It is cheap, idempotent (_WRAP_SENTINEL) and depended on by everything below, so it goes
+    # first and its failure is loud.
+    #
+    # NOTE: this is necessary but NOT sufficient. In a process where the connector module is what
+    # first drags in kv_fast_fusion (the factory's lazy loader, during
+    # ensure_kv_transfer_initialized), NPUModelRunner was already constructed by the time we get
+    # here and no __init__ patch can publish anything. That case is handled on the connector side:
+    # MooncakeConnectorFF reads the layout from the kv_cache_config it is given and treats
+    # _ACTIVE_RUNNER as a fallback.
+    #
+    # This now runs BEFORE the BFF_PD_FUSE gate, which the gate's contract permits: the gate exists
+    # to keep the KV-cache GROUP SPLIT off in stock runs, and this patch splits nothing. It seeds
+    # four inert attributes and publishes _ACTIVE_RUNNER; every reader of those
+    # (patched_free_blocks, the update_from_output wrapper, the promotion hook) is installed below
+    # the gate, so with BFF off nothing consumes them.
+    try:
+        _patch_npu_model_runner()
+    except Exception as e:  # pragma: no cover - only reachable off the Ascend stack
+        logger.warning("BFF Ascend: could not patch NPUModelRunner (%s); consumer block-sharing "
+                       "will be inert and _ACTIVE_RUNNER stays unpublished.", e, exc_info=True)
+
     # Register the connector name unconditionally so it always resolves if selected.
     try:
         from kv_fast_fusion_ascend.connectors.mooncake_layerwise_connector_ff import (
@@ -431,7 +482,7 @@ def apply_fast_fusion_ascend_patch() -> None:
         )
         register_mooncake_layerwise_ff()
     except Exception as e:  # pragma: no cover
-        logger.warning("BFF Ascend: MooncakeLayerwiseConnectorFF registration skipped: %s", e)
+        _registration_failed("MooncakeLayerwiseConnectorFF", e)
 
     # v2 of the same transport: P ships per-block signatures and the DECODE decides which blocks are
     # worth sending, so a deduplicated block is never written. Registered alongside v1 rather than
@@ -442,7 +493,7 @@ def apply_fast_fusion_ascend_patch() -> None:
         )
         register_mooncake_layerwise_ff_v2()
     except Exception as e:  # pragma: no cover
-        logger.warning("BFF Ascend: MooncakeLayerwiseConnectorFFv2 registration skipped: %s", e)
+        _registration_failed("MooncakeLayerwiseConnectorFFv2", e)
 
     # The non-layerwise (pull) transport, taught BFF's multi-group layout. No dedup — it exists so
     # the NPU can be measured on the SAME transport the GPU numbers were taken on.
@@ -452,7 +503,7 @@ def apply_fast_fusion_ascend_patch() -> None:
         )
         register_mooncake_connector_ff()
     except Exception as e:  # pragma: no cover
-        logger.warning("BFF Ascend: MooncakeConnectorFF registration skipped: %s", e)
+        _registration_failed("MooncakeConnectorFF", e)
 
     if os.environ.get("BFF_PD_FUSE", "0") != "1":
         logger.info("BFF Ascend: BFF_PD_FUSE!=1 → stock (no KV-cache group split, no patches).")
@@ -510,12 +561,7 @@ def apply_fast_fusion_ascend_patch() -> None:
     if _wrap_scheduler_promotion(Scheduler):
         logger.info("BFF Ascend: promotion-time redirect apply installed on Scheduler.")
 
-    # --- 4. NPUModelRunner lean init ---
-    try:
-        _patch_npu_model_runner()
-    except Exception as e:  # pragma: no cover - only reachable off the Ascend stack
-        logger.warning("BFF Ascend: could not patch NPUModelRunner (%s); "
-                       "consumer block-sharing will be inert.", e)
+    # --- 4. (NPUModelRunner lean init moved to step 0 — see the comment there.) ---
 
     # --- 5. Wrap update_from_output on every scheduler class that defines it (adapt, not replace) ---
     # Candidates: base Scheduler + the vllm_ascend recompute schedulers. Only those that define the

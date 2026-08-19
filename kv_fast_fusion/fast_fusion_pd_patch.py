@@ -40,6 +40,70 @@ logger = init_logger("vllm.fast_fusion_pd_patch")
 _PD_SCALE_MODE = os.environ.get("BFF_SCALE_MODE", "raw").lower()
 
 
+def _selected_connector_names() -> set:
+    """Connector names this process was actually launched with, from ``--kv-transfer-config``.
+
+    Read from ``sys.argv`` because the patch runs at import, long before a ``VllmConfig`` exists.
+    Includes connectors nested under MultiConnector's ``kv_connector_extra_config.connectors``.
+    Returns an empty set when the flag is absent or unparseable — callers must treat that as
+    "unknown", never as "not selected"."""
+    import json
+    import sys
+
+    argv = sys.argv
+    raw = None
+    for i, a in enumerate(argv):
+        if a == "--kv-transfer-config" and i + 1 < len(argv):
+            raw = argv[i + 1]
+        elif a.startswith("--kv-transfer-config="):
+            raw = a.split("=", 1)[1]
+    if not raw:
+        return set()
+    try:
+        cfg = json.loads(raw)
+    except Exception:
+        return set()
+
+    names = set()
+
+    def _walk(node):
+        if not isinstance(node, dict):
+            return
+        name = node.get("kv_connector")
+        if isinstance(name, str):
+            names.add(name)
+        extra = node.get("kv_connector_extra_config")
+        if isinstance(extra, dict):
+            for child in extra.get("connectors") or ():
+                _walk(child)
+
+    _walk(cfg)
+    return names
+
+
+def _registration_failed(name: str, exc: Exception) -> None:
+    """A connector failed to register. Fatal iff this run actually selected it.
+
+    Registration lives in try/except so a box without mooncake can still run the NCCL path. But
+    swallowing the failure for the connector the run REQUIRES turns an ImportError into
+    ``Unsupported connector type`` raised ~400 lines later inside pydantic validation, naming
+    neither the module nor the real cause. That cost two full debugging cycles on 2026-08-19, and
+    it is the same silent-degradation class as `no_kv_tensors` and `owner_never_batched`.
+
+    When the selected set cannot be determined (no --kv-transfer-config on this process, e.g. the
+    API server front-end) we warn rather than raise: refusing to start a process that never needed
+    the connector would be worse than the bug being fixed."""
+    selected = _selected_connector_names()
+    if name in selected:
+        raise RuntimeError(
+            f"{name} is selected by --kv-transfer-config but failed to register: {exc!r}. "
+            "Refusing to continue — serving would fail later with an unrelated "
+            "'Unsupported connector type' error. Fix the import above."
+        ) from exc
+    logger.warning("Fast fusion P/D patch: %s registration skipped (not selected by this "
+                   "process): %s", name, exc)
+
+
 def _free_recv_tensor(self, tensor_id: str):
     """Release a recv'd tensor as soon as the connector has consumed it.
 
@@ -172,7 +236,7 @@ def apply_fast_fusion_pd_patch():
         )
         register_mooncake_connector_ff()
     except Exception as e:  # pragma: no cover - optional dependency
-        logger.warning("Fast fusion P/D patch: MooncakeConnectorFF registration skipped: %s", e)
+        _registration_failed("MooncakeConnectorFF", e)
 
     # v2 of the same transport: the producer ships per-block signatures and the DECODE decides what
     # not to pull, so a deduplicated block is never transferred at all. Registered alongside v1
@@ -183,7 +247,19 @@ def apply_fast_fusion_pd_patch():
         )
         register_mooncake_connector_ff_v2()
     except Exception as e:  # pragma: no cover - optional dependency
-        logger.warning("Fast fusion P/D patch: MooncakeConnectorFFv2 registration skipped: %s", e)
+        _registration_failed("MooncakeConnectorFFv2", e)
+
+    # The PRE-EXTRACTION v2 (773 lines, commit 6122e3126), kept as a measurement baseline so the
+    # shared-core extraction can finally be A/B'd against what it replaced. Registered beside the
+    # current one, never instead of it. Delete both this block and the module once the question is
+    # settled — see the module docstring.
+    try:
+        from kv_fast_fusion.connectors.mooncake_connector_ff_v2_legacy import (
+            register_mooncake_connector_ff_v2_legacy,
+        )
+        register_mooncake_connector_ff_v2_legacy()
+    except Exception as e:  # pragma: no cover - optional dependency
+        _registration_failed("MooncakeConnectorFFv2Legacy", e)
 
     # --- 6. ratio mode: re-enable the minimal norm-scaling kernel infra on D ---
     if _PD_SCALE_MODE == "ratio":

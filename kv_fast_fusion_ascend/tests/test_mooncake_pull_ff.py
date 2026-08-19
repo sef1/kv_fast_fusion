@@ -196,3 +196,110 @@ def test_a_prefill_group_the_decode_does_not_want_is_simply_unused():
 def test_flatten_counts_every_group():
     assert mc.flatten_group_lists([[1, 2], [], [3]]) == [1, 2, 3]
     assert mc.flatten_group_lists([[], []]) == []
+
+
+# =====================================================================================
+# transfer-engine registration dedup
+# =====================================================================================
+def test_the_shared_tensor_layout_registers_each_region_once():
+    """The startup crash this guards: `Transfer Engine does not support overlapped memory region`.
+
+    BFF's split makes vLLM size the pool by max_layers_per_group (4), so a 28-layer / 7-group model
+    gets 4 allocations, each shared_by one layer per group. The NPU allocator honours shared_by, so
+    those 7 layers all report the SAME data_ptr — and the vendored PULL connector appends one entry
+    per (layer, K/V) unconditionally. 56 pointers, 8 distinct, and Mooncake refuses the second
+    registration of a region it already holds. The LAYERWISE connector guards the same append with
+    `if data_ptr() not in ptrs`, which is exactly why it survives the split and the pull one does
+    not."""
+    # 4 shared tensors, split into K and V => 8 distinct regions, each reported by 7 layers.
+    distinct = [(0x1000 + 0x100 * i, 0x2000 + 0x100 * i) for i in range(4)]
+    ptrs, sizes = [], []
+    for _group in range(7):
+        for k_addr, v_addr in distinct:
+            ptrs += [k_addr, v_addr]
+            sizes += [4096, 4096]
+    assert len(ptrs) == 56 and len(set(ptrs)) == 8
+
+    kept_ptrs, kept_sizes = mc.dedup_registration_regions(ptrs, sizes)
+
+    assert len(kept_ptrs) == 8
+    assert set(kept_ptrs) == set(ptrs), "dedup must drop repeats, never whole regions"
+    assert len(kept_sizes) == len(kept_ptrs), "sizes stay index-aligned with ptrs"
+    assert kept_ptrs == sorted(set(ptrs), key=ptrs.index), "first occurrence wins, order preserved"
+
+
+def test_the_ascend_layout_is_left_completely_alone():
+    """One allocation per layer — the layout the connector was written against. Dedup must be a
+    no-op there, or it would silently unregister real regions."""
+    ptrs = [1000 + 16 * j for j in range(56)]
+    sizes = [4096] * 56
+
+    assert mc.dedup_registration_regions(ptrs, sizes) == (ptrs, sizes)
+
+
+def test_dedup_keeps_the_size_that_belongs_to_the_kept_pointer():
+    """Sizes are consumed positionally by register_memory(ptr, size). Pairing a kept pointer with a
+    dropped duplicate's size would register the wrong extent."""
+    kept_ptrs, kept_sizes = mc.dedup_registration_regions(
+        [0xA, 0xB, 0xA, 0xC], [10, 20, 999, 30])
+
+    assert kept_ptrs == [0xA, 0xB, 0xC]
+    assert kept_sizes == [10, 20, 30]
+
+
+# =====================================================================================
+# where the group layout is read from
+# =====================================================================================
+class _Cfg:
+    def __init__(self, groups):
+        self.kv_cache_groups = groups
+
+
+class _Runner:
+    def __init__(self, groups):
+        self.kv_cache_config = _Cfg(groups)
+
+
+def test_the_layout_is_readable_without_any_active_runner():
+    """The `no active BFF runner` failure, in its real shape.
+
+    In a process where the connector module is what first imports kv_fast_fusion — the factory
+    loads it lazily during ensure_kv_transfer_initialized — NPUModelRunner was already constructed,
+    so no __init__ patch can publish _ACTIVE_RUNNER. The kv_cache_config the factory passes is
+    available at exactly that moment, and is the same post-split layout."""
+    groups = _groups(7, 4)
+
+    assert mc.resolve_kv_cache_groups(_Cfg(groups), None) is groups
+
+
+def test_the_runner_still_serves_as_the_fallback():
+    """Kept so a connector constructed on the old (2-arg) path is not regressed."""
+    groups = _groups(7, 4)
+
+    assert mc.resolve_kv_cache_groups(None, _Runner(groups)) is groups
+
+
+def test_the_config_wins_over_the_runner():
+    """Both are the same object in practice; if they ever diverge, the one the factory handed this
+    connector for THIS role is the authoritative one."""
+    from_cfg, from_runner = _groups(7, 4), _groups(3, 2)
+
+    assert mc.resolve_kv_cache_groups(_Cfg(from_cfg), _Runner(from_runner)) is from_cfg
+
+
+def test_an_empty_config_falls_through_rather_than_being_believed():
+    """A KVCacheConfig with no groups is not a layout, it is a missing layout. Believing it would
+    map every address to nothing and refuse later with a confusing message."""
+    groups = _groups(7, 4)
+
+    assert mc.resolve_kv_cache_groups(_Cfg([]), _Runner(groups)) is groups
+
+
+def test_no_layout_anywhere_is_still_fatal():
+    """The point of the whole file: never guess. A default group list here transfers real KV against
+    the wrong block table, and nothing downstream can detect it."""
+    with pytest.raises(mc.KVGroupLayoutError, match="unreadable"):
+        mc.resolve_kv_cache_groups(None, None)
+
+    with pytest.raises(mc.KVGroupLayoutError, match="unreadable"):
+        mc.resolve_kv_cache_groups(_Cfg([]), _Runner([]))
