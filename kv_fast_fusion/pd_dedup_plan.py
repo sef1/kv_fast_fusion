@@ -62,6 +62,9 @@ class DedupPlan:
     rejected_by_rel_err: int = 0
     accept_cos: list = field(default_factory=lambda: [0] * len(pd_lsh.ACCEPT_COS_LABELS))
     accept_rel_err: list = field(default_factory=lambda: [0] * len(pd_lsh.REL_ERR_LABELS))
+    # Cosines of the rel_err rejections, same bins as accept_cos. See LshIndex.reject_cos: only mass
+    # above sqrt(1 - MAX_REL_ERR^2) could ever be recovered by a better-matched representative.
+    reject_cos: list = field(default_factory=lambda: [0] * len(pd_lsh.ACCEPT_COS_LABELS))
 
     def n_dropped(self) -> int:
         return sum(len(v) for v in self.alias.values())
@@ -167,6 +170,7 @@ class DedupPlanner:
                     self._bin(plan, v, norms[batch_rows[j]], norms[row])
                 elif v > threshold:
                     plan.rejected_by_rel_err += 1
+                    plan.reject_cos[pd_lsh._bin(v, pd_lsh.ACCEPT_COS_BINS)] += 1
 
             if hit is None:
                 keep.append(blk.slot)
@@ -188,9 +192,12 @@ class DedupPlanner:
                 plan.accept_cos[i] += c
             for i, c in enumerate(idx.accept_rel_err):
                 plan.accept_rel_err[i] += c
+            for i, c in enumerate(idx.reject_cos):
+                plan.reject_cos[i] += c
             plan.rejected_by_rel_err += idx.rejected_by_rel_err
             idx.accept_cos = [0] * len(pd_lsh.ACCEPT_COS_LABELS)
             idx.accept_rel_err = [0] * len(pd_lsh.REL_ERR_LABELS)
+            idx.reject_cos = [0] * len(pd_lsh.ACCEPT_COS_LABELS)
             idx.rejected_by_rel_err = 0
         return plan
 

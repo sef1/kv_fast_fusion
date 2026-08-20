@@ -201,3 +201,42 @@ def test_decode_log_falls_back_to_whoever_ran_requests():
     per = {"a.log": {"running": {"max": 0}}, "b.log": {"running": {"max": 48}}}
     assert cbs._decode_log(per) is per["b.log"]
     assert cbs._decode_log({}) is None
+
+
+def _v2_stats(**over):
+    """Minimum bff_stats shape the v2 branch needs, plus whatever the case under test varies."""
+    base = {"bff_version": 2, "blocks_planned": 100, "blocks_not_requested": 6,
+            "blocks_not_requested_resident": 4, "blocks_not_requested_same_pull": 2,
+            "wire_saving_pct": 6.0, "aliases_applied": 5, "aliases_recomputed": 1}
+    base.update(over)
+    return base
+
+
+def test_a_connector_that_cannot_count_exchanges_is_not_reported_as_zero(tmp_path, capsys):
+    """`exchanges=0` claims the mechanism never ran; an ABSENT counter says only that this build
+    cannot tell. mooncake_connector_ff_v2_legacy.py is kept verbatim as a measurement baseline so it
+    can never gain the counter, and conflating the two made a legacy run that deduplicated 5.9% of
+    the wire read as stone dead."""
+    data = _run(tmp_path, _v2_stats(), [])
+    assert "exchanges" not in data["bff_v2"], "absent must not be persisted as a measured zero"
+    assert "inert" not in data["bff_v2"]
+    out = capsys.readouterr().out
+    assert "exchanges=n/a" in out
+    assert "INERT" not in out
+
+
+def test_a_genuine_zero_with_skips_is_still_called_inert(tmp_path, capsys):
+    """The counter's whole purpose: a connector that asked nothing looks identical to one that
+    asked and found nothing. Reporting it must survive the fix above."""
+    data = _run(tmp_path, _v2_stats(exchanges=0, exchange_skip_reasons={"no_peer": 7}), [])
+    assert data["bff_v2"]["inert"] is True
+    assert data["bff_v2"]["exchanges"] == 0
+    assert "INERT" in capsys.readouterr().out
+
+
+def test_v2_stats_survive_logs_that_parsed_to_nothing(tmp_path):
+    """v2 stats come from bff_stats_*.json, not the logs, so the write must not be gated on the
+    logs alone — that combination printed the numbers and then dropped them unwritten."""
+    data = _run(tmp_path, _v2_stats(exchanges=3), [])
+    assert data["bff_v2"]["exchanges"] == 3
+    assert json.loads((tmp_path / "r.json").read_text())["bff_v2"]["blocks_planned"] == 100

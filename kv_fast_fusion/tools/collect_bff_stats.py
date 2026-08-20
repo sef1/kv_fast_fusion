@@ -196,6 +196,7 @@ def collect(result_file: str, stats_dir: str, logs: list[str]) -> dict:
         cfg_per[name] = {k: s[k] for k in (
             "cross_index", "ff_groups", "encoded_batch_size", "cross_batch_redirects",
             "within_batch_redirects", "registry_blocks", "lsh_entries", "lsh_accept_cos",
+            "lsh_reject_cos", "min_cos_for_budget",
             "lsh_owners", "lsh_evicted", "layers_fused", "layers_total",
             "thresholds_per_group", "threshold", "audit_random_pair_cos",
             "lsh_accept_rel_err")
@@ -314,14 +315,21 @@ def collect(result_file: str, stats_dir: str, logs: list[str]) -> dict:
         # "0.0% saving" means two completely different things: asked and found nothing, or never
         # asked at all. The first Ascend run was the second for a whole benchmark and looked
         # identical to the first. Say which.
-        exchanges = sum(s.get("exchanges", 0) for s in v2_per.values())
+        # A connector predating this counter reports nothing rather than zero, and the two must not
+        # print alike: "exchanges=0" claims the mechanism never ran, while an ABSENT counter says
+        # only that this build cannot tell. mooncake_connector_ff_v2_legacy.py — kept verbatim as a
+        # measurement baseline, so it cannot gain the counter — is the second case, and printing it
+        # as the first made a legacy run that deduplicated 5.9% of the wire look stone dead.
+        reporting = [s for s in v2_per.values() if "exchanges" in s]
+        exchanges = sum(s.get("exchanges", 0) for s in reporting)
         skips: dict = {}
         for s in v2_per.values():
             for k, v in (s.get("exchange_skip_reasons") or {}).items():
                 skips[k] = skips.get(k, 0) + v
-        data["bff_v2"]["exchanges"] = exchanges
-        data["bff_v2"]["skip_reasons"] = skips
-        if exchanges == 0 and any(skips.values()):
+        if reporting:
+            data["bff_v2"]["exchanges"] = exchanges
+            data["bff_v2"]["skip_reasons"] = skips
+        if reporting and exchanges == 0 and any(skips.values()):
             data["bff_v2"]["inert"] = True
             print("  ! bff v2 INERT: not one signature exchange was attempted, so no block could "
                   "ever be deduplicated. Reasons: "
@@ -329,8 +337,8 @@ def collect(result_file: str, stats_dir: str, logs: list[str]) -> dict:
                              if v))
         print(f"  bff v2 (DECODE DECIDES): {dropped} of {planned} blocks never requested "
               f"= {pct:.1f}% of the wire | resident={resident} same-pull={same} "
-              f"| exchanges={exchanges}")
-        if exchanges and any(skips.values()):
+              f"| exchanges={exchanges if reporting else 'n/a (not reported by this connector)'}")
+        if reporting and exchanges and any(skips.values()):
             print("    exchanges skipped: "
                   + " ".join(f"{k}={v}" for k, v in sorted(skips.items(), key=lambda kv: -kv[1])
                              if v))
@@ -374,11 +382,30 @@ def collect(result_file: str, stats_dir: str, logs: list[str]) -> dict:
                       f"({100.0 * n / (n + kept):.0f}% of cosine-passing candidates) | "
                       + " ".join(f"g{g}={v}" for g, v in sorted(rej.items())))
             for label, key in (("accepted-cosine", "lsh_accept_cos"),
-                               ("substitution rel-err", "lsh_accept_rel_err")):
+                               ("substitution rel-err", "lsh_accept_rel_err"),
+                               ("rejected-cosine", "lsh_reject_cos")):
                 for gi, bins in sorted((s.get(key) or {}).items()):
                     nz = " ".join(f"{k}:{v}" for k, v in bins.items() if v)
                     if nz:
                         print(f"    {label} g{gi}: {nz}")
+            # Split the rejections at the cosine below which NO norm ratio can meet the budget.
+            # Below it a rejection is permanently unreachable; above it, only the norm ratio lost it.
+            # Without this line the histogram cannot answer "would rescaling the rep have helped?".
+            floor = s.get("min_cos_for_budget")
+            rej_hist = s.get("lsh_reject_cos") or {}
+            if floor and rej_hist:
+                lo = hi = 0
+                for bins in rej_hist.values():
+                    for label, n in bins.items():
+                        # Bin labels are "<lo>-<hi>"; a bin whose TOP is at or below the floor is
+                        # wholly unreachable. Bins straddling it count as reachable, which
+                        # over-states the recoverable share rather than inventing precision.
+                        top = float(label.split("-")[1])
+                        (lo, hi) = (lo + n, hi) if top <= floor else (lo, hi + n)
+                if lo + hi:
+                    print(f"    of those rejections: {hi} sit above cos>={floor:.3f} (recoverable "
+                          f"only by a better-matched rep) and {lo} below it "
+                          f"({100.0 * lo / (lo + hi):.0f}%, unreachable at any norm ratio)")
 
     if cm_per:
         # Compression FACTOR = total/(total-freed) = how many× smaller the KV cache gets. Overall is
@@ -519,8 +546,10 @@ def collect(result_file: str, stats_dir: str, logs: list[str]) -> dict:
             print(f"  bff redirects applied [{lg}]: {v['redirects_applied']} "
                   f"(reps_unresolved={v['reps_unresolved']})")
 
+    # v2_per belongs here: it comes from bff_stats_*.json rather than the logs, so a run whose logs
+    # parsed to nothing would PRINT its v2 stats and then drop them on the floor unwritten.
     if (ov_per or cm_per or sched_per or freed_per or redir_per or sat_per
-            or redundancy_per or xfer_per or any(cfg_per.values())):
+            or redundancy_per or xfer_per or v2_per or any(cfg_per.values())):
         with open(result_file, "w") as f:
             json.dump(data, f, indent=2)
         print(f"  → merged into {result_file}")

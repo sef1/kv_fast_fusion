@@ -37,6 +37,8 @@ alignment logic is unit-testable without an NPU.
 """
 
 import os
+import threading
+from collections import OrderedDict
 
 from vllm.logger import init_logger
 
@@ -44,6 +46,34 @@ logger = init_logger("vllm.mooncake_connector_ff_ascend")
 
 # Registered connector name, selected by `BASELINE=bff_pull` in run_benchmarks.sh.
 CONNECTOR_NAME = "MooncakeConnectorFF"
+
+# --- phase B (fusion) gates -----------------------------------------------------------------
+# Three runtime-separable layers, so a bad run is bisected without a rebuild:
+#   BFF_FF_SHIP=0            → accumulate + cluster on P, ship nothing. D is untouched.
+#   BFF_FF_SHIP=1 APPLY=0    → redirects ride to D and are counted, never applied.
+#   BFF_FF_SHIP=1 APPLY=1    → full fusion.
+# The first two MUST leave decode output bit-identical to phase A; that invariance is the gate.
+_FF_SHIP = os.environ.get("BFF_FF_SHIP", "1") == "1"
+_FF_APPLY = os.environ.get("BFF_FF_APPLY", "1") == "1"
+_FF_FUSE = os.environ.get("BFF_PD_FUSE", "0") == "1"
+
+
+def _parse_ff_groups(raw):
+    """``BFF_FF_GROUPS="1,2,3"`` → the set of fusion groups to run, or None for "every eligible".
+
+    Shared spelling with the layerwise connector so one A/B knob means the same thing on both
+    transports. Group 0 is the warmup group and is never eligible regardless."""
+    if raw is None or not raw.strip():
+        return None
+    out = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if part:
+            out.add(int(part))
+    return out or None
+
+
+_FF_GROUPS = _parse_ff_groups(os.environ.get("BFF_FF_GROUPS"))
 
 
 class KVGroupLayoutError(RuntimeError):
@@ -183,6 +213,99 @@ def transfer_indices(local_base, remote_base) -> list[int]:
     return out
 
 
+class FFRowStash:
+    """Producer-side handoff of redirect rows from the WORKER to the SCHEDULER.
+
+    Fusion rows are produced in ``save_kv_layer`` (worker, mid-forward) but must leave the node in
+    ``request_finished_all_groups`` (scheduler, at request completion). Under a PULL transport those
+    are the only two points that exist: the worker never talks to D — D initiates every exchange —
+    and the scheduler is the only place with a P→D message. So the two halves are joined here.
+
+    This is the same in-process channel as ``_ACTIVE_RUNNER`` and carries the same TP=1 restriction,
+    which this connector already requires elsewhere. Bounded, because a request whose rows are never
+    collected (aborted before finishing) would otherwise leak them forever."""
+
+    def __init__(self, cap: int = 4096):
+        self.lock = threading.Lock()
+        self.rows: "OrderedDict[str, dict[int, list]]" = OrderedDict()
+        self.cap = cap
+        self.dropped = 0
+
+    def add(self, ext_id: str, gi: int, rows) -> None:
+        if not rows:
+            return
+        with self.lock:
+            per_group = self.rows.get(ext_id)
+            if per_group is None:
+                per_group = {}
+                self.rows[ext_id] = per_group
+            per_group[int(gi)] = [[int(o), int(h), int(s)] for (o, h, s) in rows]
+            self.rows.move_to_end(ext_id)
+            while len(self.rows) > self.cap:
+                self.rows.popitem(last=False)
+                self.dropped += 1
+
+    def take(self, ext_id: str) -> "dict[int, list] | None":
+        """Pop this request's rows. Consume-once: a second call returns None, so a retried
+        ``request_finished`` cannot ship the same map twice."""
+        with self.lock:
+            return self.rows.pop(ext_id, None)
+
+
+class FFPendingSource:
+    """Consumer-side sink the scheduler's promotion hook drains.
+
+    ``_bff_promotion_apply`` (fast_fusion_ascend_patch.py:226) consumes ``_FF_PENDING_SOURCE``
+    expecting exactly ``.lock`` + ``.pending`` as ``{external_id: {gi: rows}}``, and optionally
+    ``.promo_stats``. On the layerwise transport that object is a live ZMQ recv thread; on a pull
+    transport the redirects arrive inside ``kv_transfer_params`` instead, so no thread is needed and
+    this plain holder satisfies the same contract."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.pending: dict[str, dict[int, list]] = {}
+        self.promo_stats = {
+            "promo_applied": 0, "promo_unresolved": 0, "promo_no_rows": 0,
+            "promo_merge_calls": 0, "promo_pending_dropped": 0,
+            "promo_unres_rep_loading": 0, "promo_unres_rep_gone": 0,
+            "promo_rows_late": 0, "promo_maps_late": 0,
+        }
+
+    def offer(self, ext_id: str, groups_rows: dict) -> None:
+        if not groups_rows:
+            return
+        with self.lock:
+            self.pending[ext_id] = {int(gi): rows for gi, rows in groups_rows.items()}
+
+    def drain(self) -> dict:
+        with self.lock:
+            out, self.pending = self.pending, {}
+        return out
+
+
+def normalize_ff_redirects(raw) -> "dict[int, list] | None":
+    """Coerce the ``ff_redirects`` field back from its JSON round trip.
+
+    ``kv_transfer_params`` crosses the proxy as JSON, which stringifies dict keys — so the group
+    index arrives as ``"3"``, not ``3``, and indexing by int would silently find nothing. Returns
+    None when the field is absent or unusable, which is the "no fusion for this request" case and
+    must stay non-fatal: a dropped redirect costs compression, never correctness."""
+    if not isinstance(raw, dict) or not raw:
+        return None
+    out: dict[int, list] = {}
+    for gi, rows in raw.items():
+        try:
+            key = int(gi)
+        except (TypeError, ValueError):
+            continue
+        if not rows:
+            continue
+        clean = [[int(r[0]), int(r[1]), int(r[2])] for r in rows if len(r) >= 3]
+        if clean:
+            out[key] = clean
+    return out or None
+
+
 def resolve_kv_cache_groups(kv_cache_config, runner):
     """The BFF group layout, from whichever source actually has it.
 
@@ -284,8 +407,47 @@ if _ASCEND_AVAILABLE:
         from kv_fast_fusion import fast_fusion_block_pool as _bp
         return getattr(_bp, "_ACTIVE_RUNNER", None)
 
+    def _ext_of(rid: str) -> str:
+        """External (P/D-stable) request id. vLLM appends a per-server random 9-char suffix, so the
+        raw request_id does NOT match across the two engines; every fusion key must be this."""
+        from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
+            get_external_request_id,
+        )
+        return get_external_request_id(rid)
+
+    # Producer worker → producer scheduler (rows), and the consumer's sink for the promotion hook.
+    # Module-level singletons because the two halves are different objects in the same process.
+    _FF_ROWS = FFRowStash()
+    _FF_SOURCE = None
+
+    def _ff_pending_source():
+        """The consumer sink, published to ``_FF_PENDING_SOURCE`` on first use.
+
+        Created lazily so a producer-only process never publishes one: the promotion hook treats a
+        published source as "this node consumes redirects", and on P that would make every promotion
+        look for maps that will never exist."""
+        global _FF_SOURCE
+        if _FF_SOURCE is None:
+            _FF_SOURCE = FFPendingSource()
+            from kv_fast_fusion import fast_fusion_block_pool as _bp
+            _bp._FF_PENDING_SOURCE = _FF_SOURCE
+            logger.info("MooncakeConnectorFF: promotion-time redirect apply ON "
+                        "(pending source published).")
+        return _FF_SOURCE
+
     class MooncakeConnectorMetadataFF(MooncakeConnectorMetadata):
-        """Same container; ``local_block_ids`` / ``remote_block_ids`` are now per group."""
+        """Same container; ``local_block_ids`` / ``remote_block_ids`` are now per group.
+
+        Adds ``fuse_reqs``: the requests whose prefill COMPLETES this step, as
+        ``(request_id, external_id, per_group_block_ids)``. The producer's normal metadata is
+        useless for fusion under a pull transport — it only learns block ids at
+        ``request_finished``, long after the forward that wrote the KV. ``fuse_reqs`` is a
+        separate, fusion-only channel built from the scheduler output, so the transfer path is
+        completely unaffected. (Same design as the GPU pull connector, which hit this first.)"""
+
+        def __init__(self):
+            super().__init__()
+            self.fuse_reqs: list[tuple] = []
 
         def add_new_req(self, request_id, local_block_ids, num_external_tokens,
                         kv_transfer_params):
@@ -316,13 +478,28 @@ if _ASCEND_AVAILABLE:
             )
 
     class MooncakeConnectorSchedulerFF(MooncakeConnectorScheduler):
-        """Per-group block ids on both ends of the P/D handshake."""
+        """Per-group block ids on both ends of the P/D handshake, plus the fusion channel."""
+
+        def __init__(self, vllm_config, engine_id):
+            super().__init__(vllm_config, engine_id)
+            # req_id -> (accumulated per-group block ids, prompt_token_ids) for prefills spanning
+            # several scheduler steps. Fusion must read K from a FULLY written prompt, so chunks
+            # accumulate here and only emit once the last one lands.
+            self._ff_chunked: dict[str, tuple] = {}
 
         def update_state_after_alloc(self, request, blocks, num_external_tokens):
             params = request.kv_transfer_params
             if params is not None and (params.get("do_remote_prefill", False)
                                        or params.get("do_remote_decode", False)):
                 self._reqs_in_batch.add(request.request_id)
+            # Consumer side: lift this request's redirect map off the params the producer attached
+            # and hand it to the promotion hook. Done HERE because it is the last point that sees
+            # kv_transfer_params, and it is strictly before the request can leave
+            # WAITING_FOR_REMOTE_KVS — i.e. inside the pre-decode window the apply requires.
+            if params is not None and _FF_APPLY:
+                rows = normalize_ff_redirects(params.get("ff_redirects"))
+                if rows:
+                    _ff_pending_source().offer(_ext_of(request.request_id), rows)
             if params is None or not params.get("do_remote_prefill"):
                 return
             if not params.get("remote_block_ids"):
@@ -358,7 +535,54 @@ if _ASCEND_AVAILABLE:
             self._reqs_need_send = {}
             meta.reqs_in_batch = self._reqs_in_batch
             self._reqs_in_batch = set()
+            self._collect_fuse_reqs(scheduler_output, meta)
             return meta
+
+        def _collect_fuse_reqs(self, scheduler_output, meta) -> None:
+            """Fusion-only: record the per-group block ids of every prefill COMPLETING this step.
+
+            A prompt spanning several scheduler steps has blocks that are not all written yet, so
+            clustering on them would cluster on garbage. Those accumulate in ``_ff_chunked`` and emit
+            only once the last chunk lands. (With ``max_num_batched_tokens == max_model_len`` every
+            prompt completes in one step, so the first loop is the common path.)
+
+            Touches only ``scheduler_output``, which is vLLM's — nothing Ascend-specific — and is
+            wrapped whole: a fusion bookkeeping error must never break scheduling."""
+            if not _FF_FUSE:
+                return
+            try:
+                for new_req in scheduler_output.scheduled_new_reqs:
+                    prompt = list(new_req.prompt_token_ids or [])
+                    n = (scheduler_output.num_scheduled_tokens[new_req.req_id]
+                         + new_req.num_computed_tokens)
+                    groups = [list(g) for g in new_req.block_ids]
+                    if n < len(prompt):
+                        self._ff_chunked[new_req.req_id] = (groups, prompt)
+                        continue
+                    meta.fuse_reqs.append((new_req.req_id, _ext_of(new_req.req_id), groups))
+
+                cached = scheduler_output.scheduled_cached_reqs
+                for i, req_id in enumerate(cached.req_ids):
+                    prev = self._ff_chunked.get(req_id)
+                    if prev is None:
+                        continue            # not a multi-step prefill → nothing to accumulate
+                    groups, prompt = prev
+                    new_block_ids = cached.new_block_ids[i]
+                    if new_block_ids is None:
+                        blocks = groups                                   # no new blocks this chunk
+                    elif req_id in cached.resumed_req_ids:
+                        blocks = [list(g) for g in new_block_ids]         # restart after preemption
+                    else:
+                        blocks = [groups[g] + list(new_block_ids[g])
+                                  for g in range(len(new_block_ids))]
+                    n = scheduler_output.num_scheduled_tokens[req_id] + cached.num_computed_tokens[i]
+                    if n < len(prompt):
+                        self._ff_chunked[req_id] = (blocks, prompt)
+                        continue
+                    self._ff_chunked.pop(req_id, None)
+                    meta.fuse_reqs.append((req_id, _ext_of(req_id), blocks))
+            except Exception as e:  # pragma: no cover - defensive (never break scheduling)
+                logger.warning("MooncakeConnectorFF: could not collect fuse reqs: %s", e)
 
         def request_finished_all_groups(self, request, block_ids):
             """``SupportsHMA`` replacement for ``request_finished``.
@@ -380,9 +604,19 @@ if _ASCEND_AVAILABLE:
 
             import math
             num_prompt_blocks = math.ceil(len(request.prompt_token_ids) / self.block_size)
+            # Fusion redirects ride the params dict that already flows P→D. Under a pull transport
+            # this is the ONLY P→D message: the worker never addresses D (D initiates every
+            # exchange, and P's listener is a ROUTER that learns no address), so a push channel would
+            # need address discovery this transport does not provide. The timing is also exactly
+            # right — these params are produced after the whole prompt is written and consumed
+            # before D allocates, i.e. strictly inside the pre-decode window the apply requires.
+            ff_redirects = None
+            if _FF_SHIP:
+                ff_redirects = _FF_ROWS.take(_ext_of(request.request_id))
             return delay_free_blocks, dict(
                 do_remote_prefill=True,
                 do_remote_decode=False,
+                ff_redirects=ff_redirects or {},
                 remote_block_ids=groups,
                 remote_engine_id=self.engine_id,
                 remote_request_id=request.request_id,
@@ -562,6 +796,8 @@ if _ASCEND_AVAILABLE:
             # happened to be imported before NPUModelRunner was constructed in THIS process — see
             # _build_base_addr_groups.
             self._kv_cache_config = kv_cache_config
+            self._layer_group: dict[str, int] = {}
+            self._n_groups = 0
             super().__init__(vllm_config, engine_id)
 
         def register_kv_caches(self, kv_caches):
@@ -612,6 +848,11 @@ if _ASCEND_AVAILABLE:
         def _build_base_addr_groups(self) -> list[list[int]]:
             groups = resolve_kv_cache_groups(self._kv_cache_config, _active_runner())
             layer_group = build_layer_group_map(groups)
+            # Kept for the fusion hook, which needs layer_name -> group index on every
+            # save_kv_layer. It is derived here anyway; discarding it would mean rebuilding the
+            # same map from the same source a second time.
+            self._layer_group = layer_group
+            self._n_groups = len(groups)
             # The base class builds its address list as a LOCAL and only ever keeps it on the
             # handshake metadata (mooncake_connector.py:1222,1238) — the worker has no
             # `kv_caches_base_addr` attribute of its own. (`self.kv_caches_base_addr` does exist on
@@ -653,11 +894,110 @@ if _ASCEND_AVAILABLE:
                 # us so it never has to depend on _ACTIVE_RUNNER being published in this process.
                 self.connector_worker = MooncakeConnectorWorkerFF(
                     vllm_config, str(self.engine_id), kv_cache_config)
+
+            # Fusion accumulator: producer-side worker role only. MooncakeFFProducer is documented
+            # transport-agnostic ("pure torch + pd_fuse — no NPU, no ZMQ"), so the layerwise
+            # connector's engine is reused verbatim rather than reimplemented for this transport.
+            self._ff_producer = None
+            self._ff_mla = False
+            self._ff_warned_unmapped = False
+            self._ff_groups_done = 0
+            if (_FF_FUSE and role != KVConnectorRole.SCHEDULER
+                    and vllm_config.kv_transfer_config.is_kv_producer):
+                from kv_fast_fusion_ascend.connectors.mooncake_layerwise_connector_ff import (
+                    MooncakeFFProducer,
+                )
+                self._ff_producer = MooncakeFFProducer()
+                self._ff_mla = bool(getattr(vllm_config.model_config, "use_mla", False))
+                logger.info("MooncakeConnectorFF: producer fusion enabled (ship=%s, groups=%s).",
+                            _FF_SHIP, "all" if _FF_GROUPS is None else sorted(_FF_GROUPS))
             if os.environ.get("BFF_PD_FUSE", "0") != "1":
                 logger.warning(
                     "MooncakeConnectorFF selected with BFF_PD_FUSE!=1. This connector requires the "
                     "BFF multi-group KV layout; with the split off it is strictly worse than the "
                     "stock MooncakeConnectorV1.")
+
+        def save_kv_layer(self, layer_name, kv_layer, attn_metadata, **kwargs):
+            """Producer fusion hook — the one place this connector sees KV as it is written.
+
+            The vendored pull connector's ``save_kv_layer`` is a no-op ``pass``
+            (mooncake_connector.py:874-878), so this adds work where there was none rather than
+            wrapping anything. vLLM drives it through the ``@maybe_transfer_kv_layer`` decorator on
+            ``unified_attention``; it fires only because ``requires_piecewise_for_cudagraph`` keeps
+            us out of a full graph, which would capture this call away and leave fusion silently
+            inert.
+
+            Everything is wrapped: fusion is an optimisation, and no failure in it may break a
+            transfer that is otherwise correct."""
+            super().save_kv_layer(layer_name, kv_layer, attn_metadata, **kwargs)
+            if self._ff_producer is None:
+                return
+            try:
+                self._ff_accumulate(layer_name, kv_layer)
+            except Exception as e:  # pragma: no cover - never break the transfer
+                logger.warning("MooncakeConnectorFF: producer fusion failed on %s: %s",
+                               layer_name, e)
+
+        def _ff_accumulate(self, layer_name, kv_layer) -> None:
+            meta = self._connector_metadata
+            fuse_reqs = getattr(meta, "fuse_reqs", None)
+            if not fuse_reqs:
+                return                       # no prefill completed this step → nothing to cluster
+            worker = self.connector_worker
+            gi = group_of(worker._layer_group, layer_name)
+            # Group 0 is the warmup group and is deliberately never fused: it holds the first and
+            # last two layers, whose KV the decode is most sensitive to. An unknown layer is skipped
+            # rather than guessed — unlike the transfer path this is not fatal, because skipping only
+            # forfeits compression.
+            #
+            # But say so LOUDLY once. on_layer detects a completed group by COUNT
+            # (`len(seen) >= len(group_layer_names)`), so a single unresolvable layer means its
+            # group never reaches its count and never clusters — fusion goes inert for that group
+            # with no error anywhere. A silently inert producer is what makes a benchmark read as
+            # "BFF doesn't help" instead of "BFF never ran".
+            if gi is None:
+                if not self._ff_warned_unmapped:
+                    self._ff_warned_unmapped = True
+                    logger.error(
+                        "MooncakeConnectorFF: layer %r maps to no KV-cache group, so its group can "
+                        "never complete and FUSION IS INERT for it. The connector's layer names "
+                        "(%d known) disagree with the forward context's.",
+                        layer_name, len(worker._layer_group))
+                return
+            if gi <= 0:
+                return
+            if _FF_GROUPS is not None and gi not in _FF_GROUPS:
+                return
+
+            self._ff_producer.reset_step(id(meta))
+            requests = [(ext_id, list(groups[gi]))
+                        for (_rid, ext_id, groups) in fuse_reqs if gi < len(groups)]
+            if not requests:
+                return
+
+            # Standard attention clusters on K only. MLA splits the key across two latent tensors
+            # sharing one physical block, so both must be compared or the redirect would alias a
+            # rope cache that was never looked at.
+            caches = ([kv_layer[0], kv_layer[1]]
+                      if self._ff_mla and len(kv_layer) > 1 else [kv_layer[0]])
+            group_layers = {ln for ln, g in worker._layer_group.items() if g == gi}
+            result = self._ff_producer.on_layer(
+                gi, layer_name, caches, group_layers, requests)
+            if not result:
+                return                       # group not complete yet, or nothing worth redirecting
+            n_rows = 0
+            for ext_id, rows in result.items():
+                _FF_ROWS.add(ext_id, gi, rows)
+                n_rows += len(rows)
+            # First completion is the proof that the whole chain is live — the hook fires, the group
+            # reaches its count, and clustering produced something. Without this the only evidence
+            # fusion ran at all is a downstream F1 change, which is exactly the ambiguity that cost
+            # this project three debugging cycles.
+            self._ff_groups_done += 1
+            if self._ff_groups_done == 1:
+                logger.info("MooncakeConnectorFF: first fusion group completed (group=%d, "
+                            "%d requests, %d redirect rows). ship=%s", gi, len(result), n_rows,
+                            _FF_SHIP)
 
         @classmethod
         def requires_piecewise_for_cudagraph(cls, extra_config: dict) -> bool:

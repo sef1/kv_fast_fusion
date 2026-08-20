@@ -313,6 +313,120 @@ def test_indices_are_preserved_not_renumbered():
 
 
 # =====================================================================================
+# phase B: producer row stash (worker -> scheduler handoff)
+# =====================================================================================
+def test_rows_are_collected_per_group_and_consumed_once():
+    """The stash exists because rows are PRODUCED in save_kv_layer (worker) and must LEAVE in
+    request_finished (scheduler). Consume-once matters: a retried request_finished must not ship
+    the same redirect map twice."""
+    stash = mc.FFRowStash()
+    stash.add("ext-a", 1, [(0, 111, 3)])
+    stash.add("ext-a", 2, [(1, 222, 4), (2, 333, 5)])
+    stash.add("ext-b", 1, [(0, 444, 6)])
+
+    got = stash.take("ext-a")
+    assert got == {1: [[0, 111, 3]], 2: [[1, 222, 4], [2, 333, 5]]}
+    assert stash.take("ext-a") is None, "consume-once"
+    assert stash.take("ext-b") == {1: [[0, 444, 6]]}
+
+
+def test_empty_rows_never_create_an_entry():
+    """A group that completed with nothing worth redirecting must not produce an empty map — that
+    would ship `ff_redirects={gi: []}` and make the consumer count a fusion that never happened."""
+    stash = mc.FFRowStash()
+    stash.add("ext-a", 1, [])
+    assert stash.take("ext-a") is None
+
+
+def test_the_stash_is_bounded_and_evicts_oldest():
+    """Requests aborted before request_finished never collect their rows. Unbounded, that leaks for
+    the life of the process."""
+    stash = mc.FFRowStash(cap=3)
+    for i in range(5):
+        stash.add(f"ext-{i}", 1, [(0, i, 0)])
+
+    assert stash.take("ext-0") is None and stash.take("ext-1") is None
+    assert stash.take("ext-4") == {1: [[0, 4, 0]]}
+    assert stash.dropped == 2
+
+
+def test_rows_are_normalized_to_plain_ints():
+    """They are about to be JSON-encoded into kv_transfer_params; numpy ints would not survive."""
+    stash = mc.FFRowStash()
+    stash.add("e", 1, [(True, 2, 3)])
+    (row,) = stash.take("e")[1]
+    assert row == [1, 2, 3]
+    assert all(type(v) is int for v in row)
+
+
+# =====================================================================================
+# phase B: the redirect field's JSON round trip
+# =====================================================================================
+def test_group_indices_survive_being_stringified_by_json():
+    """kv_transfer_params crosses the proxy as JSON, which turns dict keys into strings. Indexing
+    the result by int would silently find nothing and fusion would appear to do nothing at all."""
+    out = mc.normalize_ff_redirects({"3": [[0, 99, 1]], "5": [[2, 88, 3]]})
+    assert out == {3: [[0, 99, 1]], 5: [[2, 88, 3]]}
+    assert all(type(k) is int for k in out)
+
+
+def test_a_missing_or_empty_redirect_field_is_simply_no_fusion():
+    """Must stay non-fatal, unlike the transfer path: a dropped redirect costs compression, never
+    correctness."""
+    for raw in (None, {}, [], "nonsense", {"1": []}):
+        assert mc.normalize_ff_redirects(raw) is None
+
+
+def test_malformed_rows_are_dropped_not_guessed():
+    out = mc.normalize_ff_redirects({"1": [[0, 1, 2], [9, 9], [3, 4, 5]], "x": [[0, 1, 2]]})
+    assert out == {1: [[0, 1, 2], [3, 4, 5]]}, "short row and non-int group both dropped"
+
+
+# =====================================================================================
+# phase B: consumer sink contract with the promotion hook
+# =====================================================================================
+def test_the_pending_source_matches_what_the_promotion_hook_expects():
+    """_bff_promotion_apply consumes `.lock` + `.pending` as {ext_id: {gi: rows}} and pops per
+    request. Pinning the shape here because the hook lives in another file and would fail silently
+    (promo_no_rows) rather than raise if this drifted."""
+    src = mc.FFPendingSource()
+    src.offer("ext-a", {"1": [[0, 5, 1]]})
+
+    assert hasattr(src, "lock") and hasattr(src, "pending")
+    assert src.pending == {"ext-a": {1: [[0, 5, 1]]}}, "keys coerced to int"
+
+    with src.lock:
+        popped = src.pending.pop("ext-a", None)
+    assert popped == {1: [[0, 5, 1]]}
+
+
+def test_offering_nothing_leaves_the_hook_with_nothing_to_do():
+    src = mc.FFPendingSource()
+    src.offer("ext-a", {})
+    assert src.pending == {}
+
+
+def test_promo_stats_keys_exist_for_the_hook_to_increment():
+    """The hook does `stats["promo_no_rows"] += 1` without a guard, so a missing key is a KeyError
+    inside scheduling."""
+    src = mc.FFPendingSource()
+    for key in ("promo_applied", "promo_unresolved", "promo_no_rows", "promo_merge_calls"):
+        assert key in src.promo_stats
+
+
+# =====================================================================================
+# phase B: group selection
+# =====================================================================================
+def test_ff_groups_parsing_matches_the_layerwise_spelling():
+    """One A/B knob must mean the same thing on both transports."""
+    assert mc._parse_ff_groups("1,2,3") == {1, 2, 3}
+    assert mc._parse_ff_groups(" 2 , 4 ") == {2, 4}
+    assert mc._parse_ff_groups(None) is None
+    assert mc._parse_ff_groups("") is None
+    assert mc._parse_ff_groups("   ") is None
+
+
+# =====================================================================================
 # where the group layout is read from
 # =====================================================================================
 class _Cfg:

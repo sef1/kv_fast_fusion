@@ -103,6 +103,17 @@ def min_rel_err(cos: float) -> float:
     return float(max(0.0, 1.0 - cos * cos)) ** 0.5
 
 
+def min_cos_for_budget(budget: float) -> float:
+    """The cosine below which NO norm ratio can meet ``budget`` — the inverse of :func:`min_rel_err`.
+
+    Reading a reject_cos histogram needs this line drawn on it: mass at or below this cosine is
+    permanently unreachable (a better-matched representative cannot rescue it), while mass above it
+    was lost only to the norm ratio and could in principle be recovered. At the usual 0.30 budget it
+    is 0.954; at 0.20 it is 0.980."""
+    b = min(float(budget), 1.0)
+    return float(max(0.0, 1.0 - b * b)) ** 0.5
+
+
 def _bin(value: float, bins) -> int:
     """Index of the bin `value` falls in (clamped to the last)."""
     for j in range(len(bins) - 2, 0, -1):
@@ -175,6 +186,13 @@ class LshIndex:
         # Candidates that cleared the cosine bar and were then rejected by MAX_REL_ERR — i.e. the
         # merges the norm saved us from, which a cosine-only bar would have taken.
         self.rejected_by_rel_err = 0
+        # Their COSINES, same bins as accept_cos. Counting the rejections says how many the norm
+        # stopped; only the distribution says whether any were reachable. Because
+        # ``min_rel_err(cos) = sqrt(1 - cos^2)`` is a floor no norm ratio can beat, a rejected
+        # candidate is recoverable-in-principle (by a better-matched rep) ONLY if it sits above
+        # ``sqrt(1 - MAX_REL_ERR^2)`` — 0.954 at the usual 0.30 budget. Mass below that bin is
+        # permanently out of reach and no amount of norm engineering will bring it back.
+        self.reject_cos = [0] * len(ACCEPT_COS_LABELS)
 
     def size(self) -> int:
         return self.n_rows
@@ -252,6 +270,7 @@ class LshIndex:
                     # much the error budget removed BEYOND the cosine threshold.
                     if v > threshold:
                         self.rejected_by_rel_err += 1
+                        self.reject_cos[_bin(v, ACCEPT_COS_BINS)] += 1
                     continue
                 row = cand_rows[best_j]
             else:

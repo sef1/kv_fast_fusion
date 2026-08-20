@@ -225,6 +225,12 @@ class DedupStats:
         self.accept_cos: dict[int, list] = {}
         self.accept_rel_err: dict[int, list] = {}
         self.rejected_by_rel_err: dict[int, int] = {}
+        # Cosines of what the error budget turned away, per group. The count alone cannot say
+        # whether a rejection was salvageable; the distribution can, because
+        # sqrt(1 - MAX_REL_ERR^2) is a hard floor (0.954 at the usual 0.30). One run measured g1
+        # supplying 4,453 of 5,221 rejections, which this separates into "near-duplicates the norm
+        # ratio spoiled" and "unrelated blocks that a shared common component floated to cos ~0.9".
+        self.reject_cos: dict[int, list] = {}
         self.index_blocks: dict[int, int] = {}
         self._last_dump = 0.0
 
@@ -237,10 +243,13 @@ class DedupStats:
         7,171 were real."""
         cos = self.accept_cos.setdefault(gi, [0] * len(pd_lsh.ACCEPT_COS_LABELS))
         err = self.accept_rel_err.setdefault(gi, [0] * len(pd_lsh.REL_ERR_LABELS))
+        rej = self.reject_cos.setdefault(gi, [0] * len(pd_lsh.ACCEPT_COS_LABELS))
         for i, c in enumerate(plan.accept_cos):
             cos[i] += c
         for i, c in enumerate(plan.accept_rel_err):
             err[i] += c
+        for i, c in enumerate(getattr(plan, "reject_cos", ())):
+            rej[i] += c
         self.rejected_by_rel_err[gi] = (self.rejected_by_rel_err.get(gi, 0)
                                         + plan.rejected_by_rel_err)
 
@@ -324,6 +333,12 @@ class DedupStats:
             "max_rel_err": pd_lsh.MAX_REL_ERR,
             "rejected_by_rel_err": {str(g): n
                                     for g, n in sorted(self.rejected_by_rel_err.items()) if n},
+            # Where those rejections sat on the cosine axis. Anything at or below the bin containing
+            # sqrt(1 - max_rel_err^2) is unreachable by ANY norm ratio, so this is what says whether
+            # the budget is discarding near-duplicates or filtering noise.
+            "min_cos_for_budget": pd_lsh.min_cos_for_budget(pd_lsh.MAX_REL_ERR),
+            "lsh_reject_cos": {str(g): dict(zip(pd_lsh.ACCEPT_COS_LABELS, v))
+                               for g, v in sorted(self.reject_cos.items()) if any(v)},
         }
 
 

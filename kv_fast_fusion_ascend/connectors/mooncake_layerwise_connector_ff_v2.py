@@ -124,21 +124,27 @@ def to_external_request_id(request_id: str) -> str:
 
 
 def signatures_for_group(kv_caches: dict, layer_names, block_ids, is_mla, jl_holder,
-                         num_blocks=None):
+                         num_blocks=None, proj_holder=None):
     """Producer-side signature payload for one group's blocks.
 
     ``layer_names`` is however much of the group has been written when the transport wants to send
     it — one layer under ``BFF_SIG_LAYERS=first``, all of them under ``group``. Returns ``None``
     when there is nothing to describe; raises :class:`~kv_fast_fusion.pd_dedup_v2.KVLayoutError` if
     the cache cannot be indexed by connector block ids, which the caller must count rather than
-    swallow."""
+    swallow.
+
+    ``proj_holder`` caches the SimHash projection ACROSS calls and a real caller must pass one that
+    outlives them: the fixed-seed matrix is identical every time, so rebuilding it per group per
+    request is pure waste on the producer's critical path. It defaults to a throwaway only so the
+    pure-function tests stay callable without one."""
     layers = [kv_caches[ln] for ln in layer_names if ln in kv_caches]
     if not layers or not block_ids:
         return None
     sig, norms = signature_matrix(layers, block_ids, is_mla, jl_holder, num_blocks=num_blocks)
     if sig is None:
         return None
-    proj = pd_lsh.get_proj([None], sig.shape[1], sig.device)
+    proj = pd_lsh.get_proj(proj_holder if proj_holder is not None else [None],
+                           sig.shape[1], sig.device)
     hashes = pd_lsh.sub_hashes_device(sig, proj).cpu().tolist()
     return SignatureCodec.encode(sig, norms, hashes)
 
@@ -290,6 +296,8 @@ if _ASCEND_AVAILABLE:
             super().__init__(vllm_config, role, kv_cache_config)
             self._v2_enabled = pd_dedup_v2.V2_ENABLED
             self._jl: list = [None]
+            # See signatures_for_group: must outlive the call or the projection cache never hits.
+            self._proj: list = [None]
             self._engine: DedupEngine | None = None
             self._applier: AliasApplier | None = None
             self._client: _SigRequestClient | None = None
@@ -434,7 +442,8 @@ if _ASCEND_AVAILABLE:
                     continue
                 try:
                     payload = signatures_for_group(self._kv_caches, layer_names, local_ids,
-                                                   is_mla, self._jl, num_blocks=num_blocks)
+                                                   is_mla, self._jl, num_blocks=num_blocks,
+                                                   proj_holder=self._proj)
                 except KVLayoutError as e:
                     # Refusing is the point: a mis-indexed signature does not fail, it merges
                     # blocks that are not alike. Once per run is enough noise.

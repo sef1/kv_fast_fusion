@@ -31,6 +31,10 @@ def _worker():
 
     from kv_fast_fusion.pd_dedup_v2 import DedupEngine
     w._jl = [None]
+    # Both projection caches must be per-worker and must OUTLIVE the call. Passing a throwaway
+    # `[None]` to pd_lsh.get_proj rebuilds a fixed-seed matrix on every group of every signature
+    # request, on the producer's critical path — see test_the_projection_is_cached_across_calls.
+    w._proj = [None]
     w._ff_lock = threading.Lock()
     # The decision state moved into the shared, transport-free engine (pd_dedup_v2), which the
     # Ascend connectors use too; the worker is now transport only.

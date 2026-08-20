@@ -76,6 +76,12 @@ if v1._MOONCAKE_AVAILABLE:      # the same gate v1 uses
         def __init__(self, vllm_config, engine_id):
             super().__init__(vllm_config, engine_id)
             self._jl: list = [None]
+            # Persistent holder for the SimHash projection. It MUST outlive the call: passing a
+            # fresh ``[None]`` makes pd_lsh.get_proj's cache miss every time, so it re-ran
+            # torch.randn(SIG_DIM, TABLES*BITS) on CPU and re-copied to device once per group per
+            # signature request — on the producer's critical path, for a fixed-seed matrix that is
+            # identical every time. (v1 got this right: mooncake_layerwise_connector_ff._lsh_proj.)
+            self._proj: list = [None]
             self._engine = DedupEngine(lock=self._ff_lock)
 
         @property
@@ -100,7 +106,7 @@ if v1._MOONCAKE_AVAILABLE:      # the same gate v1 uses
                 sig, norms = signature_matrix(layers, block_ids, is_mla, self._jl)
                 if sig is None:
                     continue
-                proj = pd_lsh.get_proj([None], sig.shape[1], sig.device)
+                proj = pd_lsh.get_proj(self._proj, sig.shape[1], sig.device)
                 hashes = pd_lsh.sub_hashes_device(sig, proj).cpu().tolist()
                 out[gi] = SignatureCodec.encode(sig, norms, hashes)
             return out

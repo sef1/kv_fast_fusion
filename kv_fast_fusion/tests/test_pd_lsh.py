@@ -437,3 +437,24 @@ def test_the_budget_is_inert_by_default():
     idx, proj = _index_with_norms([v], ["rep"], [16.0])
     matched, _ = _probe_norms(idx, proj, [v], ["owner"], [10.0])
     assert matched == [True] and idx.rejected_by_rel_err == 0
+
+
+def test_the_projection_is_cached_across_calls_when_a_holder_persists():
+    """`get_proj` caches in the holder the CALLER owns, so a caller that passes a fresh `[None]`
+    silently rebuilds a fixed-seed matrix on every call. That is what both v2 connectors did, once
+    per group per signature request, on the producer's critical path."""
+    holder = [None]
+    first = pd_lsh.get_proj(holder, 32, "cpu")
+    assert pd_lsh.get_proj(holder, 32, "cpu") is first, "same holder must hit the cache"
+    assert pd_lsh.get_proj([None], 32, "cpu") is not first, "a throwaway holder always rebuilds"
+    # Rebuilt or cached, the value is identical — which is exactly why the waste was invisible.
+    assert torch.equal(pd_lsh.get_proj([None], 32, "cpu"), first)
+
+
+def test_min_cos_for_budget_inverts_min_rel_err():
+    """The floor a reject_cos histogram has to be read against."""
+    for cos in (0.90, 0.954, 0.98, 1.0):
+        assert pd_lsh.min_cos_for_budget(pd_lsh.min_rel_err(cos)) == pytest.approx(cos, abs=1e-9)
+    assert pd_lsh.min_cos_for_budget(0.30) == pytest.approx(0.9539392, abs=1e-6)
+    assert pd_lsh.min_cos_for_budget(0.20) == pytest.approx(0.9797959, abs=1e-6)
+    assert pd_lsh.min_cos_for_budget(1.0) == 0.0, "an inert budget rules nothing out"

@@ -254,3 +254,41 @@ def test_same_pull_still_merges_a_true_duplicate_under_the_budget(monkeypatch):
 
     assert plan.alias[("rB", 1)] == {0: 41}
     assert plan.rejected_by_rel_err == 0
+
+
+def test_rejections_are_binned_by_cosine_so_the_reachable_ones_can_be_counted(monkeypatch):
+    """Counting rejections says how many the norm stopped; only their COSINES say whether any could
+    ever be recovered. ``min_rel_err(cos) = sqrt(1-cos^2)`` is a floor no norm ratio beats, so a
+    rejection below ``min_cos_for_budget`` is unreachable however well the rep is rescaled — the
+    question 'would stretching the norm back help?' is exactly this histogram."""
+    monkeypatch.setattr(pd_lsh, "MAX_REL_ERR", 0.20)
+    v = [1.0, 0.0, 0.5, 0.25]
+    sigs, hashes, _n = _sig([v, v])          # identical directions: cosine 1.0
+
+    plan = DedupPlanner().plan(1, _incoming([("rA", 0, 41), ("rB", 0, 42)]),
+                               sigs, hashes, [10.0, 16.0], THR)
+
+    assert plan.rejected_by_rel_err == 1
+    assert sum(plan.reject_cos) == plan.rejected_by_rel_err, "every rejection lands in a bin"
+    # cos 1.0 is above the 0.980 floor for a 0.20 budget: lost to the norm ratio ALONE, so a
+    # better-matched representative could have taken it. That is the recoverable case.
+    top = pd_lsh.ACCEPT_COS_LABELS[plan.reject_cos.index(1)]
+    assert float(top.split("-")[1]) > pd_lsh.min_cos_for_budget(0.20)
+
+
+def test_a_rejection_below_the_budget_floor_is_reported_as_unreachable(monkeypatch):
+    """The other half: a pair whose cosine alone already violates the budget. No norm ratio can
+    rescue it, so it must not be counted as something better matching would recover."""
+    monkeypatch.setattr(pd_lsh, "MAX_REL_ERR", 0.20)      # floor: cos >= 0.980
+    a = [1.0, 0.0, 0.0, 0.0]
+    b = [0.90, 0.4359, 0.0, 0.0]                          # cos ~= 0.90, below the floor
+    sigs, hashes, norms = _sig([a, b])
+
+    plan = DedupPlanner().plan(1, _incoming([("rA", 0, 41), ("rB", 0, 42)]),
+                               sigs, hashes, norms, THR)
+
+    assert plan.n_dropped() == 0
+    assert plan.rejected_by_rel_err == sum(plan.reject_cos)
+    for i, n in enumerate(plan.reject_cos):
+        if n:
+            assert float(pd_lsh.ACCEPT_COS_LABELS[i].split("-")[1]) <= pd_lsh.min_cos_for_budget(0.20)
