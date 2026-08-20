@@ -406,6 +406,47 @@ def test_offering_nothing_leaves_the_hook_with_nothing_to_do():
     assert src.pending == {}
 
 
+def test_a_second_group_merges_instead_of_replacing_the_first():
+    """The producer emits one map per fusion GROUP, and the promotion hook pops the whole
+    {gi: rows} dict at once. An offer that overwrote would silently drop every group but the last —
+    losing most of the compression with no error anywhere."""
+    src = mc.FFPendingSource()
+    src.offer("ext-a", {1: [[0, 5, 1]]})
+    src.offer("ext-a", {2: [[1, 6, 2]]})
+
+    assert src.pending["ext-a"] == {1: [[0, 5, 1]], 2: [[1, 6, 2]]}
+
+
+def test_the_redirect_field_is_consumed_from_the_params_dict():
+    """update_state_after_alloc runs on EVERY allocation for a request, not just the first. A
+    non-destructive read re-offers rows the promotion hook already applied; the sweep then drops
+    them as 'arrived after promotion'. That is what made one run discard 853 rows while applying
+    371 blocks — one late map per apply, exactly 1:1.
+
+    This pins the `pop` semantics at the level the connector relies on: a second read of the same
+    params dict must find nothing."""
+    params = {"ff_redirects": {"1": [[0, 5, 1]]}, "do_remote_prefill": True}
+
+    first = mc.normalize_ff_redirects(params.pop("ff_redirects", None))
+    second = mc.normalize_ff_redirects(params.pop("ff_redirects", None))
+
+    assert first == {1: [[0, 5, 1]]}
+    assert second is None, "a repeated allocation must not resurrect consumed rows"
+    assert "do_remote_prefill" in params, "only the fusion field is consumed"
+
+
+def test_the_pending_sink_is_bounded():
+    """A request aborted between allocation and promotion is removed by neither the promotion hook
+    nor the late sweep, so its rows would otherwise be held for the life of the process."""
+    src = mc.FFPendingSource(cap=3)
+    for i in range(5):
+        src.offer(f"ext-{i}", {1: [[0, i, 0]]})
+
+    assert len(src.pending) == 3
+    assert "ext-0" not in src.pending and "ext-4" in src.pending
+    assert src.dropped == 2
+
+
 def test_promo_stats_keys_exist_for_the_hook_to_increment():
     """The hook does `stats["promo_no_rows"] += 1` without a guard, so a missing key is a KeyError
     inside scheduling."""

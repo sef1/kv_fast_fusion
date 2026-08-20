@@ -261,9 +261,15 @@ class FFPendingSource:
     transport the redirects arrive inside ``kv_transfer_params`` instead, so no thread is needed and
     this plain holder satisfies the same contract."""
 
-    def __init__(self):
+    def __init__(self, cap: int = 4096):
         self.lock = threading.Lock()
-        self.pending: dict[str, dict[int, list]] = {}
+        # Ordered + capped: the promotion hook removes an entry only when its owner is promoted, and
+        # `_bff_sweep_late_maps` only removes entries whose owner ALREADY was. A request aborted
+        # between allocation and promotion is in neither set, so its rows would sit here for the
+        # life of the process. Same reasoning (and cap) as FFRowStash on the producer side.
+        self.pending: "OrderedDict[str, dict[int, list]]" = OrderedDict()
+        self.cap = cap
+        self.dropped = 0
         self.promo_stats = {
             "promo_applied": 0, "promo_unresolved": 0, "promo_no_rows": 0,
             "promo_merge_calls": 0, "promo_pending_dropped": 0,
@@ -272,10 +278,21 @@ class FFPendingSource:
         }
 
     def offer(self, ext_id: str, groups_rows: dict) -> None:
+        """Add this request's per-group rows to the pending map.
+
+        MERGES rather than replaces. The promotion hook pops the whole ``{gi: rows}`` dict at once,
+        so an offer that overwrote would silently discard any group already waiting there — and the
+        producer emits one map per fusion group, not one per request."""
         if not groups_rows:
             return
         with self.lock:
-            self.pending[ext_id] = {int(gi): rows for gi, rows in groups_rows.items()}
+            per_group = self.pending.setdefault(ext_id, {})
+            for gi, rows in groups_rows.items():
+                per_group[int(gi)] = rows
+            self.pending.move_to_end(ext_id)
+            while len(self.pending) > self.cap:
+                self.pending.popitem(last=False)
+                self.dropped += 1
 
     def drain(self) -> dict:
         with self.lock:
@@ -496,8 +513,16 @@ if _ASCEND_AVAILABLE:
             # and hand it to the promotion hook. Done HERE because it is the last point that sees
             # kv_transfer_params, and it is strictly before the request can leave
             # WAITING_FOR_REMOTE_KVS — i.e. inside the pre-decode window the apply requires.
+            #
+            # POP, not get. This method is called on EVERY allocation for a request, not just the
+            # first, so a non-destructive read re-offers the same rows after the promotion hook has
+            # already consumed and applied them. The sweep then sees an already-promoted ext and
+            # discards them as "arrived after promotion", which is how a run ended up dropping 853
+            # rows while applying only 371 blocks — a 1:1 apply/late pair per request. Consuming the
+            # field at the source mirrors FFRowStash.take() on the producer, and mutating params is
+            # what the vendored code itself does (`params["do_remote_prefill"] = False` below).
             if params is not None and _FF_APPLY:
-                rows = normalize_ff_redirects(params.get("ff_redirects"))
+                rows = normalize_ff_redirects(params.pop("ff_redirects", None))
                 if rows:
                     _ff_pending_source().offer(_ext_of(request.request_id), rows)
             if params is None or not params.get("do_remote_prefill"):
