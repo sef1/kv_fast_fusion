@@ -659,6 +659,33 @@ if _ASCEND_AVAILABLE:
                     "BFF multi-group KV layout; with the split off it is strictly worse than the "
                     "stock MooncakeConnectorV1.")
 
+        @classmethod
+        def requires_piecewise_for_cudagraph(cls, extra_config: dict) -> bool:
+            """Refuse a FULL cudagraph while the BFF group split is on.
+
+            vLLM applies this in `VllmConfig.__post_init__` (config/vllm.py:935-957): if the selected
+            connector says yes and `cudagraph_mode.has_full_cudagraphs()`, it downgrades the mode to
+            PIECEWISE. `FULL_DECODE_ONLY` counts as full (`max_cudagraph_mode() == FULL`), which is
+            the mode vllm-ascend defaults to — so without this hook the decode node replays a
+            captured graph for every decode step.
+
+            That is not safe under the split. `AscendAttentionBackendImpl.update_graph_params`
+            (vllm_ascend/attention/attention_v1.py:404-447) re-reads only `seq_lens` from the live
+            metadata on each replay; `query`, `key_cache`, `value_cache`, `block_table` and `output`
+            all come from the tuple frozen at capture time. That holds for vLLM's single-group
+            contract, where those are persistent buffers updated in place — but BFF turns a dense
+            model into a seven-group hybrid with seven separate block tables, and the surrounding
+            code is visibly order-sensitive across groups (the Qwen3-next linear_attn/self_attn
+            ordering hack at :461-470). The observed symptom is garbage from the FIRST decoded token
+            with a verifiably correct KV transfer, clean at one group and broken at seven.
+
+            The GPU sibling demands PIECEWISE for a different reason — real Python work in
+            save_kv_layer that a full graph would skip — but the conclusion is the same, and phase B
+            will need it here for that reason too.
+
+            Gated on BFF_PD_FUSE so a stock single-group run keeps its full graphs."""
+            return os.environ.get("BFF_PD_FUSE", "0") == "1"
+
         def request_finished_all_groups(self, request, block_ids):
             assert self.connector_scheduler is not None
             return self.connector_scheduler.request_finished_all_groups(request, block_ids)
