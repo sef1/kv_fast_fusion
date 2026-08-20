@@ -75,8 +75,12 @@ def exact_p(a, b):
 
 
 def arm_of(tag):
-    """Arm identity = the run tag with the repeat suffix stripped."""
-    return re.sub(r"_r\d+$", "", tag)
+    """Arm identity = the run tag with the run-set and repeat suffixes stripped.
+
+    Both are stripped so runs from DIFFERENT invocations pool into one arm. Replication across
+    sweeps is the point: the 2026-08-19 legacy-vs-current effect looked significant at n=3+3 in two
+    consecutive sweeps and evaporated at n=9+9 once a third was added (p 0.011 -> 0.083)."""
+    return re.sub(r"(_s[0-9-]+)?(_r\d+)?$", "", tag)
 
 
 def main():

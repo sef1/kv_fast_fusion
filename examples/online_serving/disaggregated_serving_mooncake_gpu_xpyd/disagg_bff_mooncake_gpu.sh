@@ -232,7 +232,7 @@ fi
 REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-1200}
 RESULT_DIR=${RESULT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/f1_results}
 if [[ "$BASELINE" == "vanilla" ]]; then
-    RUN_TAG=${RUN_TAG:-mooncake_vanilla_con_${MAX_CONCURRENCY}_${NUM_PREFILL}Px${NUM_DECODE}D${RUN_REPEAT:+_r${RUN_REPEAT}}}
+    RUN_TAG=${RUN_TAG:-mooncake_vanilla_con_${MAX_CONCURRENCY}_${NUM_PREFILL}Px${NUM_DECODE}D${RUN_SET:+_s${RUN_SET}}${RUN_REPEAT:+_r${RUN_REPEAT}}}
 elif [[ "$BASELINE" == "bff_v2" || "$BASELINE" == "bff_v2_legacy" ]]; then
     # Both v2 variants share the tag shape; `_legacy` distinguishes them so the A/B lands in two
     # files. Without it the pre- and post-extraction runs would overwrite each other, which is the
@@ -244,9 +244,9 @@ elif [[ "$BASELINE" == "bff_v2" || "$BASELINE" == "bff_v2_legacy" ]]; then
     # (0.3 -> 6% saving, 1.0 -> 61%), so two runs that differ only in it are different experiments.
     # It was missing until 2026-08-19, which means every thr0.8 run silently overwrote its
     # predecessor's .json and .log — the most likely reason the 1.42 result no longer exists on disk.
-    RUN_TAG=${RUN_TAG:-mooncake_v2${_V2_VARIANT}_thr${BFF_THRESHOLD}_re${BFF_MAX_REL_ERR}_gs${BFF_GROUP_SIZE}_sig${BFF_SIG_DIM}_dedup${BFF_V2_DEDUP}_res${BFF_V2_RESIDENT}${BFF_FF_GROUPS:+_g${BFF_FF_GROUPS//,/}}_con_${MAX_CONCURRENCY}_${NUM_PREFILL}Px${NUM_DECODE}D${RUN_REPEAT:+_r${RUN_REPEAT}}}
+    RUN_TAG=${RUN_TAG:-mooncake_v2${_V2_VARIANT}_thr${BFF_THRESHOLD}_re${BFF_MAX_REL_ERR}_gs${BFF_GROUP_SIZE}_sig${BFF_SIG_DIM}_dedup${BFF_V2_DEDUP}_res${BFF_V2_RESIDENT}${BFF_FF_GROUPS:+_g${BFF_FF_GROUPS//,/}}_con_${MAX_CONCURRENCY}_${NUM_PREFILL}Px${NUM_DECODE}D${RUN_SET:+_s${RUN_SET}}${RUN_REPEAT:+_r${RUN_REPEAT}}}
 else
-    RUN_TAG=${RUN_TAG:-mooncake_${BFF_PD_MERGE}_${BFF_PD_REPR}_thr${BFF_THRESHOLD}_gs${BFF_GROUP_SIZE}_eb${BFF_PD_ENCODED_BATCH_SIZE}_${BFF_PD_CROSS_INDEX}${BFF_FF_GROUPS:+_g${BFF_FF_GROUPS//,/}}_con_${MAX_CONCURRENCY}_${NUM_PREFILL}Px${NUM_DECODE}D${RUN_REPEAT:+_r${RUN_REPEAT}}}
+    RUN_TAG=${RUN_TAG:-mooncake_${BFF_PD_MERGE}_${BFF_PD_REPR}_thr${BFF_THRESHOLD}_gs${BFF_GROUP_SIZE}_eb${BFF_PD_ENCODED_BATCH_SIZE}_${BFF_PD_CROSS_INDEX}${BFF_FF_GROUPS:+_g${BFF_FF_GROUPS//,/}}_con_${MAX_CONCURRENCY}_${NUM_PREFILL}Px${NUM_DECODE}D${RUN_SET:+_s${RUN_SET}}${RUN_REPEAT:+_r${RUN_REPEAT}}}
 fi
 
 # ---- Required BFF / HF environment (CLAUDE.md) -------------------------------

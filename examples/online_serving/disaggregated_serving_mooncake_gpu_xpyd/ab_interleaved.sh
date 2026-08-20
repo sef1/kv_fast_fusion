@@ -20,9 +20,15 @@
 # =============================================================================
 set -uo pipefail
 
-cd "$(dirname "${BASH_SOURCE[0]}")"
+cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
 
 REPEATS=${REPEATS:-3}
+# Identifies THIS invocation. Without it every invocation restarts RUN_REPEAT at 1 and silently
+# overwrites the previous sweep's results — which is exactly what happened on 2026-08-19: rounds 1
+# and 2 of the legacy/current A/B were destroyed by round 3, and survive only in a chat transcript.
+# Replication is the whole method here; losing earlier rounds defeats it.
+RUN_SET=${RUN_SET:-$(date +%m%d-%H%M)}
+export RUN_SET
 # Each arm is  <BASELINE>[:VAR=VAL[,VAR=VAL...]]  — the optional suffix is env applied to that arm
 # only. Needed for arms that differ by a knob rather than by connector, e.g. dedup-off:
 #   ARMS="bff_v2_legacy bff_v2 bff_v2:BFF_V2_DEDUP=0"

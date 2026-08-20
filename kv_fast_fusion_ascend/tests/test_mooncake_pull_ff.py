@@ -248,6 +248,71 @@ def test_dedup_keeps_the_size_that_belongs_to_the_kept_pointer():
 
 
 # =====================================================================================
+# transfer amplification
+# =====================================================================================
+def _shared_layout(n_groups=7, slots=4):
+    """Both engines under BFF: `slots` allocations, each K/V, each reported by every group."""
+    addrs = []
+    for _group in range(n_groups):
+        for slot in range(slots):
+            addrs += [0x1000 + 0x100 * slot, 0x2000 + 0x100 * slot]
+    return addrs
+
+
+def test_the_shared_layout_collapses_to_the_distinct_regions():
+    """The 7x amplification: 56 address pairs, 8 distinct. Left alone, _transfer_kv_cache emits
+    every segment 7 (duplicate addresses) x 7 (the union of groups each address maps to) = 49 times
+    instead of 7."""
+    local = _shared_layout()
+    remote = _shared_layout()
+
+    keep = mc.transfer_indices(local, remote)
+
+    assert len(local) == 56
+    assert len(keep) == 8
+    assert keep == sorted(keep), "indices stay ascending so k still selects the right block_len"
+    assert len({(local[k], remote[k]) for k in keep}) == 8
+    # Every distinct pair in the input survives somewhere in the kept set.
+    assert {(local[k], remote[k]) for k in keep} == set(zip(local, remote))
+
+
+def test_the_per_layer_layout_is_untouched():
+    """The Ascend norm: 28 layers x K/V, all distinct. Nothing may be dropped."""
+    local = [1000 + 16 * j for j in range(56)]
+    remote = [9000 + 16 * j for j in range(56)]
+
+    assert mc.transfer_indices(local, remote) == list(range(56))
+
+
+def test_a_shared_decode_against_a_per_layer_prefill_drops_nothing():
+    """Why the key is the PAIR and not the local address.
+
+    If P ever runs a per-layer layout while D runs the shared one, D's region is paired with seven
+    DIFFERENT remote regions. Keying on the local address alone would keep one and discard six —
+    six sevenths of the model's KV, silently. Pair-keying degrades to a no-op instead."""
+    local = _shared_layout()                       # 8 distinct, each repeated 7x
+    remote = [9000 + 16 * j for j in range(56)]    # 56 distinct
+
+    keep = mc.transfer_indices(local, remote)
+
+    assert keep == list(range(56)), "every distinct remote region must still be pulled"
+    assert len({local[k] for k in keep}) == 8, "the local side really is the degenerate one"
+
+
+def test_indices_are_preserved_not_renumbered():
+    """block_len is chosen by `k % len(self.block_len)` — the K/V alternation for MLA. Renumbering
+    the survivors 0..n would pick the wrong cache's block length for every odd entry."""
+    local = [0xA, 0xA, 0xB, 0xB]
+    remote = [0x1, 0x2, 0x1, 0x2]
+
+    # All four pairs are distinct despite only two distinct local addresses.
+    assert mc.transfer_indices(local, remote) == [0, 1, 2, 3]
+
+    # And when pairs do repeat, the ORIGINAL index of the first occurrence is what survives.
+    assert mc.transfer_indices([0xA, 0xB, 0xA, 0xB], [0x1, 0x2, 0x1, 0x2]) == [0, 1]
+
+
+# =====================================================================================
 # where the group layout is read from
 # =====================================================================================
 class _Cfg:

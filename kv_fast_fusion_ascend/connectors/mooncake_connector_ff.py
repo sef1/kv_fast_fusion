@@ -158,6 +158,31 @@ def flatten_group_lists(groups) -> list[int]:
     return [int(b) for g in groups for b in g]
 
 
+def transfer_indices(local_base, remote_base) -> list[int]:
+    """Indices into the base-address lists that carry DISTINCT work, first occurrence wins.
+
+    Under BFF's shared-tensor layout ``build_base_addr_groups`` degenerates: all seven layers
+    sharing an allocation report the same address, so every address maps to the UNION of every
+    group, and the 56-entry address list holds only 8 distinct regions. Left alone,
+    ``_transfer_kv_cache`` then emits each needed segment 7 (duplicate addresses) x 7 (groups) = 49
+    times instead of 7 — the same bytes to the same place, so the data is right, but it is 7x the
+    RDMA traffic and it is what drives the decode into saturation.
+
+    Keyed on the PAIR, never on the local address alone. Pair-keying is what stays correct if the
+    two ends ever disagree about layout: a per-layer P (28 distinct regions) against a shared-layout
+    D would pair one local region against seven *different* remote regions, and dropping six of them
+    would silently lose five sevenths of the model's KV. With pair-keying that case is a no-op and
+    every pair survives; only genuine (local, remote) repeats are dropped."""
+    seen: set = set()
+    out: list[int] = []
+    for k, pair in enumerate(zip(local_base, remote_base)):
+        if pair in seen:
+            continue
+        seen.add(pair)
+        out.append(k)
+    return out
+
+
 def resolve_kv_cache_groups(kv_cache_config, runner):
     """The BFF group layout, from whichever source actually has it.
 
@@ -378,6 +403,7 @@ if _ASCEND_AVAILABLE:
         because it can only be derived once the caches are registered."""
 
         base_addr_groups: list[list[int]] | None = None
+        _logged_amplification: bool = False
 
         def _transfer_kv_cache(self, req_meta):
             local_groups = req_meta["local_block_ids"]
@@ -430,13 +456,37 @@ if _ASCEND_AVAILABLE:
             # Slice the group map identically, or address k would be attributed to another layer.
             addr_groups = self.base_addr_groups[lo:hi]
 
+            # zip(local_base, remote_base) pairs index k on both engines and assumes index k names
+            # the SAME logical layer on each — which holds only because P and D iterate `kv_caches`
+            # in the same order. Note remote_base is deliberately NOT sliced by [lo:hi] while
+            # local_base is (stock behaviour); the two coincide only at PP=1. A length mismatch
+            # means the pairing has shifted and every subsequent offset is against the wrong layer.
+            if len(remote_base) != len(local_base):
+                raise KVGroupLayoutError(
+                    f"prefill offered {len(remote_base)} base addresses but this decode is using "
+                    f"{len(local_base)}; index k no longer names the same layer on both sides, so "
+                    "every transfer below would target the wrong layer. Refusing rather than "
+                    "serving against a shifted map.")
+
             remote_transfer_port = self.remote_te_port[remote_engine_id][remote_handshake_port]
             session_id = f"{remote_host}:{remote_transfer_port}"
 
             src_list, dst_list, length_list = [], [], []
             block_length = len(self.block_len)
-            for k, (src_layer_base_addr, dst_layer_base_addr) in enumerate(
-                    zip(local_base, remote_base)):
+            # Duplicate (local, remote) address pairs are the shared-tensor layout showing through;
+            # processing them again re-sends bytes already in flight. `k` is kept from the ORIGINAL
+            # enumeration because block_len is selected by `k % block_length` (K/V alternation for
+            # MLA) — renumbering the survivors would pick the wrong cache's block length.
+            keep = transfer_indices(local_base, remote_base)
+            if not self._logged_amplification:
+                self._logged_amplification = True
+                logger.info("MooncakeConnectorFF: %d of %d base-address pairs carry distinct work "
+                            "(%.1fx transfer amplification avoided).", len(keep), len(local_base),
+                            len(local_base) / len(keep) if keep else 1.0)
+            groups_covered: set = set()
+            for k in keep:
+                src_layer_base_addr = local_base[k]
+                dst_layer_base_addr = remote_base[k]
                 block_len = self.block_len[k % block_length]
                 inner_block_len = block_len // tp_num_need_pulls
                 for gi in addr_groups[k]:
@@ -450,6 +500,21 @@ if _ASCEND_AVAILABLE:
                         src_list.append(src)
                         dst_list.append(dst)
                         length_list.append(inner_block_len * len(local_block_id))
+                        groups_covered.add(gi)
+
+            # Per-request coverage check. `build_base_addr_groups` proves at startup that every
+            # group is reachable through SOME address; this proves that for THIS request every group
+            # that actually had blocks to pull emitted segments. The gap between the two is a group
+            # whose KV silently stays whatever was in the block — the decode then attends over stale
+            # KV for those layers and the only symptom is the output text. Costs a set of small ints
+            # per request.
+            wanted = {gi for gi, (_r, local_ids) in enumerate(grouped) if local_ids}
+            if wanted - groups_covered:
+                raise KVGroupLayoutError(
+                    f"request {req_meta['remote_request_id']}: KV-cache groups "
+                    f"{sorted(wanted - groups_covered)} have blocks to pull but no registered "
+                    f"allocation carried them (covered {sorted(groups_covered)}). Their layers "
+                    "would decode against stale KV with no other symptom than wrong output.")
 
             if not src_list:
                 return
@@ -547,8 +612,12 @@ if _ASCEND_AVAILABLE:
         def _build_base_addr_groups(self) -> list[list[int]]:
             groups = resolve_kv_cache_groups(self._kv_cache_config, _active_runner())
             layer_group = build_layer_group_map(groups)
+            # The base class builds its address list as a LOCAL and only ever keeps it on the
+            # handshake metadata (mooncake_connector.py:1222,1238) — the worker has no
+            # `kv_caches_base_addr` attribute of its own. (`self.kv_caches_base_addr` does exist on
+            # the RECV THREAD, but there it is a dict keyed by engine id, not this flat list.)
             return build_base_addr_groups(
-                self.kv_caches_base_addr, self._layer_names, layer_group,
+                self.xfer_handshake_metadata.kv_caches_base_addr, self._layer_names, layer_group,
                 self._caches_per_layer, len(groups))
 
         def start_load_kv(self, metadata):
