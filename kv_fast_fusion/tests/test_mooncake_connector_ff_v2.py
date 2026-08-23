@@ -484,6 +484,7 @@ def test_an_alias_is_applied_and_its_orphan_staged_for_free(monkeypatch):
     w = _worker()
     w._engine._alias_ready = {"rB": {1: {51: (41, "rA")}}}
     w._engine._planner._resident.setdefault(1, set()).add(41)      # rep landed and is still held
+    w._engine._resident_owner[(1, 41)] = "rA"                      # ...and still owned by rA
     runner = _fake_runner({"rA": [[], [41]], "rB": [[], [50, 51]]})
     monkeypatch.setattr(bp, "_ACTIVE_RUNNER", runner, raising=False)
 
@@ -498,18 +499,77 @@ def test_an_alias_is_applied_and_its_orphan_staged_for_free(monkeypatch):
 @requires_mooncake
 def test_an_alias_to_a_freed_representative_forces_a_recompute(monkeypatch):
     """v2's one real hazard. The victim block was never written, so refusing the substitution
-    cannot mean 'keep your own copy' the way it did in v1 — it has to mean recompute."""
+    cannot mean 'keep your own copy' the way it did in v1 — it has to mean recompute.
+
+    The refusal is deferred to the deadline rather than taken on sight, because a representative
+    that is not resident YET is indistinguishable from one that is gone (see the retry test below).
+    What must not change is that a rep which never arrives still ends in recompute."""
     from kv_fast_fusion import fast_fusion_block_pool as bp
     w = _worker()
     w._engine._alias_ready = {"rB": {1: {51: (41, "rA")}}}       # 41 deliberately NOT resident
     runner = _fake_runner({"rA": [[], [41]], "rB": [[], [50, 51]]})
     monkeypatch.setattr(bp, "_ACTIVE_RUNNER", runner, raising=False)
 
-    _connector(w)._ff_consumer_apply()
+    conn = _connector(w)
+    conn._ff_consumer_apply()
+    assert w._ff_failed_blocks == set(), "still within the deadline — the rep may yet register"
+
+    for _ in range(pd_dedup_v2.APPLY_MAX_AGE + 2):
+        conn._ff_consumer_apply()
 
     assert runner._updated_block_tables is None, "no table rewrite"
     assert w._ff_failed_blocks == {51}, "the never-written block goes to the load-failure path"
     assert w._engine.stats.recomputed == 1
+
+
+@requires_mooncake
+def test_a_representative_registered_late_is_applied_not_recomputed(monkeypatch):
+    """The race this retry exists for. A representative from the SAME transfer becomes resident
+    only when ITS request's release() runs, and nothing orders that before the victim's — ok_reqs
+    can list them either way, in either response message. Failing on the first look turned that
+    ordering into a full re-prefill: 601-765 requests per run, every one rep_not_resident."""
+    from kv_fast_fusion import fast_fusion_block_pool as bp
+    w = _worker()
+    w._engine._alias_ready = {"rB": {1: {51: (41, "rA")}}}
+    runner = _fake_runner({"rA": [[], [41]], "rB": [[], [50, 51]]})
+    monkeypatch.setattr(bp, "_ACTIVE_RUNNER", runner, raising=False)
+
+    conn = _connector(w)
+    conn._ff_consumer_apply()                       # rep has not registered yet
+    assert w._ff_failed_blocks == set() and w._engine.stats.applied == 0
+
+    w._engine._planner._resident.setdefault(1, set()).add(41)     # rA's transfer lands
+    w._engine._resident_owner[(1, 41)] = "rA"
+    conn._ff_consumer_apply()
+
+    assert w._engine.stats.applied == 1, "the alias is rescued, not recomputed"
+    assert w._ff_failed_blocks == set()
+    assert runner._updated_block_tables == {"rB": {1: [50, 41]}}
+
+
+@requires_mooncake
+def test_a_recycled_representative_is_refused_even_though_it_is_resident(monkeypatch):
+    """The hazard the retry would otherwise open. Waiting for a rep means the block id can be freed
+    and REISSUED to another request inside the deadline; residency would then be true again with
+    entirely different KV behind it. Applying that is the one failure here no counter would catch,
+    so identity — not presence — is what the apply checks."""
+    from kv_fast_fusion import fast_fusion_block_pool as bp
+    w = _worker()
+    w._engine._alias_ready = {"rB": {1: {51: (41, "rA")}}}
+    runner = _fake_runner({"rA": [[], [41]], "rB": [[], [50, 51]]})
+    monkeypatch.setattr(bp, "_ACTIVE_RUNNER", runner, raising=False)
+
+    # Block 41 is resident again — but it now belongs to rC, not the rA we chose.
+    w._engine._planner._resident.setdefault(1, set()).add(41)
+    w._engine._resident_owner[(1, 41)] = "rC"
+
+    conn = _connector(w)
+    for _ in range(pd_dedup_v2.APPLY_MAX_AGE + 2):
+        conn._ff_consumer_apply()
+
+    assert w._engine.stats.applied == 0, "never point a victim at another request's KV"
+    assert w._engine.stats.fail_reasons["rep_recycled"] == 1
+    assert w._ff_failed_blocks == {51}, "recompute is the safe outcome"
 
 
 @requires_mooncake
@@ -521,6 +581,7 @@ def test_an_owner_that_never_gets_batched_forces_a_recompute(monkeypatch):
     w = _worker()
     w._engine._alias_ready = {"rB": {1: {51: (41, "rA")}}}
     w._engine._planner._resident.setdefault(1, set()).add(41)
+    w._engine._resident_owner[(1, 41)] = "rA"
     runner = _fake_runner({"rA": [[], [41]], "rB": [[], [50, 51]]}, batched=["rA"])
     monkeypatch.setattr(bp, "_ACTIVE_RUNNER", runner, raising=False)
     conn = _connector(w)
@@ -550,10 +611,15 @@ def test_each_failure_names_its_own_cause(monkeypatch, scenario, reason):
     w._engine._alias_ready = {"rB": {1: {victim: (41, "rA")}}}
     if scenario == "victim_gone":
         w._engine._planner._resident.setdefault(1, set()).add(41)
+        w._engine._resident_owner[(1, 41)] = "rA"
     runner = _fake_runner({"rA": [[], [41]], "rB": [[], [50, 51]]})
     monkeypatch.setattr(bp, "_ACTIVE_RUNNER", runner, raising=False)
 
-    _connector(w)._ff_consumer_apply()
+    conn = _connector(w)
+    # rep_not_resident is retried to the deadline (the rep may simply not have been registered
+    # yet), victim_not_in_table is terminal on sight — so drive past the deadline to see both.
+    for _ in range(pd_dedup_v2.APPLY_MAX_AGE + 2):
+        conn._ff_consumer_apply()
 
     assert w._engine.stats.fail_reasons[reason] == 1
     assert sum(w._engine.stats.fail_reasons.values()) == 1, "exactly one cause is charged"
@@ -668,6 +734,7 @@ def test_the_default_applier_never_reaches_the_ambiguity_branch():
     engine = pd_dedup_v2.DedupEngine(resident=False)
     engine._alias_ready = {"rB": {1: {51: (41, "rA")}}}
     engine._planner._resident.setdefault(1, set()).add(41)
+    engine._resident_owner[(1, 41)] = "rA"
     runner = _fake_runner({"rA": [[], [41]], "rB": [[], [50, 51]]})
     written = []
     applier = pd_dedup_v2.AliasApplier(

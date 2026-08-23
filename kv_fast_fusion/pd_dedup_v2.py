@@ -73,7 +73,7 @@ STATS_DIR = os.environ.get("BFF_PD_STATS_DIR", ".")
 # reported a single number for all four and the root cause (maps staged a whole transfer too early)
 # had to be inferred from the step rate instead of read off the run.
 FAIL_REASONS = ("owner_never_batched", "rep_not_resident", "victim_not_in_table",
-                "block_table_write_refused", "owner_id_ambiguous")
+                "block_table_write_refused", "owner_id_ambiguous", "rep_recycled")
 
 # Why an exchange did not happen at all. A connector that never ASKS produces exactly the same
 # all-zero stats as one that asked and found nothing, and the first Ascend run was the former for
@@ -512,6 +512,15 @@ class DedupEngine:
     def is_resident(self, group: int, block_id: int) -> bool:
         return self._planner.is_resident(group, block_id)
 
+    def resident_owner(self, group: int, block_id: int):
+        """Which request registered this block, or None if it is not currently a legal target.
+
+        Identity, not just presence. A block id can be freed and handed to a different request
+        inside the apply deadline, and the index would then hold the SAME id with entirely
+        different KV behind it. Checking residency alone cannot tell those apart, so any retry
+        across time must compare this against the owner recorded when the alias was decided."""
+        return self._resident_owner.get((group, int(block_id)))
+
     # -- test/introspection helpers ------------------------------------------------------
     def note_resident(self, group: int, sigs, hashes, norms, block_ids, owner="") -> None:
         if not self._resident_enabled:
@@ -626,17 +635,30 @@ class AliasApplier:
                         stats.note_failure("owner_never_batched", len(m))
                 continue
             local_rid = rid2local[rid]
-            for gi, mapping in by_group.items():
+            # Mutated in place, so a group that is retried keeps this request's original deadline.
+            for gi, mapping in list(by_group.items()):
                 new_blocks, why = self._substitute(rid2blocks, rid, gi, mapping)
                 # Free ONLY when the device table was really rewritten — and recompute whenever it
                 # was not, because unlike v1 the victim block holds nothing.
                 if why is None and self._write(runner, local_rid, int(gi), new_blocks):
                     updated.setdefault(local_rid, {})[int(gi)] = new_blocks
                     n_applied += len(mapping)
-                else:
-                    failed.update(mapping)
-                    stats.note_failure(why or "block_table_write_refused", len(mapping))
-            done.append(rid)
+                    del by_group[gi]
+                    continue
+                # "Not resident YET" is not "gone". A representative from the SAME transfer becomes
+                # resident only when ITS request's release() runs, and nothing orders that before
+                # the victim's — the two arrive in whatever order ok_reqs lists them, possibly in
+                # different response messages. Treating the miss as terminal turned that race into a
+                # full re-prefill: 601-765 requests per run, 100% of them rep_not_resident. Retry on
+                # the deadline owner_never_batched already uses; a rep that is genuinely gone still
+                # fails, just at the deadline instead of on the first look.
+                if why == "rep_not_resident" and self.step - first_step <= APPLY_MAX_AGE:
+                    continue
+                del by_group[gi]
+                failed.update(mapping)
+                stats.note_failure(why or "block_table_write_refused", len(mapping))
+            if not by_group:
+                done.append(rid)
         for rid in done:
             self.pending.pop(rid, None)
 
@@ -662,10 +684,17 @@ class AliasApplier:
             return None, "victim_not_in_table"
         blocks = [int(b) for b in groups[gi]]
         pos = {b: i for i, b in enumerate(blocks)}
-        for victim, (rep, _owner) in mapping.items():
+        for victim, (rep, owner) in mapping.items():
             if victim not in pos:
                 return None, "victim_not_in_table"
             if not self._engine.is_resident(gi, rep):
                 return None, "rep_not_resident"
+            # Residency says a block with this id is a legal target; it does not say it is the
+            # block we chose. Between decision and apply the id can be freed and reissued to
+            # another request, and applying then would point the victim at unrelated KV — silently,
+            # which is the one failure mode in this file that no counter would catch. The owner
+            # recorded at decision time is what distinguishes them.
+            if self._engine.resident_owner(gi, rep) != owner:
+                return None, "rep_recycled"
             blocks[pos[victim]] = int(rep)
         return blocks, None

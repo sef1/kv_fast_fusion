@@ -32,9 +32,22 @@ from itertools import combinations
 ALPHA = 0.05
 
 
+# Config fields that make two runs DIFFERENT EXPERIMENTS rather than repeats of one. Pooling across
+# any of these is not averaging noise, it is averaging two answers. `max_tokens` is here because it
+# is absent from RUN_TAG and on 2026-08-20 silently pooled a 1024-token sweep with an 8192-token one
+# into a single arm, reporting a mean of 0.809 rps that described neither.
+POOL_KEYS = ("max_tokens", "num_prompts", "max_concurrency", "request_rate", "burstiness",
+             "min_tokens", "model", "dataset_path")
+
+
 def load(path):
     with open(path) as fh:
         d = json.load(fh)
+    if d.get("request_throughput_rps") is None:
+        # A cell that died mid-run leaves the collector's log-derived sections but no benchmark
+        # result. Naming it is the point: silently dropping it turns a 2-of-3 arm into something
+        # that reads like a complete one.
+        raise ValueError("no request_throughput_rps — incomplete run")
     b = d.get("bff_v2") or {}
     dec = [v for k, v in (d.get("kv_transfer_failures") or {}).items() if "decode" in k]
     v = dec[0] if dec else {}
@@ -51,6 +64,7 @@ def load(path):
         "recomp": v.get("recomputed_requests"),
         "ngram": ev.get("ngram_match"),
         "drun": run,
+        "cfg": tuple((k, (d.get("config") or {}).get(k)) for k in POOL_KEYS),
     }
 
 
@@ -86,20 +100,47 @@ def arm_of(tag):
 def main():
     d = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(__file__), "f1_results")
     runs = {}
+    skipped = []
     for f in sorted(glob.glob(os.path.join(d, "f1_*_r[0-9]*.json"))):
         tag = os.path.basename(f)[3:-5]
         try:
-            runs.setdefault(arm_of(tag), []).append((tag, load(f)))
+            r = load(f)
         except Exception as e:                      # a crashed run leaves a truncated file
-            print(f"  ! skipping {os.path.basename(f)}: {e}")
+            skipped.append((os.path.basename(f), str(e)))
+            continue
+        # The arm is the tag AND the config: two runs that differ in an untagged knob are two
+        # experiments, and pooling them reports a mean describing neither.
+        runs.setdefault((arm_of(tag), r["cfg"]), []).append((tag, r))
+
+    if skipped:
+        for name, why in skipped:
+            print(f"  ! incomplete cell, not counted: {name}  ({why})")
+
+    # Same tag, different config: name the fields that differ, because the tag alone gives the user
+    # no way to tell the two apart in the listing below.
+    by_tag, differing = {}, {}
+    for arm, cfg in runs:
+        by_tag.setdefault(arm, []).append(cfg)
+    for arm, cfgs in by_tag.items():
+        if len(cfgs) > 1:
+            differing[arm] = sorted(k for k in POOL_KEYS
+                                    if len({dict(c).get(k) for c in cfgs}) > 1)
+            print(f"\n  ! {arm}\n    split into {len(cfgs)} arms — same run tag but different "
+                  f"{', '.join(differing[arm])}. These are separate experiments; they are NOT "
+                  f"pooled and must not be compared with each other.")
 
     if not runs:
         print(f"No repeated runs in {d} (expects f1_*_r<N>.json — set RUN_REPEAT).")
         return 1
 
-    series = {}
-    for arm, rows in sorted(runs.items()):
-        print(f"\n{arm}   (n={len(rows)})")
+    series, of_arm = {}, {}
+    for (arm, cfg), rows in sorted(runs.items()):
+        # Disambiguate with only the fields that actually differ, so the common case stays readable
+        # and the split case names its cause.
+        keys = differing.get(arm)
+        label = arm if not keys else (
+            arm + "  [" + " ".join(f"{k}={dict(cfg).get(k)}" for k in keys) + "]")
+        print(f"\n{label}   (n={len(rows)})")
         for tag, r in sorted(rows):
             print(f"   {tag[-3:]:>3}  rps={r['rps']:.3f}  tok/s={r['tok_s'] or 0:6.0f}  "
                   f"wire={r['wire'] or 0:5.2f}%  applied={r['applied']}  "
@@ -110,7 +151,8 @@ def main():
         if rps:
             print(f"   mean rps={sum(rps) / len(rps):.3f}   mean tok/s={sum(tps) / len(tps):.0f}"
                   if tps else f"   mean rps={sum(rps) / len(rps):.3f}")
-            series[arm] = (rps, tps)
+            series[label] = (rps, tps)
+            of_arm[label] = (arm, cfg)
 
     if len(series) < 2:
         print("\n(need two or more arms to compare)")
@@ -118,7 +160,21 @@ def main():
 
     print(f"\n{'=' * 78}\nPairwise exact permutation tests (one-sided, alpha={ALPHA})")
     names = sorted(series, key=lambda a: -sum(series[a][0]) / len(series[a][0]))
-    pairs = list(combinations(names, 2))
+    # Only arms measured under the SAME run config are a treatment comparison. Across configs the
+    # gap is dominated by the workload — max_tokens 1024 vs 8192 moved rps by 100% here, twenty
+    # times any effect under test — so such a p-value describes the benchmark, not the connector.
+    pairs, cross = [], 0
+    for hi, lo in combinations(names, 2):
+        if of_arm[hi][1] != of_arm[lo][1]:
+            cross += 1
+            continue
+        pairs.append((hi, lo))
+    if cross:
+        print(f"({cross} pair(s) skipped: different run configs — those gaps measure the workload, "
+              f"not the treatment.)")
+    if not pairs:
+        print("No comparable pairs: every arm here differs by run config rather than by treatment.")
+        return 0
     if len(pairs) > 1:
         print(f"NOTE: {len(pairs)} comparisons — a single p<{ALPHA} among them is weaker than it "
               f"looks (Bonferroni bar is {ALPHA / len(pairs):.3f}).")

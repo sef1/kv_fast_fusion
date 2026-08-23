@@ -38,6 +38,7 @@ alignment logic is unit-testable without an NPU.
 
 import os
 import threading
+import time
 from collections import OrderedDict
 
 from vllm.logger import init_logger
@@ -74,6 +75,12 @@ def _parse_ff_groups(raw):
 
 
 _FF_GROUPS = _parse_ff_groups(os.environ.get("BFF_FF_GROUPS"))
+
+# Where MooncakeFFProducer writes `bff_stats_<pid>.json`, which the benchmark's collect_bff_stats
+# globs for compression and overhead. Same env var as the layerwise connector so one harness reads
+# both transports. Unset → the producer's maybe_dump_stats is a no-op and the harness reports
+# "bff stats: none found", which is exactly what happened before this was wired.
+_PD_STATS_DIR = os.environ.get("BFF_PD_STATS_DIR")
 
 
 class KVGroupLayoutError(RuntimeError):
@@ -958,7 +965,18 @@ if _ASCEND_AVAILABLE:
             if self._ff_producer is None:
                 return
             try:
+                # Timed OUTSIDE the accumulate so `forward_ms` captures everything fusion adds to
+                # the prefill thread — the per-layer accounting and the stash write too, not just
+                # the clustering. That total is the number an overhead claim has to defend.
+                _t0 = time.perf_counter()
                 self._ff_accumulate(layer_name, kv_layer)
+                self._ff_producer.note_forward((time.perf_counter() - _t0) * 1e3)
+                # Dumped from HERE, never from inside _ff_accumulate. That function returns early
+                # for the warmup group and for every layer that does not complete a group, so it is
+                # reached on roughly one layer in 28 — and a backstop gated behind the conditions it
+                # exists to survive is not a backstop. The layerwise connector learned this by
+                # freezing a prefill node's ledger at its step-1 snapshot for an entire run.
+                self._ff_producer.maybe_dump_stats(_PD_STATS_DIR)
             except Exception as e:  # pragma: no cover - never break the transfer
                 logger.warning("MooncakeConnectorFF: producer fusion failed on %s: %s",
                                layer_name, e)
@@ -989,6 +1007,15 @@ if _ASCEND_AVAILABLE:
                         "(%d known) disagree with the forward context's.",
                         layer_name, len(worker._layer_group))
                 return
+
+            # Wire-bytes denominator, tallied for EVERY group including the warmup one and BEFORE
+            # the fusion filter below. Compression has to be quoted against all the blocks that
+            # actually crossed the wire, not just the ones fusion was allowed to look at — measuring
+            # it against the fusion groups alone would flatter the ratio by ~1/7 here.
+            n_block_layers = sum(len(groups[gi])
+                                 for (_rid, _ext, groups) in fuse_reqs if gi < len(groups))
+            self._ff_producer.note_transferred(n_block_layers)
+
             if gi <= 0:
                 return
             if _FF_GROUPS is not None and gi not in _FF_GROUPS:

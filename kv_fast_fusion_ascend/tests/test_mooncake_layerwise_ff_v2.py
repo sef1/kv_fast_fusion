@@ -400,6 +400,7 @@ def test_the_applier_finds_the_owner_through_the_local_id_suffix():
     engine = DedupEngine(resident=False)
     engine._alias_ready = {ext_b: {1: {51: (41, ext_a)}}}
     engine._planner._resident.setdefault(1, set()).add(41)
+    engine._resident_owner[(1, 41)] = ext_a
     runner = _applier_runner({ext_a + SUFFIX: [[], [41]], ext_b + SUFFIX: [[], [50, 51]]})
     applier, written, failed = _applier(engine, normalize=a2.to_external_request_id)
 
@@ -420,6 +421,7 @@ def test_an_id_space_mismatch_ages_every_alias_out_as_owner_never_batched():
     engine = DedupEngine(resident=False)
     engine._alias_ready = {ext_b: {1: {51: (41, ext_a)}}}
     engine._planner._resident.setdefault(1, set()).add(41)
+    engine._resident_owner[(1, 41)] = ext_a
     runner = _applier_runner({ext_a + SUFFIX: [[], [41]], ext_b + SUFFIX: [[], [50, 51]]})
     applier, written, failed = _applier(engine)          # no normalizer
 
@@ -438,6 +440,7 @@ def test_the_default_normalizer_is_identity():
     engine = DedupEngine(resident=False)
     engine._alias_ready = {rid: {1: {51: (41, "owner")}}}
     engine._planner._resident.setdefault(1, set()).add(41)
+    engine._resident_owner[(1, 41)] = "owner"
     runner = _applier_runner({"owner": [[], [41]], rid: [[], [50, 51]]})
     applier, written, failed = _applier(engine)
 
@@ -459,6 +462,7 @@ def test_two_batched_requests_sharing_an_external_id_are_refused_not_guessed_at(
     engine = DedupEngine(resident=False)
     engine._alias_ready = {ext: {1: {51: (41, "owner")}}}
     engine._planner._resident.setdefault(1, set()).add(41)
+    engine._resident_owner[(1, 41)] = "owner"
     runner = _applier_runner({"owner" + SUFFIX: [[], [41]],
                               locals_[0]: [[], [50, 51]], locals_[1]: [[], [60, 51]]})
     before = [list(g) for g in runner.requests[locals_[1]].block_ids]
