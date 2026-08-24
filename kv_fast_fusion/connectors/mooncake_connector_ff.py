@@ -129,6 +129,10 @@ _FF_ROWS_MAX_PENDING = int(os.environ.get("BFF_FF_ROWS_MAX_PENDING", "4096"))
 _FF_DONE_TID_TTL = float(os.environ.get("BFF_FF_DONE_TID_TTL", "10"))
 _FF_DONE_TID_MAX = int(os.environ.get("BFF_FF_DONE_TID_MAX", "4096"))
 
+# Seconds between producer hold-window summary lines (see _ff_maybe_log_hold). Matched to the
+# scheduler's own logging cadence so the two interleave readably in prefill*.log.
+_FF_HOLD_LOG_S = float(os.environ.get("BFF_HOLD_LOG_S", "10"))
+
 
 def _parse_thresholds(raw: str | None) -> dict[int, float]:
     """Parse ``BFF_THRESHOLD_G`` ("1:0.97,2:0.90") into ``{group: threshold}``.
@@ -1179,6 +1183,12 @@ if _MOONCAKE_AVAILABLE:
             # Blocks whose pull failed; drained by get_block_ids_with_load_errors so the scheduler
             # can recompute (or fail) those requests instead of waiting on KV that never arrives.
             self._ff_failed_blocks: set[int] = set()
+            # Producer hold window (see _ff_note_hold_start). p_req_id -> (t_ready, n_blocks) for
+            # requests whose prefill is done and whose blocks are pinned waiting for D to pull,
+            # plus the completed (ms, blocks) samples not yet reported.
+            self._ff_hold: dict[str, tuple[float, int]] = {}
+            self._ff_hold_done: list[tuple[float, int]] = []
+            self._ff_hold_logged = 0.0
 
         # -- group layout -------------------------------------------------------------
         def build_group_maps(self, kv_caches: dict[str, torch.Tensor] | None = None) -> None:
@@ -1409,6 +1419,78 @@ if _MOONCAKE_AVAILABLE:
             with self._ff_lock:
                 out, self._ff_done_from_d = self._ff_done_from_d, set()
                 return out
+
+        # -- producer hold window --------------------------------------------------------
+        # How long P pins a finished request's KV waiting for D to pull it, and how many blocks
+        # that is. This is the quantity every "free P's blocks earlier" idea is bounded by, and it
+        # was never measured — the existing producer counters say P is *wedged* (full cache, nothing
+        # running) but not for how long any individual request holds, which is what decides whether
+        # cancelling a pull early can buy anything.
+        #
+        # `record_send_reqs` is the moment prefill is done and the blocks are pinned (it sets
+        # `ready` and starts the abort timer); `fetch_finished_sending_reqs` is the moment the
+        # scheduler is told to release them (pull complete, or the 480 s abort timeout). Both are
+        # stock methods with no FF override, so wrapping them costs nothing and cannot change the
+        # transfer.
+        async def record_send_reqs(self, metadata):
+            out = await super().record_send_reqs(metadata)
+            try:
+                now = time.perf_counter()
+                for p_req_id, (_tid, block_ids) in metadata.reqs_to_send.items():
+                    if not block_ids:
+                        continue      # the update_state_after_alloc pre-registration, not a hold
+                    # Per-group lists under FF, a flat list under stock — count either.
+                    n = sum(len(g) for g in block_ids) if isinstance(block_ids[0], (list, tuple)) \
+                        else len(block_ids)
+                    self._ff_hold[p_req_id] = (now, n)
+            except Exception as e:  # pragma: no cover - instrumentation must never break a transfer
+                logger.warning("BFF hold: start stamp failed: %s", e)
+            return out
+
+        async def fetch_finished_sending_reqs(self):
+            done = await super().fetch_finished_sending_reqs()
+            try:
+                now = time.perf_counter()
+                for rid in done or ():
+                    got = self._ff_hold.pop(rid, None)
+                    if got is not None:
+                        self._ff_hold_done.append(((now - got[0]) * 1000.0, got[1]))
+                self._ff_maybe_log_hold(now)
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning("BFF hold: release stamp failed: %s", e)
+            return done
+
+        def _ff_maybe_log_hold(self, now: float) -> None:
+            """Emit one summary line every _FF_HOLD_LOG_S, parsed by tools/collect_bff_stats.py.
+
+            Reports the still-held total alongside the completed samples on purpose: the samples say
+            how long a hold lasts, the in-flight total says how much of P's cache is sitting in that
+            state right now, and the feature is only worth building if BOTH are large."""
+            if now - self._ff_hold_logged < _FF_HOLD_LOG_S:
+                return
+            self._ff_hold_logged = now
+            if not self._ff_hold_done and not self._ff_hold:
+                return
+            # A hold that outlives the abort timeout was released by some path that never reached
+            # fetch_finished_sending_reqs (reqs_not_processed, an aborted request). Drop it rather
+            # than let it inflate in_flight forever, and report it: a nonzero count here is the
+            # 480 s stranding pathology, which is a different bug from a slow decode.
+            import vllm.envs as _envs
+            cutoff = now - _envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT - 60
+            stranded = [k for k, v in self._ff_hold.items() if v[0] < cutoff]
+            for k in stranded:
+                self._ff_hold.pop(k, None)
+            ms = sorted(s[0] for s in self._ff_hold_done)
+            blocks = sum(s[1] for s in self._ff_hold_done)
+            held_now = sum(v[1] for v in self._ff_hold.values())
+            def q(p):
+                return ms[min(len(ms) - 1, int(p * len(ms)))] if ms else 0.0
+            logger.info(
+                "BFF hold | released=%d | held_ms p50=%.0f p90=%.0f max=%.0f | released_blocks=%d "
+                "| in_flight_reqs=%d in_flight_blocks=%d | stranded=%d",
+                len(ms), q(0.5), q(0.9), ms[-1] if ms else 0.0, blocks,
+                len(self._ff_hold), held_now, len(stranded))
+            self._ff_hold_done.clear()
 
         # -- the one transfer change: index every layer by ITS group's block table -------
         async def _build_transfer_params(self, ready_reqs, agent_meta):

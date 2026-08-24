@@ -45,6 +45,13 @@ export NUM_PREFILL=${NUM_PREFILL:-1}
 export NUM_DECODE=${NUM_DECODE:-1}
 export MAX_CONCURRENCY=${MAX_CONCURRENCY:-150}
 export NUM_PROMPTS=${NUM_PROMPTS:-500}
+# Same default the inner script computes, resolved here so this driver can tell whether a cell
+# actually produced a result. Exported so both agree even when the caller overrides it.
+export RESULT_DIR=${RESULT_DIR:-$PWD/f1_results}
+
+# Truncated per sweep. It used to accumulate across every sweep ever run, so a fresh sweep opened
+# with a wall of stale entries and there was no way to tell which belonged to it.
+: > ab_failures.txt
 
 echo "Interleaved A/B: arms=[$ARMS] repeats=$REPEATS"
 echo "  thr=$BFF_THRESHOLD rel_err=$BFF_MAX_REL_ERR conc=$MAX_CONCURRENCY n=$NUM_PROMPTS"
@@ -64,13 +71,25 @@ for r in $(seq 1 "$REPEATS"); do
         echo "=============================================================="
         echo "  repeat $r/$REPEATS   arm=$arm ${env_args[*]}  ($(date +%H:%M:%S))"
         echo "=============================================================="
+        # A cell is judged by whether it produced a result, NEVER by its exit code. The inner
+        # script's cleanup() ends with `kill -- -$$`, which SIGTERMs that script itself before it
+        # reaches `exit 0` — so a completely successful run exits non-zero. Trusting rc marked
+        # every cell of every sweep as failed, and on 2026-08-23 that made six healthy runs look
+        # like six engine crashes (the "EngineCore died unexpectedly" line is the servers being
+        # shut down on purpose after the benchmark finished).
+        marker=$(mktemp)
         env "${env_args[@]}" RUN_REPEAT="$r" BASELINE="$arm" ./disagg_bff_mooncake_gpu.sh
         rc=$?
+        # -newer, not a file count: re-running a cell OVERWRITES its result in place, so the count
+        # would not grow and a genuine rerun would read as a failure.
+        produced=$(find "$RESULT_DIR" -maxdepth 1 -name 'f1_*.json' -newer "$marker" -print -quit \
+                   2>/dev/null)
+        rm -f "$marker"
         # Keep going on failure: a lost cell is recoverable, an aborted sweep costs the whole hour.
         # It is reported at the end so a partial matrix is never mistaken for a complete one.
-        if [[ $rc -ne 0 ]]; then
-            echo "  !! arm=$spec repeat=$r exited $rc — continuing"
-            echo "$spec r$r rc=$rc" >> ab_failures.txt
+        if [[ -z "$produced" ]]; then
+            echo "  !! arm=$spec repeat=$r wrote no result (exit $rc) — continuing"
+            echo "$spec r$r rc=$rc no-result" >> ab_failures.txt
         fi
         sleep 10   # let the driver release GPU memory before the next launch
     done

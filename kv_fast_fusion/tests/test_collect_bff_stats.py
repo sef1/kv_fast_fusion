@@ -240,3 +240,68 @@ def test_v2_stats_survive_logs_that_parsed_to_nothing(tmp_path):
     data = _run(tmp_path, _v2_stats(exchanges=3), [])
     assert data["bff_v2"]["exchanges"] == 3
     assert json.loads((tmp_path / "r.json").read_text())["bff_v2"]["blocks_planned"] == 100
+
+
+# =====================================================================================
+# run_config — making a result file self-describing
+# =====================================================================================
+# The benchmark records eight fields (model, dataset, num_prompts, max_concurrency, request_rate,
+# burstiness, max_tokens, stream). Nothing about the topology, the BFF knobs or the GPU utilisation
+# reached the result file, so every comparison had to be made by decoding a filename by hand — and
+# `BFF_THRESHOLD_G` was in no filename at all. Three separate times on 2026-08-24 a configuration
+# difference was reported as a code regression because of it.
+def test_run_config_records_what_the_experiment_actually_was(monkeypatch):
+    monkeypatch.setenv("NUM_DECODE", "2")
+    monkeypatch.setenv("BFF_THRESHOLD", "0.9")
+    monkeypatch.setenv("BFF_THRESHOLD_G", "1:0.95")
+    cfg = cbs.run_config()
+
+    assert cfg["num_decode"] == {"value": "2", "explicit": True}
+    assert cfg["bff_threshold_g"] == {"value": "1:0.95", "explicit": True}, \
+        "the one field that appears in no filename"
+
+
+def test_an_unset_variable_is_distinguishable_from_one_set_to_its_default(monkeypatch):
+    """`BFF_MAX_REL_ERR` unset means 1.0, which is INERT — the aggressive setting, not the safe one.
+
+    Recording only the effective value would make 'ran without an error budget' and 'chose the
+    budget 1.0' identical in the file, and the first is the one that halves ngram."""
+    monkeypatch.delenv("BFF_MAX_REL_ERR", raising=False)
+    unset = cbs.run_config()["bff_max_rel_err"]
+    monkeypatch.setenv("BFF_MAX_REL_ERR", "1.0")
+    chosen = cbs.run_config()["bff_max_rel_err"]
+
+    assert unset["value"] == chosen["value"] == "1.0"
+    assert unset["explicit"] is False and chosen["explicit"] is True
+
+
+def test_the_decode_count_comes_from_config_then_falls_back_to_the_logs():
+    """Throughput scales with the decode count, so normalising by it is what stops a 1P×2D run
+    reading as twice as fast as a 1P×1D one. Result files written before run_config existed must
+    still normalise, hence the log-derived fallback."""
+    assert cbs.num_decodes({"run_config": {"num_decode": {"value": "2", "explicit": True}}}) == 2
+    assert cbs.num_decodes({"bff_sched": {"decode1.log": {}, "decode2.log": {}, "prefill1.log": {}}}) == 2
+    assert cbs.num_decodes({}) == 1, "never zero — this is a divisor"
+
+
+def test_a_malformed_decode_count_does_not_crash_the_summary():
+    """The collector runs after a benchmark that already succeeded. A junk value here must cost the
+    normalisation, never the report of a run that cost half an hour of GPU."""
+    assert cbs.num_decodes({"run_config": {"num_decode": {"value": "two", "explicit": True}}}) == 1
+    assert cbs.num_decodes({"run_config": {"num_decode": None}}) == 1
+
+
+def test_per_decode_throughput_is_what_separates_topology_from_regression(capsys):
+    """The 2026-08-24 case: 0.52 req/s on one decode vs 1.04 on two, read as a slowdown. Per decode
+    GPU they are 1374 and 1312 tok/s — the same machine speed, twice the machines."""
+    one = {"label": "1D", "request_throughput_rps": 0.522, "output_throughput_toks_s": 1373.7,
+           "run_config": {"num_decode": {"value": "1", "explicit": True},
+                          "num_prefill": {"value": "1", "explicit": True}}}
+    two = {"label": "2D", "request_throughput_rps": 1.038, "output_throughput_toks_s": 2624.3,
+           "run_config": {"num_decode": {"value": "2", "explicit": True},
+                          "num_prefill": {"value": "1", "explicit": True}}}
+    cbs.summarize(one); cbs.summarize(two)
+    out = capsys.readouterr().out
+
+    assert "1374 per decode GPU (1P x 1D)" in out
+    assert "1312 per decode GPU (1P x 2D)" in out

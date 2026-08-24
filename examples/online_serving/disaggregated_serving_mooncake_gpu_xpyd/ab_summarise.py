@@ -39,6 +39,23 @@ ALPHA = 0.05
 POOL_KEYS = ("max_tokens", "num_prompts", "max_concurrency", "request_rate", "burstiness",
              "min_tokens", "model", "dataset_path")
 
+# The same rule applied to the run's own settings, which the benchmark never recorded and
+# `collect_bff_stats.run_config` now does. Topology is first because it is the one that distorts
+# hardest: req/s scales with the decode count, so pooling a 1P×1D arm with a 1P×2D arm reports a
+# mean that describes neither and looks exactly like a regression. Runs written before run_config
+# existed have none of these, compare equal on all of them, and still pool as they always did.
+CONFIG_KEYS = ("num_decode", "num_prefill", "tp", "baseline",
+               "bff_threshold", "bff_threshold_g", "bff_max_rel_err", "bff_scale_mode",
+               "bff_sig_dim", "bff_group_size", "bff_pd_cross_index",
+               "bff_v2_dedup", "bff_v2_resident", "bff_ff_groups",
+               "prefill_gpu_util", "decode_gpu_util", "max_model_len")
+
+
+def _run_cfg(d, key):
+    """One run_config value, or None for a result file written before run_config existed."""
+    e = (d.get("run_config") or {}).get(key)
+    return e.get("value") if isinstance(e, dict) else None
+
 
 def load(path):
     with open(path) as fh:
@@ -64,7 +81,8 @@ def load(path):
         "recomp": v.get("recomputed_requests"),
         "ngram": ev.get("ngram_match"),
         "drun": run,
-        "cfg": tuple((k, (d.get("config") or {}).get(k)) for k in POOL_KEYS),
+        "cfg": (tuple((k, (d.get("config") or {}).get(k)) for k in POOL_KEYS)
+                + tuple((k, _run_cfg(d, k)) for k in CONFIG_KEYS)),
     }
 
 
@@ -123,7 +141,7 @@ def main():
         by_tag.setdefault(arm, []).append(cfg)
     for arm, cfgs in by_tag.items():
         if len(cfgs) > 1:
-            differing[arm] = sorted(k for k in POOL_KEYS
+            differing[arm] = sorted(k for k in POOL_KEYS + CONFIG_KEYS
                                     if len({dict(c).get(k) for c in cfgs}) > 1)
             print(f"\n  ! {arm}\n    split into {len(cfgs)} arms — same run tag but different "
                   f"{', '.join(differing[arm])}. These are separate experiments; they are NOT "

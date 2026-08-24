@@ -24,9 +24,12 @@
 #   * No NCCL env (VLLM_NCCL_SO_PATH / NCCL_P2P_DISABLE / custom all-reduce),
 #     and no kv_buffer_size — Mooncake reads registered memory directly, so
 #     there is no recv-buffer threshold to tune on D.
-#   * BFF_SCALE_MODE is raw only: the redirect maps ride the transfer ACK, which
-#     carries no float payload, so `ratio` has no channel here (use the NCCL
-#     connector for ratio mode).
+#   * BFF_SCALE_MODE=ratio needs BASELINE=bff_v2. On v1 the redirect maps ride
+#     the transfer ACK, which carries no float payload, so there is nowhere to
+#     put the per-block scales and the connector downgrades to raw with a
+#     warning. v2 ships exact per-block K/V norms inside the SIGNATURE payload
+#     and the decode divides by its representative's, so no new wire channel is
+#     involved and ratio works here.
 #
 # Everything else — the 128 block size, prefix caching, hybrid KV-cache manager,
 # the BFF group split and the F1 benchmark against the proxy — is identical, so
@@ -113,7 +116,7 @@ else
     HYBRID_FLAG="--no-disable-hybrid-kv-cache-manager"
 fi
 ENABLE_CHUNKED=${ENABLE_CHUNKED:-1}
-MAX_MODEL_LEN=${MAX_MODEL_LEN:-8192}
+MAX_MODEL_LEN=${MAX_MODEL_LEN:-24576}
 MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-8192}
 ATTENTION_BACKEND=${ATTENTION_BACKEND:-}
 if [[ "${VLLM_BATCH_INVARIANT:-0}" == "1" && -z "$ATTENTION_BACKEND" ]]; then
@@ -131,7 +134,7 @@ fi
 
 # ---- BFF knobs ---------------------------------------------------------------
 BFF_PD_MERGE=${BFF_PD_MERGE:-cc}         # within-batch clustering (cc, nr_tree)
-BFF_SCALE_MODE=raw                       # the only mode this transport supports (see header)
+BFF_SCALE_MODE=${BFF_SCALE_MODE:-raw}    # raw | ratio — ratio needs BASELINE=bff_v2 (see header)
 BFF_PD_REPR=${BFF_PD_REPR:-proj}         # full | proj (LSH) | mean
 BFF_PD_FUSE=${BFF_PD_FUSE:-1}            # connector-level fusion + redirect propagation
 BFF_GROUP_SIZE=${BFF_GROUP_SIZE:-4}      # fusion layers packed per KV cache group
@@ -231,8 +234,27 @@ if (( NUM_PROMPTS < 2 * MAX_CONCURRENCY )); then
 fi
 REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-1200}
 RESULT_DIR=${RESULT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/f1_results}
+# GPU-memory fractions ride the tag ONLY when they differ from the defaults. They change how much
+# KV each side gets — a different experiment, not a repeat — but neither the tag nor the benchmark's
+# recorded `config` carried them, so two utilisation arms overwrote each other on disk and the
+# summariser's config guard could not see the difference either. Conditional so every existing tag
+# is unchanged and older results stay comparable.
+_MEM_TAG=""
+[[ "$PREFILL_GPU_UTIL" != "0.85" ]] && _MEM_TAG+="_pu${PREFILL_GPU_UTIL}"
+[[ "$DECODE_GPU_UTIL" != "0.85" ]] && _MEM_TAG+="_du${DECODE_GPU_UTIL}"
+# Same reasoning as _re below: ratio and raw at the same threshold are DIFFERENT experiments (that
+# is the whole comparison), so they must not share a filename. Conditional, so every raw tag ever
+# written is unchanged and older results stay poolable with new ones.
+[[ "$BFF_SCALE_MODE" != "raw" ]] && _MEM_TAG+="_${BFF_SCALE_MODE}"
+# MAX_TOKENS governs the run more strongly than anything else in this tag — 8192 vs 1024 moved
+# req/s by ~4x on 2026-08-24 (token throughput was IDENTICAL; the requests were simply longer) and
+# looked like a code regression. It was absent from the tag, so those two runs shared a filename and
+# the second would have silently overwritten the first — the failure the _re comment below records.
+# ab_summarise.py refuses to pool across it; the tag is what stops the .json being lost first.
+[[ "$MAX_TOKENS" != "8192" ]] && _MEM_TAG+="_mt${MAX_TOKENS}"
+
 if [[ "$BASELINE" == "vanilla" ]]; then
-    RUN_TAG=${RUN_TAG:-mooncake_vanilla_con_${MAX_CONCURRENCY}_${NUM_PREFILL}Px${NUM_DECODE}D${RUN_SET:+_s${RUN_SET}}${RUN_REPEAT:+_r${RUN_REPEAT}}}
+    RUN_TAG=${RUN_TAG:-mooncake_vanilla${_MEM_TAG}_con_${MAX_CONCURRENCY}_${NUM_PREFILL}Px${NUM_DECODE}D${RUN_SET:+_s${RUN_SET}}${RUN_REPEAT:+_r${RUN_REPEAT}}}
 elif [[ "$BASELINE" == "bff_v2" || "$BASELINE" == "bff_v2_legacy" ]]; then
     # Both v2 variants share the tag shape; `_legacy` distinguishes them so the A/B lands in two
     # files. Without it the pre- and post-extraction runs would overwrite each other, which is the
@@ -244,9 +266,9 @@ elif [[ "$BASELINE" == "bff_v2" || "$BASELINE" == "bff_v2_legacy" ]]; then
     # (0.3 -> 6% saving, 1.0 -> 61%), so two runs that differ only in it are different experiments.
     # It was missing until 2026-08-19, which means every thr0.8 run silently overwrote its
     # predecessor's .json and .log — the most likely reason the 1.42 result no longer exists on disk.
-    RUN_TAG=${RUN_TAG:-mooncake_v2${_V2_VARIANT}_thr${BFF_THRESHOLD}_re${BFF_MAX_REL_ERR}_gs${BFF_GROUP_SIZE}_sig${BFF_SIG_DIM}_dedup${BFF_V2_DEDUP}_res${BFF_V2_RESIDENT}${BFF_FF_GROUPS:+_g${BFF_FF_GROUPS//,/}}_con_${MAX_CONCURRENCY}_${NUM_PREFILL}Px${NUM_DECODE}D${RUN_SET:+_s${RUN_SET}}${RUN_REPEAT:+_r${RUN_REPEAT}}}
+    RUN_TAG=${RUN_TAG:-mooncake_v2${_V2_VARIANT}_thr${BFF_THRESHOLD}_re${BFF_MAX_REL_ERR}_gs${BFF_GROUP_SIZE}_sig${BFF_SIG_DIM}_dedup${BFF_V2_DEDUP}_res${BFF_V2_RESIDENT}${BFF_FF_GROUPS:+_g${BFF_FF_GROUPS//,/}}${_MEM_TAG}_con_${MAX_CONCURRENCY}_${NUM_PREFILL}Px${NUM_DECODE}D${RUN_SET:+_s${RUN_SET}}${RUN_REPEAT:+_r${RUN_REPEAT}}}
 else
-    RUN_TAG=${RUN_TAG:-mooncake_${BFF_PD_MERGE}_${BFF_PD_REPR}_thr${BFF_THRESHOLD}_gs${BFF_GROUP_SIZE}_eb${BFF_PD_ENCODED_BATCH_SIZE}_${BFF_PD_CROSS_INDEX}${BFF_FF_GROUPS:+_g${BFF_FF_GROUPS//,/}}_con_${MAX_CONCURRENCY}_${NUM_PREFILL}Px${NUM_DECODE}D${RUN_SET:+_s${RUN_SET}}${RUN_REPEAT:+_r${RUN_REPEAT}}}
+    RUN_TAG=${RUN_TAG:-mooncake_${BFF_PD_MERGE}_${BFF_PD_REPR}_thr${BFF_THRESHOLD}_gs${BFF_GROUP_SIZE}_eb${BFF_PD_ENCODED_BATCH_SIZE}_${BFF_PD_CROSS_INDEX}${BFF_FF_GROUPS:+_g${BFF_FF_GROUPS//,/}}${_MEM_TAG}_con_${MAX_CONCURRENCY}_${NUM_PREFILL}Px${NUM_DECODE}D${RUN_SET:+_s${RUN_SET}}${RUN_REPEAT:+_r${RUN_REPEAT}}}
 fi
 
 # ---- Required BFF / HF environment (CLAUDE.md) -------------------------------

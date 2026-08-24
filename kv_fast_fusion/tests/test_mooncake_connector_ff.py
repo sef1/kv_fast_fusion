@@ -1156,3 +1156,79 @@ def test_stats_report_the_layer_ceiling(monkeypatch):
     s = f.stats_dict()
     assert s["layers_total"] == 6
     assert s["layers_fused"] == 2, "group 0 is never fused and BFF_FF_GROUPS excluded group 2"
+
+
+# =====================================================================================
+# producer hold window
+# =====================================================================================
+# What these pin: the producer pins a finished request's KV from `record_send_reqs` (prefill done,
+# abort timer started) until `fetch_finished_sending_reqs` reports it (pull complete, or the 480 s
+# timeout). That duration x the pinned block count is the ceiling on every "cancel the pull and free
+# P's blocks early" design, and it had never been measured. Both wrapped methods are stock with no
+# other FF override, so a break here is silent — the run simply reports nothing, which is exactly
+# what an unrelated failed run looks like.
+def _hold_worker(monkeypatch):
+    import asyncio as _a
+    w = mc.MooncakeConnectorWorkerFF.__new__(mc.MooncakeConnectorWorkerFF)
+    w._ff_hold, w._ff_hold_done, w._ff_hold_logged = {}, [], 0.0
+    base = mc.MooncakeConnectorWorker
+
+    async def _noop_record(self, metadata):
+        return None
+
+    async def _noop_fetch(self):
+        return self._test_finished
+
+    monkeypatch.setattr(base, "record_send_reqs", _noop_record, raising=False)
+    monkeypatch.setattr(base, "fetch_finished_sending_reqs", _noop_fetch, raising=False)
+    return w, _a
+
+
+@requires_mooncake
+def test_the_hold_window_is_measured_from_prefill_done_to_release(monkeypatch, caplog):
+    """A released request reports a duration and its block count, per-GROUP lists summed."""
+    w, aio = _hold_worker(monkeypatch)
+    meta = types.SimpleNamespace(reqs_to_send={"p0": ("t0", [[1, 2], [3, 4, 5]])})
+
+    aio.run(w.record_send_reqs(meta))
+    assert set(w._ff_hold) == {"p0"} and w._ff_hold["p0"][1] == 5, "per-group lists must be summed"
+
+    w._test_finished = {"p0"}
+    with caplog.at_level("INFO"):
+        aio.run(w.fetch_finished_sending_reqs())
+
+    assert w._ff_hold == {}, "a released request must stop counting as in-flight"
+    assert "BFF hold |" in caplog.text
+    assert "released=1" in caplog.text and "released_blocks=5" in caplog.text
+
+
+@requires_mooncake
+def test_a_flat_block_list_is_counted_too(monkeypatch):
+    """Stock passes a flat list, FF passes per-group lists. Counting only one shape would silently
+    report zero pinned blocks on the other, which reads identically to 'nothing is pinned'."""
+    w, aio = _hold_worker(monkeypatch)
+    aio.run(w.record_send_reqs(
+        types.SimpleNamespace(reqs_to_send={"p0": ("t0", [1, 2, 3])})))
+    assert w._ff_hold["p0"][1] == 3
+
+
+@requires_mooncake
+def test_a_preregistered_request_is_not_a_hold(monkeypatch):
+    """`record_send_reqs` is also called with an empty block list from update_state_after_alloc,
+    before the request has finished prefilling. Counting that as a hold would start the clock long
+    before the blocks are actually pinned and inflate every duration."""
+    w, aio = _hold_worker(monkeypatch)
+    aio.run(w.record_send_reqs(types.SimpleNamespace(reqs_to_send={"p0": ("t0", [])})))
+    assert w._ff_hold == {}
+
+
+@requires_mooncake
+def test_instrumentation_never_breaks_the_transfer(monkeypatch):
+    """The wrapped methods are on the transfer's critical path. A malformed metadata must cost the
+    measurement, never the send."""
+    w, aio = _hold_worker(monkeypatch)
+    aio.run(w.record_send_reqs(types.SimpleNamespace(reqs_to_send={"p0": "not-a-tuple"})))
+    assert w._ff_hold == {}, "bad input is dropped, not raised"
+
+    w._test_finished = {"p0"}
+    assert aio.run(w.fetch_finished_sending_reqs()) == {"p0"}, "the release set still passes through"

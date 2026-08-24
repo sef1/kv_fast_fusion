@@ -28,6 +28,71 @@ import os
 import re
 import sys
 
+# Every environment variable that DEFINES the experiment, with the launcher's own default beside it.
+# The benchmark writes a `config` block of eight fields (model, dataset, num_prompts,
+# max_concurrency, request_rate, burstiness, max_tokens, stream) and nothing else — no topology, no
+# BFF knob, no GPU utilisation. Everything that actually distinguishes two runs survived only in the
+# filename, and `BFF_THRESHOLD_G` not even there.
+#
+# That gap is not cosmetic. On 2026-08-24 a 1P×1D run at 0.52 req/s was read as a slowdown against a
+# 1P×2D run at 1.04 — the same 1374 vs 1312 tok/s PER DECODE GPU — because the decode count appeared
+# nowhere in the result file. A run has to be able to say what it was.
+#
+# The default matters as much as the value: BFF_MAX_REL_ERR unset means 1.0, which is INERT — the
+# aggressive setting, not the safe one — so "unset" is recorded as such rather than silently
+# becoming its default.
+RUN_CONFIG_VARS = (
+    ("BASELINE", "bff_v2"),
+    ("NUM_PREFILL", "1"), ("NUM_DECODE", "1"), ("TP", "1"),
+    ("BFF_THRESHOLD", "0.75"), ("BFF_THRESHOLD_G", None),
+    ("BFF_MAX_REL_ERR", "1.0"), ("BFF_SCALE_MODE", "raw"),
+    ("BFF_SIG_DIM", "128"), ("BFF_GROUP_SIZE", "4"), ("BFF_PD_CROSS_INDEX", "lsh"),
+    ("BFF_V2_DEDUP", "1"), ("BFF_V2_RESIDENT", "1"), ("BFF_FF_GROUPS", None),
+    ("PREFILL_GPU_UTIL", "0.85"), ("DECODE_GPU_UTIL", "0.85"),
+    ("MAX_MODEL_LEN", None), ("MIN_TOKENS", None), ("MAX_TOKENS", None),
+    ("NUM_PROMPTS", None), ("MAX_CONCURRENCY", None),
+)
+
+
+def run_config() -> dict:
+    """The experiment's own settings, read from the launcher's environment.
+
+    The collector is invoked from inside the launch script, so it inherits every knob the run used —
+    no new plumbing, and still strictly post-run. Each entry records the effective value and whether
+    it was explicitly set, because a default that is also the aggressive setting is exactly the case
+    a reader must not have to guess at."""
+    out = {}
+    for name, default in RUN_CONFIG_VARS:
+        raw = os.environ.get(name)
+        out[name.lower()] = {"value": raw if raw is not None else default,
+                             "explicit": raw is not None}
+    return out
+
+
+def cfg_value(data: dict, key: str, fallback=None):
+    """One run_config value, tolerating result files written before run_config existed."""
+    entry = (data.get("run_config") or {}).get(key)
+    if isinstance(entry, dict):
+        return entry.get("value", fallback)
+    return fallback
+
+
+def num_decodes(data: dict) -> int:
+    """How many decode instances served this run.
+
+    Prefers run_config; falls back to counting decode logs in bff_sched so files written before
+    run_config existed still normalise. Returns at least 1 — dividing by zero here would turn a
+    missing field into a crash in the one place that exists to make reading easier."""
+    v = cfg_value(data, "num_decode")
+    try:
+        if v is not None:
+            return max(1, int(v))
+    except (TypeError, ValueError):
+        pass
+    n = len([k for k in (data.get("bff_sched") or {}) if "decode" in k])
+    return max(1, n)
+
+
 sched_pat = re.compile(r"BFF sched \| step=\d+ \| running=(\d+) \| waiting=(\d+) \| "
                        r"free_blocks=(\d+) / (\d+) \| block_usage=([\d.]+)% \| preempt\(cum\)=(\d+)")
 freed_pat = re.compile(r"Block merging freed (-?\d+) blocks")
@@ -53,6 +118,13 @@ pull_fail_pat = re.compile(r"pull FAILED for \S+ \((\d+) blocks invalid\)")
 recompute_pat = re.compile(r"Recovered from KV load failure: (\d+) request\(s\) rescheduled "
                            r"\((\d+) tokens affected\)")
 send_timeout_pat = re.compile(r"timed out after \d+ seconds without being sent")
+# How long the PRODUCER pins a finished request's KV waiting for the decode to pull it, and how many
+# blocks sit in that state. Every "free P's blocks earlier" idea is bounded by this product: a short
+# hold means there is no window to reclaim however clever the signalling, and a small in-flight total
+# means there is nothing worth reclaiming. Emitted by MooncakeConnectorWorkerFF._ff_maybe_log_hold.
+hold_pat = re.compile(
+    r"BFF hold \| released=(\d+) \| held_ms p50=([\d.]+) p90=([\d.]+) max=([\d.]+) \| "
+    r"released_blocks=(\d+) \| in_flight_reqs=(\d+) in_flight_blocks=(\d+) \| stranded=(\d+)")
 # A producer holding a full KV cache with nothing running is wedged behind KV that decode has not
 # pulled: it cannot start new prefills. On a decode this combination cannot persist.
 WEDGE_PCT = 95.0
@@ -203,12 +275,14 @@ def collect(result_file: str, stats_dir: str, logs: list[str]) -> dict:
             if k in s}
 
     sched_per, freed_per, redir_per, sat_per, redundancy_per = {}, {}, {}, {}, {}
-    xfer_per = {}
+    xfer_per, hold_per = {}, {}
     for lg in logs:
         runs, waits, frees, usages, total, preempt_last = [], [], [], [], None, None
         freed_sum = freed_cnt = redir_app = redir_unres = redir_cnt = 0
         sat_run, sat_wait, eng_n, prefix_hits = [], [], 0, []
         fail_cnt = fail_blocks = recov_reqs = recov_tokens = send_timeouts = wedged = 0
+        hold_rel = hold_blocks = hold_stranded = 0
+        hold_p50, hold_p90, hold_max, hold_inflight = [], [], [], []
         try:
             with open(lg) as f:
                 for line in f:
@@ -241,6 +315,19 @@ def collect(result_file: str, stats_dir: str, logs: list[str]) -> dict:
                         recov_tokens += int(rc.group(2))
                     if send_timeout_pat.search(line):
                         send_timeouts += 1
+                    hd = hold_pat.search(line)
+                    if hd:
+                        n = int(hd.group(1))
+                        hold_rel += n
+                        hold_blocks += int(hd.group(5))
+                        hold_stranded += int(hd.group(8))
+                        # Weight the quantiles by how many releases the window covered, so a quiet
+                        # 10 s bucket with one slow request does not outvote a busy one.
+                        if n:
+                            hold_p50 += [float(hd.group(2))] * n
+                            hold_p90 += [float(hd.group(3))] * n
+                            hold_max.append(float(hd.group(4)))
+                        hold_inflight.append(int(hd.group(7)))
                     fr = freed_pat.search(line)
                     if fr:
                         freed_sum += int(fr.group(1))
@@ -266,6 +353,12 @@ def collect(result_file: str, stats_dir: str, logs: list[str]) -> dict:
                            "running": stats(sat_run), "waiting": stats(sat_wait)}
         if prefix_hits and max(prefix_hits) > 0:
             redundancy_per[lg] = {"prefix_cache_hit_pct": stats(prefix_hits)}
+        if hold_inflight:
+            hold_per[lg] = {"released_requests": hold_rel, "released_blocks": hold_blocks,
+                            "held_ms_p50": stats(hold_p50), "held_ms_p90": stats(hold_p90),
+                            "held_ms_max": max(hold_max) if hold_max else 0.0,
+                            "in_flight_blocks": stats(hold_inflight),
+                            "stranded_requests": hold_stranded}
         if fail_cnt or recov_reqs or send_timeouts or wedged:
             xfer_per[lg] = {"failed_pulls": fail_cnt, "invalid_blocks": fail_blocks,
                             "recomputed_requests": recov_reqs,
@@ -278,6 +371,10 @@ def collect(result_file: str, stats_dir: str, logs: list[str]) -> dict:
             data = json.load(f)
     except Exception:
         data = {}
+
+    # Unconditional: a result file must be able to say what experiment produced it, whether or not
+    # any log happened to parse. This is also why the write gate below always fires.
+    data["run_config"] = run_config()
 
     if ov_per:
         avg = sum(v["avg_group_dedup_ms"] for v in ov_per.values()) / len(ov_per)
@@ -508,6 +605,25 @@ def collect(result_file: str, stats_dir: str, logs: list[str]) -> dict:
                       "nothing running (completed KV waiting to be pulled; new prefills "
                       "cannot start)")
 
+    if hold_per:
+        # The ceiling on every "cancel the pull, free P's blocks early" design. The reclaimable
+        # window is the hold duration, and the reclaimable volume is in_flight_blocks x the decline
+        # fraction — so a short hold or a small in-flight total settles the question before any
+        # protocol is written.
+        data["bff_producer_hold"] = hold_per
+        for lg, v in hold_per.items():
+            inf, total = v["in_flight_blocks"], None
+            for slg, sv in sched_per.items():
+                if slg == lg:
+                    total = sv.get("total_blocks")
+            pct = f" ({100.0 * inf['mean'] / total:.0f}% of its cache)" if total else ""
+            print(f"  producer hold [{lg}]: {v['released_requests']} requests released | "
+                  f"held p50={v['held_ms_p50']['mean'] / 1000:.1f}s "
+                  f"p90={v['held_ms_p90']['mean'] / 1000:.1f}s "
+                  f"max={v['held_ms_max'] / 1000:.1f}s | pinned awaiting pull: "
+                  f"mean={inf['mean']:.0f} max={inf['max']} blocks{pct}"
+                  + (f" | {v['stranded_requests']} STRANDED" if v["stranded_requests"] else ""))
+
     if redundancy_per:
         # Read every compression number against this. If the workload repeats almost nothing, a
         # large factor is substitution of interchangeable blocks, not deduplication.
@@ -546,13 +662,12 @@ def collect(result_file: str, stats_dir: str, logs: list[str]) -> dict:
             print(f"  bff redirects applied [{lg}]: {v['redirects_applied']} "
                   f"(reps_unresolved={v['reps_unresolved']})")
 
-    # v2_per belongs here: it comes from bff_stats_*.json rather than the logs, so a run whose logs
-    # parsed to nothing would PRINT its v2 stats and then drop them on the floor unwritten.
-    if (ov_per or cm_per or sched_per or freed_per or redir_per or sat_per
-            or redundancy_per or xfer_per or v2_per or any(cfg_per.values())):
-        with open(result_file, "w") as f:
-            json.dump(data, f, indent=2)
-        print(f"  → merged into {result_file}")
+    # Always written now: run_config is set unconditionally above, so there is always something to
+    # merge. A run whose logs parsed to nothing is exactly the run whose configuration a reader most
+    # needs — gating the write on parsed metrics would drop it precisely then.
+    with open(result_file, "w") as f:
+        json.dump(data, f, indent=2)
+    print(f"  → merged into {result_file}")
 
     return data
 
@@ -568,9 +683,17 @@ def summarize(data: dict) -> None:
     el = data.get("elapsed_s")
     print(f"\n===== SUMMARY [{data.get('label', '')}] =====")
     print(f"  accuracy: F1={f1:.4f}" if isinstance(f1, (int, float)) else "  accuracy: F1=n/a")
+    # Per-decode-GPU throughput sits beside the raw figure because req/s scales with the decode
+    # count, and comparing across topologies without normalising reads as a regression. A 1P×1D run
+    # at 0.52 req/s and a 1P×2D run at 1.04 were 1374 vs 1312 tok/s per decode — the same machine
+    # speed, twice the machines. Whichever way the comparison goes, this is the number that settles
+    # whether anything actually got slower.
+    nd, npf = num_decodes(data), cfg_value(data, "num_prefill", "?")
     print(f"  throughput: {rps:.2f} req/s" if isinstance(rps, (int, float))
           else "  throughput: n/a", end="")
     print((f" | {otps:.1f} output tok/s" if isinstance(otps, (int, float)) else "")
+          + (f" | {otps / nd:.0f} per decode GPU ({npf}P x {nd}D)"
+             if isinstance(otps, (int, float)) else "")
           + (f" | elapsed {el:.1f}s" if isinstance(el, (int, float)) else ""))
     print(f"  latency ms: TTFT[{_lat(data.get('ttft_ms'))}] "
           f"TPOT[{_lat(data.get('tpot_ms'))}] ITL[{_lat(data.get('itl_ms'))}]")
