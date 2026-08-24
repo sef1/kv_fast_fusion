@@ -32,11 +32,13 @@ from vllm.utils.network_utils import make_zmq_socket
 from kv_fast_fusion import pd_dedup_v2, pd_lsh
 from kv_fast_fusion.connectors import mooncake_connector_ff as v1
 from kv_fast_fusion.pd_dedup_v2 import (
+    SCALE_MODE,
     SENTINEL,
     AliasApplier,
     DedupEngine,
     DedupStats,
     SignatureCodec,
+    block_layer_norms,
     signature_matrix,
 )
 
@@ -94,12 +96,18 @@ if v1._MOONCAKE_AVAILABLE:      # the same gate v1 uses
 
             Reads straight out of ``device_kv_caches``, so it costs the producer nothing on the
             forward path — the reason v2 needs no ``save_kv_layer`` hook and no PIECEWISE
-            cudagraph constraint."""
+            cudagraph constraint.
+
+            Under ``BFF_SCALE_MODE=ratio`` it also ships the exact per-(block, layer) K/V norms the
+            decode needs to rescale an alias in-kernel. They ride this payload rather than a new
+            channel, which is what makes ratio mode reachable on a transport whose ACK carries no
+            floats. Layer order is ``sorted(self._group_layers[gi])`` — the SAME order the decode's
+            ``fused_requests`` fill walks, so column *l* means the same layer on both sides."""
             out: dict[int, dict] = {}
             caches = getattr(self, "device_kv_caches", None) or {}
             for gi, block_ids in block_ids_by_group.items():
-                layers = [caches[ln] for ln in sorted(self._group_layers.get(gi, ()))
-                          if ln in caches]
+                names = sorted(self._group_layers.get(gi, ()))
+                layers = [caches[ln] for ln in names if ln in caches]
                 if not layers or not block_ids:
                     continue
                 is_mla = layers[0].ndim == 3
@@ -108,7 +116,15 @@ if v1._MOONCAKE_AVAILABLE:      # the same gate v1 uses
                     continue
                 proj = pd_lsh.get_proj(self._proj, sig.shape[1], sig.device)
                 hashes = pd_lsh.sub_hashes_device(sig, proj).cpu().tolist()
-                out[gi] = SignatureCodec.encode(sig, norms, hashes)
+                kvn = None
+                if SCALE_MODE == "ratio" and len(layers) == len(names):
+                    # Ship a column per layer only when EVERY layer this group names is present.
+                    # The decode indexes the ratio row by position in its own sorted(group_layers),
+                    # so a partial set here would scale layer i by layer j's ratio — silently, and
+                    # no counter would catch it. Withholding instead makes the decode decline the
+                    # alias (`no_kv_norms`) and pull the block, which is merely slower.
+                    kvn = block_layer_norms(layers, block_ids, is_mla)
+                out[gi] = SignatureCodec.encode(sig, norms, hashes, kv_norms=kvn)
             return out
 
         async def send_kv_to_decode(self, identity, sock, meta):
@@ -298,6 +314,11 @@ if v1._MOONCAKE_AVAILABLE:      # the same gate v1 uses
 
         _WORKER_CLS = MooncakeConnectorWorkerFFv2
 
+        # v2 has a channel for the per-block scales: the producer ships exact K/V norms inside the
+        # signature payload and the decode divides by its representative's, so ratio mode needs no
+        # float payload on the ACK — the reason v1 has to downgrade and this does not.
+        _SUPPORTS_SCALE_MODES = True
+
         @classmethod
         def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
             """v1 demanded PIECEWISE because it ran real Python per layer inside ``save_kv_layer``.
@@ -311,8 +332,11 @@ if v1._MOONCAKE_AVAILABLE:      # the same gate v1 uses
             a = getattr(self, "_ff_applier", None)
             if a is None:
                 worker = self.connector_worker
+                # _group_layers is passed by reference, not copied: it is filled in
+                # register_kv_caches and the applier must see whatever is there at apply time.
                 a = self._ff_applier = AliasApplier(
-                    worker._engine, v1.write_runner_block_table, worker.note_failed_blocks)
+                    worker._engine, v1.write_runner_block_table, worker.note_failed_blocks,
+                    group_layers=worker._group_layers)
             return a
 
         def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:

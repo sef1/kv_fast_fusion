@@ -90,6 +90,19 @@ REL_ERR_LABELS = tuple(
 # the cosine bar is the binding constraint and the norm can only make a given pair worse.
 MAX_REL_ERR = float(os.environ.get("BFF_MAX_REL_ERR", "1.0"))
 
+# Under BFF_SCALE_MODE=ratio the norm ratio is CORRECTED in-kernel, so `rel_err` as it happens to
+# fall is no longer what the decode suffers — every accepted pair lands on its floor sqrt(1-cos^2).
+# That changes both halves of the selection:
+#
+#   * ranking — by rel_err, a candidate at cos 0.90 with a matched norm beats one at cos 0.96 that
+#     is 1.5x too big (0.436 vs 0.608). Rescaling erases exactly that disadvantage, so ranking by
+#     rel_err would systematically pick the WORSE of the two. Rank by cosine.
+#   * the bar — MAX_REL_ERR becomes a bar on direction error alone, i.e. cos >= sqrt(1-budget^2).
+#
+# Read from the same env pd_dedup_v2.SCALE_MODE does, so the probe and the payload cannot disagree
+# about which mode a run is in.
+RATIO_MODE = os.environ.get("BFF_SCALE_MODE", "raw").lower() == "ratio"
+
 
 def rel_err(cos: float, norm_ratio: float) -> float:
     """Relative L2 error of substituting a rep for the owner block. See :data:`REL_ERR_BINS`."""
@@ -232,6 +245,12 @@ class LshIndex:
         hits: list[tuple[int, object, int]] = []
         if not self.n_rows:
             return matched, hits
+        # ratio mode turns the error budget into a bar on DIRECTION error alone (see RATIO_MODE):
+        # the norms are corrected in-kernel, so a pair's error is sqrt(1-cos^2) and the budget is
+        # met exactly when cos >= min_cos_for_budget(budget). Folding it into the cosine bar here
+        # keeps the accept test a single comparison and leaves `threshold` meaning what it always
+        # meant. Whichever bar is tighter wins.
+        cos_bar = max(threshold, min_cos_for_budget(MAX_REL_ERR)) if RATIO_MODE else threshold
         for i in range(n):
             owner_i = owners[i]
             if LSH_MAX_CAND > 0:
@@ -254,7 +273,7 @@ class LshIndex:
             rows = torch.tensor(cand_rows, dtype=torch.long, device=self.mat.device)
             sims = self.mat.index_select(0, rows) @ cur[i]              # [C]
             own = float(norms[i]) if norms is not None else None
-            if own is not None and MAX_REL_ERR < 1.0:
+            if own is not None and MAX_REL_ERR < 1.0 and not RATIO_MODE:
                 # Rank by the error the decode will actually suffer, not by cosine. The two
                 # disagree whenever the norms differ: a candidate 1.3x the owner's magnitude is a
                 # bad substitution however well aligned it is, and picking max(cosine) would take
@@ -276,10 +295,20 @@ class LshIndex:
             else:
                 best_val, best_j = sims.max(dim=0)
                 v = float(best_val.item())
-                if v <= threshold:
+                if v <= cos_bar:
+                    # Same accounting as the raw branch: a candidate that cleared the cosine
+                    # THRESHOLD and was stopped by the raised bar was stopped by the error budget,
+                    # so the two modes' histograms stay comparable.
+                    if RATIO_MODE and v > threshold:
+                        self.rejected_by_rel_err += 1
+                        self.reject_cos[_bin(v, ACCEPT_COS_BINS)] += 1
                     continue
                 row = cand_rows[int(best_j.item())]
-                e = (rel_err(v, float(self.row_norm.get(row, own or 1.0)) / (own or 1.0))
+                # In ratio mode the norm ratio is corrected, so the error the decode suffers is the
+                # floor, not the as-it-falls value. Binning the latter would report an accuracy cost
+                # this run does not pay and make the two modes' curves incomparable.
+                e = (min_rel_err(v) if RATIO_MODE else
+                     rel_err(v, float(self.row_norm.get(row, own or 1.0)) / (own or 1.0))
                      if own is not None else None)
             rep_key, rep_slot, _ = self.meta[row]
             hits.append((i, rep_key, rep_slot))

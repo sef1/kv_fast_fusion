@@ -39,25 +39,42 @@ def extract_code(text: str) -> str:
             return blocks[0].strip()
     return text.strip()
 
+# Above this many characters we decline to parse at all. CPython's parser cost is superlinear in
+# nesting depth, and a degenerate generation that runs to max_tokens is routinely tens of KB of
+# unbalanced brackets. Such a blob is never valid Python, so refusing to parse it changes no score —
+# it only bounds the cost. Ordinary answers are a few KB.
+_MAX_PARSE_CHARS = 200_000
+
+# ast.parse raises more than SyntaxError on hostile input: MemoryError (deep nesting / very long
+# source), RecursionError (deeply nested expressions), and ValueError (embedded null bytes). A
+# 6000-token runaway completion hits the first of these, which took down a whole 1024-sample scoring
+# pass after the inference had already succeeded.
+_PARSE_FAILURES = (SyntaxError, ValueError, MemoryError, RecursionError)
+
+
+def _parses(source: str) -> bool:
+    """True iff `source` is parseable Python, treating 'too big to try' as not parseable."""
+    if len(source) > _MAX_PARSE_CHARS:
+        return False
+    try:
+        ast.parse(source)
+        return True
+    except _PARSE_FAILURES:
+        return False
+
+
 def check_syntax_validity(prompt: str, prediction: str) -> bool:
-    """Checks syntax by combining prompt + prediction or dedenting the fragment."""
+    """Checks syntax by combining prompt + prediction or dedenting the fragment.
+
+    Never raises: an input the parser cannot handle is, for this metric's purposes, not valid
+    syntax. Returning False is the honest answer and keeps one pathological sample from voiding the
+    scores of every other sample in the run."""
     clean_pred = extract_code(prediction)
     if not clean_pred:
         return False
-    
-    # 1. Try parsing full concatenated script
-    try:
-        ast.parse(prompt + "\n" + clean_pred)
-        return True
-    except SyntaxError:
-        pass
-        
-    # 2. Try parsing prediction alone after dedenting
-    try:
-        ast.parse(textwrap.dedent(clean_pred))
-        return True
-    except SyntaxError:
-        return False
+
+    # 1. Full concatenated script, then 2. the prediction alone after dedenting.
+    return _parses(prompt + "\n" + clean_pred) or _parses(textwrap.dedent(clean_pred))
 
 def normalized_exact_match(prediction: str, ground_truth: str) -> bool:
     """Exact match comparison ignoring extra blank lines and trailing whitespace."""
@@ -406,6 +423,30 @@ async def main():
     # ==========================================
     # Evaluation Block
     # ==========================================
+    # Persist the raw completions BEFORE scoring. Inference is the expensive half (~25 min of NPU
+    # time for 1024 prompts); scoring is cheap and re-runnable. Writing only the final summary
+    # meant a scoring crash destroyed the inference too — the con200 run reached
+    # "Inference completed ... 1023/1024 ok" and then lost all of it to a MemoryError in ast.parse.
+    # With this file on disk the metrics can be recomputed offline without touching the cluster.
+    try:
+        # Beside the summary, wherever that ends up — --result-file may redirect it out of
+        # --result-dir, and the two belong together.
+        _summary_path = args.result_file or os.path.join(args.result_dir, "benchmark_results.json")
+        raw_file = os.path.join(os.path.dirname(_summary_path) or ".", "raw_outputs.json")
+        os.makedirs(os.path.dirname(raw_file) or ".", exist_ok=True)
+        # Only the three fields scoring reads. Dumping the whole record would carry `itl` — one
+        # float per generated token, ~2.3M of them across a 1024-prompt run — turning a ~5 MB
+        # checkpoint into ~100 MB for data the metrics never look at.
+        slim = [{"prompt": o.get("prompt", ""),
+                 "generated_text": o.get("generated_text", ""),
+                 "success": bool(o.get("success"))} for o in outputs]
+        with open(raw_file, "w") as f:
+            json.dump({"outputs": slim, "sample_ids": list(references.keys())}, f)
+        print(f"\nRaw completions saved to {raw_file}")
+    except Exception as e:
+        # Never let checkpointing be the thing that breaks the run it exists to protect.
+        print(f"  [warn] could not save raw completions: {type(e).__name__}: {e}")
+
     eval_results: Dict[str, Any] = {}
 
     if args.compute_f1 or args.compute_code_metrics:
@@ -416,6 +457,10 @@ async def main():
         ast_valid_scores = []
         em_scores = []
 
+        # Scoring is per sample and must stay that way. A run costs ~25 minutes of NPU time, and
+        # letting one pathological completion abort the loop throws away the other 1023 — which is
+        # exactly what a MemoryError out of ast.parse did on the con200 run.
+        n_scoring_errors = 0
         for output, sample_id in zip(outputs, sample_ids):
             if output.get('success') and output.get('generated_text') is not None:
                 gt = references[sample_id]
@@ -423,13 +468,22 @@ async def main():
                 if gt:
                     eval_preds.append(pred)
                     eval_refs.append(gt)
-                    
-                    if args.compute_f1:
-                        f1_scores.append(f1_score(pred, gt))
 
-                    if args.compute_code_metrics:
-                        ast_valid_scores.append(1.0 if check_syntax_validity(output.get("prompt", ""), pred) else 0.0)
-                        em_scores.append(1.0 if normalized_exact_match(pred, gt) else 0.0)
+                    try:
+                        if args.compute_f1:
+                            f1_scores.append(f1_score(pred, gt))
+
+                        if args.compute_code_metrics:
+                            ast_valid_scores.append(1.0 if check_syntax_validity(output.get("prompt", ""), pred) else 0.0)
+                            em_scores.append(1.0 if normalized_exact_match(pred, gt) else 0.0)
+                    except Exception as e:
+                        # Counted and reported, never silent: a scoring pass that quietly skipped
+                        # samples would bias every metric downstream of it.
+                        n_scoring_errors += 1
+                        print(f"  [warn] scoring failed for sample {sample_id}: {type(e).__name__}: {e}")
+        if n_scoring_errors:
+            print(f"  [warn] {n_scoring_errors} sample(s) could not be scored and are excluded "
+                  f"from the means below.")
 
         print("\n=== Evaluation Results ===")
         if args.compute_f1 and f1_scores:

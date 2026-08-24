@@ -122,7 +122,7 @@ def test_a_duplicate_is_dropped_from_the_pull_request():
 
     assert planned["rA"][1] == [41], "the first copy is still pulled"
     assert planned["rB"][1] == [v2._SENTINEL], "the second is not requested"
-    assert w.take_pending_alias("rB") == {1: {42: (41, "rA")}}
+    assert w.take_pending_alias("rB") == {1: {42: (41, "rA", None)}}
     assert w._engine.stats.dropped_batch == {1: 1} and w._engine.stats.planned == {1: 2}
 
 
@@ -140,7 +140,7 @@ def test_a_dropped_block_keeps_its_position_in_the_request():
     planned = w.plan_pull(req_blocks, sigs, threshold=0.75)
 
     assert planned["rB"][1] == [50, v2._SENTINEL, 52, 53], "same length, hole in the middle"
-    assert w.take_pending_alias("rB") == {1: {51: (40, "rA")}}
+    assert w.take_pending_alias("rB") == {1: {51: (40, "rA", None)}}
 
 
 @requires_mooncake
@@ -227,7 +227,7 @@ def test_a_resident_block_serves_a_later_pull():
     planned = w.plan_pull({"rA": [[], [41]]}, {"rA": {1: _payload([v])}}, threshold=0.75)
 
     assert planned["rA"][1] == [v2._SENTINEL], "served entirely from a block already on D"
-    assert w.take_pending_alias("rA") == {1: {41: (900, "old")}}
+    assert w.take_pending_alias("rA") == {1: {41: (900, "old", None)}}
     assert w._engine.stats.dropped_resident == {1: 1}
 
 
@@ -292,7 +292,7 @@ def test_an_alias_is_not_appliable_until_its_transfer_completes():
     w.process_pulling_result(
         types.SimpleNamespace(ok_reqs=["rB"], err_reqs=None, ff_redirects=None), pull_metas)
 
-    assert w.drain_pending_alias() == {"rB": {1: {42: (41, "rA")}}}, "appliable once it lands"
+    assert w.drain_pending_alias() == {"rB": {1: {42: (41, "rA", None)}}}, "appliable once it lands"
 
 
 @requires_mooncake
@@ -482,7 +482,7 @@ def _connector(worker):
 def test_an_alias_is_applied_and_its_orphan_staged_for_free(monkeypatch):
     from kv_fast_fusion import fast_fusion_block_pool as bp
     w = _worker()
-    w._engine._alias_ready = {"rB": {1: {51: (41, "rA")}}}
+    w._engine._alias_ready = {"rB": {1: {51: (41, "rA", None)}}}
     w._engine._planner._resident.setdefault(1, set()).add(41)      # rep landed and is still held
     w._engine._resident_owner[(1, 41)] = "rA"                      # ...and still owned by rA
     runner = _fake_runner({"rA": [[], [41]], "rB": [[], [50, 51]]})
@@ -506,7 +506,7 @@ def test_an_alias_to_a_freed_representative_forces_a_recompute(monkeypatch):
     What must not change is that a rep which never arrives still ends in recompute."""
     from kv_fast_fusion import fast_fusion_block_pool as bp
     w = _worker()
-    w._engine._alias_ready = {"rB": {1: {51: (41, "rA")}}}       # 41 deliberately NOT resident
+    w._engine._alias_ready = {"rB": {1: {51: (41, "rA", None)}}}       # 41 deliberately NOT resident
     runner = _fake_runner({"rA": [[], [41]], "rB": [[], [50, 51]]})
     monkeypatch.setattr(bp, "_ACTIVE_RUNNER", runner, raising=False)
 
@@ -530,7 +530,7 @@ def test_a_representative_registered_late_is_applied_not_recomputed(monkeypatch)
     ordering into a full re-prefill: 601-765 requests per run, every one rep_not_resident."""
     from kv_fast_fusion import fast_fusion_block_pool as bp
     w = _worker()
-    w._engine._alias_ready = {"rB": {1: {51: (41, "rA")}}}
+    w._engine._alias_ready = {"rB": {1: {51: (41, "rA", None)}}}
     runner = _fake_runner({"rA": [[], [41]], "rB": [[], [50, 51]]})
     monkeypatch.setattr(bp, "_ACTIVE_RUNNER", runner, raising=False)
 
@@ -555,7 +555,7 @@ def test_a_recycled_representative_is_refused_even_though_it_is_resident(monkeyp
     so identity — not presence — is what the apply checks."""
     from kv_fast_fusion import fast_fusion_block_pool as bp
     w = _worker()
-    w._engine._alias_ready = {"rB": {1: {51: (41, "rA")}}}
+    w._engine._alias_ready = {"rB": {1: {51: (41, "rA", None)}}}
     runner = _fake_runner({"rA": [[], [41]], "rB": [[], [50, 51]]})
     monkeypatch.setattr(bp, "_ACTIVE_RUNNER", runner, raising=False)
 
@@ -579,7 +579,7 @@ def test_an_owner_that_never_gets_batched_forces_a_recompute(monkeypatch):
     from kv_fast_fusion import fast_fusion_block_pool as bp
     from kv_fast_fusion import pd_dedup_v2
     w = _worker()
-    w._engine._alias_ready = {"rB": {1: {51: (41, "rA")}}}
+    w._engine._alias_ready = {"rB": {1: {51: (41, "rA", None)}}}
     w._engine._planner._resident.setdefault(1, set()).add(41)
     w._engine._resident_owner[(1, 41)] = "rA"
     runner = _fake_runner({"rA": [[], [41]], "rB": [[], [50, 51]]}, batched=["rA"])
@@ -608,7 +608,7 @@ def test_each_failure_names_its_own_cause(monkeypatch, scenario, reason):
     from kv_fast_fusion import fast_fusion_block_pool as bp
     w = _worker()
     victim = 51 if scenario == "rep_freed" else 99      # 99 is not in rB's table
-    w._engine._alias_ready = {"rB": {1: {victim: (41, "rA")}}}
+    w._engine._alias_ready = {"rB": {1: {victim: (41, "rA", None)}}}
     if scenario == "victim_gone":
         w._engine._planner._resident.setdefault(1, set()).add(41)
         w._engine._resident_owner[(1, 41)] = "rA"
@@ -732,7 +732,7 @@ def test_the_default_applier_never_reaches_the_ambiguity_branch():
     """`normalize_req_id` defaults to identity and the runner's batch is a dict, so two entries can
     never collide. The GPU stats reporting owner_id_ambiguous=0 is not luck — it is unreachable."""
     engine = pd_dedup_v2.DedupEngine(resident=False)
-    engine._alias_ready = {"rB": {1: {51: (41, "rA")}}}
+    engine._alias_ready = {"rB": {1: {51: (41, "rA", None)}}}
     engine._planner._resident.setdefault(1, set()).add(41)
     engine._resident_owner[(1, 41)] = "rA"
     runner = _fake_runner({"rA": [[], [41]], "rB": [[], [50, 51]]})

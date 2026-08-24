@@ -181,10 +181,10 @@ def test_a_declined_block_becomes_a_pending_alias_not_an_applied_one():
 
     _answer(engine, 1, {"rA": [41], "rB": [42]}, {"rA": _payload([v]), "rB": _payload([v])})
 
-    assert engine.pending_alias("rB") == {1: {42: (41, "rA")}}
+    assert engine.pending_alias("rB") == {1: {42: (41, "rA", None)}}
     assert engine.drain_ready() == {}, "not appliable while the KV is in flight"
     engine.release("rB")
-    assert engine.drain_ready() == {"rB": {1: {42: (41, "rA")}}}
+    assert engine.drain_ready() == {"rB": {1: {42: (41, "rA", None)}}}
 
 
 def test_a_request_that_never_lands_never_becomes_appliable():
@@ -398,7 +398,7 @@ def test_the_applier_finds_the_owner_through_the_local_id_suffix():
     out under the LOCAL id — the block table and the merge channel are both addressed that way."""
     ext_a, ext_b = "chatcmpl-aaa", "chatcmpl-bbb"
     engine = DedupEngine(resident=False)
-    engine._alias_ready = {ext_b: {1: {51: (41, ext_a)}}}
+    engine._alias_ready = {ext_b: {1: {51: (41, ext_a, None)}}}
     engine._planner._resident.setdefault(1, set()).add(41)
     engine._resident_owner[(1, 41)] = ext_a
     runner = _applier_runner({ext_a + SUFFIX: [[], [41]], ext_b + SUFFIX: [[], [50, 51]]})
@@ -419,7 +419,7 @@ def test_an_id_space_mismatch_ages_every_alias_out_as_owner_never_batched():
     suffixed runner ids finds nothing at all."""
     ext_a, ext_b = "chatcmpl-aaa", "chatcmpl-bbb"
     engine = DedupEngine(resident=False)
-    engine._alias_ready = {ext_b: {1: {51: (41, ext_a)}}}
+    engine._alias_ready = {ext_b: {1: {51: (41, ext_a, None)}}}
     engine._planner._resident.setdefault(1, set()).add(41)
     engine._resident_owner[(1, 41)] = ext_a
     runner = _applier_runner({ext_a + SUFFIX: [[], [41]], ext_b + SUFFIX: [[], [50, 51]]})
@@ -438,7 +438,7 @@ def test_the_default_normalizer_is_identity():
     """CUDA runs with matching ids (the stable-id patch) and must be untouched by this change."""
     rid = "chatcmpl-aaa"
     engine = DedupEngine(resident=False)
-    engine._alias_ready = {rid: {1: {51: (41, "owner")}}}
+    engine._alias_ready = {rid: {1: {51: (41, "owner", None)}}}
     engine._planner._resident.setdefault(1, set()).add(41)
     engine._resident_owner[(1, 41)] = "owner"
     runner = _applier_runner({"owner": [[], [41]], rid: [[], [50, 51]]})
@@ -460,7 +460,7 @@ def test_two_batched_requests_sharing_an_external_id_are_refused_not_guessed_at(
     assert len({a2.to_external_request_id(r) for r in locals_}) == 1, "the collision under test"
 
     engine = DedupEngine(resident=False)
-    engine._alias_ready = {ext: {1: {51: (41, "owner")}}}
+    engine._alias_ready = {ext: {1: {51: (41, "owner", None)}}}
     engine._planner._resident.setdefault(1, set()).add(41)
     engine._resident_owner[(1, 41)] = "owner"
     runner = _applier_runner({"owner" + SUFFIX: [[], [41]],

@@ -1511,6 +1511,14 @@ if _MOONCAKE_AVAILABLE:
         # restating this __init__ (which deliberately skips MooncakeConnector's — see below).
         _WORKER_CLS = MooncakeConnectorWorkerFF
 
+        # Whether BFF_SCALE_MODE other than "raw" reaches the kernel on this connector. False here
+        # because v1 has nowhere to put the per-block scales: its redirect map rides the transfer
+        # ACK, which carries no float payload. v2 sets it True — the producer ships exact per-block
+        # K/V norms inside the signature payload and the scale is computed entirely on the decode,
+        # so no new wire channel is involved. Kept as a class flag rather than an isinstance check
+        # so a downgrade is a property of the connector, stated where the connector is defined.
+        _SUPPORTS_SCALE_MODES = False
+
         def __init__(self, vllm_config, role, kv_cache_config=None):
             # NOTE: deliberately skips MooncakeConnector.__init__ and initializes its base
             # directly. The stock __init__ constructs the STOCK worker, which spins up a Transfer
@@ -1540,11 +1548,12 @@ if _MOONCAKE_AVAILABLE:
 
             self.is_producer = kv_cfg.kv_role == "kv_producer"
             self._ff_fuse = _BFF_PD_FUSE
-            if self._ff_fuse and _PD_SCALE_MODE != "raw":
+            if self._ff_fuse and _PD_SCALE_MODE != "raw" and not self._SUPPORTS_SCALE_MODES:
                 logger.warning(
-                    "MooncakeConnectorFF: BFF_SCALE_MODE=%s is not supported on this transport "
-                    "(the redirect maps ride the transfer ACK, which carries no float payload) — "
-                    "running as 'raw'. Use the NCCL connector for ratio mode.", _PD_SCALE_MODE)
+                    "%s: BFF_SCALE_MODE=%s is not supported by this connector (v1's redirect maps "
+                    "ride the transfer ACK, which carries no float payload) — running as 'raw'. "
+                    "Use the v2 connector, or NCCL, for ratio mode.",
+                    type(self).__name__, _PD_SCALE_MODE)
             self._fusion = FFProducerFusion() if self._ff_fuse else None
             self._ff_tp = _UNSET
             self._ff_step = 0

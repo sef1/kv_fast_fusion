@@ -161,9 +161,16 @@ def apply_fast_fusion_pd_patch():
                 num_layers, num_slots + 1, max_blocks_per_req,
                 dtype=torch.bfloat16, device=self.device)
             self._fused_slot = {}                          # req_id → slot in [1, num_slots]
+            self._fused_filled = {}                        # req_id → layers written (see refill)
             self._free_slots = list(range(1, num_slots + 1))
             self._seq_to_slot = torch.zeros(max_reqs, dtype=torch.int32, device=self.device)
             self._seq_to_slot_cpu = torch.zeros(max_reqs, dtype=torch.int32, device="cpu")
+            # The kernel is bound only for layers in [warmup, max_layer). A FUSION layer outside
+            # that window would be substituted UNSCALED — raw-mode error re-entering through the
+            # back door, and invisible. It cannot happen today: fast_fusion_core splits
+            # `warmup = layers[0:2] + layers[-2:]`, `fused = layers[2:-2]`, exactly this window. The
+            # two sides derive the bound independently, so _pd_refill_grown checks the agreement
+            # against the layers that actually carry scales rather than trusting this comment.
             self._ff_warmup_layers = 2
             self._ff_max_layer_idx = num_layers - 2
             logger.info("Fast fusion P/D ratio: norm buffers [%d layers, %d slots, %d blocks/req].",
@@ -286,6 +293,59 @@ def _apply_pd_ratio_kernel_infra() -> None:
 
     _orig_build_meta = GPUModelRunner._build_attention_metadata
 
+    def _pd_refill_grown(runner) -> None:
+        """Re-write the norm rows of any request whose scales GREW after its slot was filled.
+
+        `_fill_norm_buffers` is write-once per request (`if req_id in self._fused_slot: continue`) —
+        correct for the single-instance path, where a request's whole ratio map is known before it
+        is ever batched. In P/D it is not: `AliasApplier` applies group by group, and the
+        `rep_not_resident` retry deliberately carries a group over to a later step. A request whose
+        group 1 alias lands at step N and group 3 alias at step N+2 would keep the slot it got at
+        step N and group 3's scale would never reach the buffer — an UNSCALED substitution, the one
+        error ratio mode exists to remove, showing up only as unexplained accuracy loss.
+
+        Cheap because it fires only on the growth: `_fused_filled` records how many layers were
+        written, so the steady state is one dict lookup per fused request."""
+        filled = runner._fused_filled
+        dt = runner.norms_k_buf.dtype
+        B = runner.norms_k_buf.shape[2]
+        for rid, slot in runner._fused_slot.items():
+            per_layer = runner.fused_requests.get(rid)
+            if per_layer is None or filled.get(rid) == len(per_layer):
+                continue
+            for layer_name, (nk, nv) in per_layer.items():
+                try:
+                    li = int(layer_name.split('.')[2])
+                except Exception:
+                    continue
+                # A scale for a layer the kernel is not bound to is a substitution that silently
+                # stays unscaled. Say so once — it means the group split and the kernel window have
+                # drifted apart, and no accuracy number would name the cause.
+                if not (runner._ff_warmup_layers <= li < runner._ff_max_layer_idx):
+                    if not getattr(runner, "_ff_window_warned", False):
+                        runner._ff_window_warned = True
+                        logger.warning(
+                            "BFF P/D ratio: layer %s (index %d) carries a scale but is outside the "
+                            "kernel window [%d, %d) — that alias is applied UNSCALED. The fusion "
+                            "group split and the kernel window no longer agree.",
+                            layer_name, li, runner._ff_warmup_layers, runner._ff_max_layer_idx)
+                    continue
+                n = min(nk.shape[0], B)
+                runner.norms_k_buf[li, slot, :n] = nk[:n].to(dt)
+                runner.norms_v_buf[li, slot, :n] = nv[:n].to(dt)
+            filled[rid] = len(per_layer)
+            # Once per process: the single line that says the scales reached the GPU buffer the
+            # kernel reads. Everything upstream can succeed while this never happens (the connector
+            # downgraded to raw, the norms were never shipped, the runner has no buffers), and the
+            # only other symptom is an accuracy number that quietly looks like raw mode.
+            if not getattr(runner, "_ff_ratio_logged", False):
+                runner._ff_ratio_logged = True
+                logger.info(
+                    "BFF P/D ratio: first scales in the norm buffers | req=%s slot=%d layers=%d "
+                    "| k range [%.3f, %.3f]", rid, slot, len(per_layer),
+                    float(runner.norms_k_buf[:, slot, :].min()),
+                    float(runner.norms_k_buf[:, slot, :].max()))
+
     def _pd_build_attention_metadata(self, *args, **kwargs):
         out = _orig_build_meta(self, *args, **kwargs)
         if getattr(self, "norms_k_buf", None) is None:
@@ -301,10 +361,28 @@ def _apply_pd_ratio_kernel_infra() -> None:
                     self.norms_k_buf[:, slot, :] = 1.0
                     self.norms_v_buf[:, slot, :] = 1.0
                     self.fused_requests.pop(rid, None)
+                    self._fused_filled.pop(rid, None)
             # Slot-fill (write-once) + build this step's seq→slot map, matching single-instance.
             req_ids = self.input_batch.req_ids
             fused_reqs = [r for r in req_ids if r in self.fused_requests]
+            _pd_refill_grown(self)
             self._fill_norm_buffers(req_ids, fused_reqs)
+            # `_fill_norm_buffers` skips a request when `_free_slots` is empty, and a request with
+            # no slot maps to seq_to_slot 0 — the all-ones sentinel row — so its aliases are applied
+            # UNSCALED. There is one slot per max_num_seqs and the decode has been seen running 149
+            # of 150, so this is not a hypothetical margin. It is also completely silent: the run
+            # still reports ratio mode, still pays for the kernel, and quietly delivers raw for
+            # whichever requests lost the race. Count it, and name it once.
+            missing = [r for r in fused_reqs if r not in self._fused_slot]
+            if missing:
+                self._ff_slots_missed = getattr(self, "_ff_slots_missed", 0) + len(missing)
+                if not getattr(self, "_ff_slots_warned", False):
+                    self._ff_slots_warned = True
+                    logger.warning(
+                        "BFF P/D ratio: %d fused request(s) got no norm slot (%d of %d in use) — "
+                        "their aliases are applied UNSCALED. Raise --max-num-seqs or the slot "
+                        "count; every later occurrence is counted, not logged.",
+                        len(missing), len(self._fused_slot), self.norms_k_buf.shape[1] - 1)
             # Attach the full slot-indexed buffers + seq→slot to every fusion-layer metadata so
             # patched_forward selects [layer_idx]. has_fused_reqs gates the kernel vs flash path
             # (forced True during cudagraph capture so the captured graph records the kernel).

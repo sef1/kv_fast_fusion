@@ -79,7 +79,19 @@ FAIL_REASONS = ("owner_never_batched", "rep_not_resident", "victim_not_in_table"
 # all-zero stats as one that asked and found nothing, and the first Ascend run was the former for
 # an entire benchmark before a log dive found it. Silence is not an acceptable report.
 SKIP_REASONS = ("no_kv_tensors", "no_signature", "length_mismatch", "kv_layout_refused",
-                "no_peer", "empty_group")
+                "no_peer", "empty_group", "no_kv_norms")
+
+# How a substituted block is read on the decode.
+#   "raw"   : the victim reads the representative's block verbatim. The substitution error is
+#             ``sqrt(1 + r^2 - 2*r*cos)`` with r the norm ratio as it happens to fall, which is why
+#             MAX_REL_ERR has to reject most candidates to protect accuracy.
+#   "ratio" : the victim reads the SAME physical block scaled by its own ``||victim||/||rep||`` per
+#             layer, applied in-kernel as the block is loaded (fast_fusion_triton_attn) so one block
+#             serves several requests at different scales. That drives the error to its optimum
+#             ``sqrt(1 - cos^2)``, which no norm ratio can beat, so the cosine bar becomes the only
+#             accuracy knob and MAX_REL_ERR stops having to do the rejecting.
+# Read from the same env the runner-side kernel infra keys off, so the two cannot disagree.
+SCALE_MODE = os.environ.get("BFF_SCALE_MODE", "raw").lower()
 
 
 def threshold_for(gi: int) -> float:
@@ -125,6 +137,58 @@ def key_blocks(kv, idx: "torch.Tensor", is_mla: bool) -> "torch.Tensor":
     if not hasattr(k, "index_select"):
         raise KVLayoutError(f"per-layer cache is a {type(k).__name__}, not a tensor")
     return k.index_select(0, idx)
+
+
+def value_blocks(kv, idx: "torch.Tensor", is_mla: bool):
+    """The V counterpart of :func:`key_blocks`, or ``None`` where there is no separate V.
+
+    MLA keeps a single latent cache with no distinct V, so a caller that needs a V scale must treat
+    ``None`` as "leave it at 1.0" rather than reusing K's — scaling a latent by a K-derived ratio
+    would be a silent, unbounded error."""
+    if isinstance(kv, (list, tuple)):
+        if len(kv) < 2:
+            return None
+        v = kv[1]                       # Ascend: [K, V], each [num_blocks, ...]
+    elif is_mla:
+        return None                     # single latent cache: no separate V to scale
+    elif kv.ndim >= 4 and kv.shape[0] == 2:
+        return kv[1].index_select(0, idx)   # GPU stacked [2, num_blocks, ...]
+    else:
+        return None                     # a bare K tensor: nothing to pair it with
+    if not hasattr(v, "index_select"):
+        raise KVLayoutError(f"per-layer V cache is a {type(v).__name__}, not a tensor")
+    return v.index_select(0, idx)
+
+
+def block_layer_norms(kv_layers: list, block_ids: list[int], is_mla: bool):
+    """Exact per-(block, layer) L2 norms of K and V, as ``([N, L], [N, L])`` float32 on CPU.
+
+    These are what the ratio kernel scales by, and they are deliberately NOT the norms
+    :func:`signature_matrix` returns. Those are norms of the JL *projection* — an estimate carrying
+    ~1/sqrt(SIG_DIM) error (≈9% at the default 128) — and they cover K only, because the signature
+    is built from K. A scale factor is applied to the KV that is actually read, so it has to be
+    exact and it has to exist for V.
+
+    Per LAYER, not per group: the signature's cosine is a group-level quantity (the group's layers
+    concatenated), but the kernel's buffer is indexed ``[layer, slot, block]`` and each layer's KV
+    has its own magnitude. Collapsing the group to one scale would mis-scale every layer but one.
+
+    Where a layer has no separate V (MLA), that column is left at 1.0 — see :func:`value_blocks`."""
+    if not block_ids or not kv_layers:
+        return None, None
+    first = kv_layers[0]
+    probe = first[0] if isinstance(first, (list, tuple)) else first
+    idx = torch.as_tensor(block_ids, dtype=torch.long, device=probe.device)
+    n, L = len(block_ids), len(kv_layers)
+    k_out = torch.ones(n, L, dtype=torch.float32)
+    v_out = torch.ones(n, L, dtype=torch.float32)
+    for li, kv in enumerate(kv_layers):
+        k = key_blocks(kv, idx, is_mla).float().reshape(n, -1)
+        k_out[:, li] = k.norm(dim=1).cpu()
+        v = value_blocks(kv, idx, is_mla)
+        if v is not None:
+            v_out[:, li] = v.float().reshape(n, -1).norm(dim=1).cpu()
+    return k_out, v_out
 
 
 def signature_matrix(kv_layers: list, block_ids: list[int], is_mla: bool, jl_holder: list,
@@ -177,19 +241,49 @@ class SignatureCodec:
     encoder."""
 
     @staticmethod
-    def encode(sig: torch.Tensor, norms: torch.Tensor, hashes: list) -> dict:
-        return {"sig": sig.to(torch.float16).cpu().numpy().tobytes(),
-                "dim": int(sig.shape[1]),
-                "norms": [float(x) for x in norms.detach().cpu().tolist()],
-                "hashes": hashes}
+    def encode(sig: torch.Tensor, norms: torch.Tensor, hashes: list,
+               kv_norms: tuple | None = None) -> dict:
+        """``kv_norms`` is the optional ``(k[N, L], v[N, L])`` from :func:`block_layer_norms`.
+
+        Carried as fp32 bytes because it is a *scale factor* applied to real KV, not a similarity
+        estimate: fp16 would inject ~0.1% into every aliased block for no meaningful saving. At 4
+        layers per group that is 32 B against a ~1 MB block — 0.003% of the wire."""
+        out = {"sig": sig.to(torch.float16).cpu().numpy().tobytes(),
+               "dim": int(sig.shape[1]),
+               "norms": [float(x) for x in norms.detach().cpu().tolist()],
+               "hashes": hashes}
+        if kv_norms is not None and kv_norms[0] is not None:
+            k, v = kv_norms
+            out["kvn"] = k.to(torch.float32).cpu().numpy().tobytes()
+            out["kvn_v"] = v.to(torch.float32).cpu().numpy().tobytes()
+            out["kvn_layers"] = int(k.shape[1])
+        return out
 
     @staticmethod
     def decode(payload: dict):
+        """The similarity half: ``(sig, norms, hashes)``. Deliberately unchanged by ratio mode —
+        the scale data is a separate concern with a separate reader (:meth:`kv_norms`), so raw-mode
+        callers neither parse it nor care whether the producer shipped it."""
         import numpy as np
         dim = int(payload["dim"])
         arr = np.frombuffer(payload["sig"], dtype=np.float16).reshape(-1, dim)
         return (torch.from_numpy(arr.copy()).float(),
                 payload["norms"], payload["hashes"])
+
+    @staticmethod
+    def kv_norms(payload: dict):
+        """The scale half: exact ``(k[N, L], v[N, L])``, or ``None`` from a producer running raw.
+
+        Returning ``None`` rather than ones is the point — it lets the consumer tell "this producer
+        does not ship scales" from "these blocks happen to scale by 1", and refuse to alias under
+        ratio mode instead of silently substituting unscaled KV."""
+        import numpy as np
+        if payload.get("kvn") is None:
+            return None
+        L = int(payload["kvn_layers"])
+        k = np.frombuffer(payload["kvn"], dtype=np.float32).reshape(-1, L)
+        v = np.frombuffer(payload["kvn_v"], dtype=np.float32).reshape(-1, L)
+        return torch.from_numpy(k.copy()), torch.from_numpy(v.copy())
 
 
 class DedupStats:
@@ -354,11 +448,12 @@ class DedupEngine:
         self.stats = DedupStats()
         self._planner = DedupPlanner()
         self._resident_enabled = V2_RESIDENT if resident is None else resident
-        # Decided, transfer still in flight: {req_id: {group: {victim_block: (rep, rep_owner)}}}.
+        # Decided, transfer still in flight:
+        # {req_id: {group: {victim_block: (rep, rep_owner, scale_or_None)}}}.
         # Keyed by the victim's BLOCK ID, not its slot, because a transfer covers only a request's
         # unhashed tail while the runner's table is the full list — matching by value removes the
         # offset entirely and rejects a stale entry for free.
-        self._pending_alias: dict[str, dict[int, dict[int, tuple[int, str]]]] = {}
+        self._pending_alias: dict[str, dict[int, dict[int, tuple[int, str, tuple | None]]]] = {}
         # Decided AND landed. Only entries here are handed to the apply path.
         #
         # The distinction is the whole reason the first v2 run applied 22 of 26,531 aliases: the
@@ -366,12 +461,17 @@ class DedupEngine:
         # owner to be batched, but an owner cannot be batched until its KV lands, which is the
         # entire remote round trip. Staging at decision time started that clock a whole transfer too
         # early, so essentially every alias expired and its never-written block went to recompute.
-        self._alias_ready: dict[str, dict[int, dict[int, tuple[int, str]]]] = {}
+        self._alias_ready: dict[str, dict[int, dict[int, tuple[int, str, tuple | None]]]] = {}
         # Signatures of the blocks a transfer is actually fetching, held until it lands: only then
         # is the KV real and the block a legal alias target.
         self._pending_resident: dict[str, dict[int, tuple]] = {}
         # (group, block id) -> the request that brought it in, for the apply-time check.
         self._resident_owner: dict[tuple[int, int], str] = {}
+        # (group, block id) -> exact per-layer (||K||, ||V||) as the producer measured them.
+        # Only the representative side needs this: the victim's norms arrive with its own signature
+        # and are consumed the moment the alias is decided. Kept in lockstep with _resident_owner —
+        # both are dropped in on_blocks_freed, so a stale block can never supply a scale.
+        self._block_kvn: dict[tuple[int, int], tuple] = {}
         if self._resident_enabled:
             self._install_free_hook()
 
@@ -395,9 +495,15 @@ class DedupEngine:
     def on_blocks_freed(self, freed_ids) -> None:
         with self.lock:
             self._planner.forget_any(freed_ids)
-            for b in freed_ids:
-                for key in [k for k in self._resident_owner if k[1] == int(b)]:
-                    self._resident_owner.pop(key, None)
+            # One pass over the index per free EVENT, not per freed block: the old form rescanned
+            # every resident key for each id, which is O(freed x index) on the block pool's hot
+            # release path with an index that holds tens of thousands of blocks.
+            gone = {int(b) for b in freed_ids}
+            for key in [k for k in self._resident_owner if k[1] in gone]:
+                self._resident_owner.pop(key, None)
+                # Kept in lockstep: a scale computed from a freed block's norms would describe KV
+                # that no longer exists there.
+                self._block_kvn.pop(key, None)
 
     # -- deciding ------------------------------------------------------------------------
     def plan(self, req_blocks: dict, signatures: dict, threshold=None) -> dict:
@@ -416,6 +522,10 @@ class DedupEngine:
             thr = threshold_for(gi) if threshold is None else threshold
             incoming: list[IncomingBlock] = []
             mats, hashes, norms = [], [], []
+            # Exact per-(block, layer) KV norms, keyed by signature row, kept only under ratio mode.
+            # They are the numerator of every scale this group will produce; the representative's
+            # side is looked up from _block_kvn, which release() fills for blocks that stay.
+            kvn_rows: dict[int, tuple] = {}
             row = 0
             for rid, per_group in req_blocks.items():
                 payload = (signatures.get(rid) or {}).get(gi)
@@ -423,6 +533,7 @@ class DedupEngine:
                     continue
                 ids = per_group[gi] if gi < len(per_group) else []
                 sig, nrm, hsh = SignatureCodec.decode(payload)
+                pk = SignatureCodec.kv_norms(payload) if SCALE_MODE == "ratio" else None
                 if sig.shape[0] != len(ids):
                     # P and D disagree about this request's block count. Never guess: leave the
                     # request alone and it transfers exactly as vanilla would.
@@ -435,6 +546,8 @@ class DedupEngine:
                 norms.extend(nrm)
                 hashes.extend(hsh)
                 for slot, bid in enumerate(ids):
+                    if pk is not None:
+                        kvn_rows[row] = (pk[0][slot], pk[1][slot])
                     incoming.append(IncomingBlock(rid, gi, slot, int(bid), row))
                     row += 1
             if not incoming:
@@ -445,25 +558,37 @@ class DedupEngine:
                 plan = self._planner.plan(gi, incoming, sigs, hashes, norms, thr)
                 self.stats.planned[gi] = self.stats.planned.get(gi, 0) + len(incoming)
                 self.stats.absorb(gi, plan)
-                self._record(gi, plan, incoming, sigs, hashes, norms, planned)
+                self._record(gi, plan, incoming, sigs, hashes, norms, planned, kvn_rows)
                 self.stats.index_blocks[gi] = self._planner.size(gi)
         return planned
 
-    def _record(self, gi, plan, incoming, sigs, hashes, norms, planned) -> None:
+    def _record(self, gi, plan, incoming, sigs, hashes, norms, planned, kvn_rows=None) -> None:
         """Turn one group's plan into sentinels, pending aliases and pending residency."""
         by_slot = {(b.req_id, b.slot): b for b in incoming}
         owner_of = {b.block_id: b.req_id for b in incoming}
+        kvn_rows = kvn_rows or {}
 
         for (rid, g), slots in plan.alias.items():
             for slot, rep in slots.items():
-                victim = by_slot[(rid, slot)].block_id
+                blk = by_slot[(rid, slot)]
+                victim = blk.block_id
                 same_transfer = owner_of.get(int(rep))
                 rep_owner = same_transfer or self._resident_owner.get((g, int(rep)))
                 if rep_owner is None:
                     continue      # cannot name an owner → do not risk it; fetch the block
+                scale = None
+                if SCALE_MODE == "ratio":
+                    scale = self._scale_for(g, rep, kvn_rows.get(blk.row), same_transfer, by_slot,
+                                            owner_of, kvn_rows)
+                    if scale is None:
+                        # Ratio mode promises every substituted block is norm-corrected. Without
+                        # both sides' norms it cannot be, and shipping an unscaled alias would be
+                        # the raw-mode error this whole path exists to remove. Fetch the block.
+                        self.stats.note_skip("no_kv_norms")
+                        continue
                 planned[rid][g][slot] = SENTINEL
                 self._pending_alias.setdefault(rid, {}).setdefault(g, {})[victim] = (
-                    int(rep), rep_owner)
+                    int(rep), rep_owner, scale)
                 d = self.stats.dropped_batch if same_transfer else self.stats.dropped_resident
                 d[g] = d.get(g, 0) + 1
 
@@ -475,7 +600,30 @@ class DedupEngine:
                 sigs[torch.as_tensor(rows, dtype=torch.long)],
                 [hashes[r] for r in rows],
                 [norms[r] for r in rows],
-                [by_slot[(rid, s)].block_id for s in keep_slots])
+                [by_slot[(rid, s)].block_id for s in keep_slots],
+                [kvn_rows.get(r) for r in rows])
+
+    def _scale_for(self, g, rep, victim_kvn, same_transfer, by_slot, owner_of, kvn_rows):
+        """``(k_ratio[L], v_ratio[L])`` = ``||victim|| / ||rep||`` per layer, or None if unknown.
+
+        The representative's norms come from two different places depending on where it lives: a
+        block from THIS transfer has not been registered yet, so its norms are still in this
+        batch's rows; a resident one was registered by an earlier transfer. Both are exact producer
+        norms — never the projected ones, which are estimates and K-only."""
+        if victim_kvn is None:
+            return None
+        if same_transfer is not None:
+            rep_kvn = next((kvn_rows.get(b.row) for b in by_slot.values()
+                            if b.block_id == int(rep)), None)
+        else:
+            rep_kvn = self._block_kvn.get((g, int(rep)))
+        if rep_kvn is None:
+            return None
+        vk, vv = victim_kvn
+        rk, rv = rep_kvn
+        # Clamp the denominator, not the ratio: a zero-norm representative is degenerate, and
+        # dividing by it would produce inf scales that poison the whole request's attention.
+        return (vk / rk.clamp(min=1e-6), vv / rv.clamp(min=1e-6))
 
     # -- landing -------------------------------------------------------------------------
     def release(self, req_id: str) -> None:
@@ -489,10 +637,12 @@ class DedupEngine:
         if not pend or not self._resident_enabled:
             return
         with self.lock:
-            for gi, (sig, hsh, nrm, ids) in pend.items():
+            for gi, (sig, hsh, nrm, ids, kvn) in pend.items():
                 self._planner.register(gi, sig, hsh, nrm, ids)
-                for b in ids:
+                for i, b in enumerate(ids):
                     self._resident_owner[(gi, int(b))] = req_id
+                    if kvn[i] is not None:
+                        self._block_kvn[(gi, int(b))] = kvn[i]
                 self.stats.index_blocks[gi] = self._planner.size(gi)
 
     def forget(self, req_ids) -> None:
@@ -557,11 +707,16 @@ class AliasApplier:
     joined."""
 
     def __init__(self, engine: DedupEngine, write_block_table, note_failed_blocks,
-                 normalize_req_id=None) -> None:
+                 normalize_req_id=None, group_layers=None) -> None:
         self._engine = engine
         self._write = write_block_table
         self._note_failed = note_failed_blocks
         self._norm = normalize_req_id or (lambda rid: rid)
+        # ratio mode only: ``{group: iterable_of_layer_names}``, the connector worker's own
+        # ``_group_layers`` passed by reference (it is filled during register_kv_caches, possibly
+        # after this object is built, and mutated in place). Without it there is nowhere to put a
+        # scale, so ratio mode has to be inert rather than half-applied — see :meth:`_store_ratios`.
+        self._group_layers = group_layers
         self.pending: dict[str, tuple[dict, int]] = {}
         self.pending_merges: dict | None = None
         self.step = 0
@@ -637,11 +792,15 @@ class AliasApplier:
             local_rid = rid2local[rid]
             # Mutated in place, so a group that is retried keeps this request's original deadline.
             for gi, mapping in list(by_group.items()):
-                new_blocks, why = self._substitute(rid2blocks, rid, gi, mapping)
+                new_blocks, scales, why = self._substitute(rid2blocks, rid, gi, mapping)
                 # Free ONLY when the device table was really rewritten — and recompute whenever it
                 # was not, because unlike v1 the victim block holds nothing.
                 if why is None and self._write(runner, local_rid, int(gi), new_blocks):
                     updated.setdefault(local_rid, {})[int(gi)] = new_blocks
+                    # Strictly after the write: the scales describe a substitution that has actually
+                    # happened, and a scale recorded for a table that was refused would rescale KV
+                    # the victim still owns.
+                    self._store_ratios(runner, local_rid, int(gi), scales, len(new_blocks))
                     n_applied += len(mapping)
                     del by_group[gi]
                     continue
@@ -678,23 +837,66 @@ class AliasApplier:
         the pool frees it, so this is an exact answer to "was it recycled since the decision", which
         is the only way an alias can point at the wrong KV.
 
-        Returns ``(blocks, None)`` on success, ``(None, reason)`` otherwise."""
+        Returns ``(blocks, scales, None)`` on success, ``(None, None, reason)`` otherwise. ``scales``
+        maps a block's POSITION in this group's table to its ``(k[L], v[L])`` per-layer ratio — the
+        position, not the block id, because the kernel indexes norms by ``seq_offset // BLOCK_SIZE``
+        and because after substitution several positions can share one physical block."""
         groups = rid2blocks[rid]
         if gi >= len(groups):
-            return None, "victim_not_in_table"
+            return None, None, "victim_not_in_table"
         blocks = [int(b) for b in groups[gi]]
         pos = {b: i for i, b in enumerate(blocks)}
-        for victim, (rep, owner) in mapping.items():
+        scales: dict[int, tuple] = {}
+        for victim, (rep, owner, scale) in mapping.items():
             if victim not in pos:
-                return None, "victim_not_in_table"
+                return None, None, "victim_not_in_table"
             if not self._engine.is_resident(gi, rep):
-                return None, "rep_not_resident"
+                return None, None, "rep_not_resident"
             # Residency says a block with this id is a legal target; it does not say it is the
             # block we chose. Between decision and apply the id can be freed and reissued to
             # another request, and applying then would point the victim at unrelated KV — silently,
             # which is the one failure mode in this file that no counter would catch. The owner
             # recorded at decision time is what distinguishes them.
             if self._engine.resident_owner(gi, rep) != owner:
-                return None, "rep_recycled"
+                return None, None, "rep_recycled"
             blocks[pos[victim]] = int(rep)
-        return blocks, None
+            if scale is not None:
+                scales[pos[victim]] = scale
+        return blocks, scales, None
+
+    def _store_ratios(self, runner, rid, gi, scales, nb) -> None:
+        """Record this group's per-block K/V scales on ``runner.fused_requests`` for the kernel.
+
+        Shape and semantics are the ones ``fast_fusion_pd_patch`` documents and the NCCL connector
+        already writes (``p2p_nccl_connector_ff._pd_store_ratio``): ``fused_requests[rid][layer_name]
+        = (nk, nv)``, 1-D fp32 of length ``nb``, defaulting to 1.0 so a block that was NOT aliased is
+        left alone. Column *l* of a scale row is ``sorted(group_layers[gi])[l]`` — the same order the
+        producer built the norms in.
+
+        Silent no-op when there is nothing to record, but a *loud* one when ratios exist and there is
+        nowhere to put them: an alias whose scale never reaches the kernel is an unscaled
+        substitution, which is precisely the raw-mode error ratio mode exists to remove, and it would
+        otherwise show up only as unexplained accuracy loss."""
+        if not scales:
+            return
+        names = sorted((self._group_layers or {}).get(gi, ()))
+        fused = getattr(runner, "fused_requests", None)
+        if not names or fused is None:
+            from vllm.logger import init_logger
+            init_logger("vllm.pd_dedup_v2").warning(
+                "BFF v2 ratio: %d scaled alias(es) for %s group %d have nowhere to go "
+                "(group_layers=%s, runner.fused_requests=%s) — they would be applied UNSCALED.",
+                len(scales), rid, gi, bool(names), fused is not None)
+            return
+        per_layer = fused.setdefault(rid, {})
+        for li, ln in enumerate(names):
+            entry = per_layer.get(ln)
+            if entry is None:
+                entry = (torch.ones(nb, dtype=torch.float32),
+                         torch.ones(nb, dtype=torch.float32))
+                per_layer[ln] = entry
+            nk, nv = entry
+            for p, (k_row, v_row) in scales.items():
+                if 0 <= p < nk.shape[0] and li < k_row.shape[0]:
+                    nk[p] = float(k_row[li])
+                    nv[p] = float(v_row[li])
