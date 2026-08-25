@@ -223,12 +223,12 @@ def test_the_producer_is_asked_about_its_blocks_and_the_engine_planned_over_the_
     engine records from that answer addresses D: the alias victim, the representative, the residency
     index, and the ids handed to get_block_ids_with_load_errors, which vLLM reads as D's own blocks.
     Planning over P's ids left AliasApplier unable to find a single victim in D's block table."""
-    aligned = [([10, 11], [70, 71]), ([20], [80])]
+    aligned = [([], []), ([10, 11], [70, 71]), ([20], [80])]
 
     ask, plan = v2.signature_request_and_plan_groups(aligned)
 
-    assert ask == {0: [10, 11], 1: [20]}, "the request carries the PRODUCER's block ids"
-    assert plan == {0: [70, 71], 1: [80]}, "the engine is planned over the DECODE's"
+    assert ask == {1: [10, 11], 2: [20]}, "the request carries the PRODUCER's block ids"
+    assert plan == {1: [70, 71], 2: [80]}, "the engine is planned over the DECODE's"
 
 
 def test_groups_are_keyed_by_index_and_empties_dropped():
@@ -252,7 +252,7 @@ def test_a_group_the_decode_did_not_allocate_is_asked_about_by_neither_side():
     """A full prefix-cache hit on one group leaves P's list non-empty and D's empty. There is
     nothing to read and nothing to alias, so it must not reach the engine at all — an entry with a
     populated `ask` and an empty `plan` would trip plan()'s row-count guard for the whole group."""
-    ask, plan = v2.signature_request_and_plan_groups([([10, 11], [])])
+    ask, plan = v2.signature_request_and_plan_groups([([], []), ([10, 11], [])])
 
     assert ask == {} and plan == {}
 
@@ -261,11 +261,60 @@ def test_the_two_spaces_stay_the_same_length_per_group():
     """plan() refuses a group whose signature row count does not match its block count, and the row
     count comes from `ask`. align_per_group is what makes them equal; this pins that the helper does
     not disturb it."""
-    aligned = [([10, 11, 12], [70, 71, 72])]
+    aligned = [([], []), ([10, 11, 12], [70, 71, 72])]
 
     ask, plan = v2.signature_request_and_plan_groups(aligned)
 
     assert [len(v) for v in ask.values()] == [len(v) for v in plan.values()]
+
+
+# =====================================================================================
+# the warmup group is never eligible
+# =====================================================================================
+def test_the_warmup_group_is_never_asked_about_or_planned():
+    """Group 0 holds layers[0:2] + layers[-2:] — the first two and last two layers. Every other BFF
+    path refuses it by name; this connector was the only one without the guard because it subclasses
+    v1's transport while the policy lived in v1's fusion path, which v2 deletes.
+
+    Unguarded, one run aliased 99.16% of it: 11,582 blocks onto 23 representatives, so nearly every
+    request shared one of 23 physical blocks for its first and last two layers. The output stayed
+    fluent — each substitution was cosine >0.98 — but the model stopped answering the prompt and
+    stopped emitting EOS, and 27.6% of requests ran to the token cap."""
+    aligned = [([10, 11], [70, 71]), ([20, 21], [80, 81])]
+
+    ask, plan = v2.signature_request_and_plan_groups(aligned)
+
+    assert 0 not in ask, "the producer must not even be asked for the warmup group"
+    assert 0 not in plan, "and it must never reach the engine"
+    assert ask == {1: [20, 21]} and plan == {1: [80, 81]}
+
+
+def test_an_explicit_selection_restricts_further_but_cannot_re_admit_the_warmup_group():
+    """BFF_FF_GROUPS is an A/B knob over the ELIGIBLE groups, which never include 0 — same
+    semantics as `_parse_ff_groups`, so one knob means the same thing on both transports."""
+    aligned = [([10], [70]), ([20], [80]), ([30], [90]), ([40], [100])]
+
+    ask, plan = v2.signature_request_and_plan_groups(aligned, groups={0, 1, 3})
+
+    assert set(ask) == {1, 3}, "group 0 stays out even when named explicitly"
+    assert set(plan) == {1, 3}
+
+
+def test_no_selection_means_every_group_except_the_warmup_one():
+    """`None` is 'every eligible group', not 'every group' — the distinction the omission turned on:
+    unset must not mean the warmup group is included."""
+    aligned = [([10], [70]), ([20], [80]), ([30], [90])]
+
+    ask, _plan = v2.signature_request_and_plan_groups(aligned, groups=None)
+
+    assert set(ask) == {1, 2}
+
+
+def test_an_empty_selection_disables_the_exchange_entirely():
+    """Distinct from None. A caller that computed 'no groups' must ask about nothing, not
+    everything."""
+    assert v2.signature_request_and_plan_groups([([10], [70]), ([20], [80])], groups=set()) == ({},
+                                                                                               {})
 
 
 # =====================================================================================

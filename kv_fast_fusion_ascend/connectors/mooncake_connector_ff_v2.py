@@ -48,7 +48,7 @@ codec logic stay unit-testable without an NPU. v1 is untouched; this registers a
 import os
 import threading
 import time
-from typing import Any
+from typing import Any, ClassVar
 
 from vllm.logger import init_logger
 
@@ -115,7 +115,7 @@ def filter_sentinels(planned, *paired):
             *([lst[i] for i in kept if i < len(lst)] for lst in paired))
 
 
-def signature_request_and_plan_groups(aligned):
+def signature_request_and_plan_groups(aligned, groups=None):
     """The two block-id spaces this transport has to keep apart, from one aligned pair per group.
 
     Returns ``(ask, plan)``, both ``{group: [block ids]}``:
@@ -134,10 +134,26 @@ def signature_request_and_plan_groups(aligned):
     Safe only because ``align_per_group`` has already made the two lists equal-length and
     positionally paired, so P's signature rows line up with D's ids slot for slot. Groups with
     nothing to pull are dropped from both: asking about them wastes a payload and invites an
-    empty-signature reply that looks like a failure."""
+    empty-signature reply that looks like a failure.
+
+    **Group 0 is never eligible.** It is the warmup group — ``layers[0:2] + layers[-2:]``, so on
+    Qwen2.5-7B the first two and the last two layers — and every other BFF path refuses it by name:
+    the GPU v2 sender, the Ascend layerwise v2 sender, and v1's own producer fusion. This connector
+    was the only one without the guard, because it subclasses v1's *transport* while the group
+    policy lived in v1's *fusion* path, which v2 deletes. The cost of the omission: 99.16% of group
+    0 aliased in one run, 11,582 blocks collapsed onto 23 representatives, so nearly every request
+    shared one of 23 physical blocks for its first and last two layers. The output stayed fluent —
+    each substitution was individually tiny, mostly cosine >0.98 — but the model stopped answering
+    the prompt and stopped emitting EOS, and 27.6% of requests ran to the token cap.
+
+    ``groups`` restricts further, and is the ``BFF_FF_GROUPS`` selection (``None`` = every eligible
+    group). Taken as a parameter rather than read from v1 so this stays pure and importable off the
+    Ascend stack."""
     ask, plan = {}, {}
     for gi, (remote_ids, local_ids) in enumerate(aligned):
-        if not remote_ids or not local_ids:
+        if gi <= 0 or not remote_ids or not local_ids:
+            continue
+        if groups is not None and gi not in groups:
             continue
         ask[int(gi)] = [int(b) for b in remote_ids]
         plan[int(gi)] = [int(b) for b in local_ids]
@@ -385,6 +401,9 @@ if _ASCEND_AVAILABLE:
         dedup_engine: "DedupEngine | None" = None
         sig_port_offset: int = FF_PULL_V2_PORT_OFFSET
         _logged_first_decline = False
+        # Groups already reported by _warn_on_runaway_groups. Deliberately class-level and shared:
+        # the warning is once per group for the process, not once per request or per thread.
+        _warned_runaway: ClassVar[set] = set()
 
         def _plan_aligned(self, req_meta, aligned):
             """Ask P for signatures of the blocks we are about to read, and decide.
@@ -404,7 +423,7 @@ if _ASCEND_AVAILABLE:
             if (self.dedup_engine is None or self.sig_client is None
                     or not pd_dedup_v2.V2_ENABLED):
                 return {}
-            ask, plan_groups = signature_request_and_plan_groups(aligned)
+            ask, plan_groups = signature_request_and_plan_groups(aligned, v1._FF_GROUPS)
             if not ask:
                 return {}
             # EXTERNAL id, not `remote_request_id` itself: that is P's local request id, while the
@@ -436,7 +455,32 @@ if _ASCEND_AVAILABLE:
                 self.dedup_engine.forget([ext_id])
                 return {}
             out = planned.get(ext_id)
-            return {gi: out[gi] for gi in plan_groups if gi < len(out)} if out else {}
+            if not out:
+                return {}
+            result = {gi: out[gi] for gi in plan_groups if gi < len(out)}
+            self._warn_on_runaway_groups(result)
+            return result
+
+        def _warn_on_runaway_groups(self, planned) -> None:
+            """Say so when a group is being deduped almost entirely.
+
+            A group whose blocks are nearly all interchangeable is not a compression win — it is a
+            group that should not be deduped at all, because whatever distinguishes its blocks is
+            below the signature's resolution. The warmup group said exactly this at 99.16% for a
+            whole run and the number sat unread in the stats file while the benchmark reported a
+            flattering 19.7% overall saving. Cheap enough to leave on: one ratio per group."""
+            for gi, plan_g in planned.items():
+                if gi in KVCacheRecvingThreadFFv2._warned_runaway or not plan_g:
+                    continue
+                declined = sum(1 for b in plan_g if b < 0)
+                if declined < 0.9 * len(plan_g):
+                    continue
+                KVCacheRecvingThreadFFv2._warned_runaway.add(gi)
+                logger.warning(
+                    "BFF pull-v2: group %d declined %d of %d blocks (%.0f%%) in one request. A "
+                    "group this uniform is not compressible, it is under-resolved by the signature "
+                    "— check that it is a fusion group and consider excluding it via BFF_FF_GROUPS.",
+                    gi, declined, len(plan_g), 100.0 * declined / len(plan_g))
 
         def _align_and_group(self, req_meta, local_groups, remote_groups, tp_num_need_pulls):
             """v1's tail-align + coalesce, with the declined positions removed in between.
