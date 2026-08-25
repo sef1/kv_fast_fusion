@@ -929,6 +929,15 @@ if _ASCEND_AVAILABLE:
             agree — but if they ever did not, every slot this trace reports would be an address the
             hardware never used, and the whole trace would be reassuring about the wrong table.
 
+            Three views have to agree, and only the third is the one attention reads:
+              * ``st.block_ids[gi]`` — the runner's Python list, what this trace's arithmetic uses;
+              * ``block_table.np`` — the pinned host row, what the runner's next commit publishes;
+              * ``block_table.gpu`` — the DEVICE tensor the forward indexes.
+
+            The device read is a host-device sync, so it only runs under BFF_V2_TRACE_SLOTS and only
+            until the first mismatch. Comparing the first two alone cannot see a failed publish:
+            both are host-side, and a redirect that never reached the device would look perfect.
+
             Compared over the row's real length only: the device table is rectangular and padded to
             the widest request in the batch."""
             if MooncakeConnectorFFv2._logged_mirror_drift:
@@ -937,20 +946,24 @@ if _ASCEND_AVAILABLE:
                 ridx = runner.input_batch.req_id_to_index.get(rid)
                 bt = runner.input_batch.block_table[gi]
                 n = min(len(mirror_row), int(bt.num_blocks_per_row[ridx]))
-                device_row = [int(x) for x in bt.block_table.np[ridx, :n]]
+                host_row = [int(x) for x in bt.block_table.np[ridx, :n]]
+                device_row = [int(x) for x in bt.block_table.gpu[ridx, :n].cpu()]
             except Exception:       # noqa: BLE001 - a diagnostic must never break the step
                 return
             mirror = [int(x) for x in mirror_row[:n]]
-            if mirror == device_row:
+            if mirror == host_row == device_row:
                 return
             MooncakeConnectorFFv2._logged_mirror_drift = True
-            bad = next((i for i, (a, b) in enumerate(zip(mirror, device_row)) if a != b), None)
+            which = "host table" if mirror != host_row else "DEVICE table"
+            other = host_row if mirror != host_row else device_row
+            bad = next((i for i, (a, b) in enumerate(zip(mirror, other)) if a != b), None)
             logger.error(
-                "BFF pull-v2: %s group %d — the runner's block list and the DEVICE block table "
-                "disagree at position %s (%s vs %s). Attention reads the device table, so the "
-                "addresses this trace reports are not the ones being written.",
-                rid, gi, bad, mirror[bad] if bad is not None else "?",
-                device_row[bad] if bad is not None else "?")
+                "BFF pull-v2: %s group %d — the runner's block list and the %s disagree at position "
+                "%s (%s vs %s). Attention reads the device table, so the addresses this trace "
+                "reports are not the ones being written. runner=%s host=%s device=%s",
+                rid, gi, which, bad,
+                mirror[bad] if bad is not None else "?", other[bad] if bad is not None else "?",
+                mirror[:8], host_row[:8], device_row[:8])
 
         def _audit_hot_blocks(self, runner) -> None:
             """After applying: is any physical block in two live requests' write frontiers?

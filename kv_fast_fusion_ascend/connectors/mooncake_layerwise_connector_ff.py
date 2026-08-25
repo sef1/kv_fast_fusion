@@ -1257,21 +1257,73 @@ def _ff_write_runner_block_table(runner, rid, gi, new_blocks) -> bool:
     KV (aliasing → ramble → F1 and throughput both collapse). Free only when this returns True.
 
     Module-level (like ``resolve_redirect_rows``) so the coupling is unit-testable off-NPU with a
-    fake runner — this is the exact invariant the con512 corruption violated."""
+    fake runner — this is the exact invariant the con512 corruption violated.
+
+    **Why the DEVICE tensor is written here and not left to the runner.** The Ascend runner commits
+    the block table at the top of ``_prepare_inputs`` (model_runner_v1.py:616) and computes the slot
+    mapping immediately after; the connector's ``start_load_kv`` — where this is called from — runs
+    later, inside ``maybe_get_kv_connector_output``. So by the time we arrive:
+
+      * the host->device copy for this step has already been issued, which makes the device write
+        load-bearing rather than belt-and-braces: without it the redirect would not be visible until
+        the NEXT step's commit; and
+      * this step's slot mapping was computed from the PRE-redirect table, so a redirect changes
+        what the forward READS this step and where it WRITES only from the following one."""
     ridx = runner.input_batch.req_id_to_index.get(rid)
     if ridx is None:
         return False
     # NPU `MultiGroupBlockTable.__getitem__(gi)` → the per-group BlockTable (valid on GPU too).
     bt_obj = runner.input_batch.block_table[gi]
+    if getattr(bt_obj, "use_hybrid_blocks", False):
+        # Hybrid mode changes the table's contract entirely: it holds LOGICAL block ids, expanded
+        # `blocks_per_phys_block` per physical block (`append_row` converts before writing), and
+        # `num_blocks_per_row` counts logical blocks. Writing physical ids at a physical stride
+        # would be wrong in value, wrong in stride, and bounded by a count in the other unit — and
+        # it would corrupt the head of the sequence, which is the prompt, in silence.
+        #
+        # It cannot happen today: BFF requires block size 128 and AscendAttentionBackend's only
+        # supported kernel size is 128, so blocks_per_phys_block is 1 and hybrid is off. Refused
+        # rather than converted because the conversion would be a code path no run exercises;
+        # returning False is this function's existing "I did not write" signal, so the caller
+        # withholds the block free and redirects degrade to off.
+        _warn_hybrid_block_table(bt_obj)
+        return False
     n = min(len(new_blocks), int(bt_obj.num_blocks_per_row[ridx]))
     row = new_blocks[:n]
     bt_obj.block_table.np[ridx, :n] = row
-    bt_obj.block_table.gpu[ridx, :n] = torch.tensor(
-        row, device=bt_obj.block_table.gpu.device, dtype=bt_obj.block_table.gpu.dtype)
+    # Published from the PINNED host row we just wrote, which is what CpuGpuBuffer exists for
+    # (`.np` is a numpy view of `.cpu`). Building a tensor from the Python list instead meant a
+    # pageable host->device copy for every applied (request, group) on the forward thread. Copying
+    # from `.cpu` also cannot diverge from `.np`, because it IS `.np`.
+    cpu = getattr(bt_obj.block_table, "cpu", None)
+    if cpu is not None:
+        bt_obj.block_table.gpu[ridx, :n].copy_(cpu[ridx, :n], non_blocking=True)
+    else:       # a buffer without a pinned mirror (fakes, future types) — still publish correctly
+        bt_obj.block_table.gpu[ridx, :n] = torch.tensor(
+            row, device=bt_obj.block_table.gpu.device, dtype=bt_obj.block_table.gpu.dtype)
     st = runner.requests.get(rid)
     if st is not None and gi < len(st.block_ids):
         st.block_ids[gi][:n] = row
     return True
+
+
+_HYBRID_WARNED = False
+
+
+def _warn_hybrid_block_table(bt_obj) -> None:
+    """One ERROR for the process: the condition is static, so repeating it per apply says nothing."""
+    global _HYBRID_WARNED
+    if _HYBRID_WARNED:
+        return
+    _HYBRID_WARNED = True
+    logger.error(
+        "BFF: the runner's block table is in HYBRID mode (physical block size %s split into %s "
+        "logical blocks of %s). It stores logical block ids, which this connector does not emit, so "
+        "block-table redirects are DISABLED — fusion will free nothing rather than corrupt the "
+        "prompt. Run with --block-size equal to the attention backend's supported kernel block "
+        "size (128) to re-enable them.",
+        getattr(bt_obj, "physical_block_size", "?"),
+        getattr(bt_obj, "blocks_per_phys_block", "?"), getattr(bt_obj, "block_size", "?"))
 
 
 def _classify_owner_miss(ext_id: str, ever_snapshotted) -> str:

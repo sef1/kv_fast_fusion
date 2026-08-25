@@ -401,11 +401,21 @@ def test_ff_groups_filters_fusion_set():
 # --------------------------------------------------------------------------------------------
 
 class _FakeBlockTable:
-    def __init__(self, rows, cols):
-        import numpy as np
+    """Mirrors vllm_ascend's BlockTable closely enough for the write path.
+
+    `.np` is a numpy VIEW of the pinned `.cpu` tensor, exactly as CpuGpuBuffer builds it — the
+    connector publishes to the device by copying that row, so a fixture with independent arrays
+    would pass a test the real thing would fail."""
+
+    def __init__(self, rows, cols, use_hybrid_blocks=False):
         self.num_blocks_per_row = [cols] * rows
+        self.use_hybrid_blocks = use_hybrid_blocks
+        self.physical_block_size = 128
+        self.block_size = 64 if use_hybrid_blocks else 128
+        self.blocks_per_phys_block = 2 if use_hybrid_blocks else 1
         self.block_table = type("BT", (), {})()
-        self.block_table.np = np.zeros((rows, cols), dtype=np.int64)
+        self.block_table.cpu = torch.zeros(rows, cols, dtype=torch.long)
+        self.block_table.np = self.block_table.cpu.numpy()
         self.block_table.gpu = torch.zeros(rows, cols, dtype=torch.long)
 
 
@@ -416,11 +426,12 @@ class _FakeReqState:
 
 class _FakeRunner:
     """Minimal stand-in for the NPU model runner: only what _ff_write_runner_block_table touches."""
-    def __init__(self, resident_rids, ngroups=2, cols=4):
+    def __init__(self, resident_rids, ngroups=2, cols=4, use_hybrid_blocks=False):
         self.input_batch = type("IB", (), {})()
         self.input_batch.req_id_to_index = {rid: i for i, rid in enumerate(resident_rids)}
-        self.input_batch.block_table = [_FakeBlockTable(len(resident_rids), cols)
-                                        for _ in range(ngroups)]
+        self.input_batch.block_table = [
+            _FakeBlockTable(len(resident_rids), cols, use_hybrid_blocks)
+            for _ in range(ngroups)]
         self.requests = {rid: _FakeReqState(ngroups, cols) for rid in resident_rids}
 
 
@@ -472,6 +483,71 @@ def test_write_returns_true_and_repoints_resident_rid():
     assert list(runner.input_batch.block_table[1].block_table.np[0, :2]) == [100, 101]
     assert runner.input_batch.block_table[1].block_table.gpu[0, :2].tolist() == [100, 101]
     assert runner.requests["reqA"].block_ids[1][:2] == [100, 101]
+
+
+def test_the_device_row_agrees_with_the_host_row_after_every_write():
+    """The device tensor is what attention reads; `.np` is what the runner's own commit will publish
+    next step. They must agree after each write, including a second write over the first.
+
+    This pins the INVARIANT, not the mechanism: copying from the pinned `.cpu` row and building a
+    tensor from the Python list both satisfy it. The reason to prefer the former is that it is a
+    pinned, non-blocking copy rather than a pageable one on the forward thread — a cost, not a
+    correctness property, so it is documented at the call site rather than asserted here."""
+    runner = _FakeRunner(["reqA"], ngroups=2, cols=4)
+
+    _ff_write_runner_block_table(runner, "reqA", 1, [100, 101])
+    bt = runner.input_batch.block_table[1].block_table
+    assert bt.gpu[0, :2].tolist() == bt.np[0, :2].tolist() == [100, 101]
+
+    _ff_write_runner_block_table(runner, "reqA", 1, [7, 8, 9])
+    assert bt.gpu[0, :3].tolist() == bt.np[0, :3].tolist() == [7, 8, 9]
+
+
+def test_a_buffer_without_a_pinned_mirror_still_publishes():
+    """The fallback path. A block table whose buffer has no `.cpu` — a fake, or a future buffer
+    type — must still reach the device rather than silently leaving it stale."""
+    runner = _FakeRunner(["reqA"], ngroups=2, cols=4)
+    del runner.input_batch.block_table[1].block_table.cpu
+    runner.input_batch.block_table[1].block_table.np = \
+        runner.input_batch.block_table[1].block_table.np.copy()
+
+    assert _ff_write_runner_block_table(runner, "reqA", 1, [100, 101]) is True
+    assert runner.input_batch.block_table[1].block_table.gpu[0, :2].tolist() == [100, 101]
+
+
+def test_a_hybrid_block_table_is_refused_rather_than_corrupted():
+    """Hybrid mode stores LOGICAL block ids, expanded per physical block, and counts logical blocks
+    in num_blocks_per_row. Writing physical ids at a physical stride would be wrong in value, wrong
+    in stride, and bounded by a count in the other unit — corrupting the head of the sequence, which
+    is the prompt, in silence.
+
+    It cannot arise at block size 128 (the backend's only supported kernel size), so refusing costs
+    nothing today and cannot corrupt tomorrow. False is the existing 'I did not write' signal, so
+    the caller withholds the block free and redirects degrade to off."""
+    import kv_fast_fusion_ascend.connectors.mooncake_layerwise_connector_ff as mod
+    mod._HYBRID_WARNED = False
+    runner = _FakeRunner(["reqA"], ngroups=2, cols=4, use_hybrid_blocks=True)
+
+    assert _ff_write_runner_block_table(runner, "reqA", 1, [100, 101]) is False
+
+    bt = runner.input_batch.block_table[1].block_table
+    assert bt.np[0].tolist() == [0, 0, 0, 0], "the table must be left exactly as it was"
+    assert bt.gpu[0].tolist() == [0, 0, 0, 0]
+    assert runner.requests["reqA"].block_ids[1] == [0, 0, 0, 0]
+
+
+def test_a_refused_hybrid_write_withholds_the_free():
+    """The coupling that matters: a refusal must reach the apply site as 'do not free', or the
+    request would keep a table nobody repointed while its blocks were handed to someone else."""
+    import kv_fast_fusion_ascend.connectors.mooncake_layerwise_connector_ff as mod
+    mod._HYBRID_WARNED = False
+    runner = _FakeRunner(["live"], use_hybrid_blocks=True)
+
+    updated = {}
+    if _ff_write_runner_block_table(runner, "live", 1, [100, 101]):
+        updated["live"] = [100, 101]
+
+    assert updated == {}
 
 
 def test_free_is_coupled_to_write_success():

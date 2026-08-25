@@ -41,7 +41,7 @@
 # =============================================================================
 
 # ---- Model / topology --------------------------------------------------------
-MODEL=${MODEL:-Qwen/Qwen2.5-7B-Instruct}
+MODEL=${MODEL:-deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct}
 TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-1200}
 PROXY_HTTP_PORT=${PROXY_HTTP_PORT:-10001}   # proxy HTTP serving port (benchmark target)
 KV_IP=${KV_IP:-10.10.10.174}
@@ -505,7 +505,8 @@ common_args() {
         --max-num-batched-tokens $MAX_NUM_BATCHED_TOKENS \
         ${ATTENTION_BACKEND:+--attention-backend $ATTENTION_BACKEND} \
         $([ "$DISABLE_CUSTOM_AR" = "1" ] && [ "$TP" -gt 1 ] && echo --disable-custom-all-reduce) \
-        --max-num-seqs $MAX_CONCURRENCY"
+        --max-num-seqs $MAX_CONCURRENCY"      
+        
 }
 
 main() {

@@ -134,6 +134,14 @@ BFF_V2_SIG_TIMEOUT=${BFF_V2_SIG_TIMEOUT:-2}   # no answer in this long -> send t
 # recv thread, never the forward path, so a generous budget costs one request's KV latency while a
 # tight one silently costs the whole optimisation.
 BFF_PULL_V2_SIG_TIMEOUT=${BFF_PULL_V2_SIG_TIMEOUT:-10}
+# Ceiling on how much of ONE request may be served from other requests' blocks. BFF_MAX_REL_ERR is a
+# per-BLOCK bar; this is the per-REQUEST one, and they are not substitutes. At max_rel_err=0.3 the
+# cosine floor is 0.954 — sane for one block, catastrophic for nineteen of twenty, because the model
+# then attends to a coherent prompt that is not the one it was asked. 1.0 disables it.
+BFF_V2_MAX_REQ_DECLINE=${BFF_V2_MAX_REQ_DECLINE:-0.5}
+# Refuse to alias a block the decode has not finished writing (its last prompt block is partially
+# filled). 1 = guard on and count; 0 = reproduce the old behaviour, still counted.
+BFF_V2_PROTECT_HOT_BLOCKS=${BFF_V2_PROTECT_HOT_BLOCKS:-1}
 # Ceiling on the relative substitution error a merge may inject:
 #   rel_err = ||k_owner - k_rep|| / ||k_owner|| = sqrt(1 + r^2 - 2*r*cos),  r = |k_rep|/|k_owner|
 # This, not BFF_THRESHOLD, governs accuracy — cosine is scale-free, so a pair can clear any cosine
@@ -409,7 +417,9 @@ export_bff_env() {
   export BFF_MAX_REL_ERR=$BFF_MAX_REL_ERR BFF_V2_DEDUP=$BFF_V2_DEDUP \
          BFF_V2_RESIDENT=$BFF_V2_RESIDENT BFF_SIG_DIM=$BFF_SIG_DIM \
          BFF_V2_MAX_RESIDENT=$BFF_V2_MAX_RESIDENT BFF_V2_SIG_TIMEOUT=$BFF_V2_SIG_TIMEOUT \
-         BFF_PULL_V2_SIG_TIMEOUT=$BFF_PULL_V2_SIG_TIMEOUT BFF_SIG_LAYERS=$BFF_SIG_LAYERS
+         BFF_PULL_V2_SIG_TIMEOUT=$BFF_PULL_V2_SIG_TIMEOUT BFF_SIG_LAYERS=$BFF_SIG_LAYERS \
+         BFF_V2_MAX_REQ_DECLINE=$BFF_V2_MAX_REQ_DECLINE \
+         BFF_V2_PROTECT_HOT_BLOCKS=$BFF_V2_PROTECT_HOT_BLOCKS
   # BOTH roles dump fuse stats: the producer counts blocks + redirects shipped, the decode side counts
   # the redirects that actually landed and the REAL freed-block delta (the measured compression).
   export BFF_PD_STATS_DIR="$results_root"
@@ -744,6 +754,31 @@ if v2:
             reasons[k] = reasons.get(k, 0) + n
     if reasons:
         print("    alias failures: " + " ".join(f"{k}={n}" for k, n in sorted(reasons.items())))
+
+    # THE distribution. A run-level saving of a few percent reads identically whether every request
+    # gave up a little or a handful gave up nearly everything — and only the second answers the
+    # wrong prompt. Printed next to the saving so the two are never read apart again.
+    BUCKETS = ("0-10%", "10-25%", "25-50%", "50-75%", "75-90%", "90-100%")
+    hist = {b: sum((s.get("request_decline_frac") or {}).get(b, 0) for s in v2) for b in BUCKETS}
+    n_req = sum(hist.values())
+    if n_req:
+        print("    per-request decline: "
+              + " ".join(f"{b}={hist[b]}" for b in BUCKETS if hist[b]))
+        heavy = hist["75-90%"] + hist["90-100%"]
+        capped = sum(s.get("requests_capped", 0) for s in v2)
+        if capped:
+            print(f"    -> {capped} request(s) exceeded BFF_V2_MAX_REQ_DECLINE and were read in "
+                  f"full: that much substitution answers a neighbouring prompt.")
+        if heavy:
+            print(f"    -> {heavy} request(s) ({100.0*heavy/n_req:.1f}%) had OVER 75% of their KV "
+                  f"replaced. Compare against the length(=max_tokens) share in the serving log — "
+                  f"a matching fraction means those are the damaged requests.")
+    hot = sum(s.get("hot_block_aliases", 0) for s in v2)
+    if hot:
+        guarded = any(s.get("hot_block_guarded") for s in v2)
+        print(f"    hot-block aliases: {hot} "
+              f"({'refused' if guarded else 'APPLIED — BFF_V2_PROTECT_HOT_BLOCKS=0'}), "
+              f"{sum(s.get('hot_block_free_slots', 0) for s in v2)} free slots at stake")
     if not prod:
         raise SystemExit
 
