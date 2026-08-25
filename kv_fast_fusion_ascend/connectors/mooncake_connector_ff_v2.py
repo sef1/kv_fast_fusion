@@ -47,6 +47,7 @@ codec logic stay unit-testable without an NPU. v1 is untouched; this registers a
 
 import os
 import threading
+import time
 from typing import Any
 
 from vllm.logger import init_logger
@@ -60,7 +61,19 @@ CONNECTOR_NAME = "MooncakeConnectorFFv2"
 # colliding.
 FF_PULL_V2_PORT_OFFSET = int(os.environ.get("BFF_MOONCAKE_FF_PULL_V2_PORT_OFFSET", "22000"))
 # Seconds D waits for P's signatures before reading the request whole.
-SIG_EXCHANGE_TIMEOUT = float(os.environ.get("BFF_V2_SIG_TIMEOUT", "2"))
+#
+# Its own knob, and a much larger default than the layerwise transport's 2s, because the two are not
+# the same amount of work. There, D answers from a dict it already holds. Here, P has to gather the
+# blocks on the NPU and sync them back to the host (signatures_for_group ends in a `.cpu()`) on a
+# side thread, while that same device is saturated with prefill. The exchange runs on the recv
+# thread, never the forward path, so a generous timeout costs one request's KV latency — whereas a
+# tight one costs the whole optimisation, silently, by falling back to a full read every time.
+# Deliberately NOT falling back to BFF_V2_SIG_TIMEOUT: the harness exports that unconditionally with
+# the layerwise default of 2, so "use it if set" would mean "always 2" and this default would be
+# dead code.
+SIG_EXCHANGE_TIMEOUT = float(os.environ.get("BFF_PULL_V2_SIG_TIMEOUT", "10"))
+# How long register_kv_caches waits for the producer's REP socket to bind before saying so.
+SIG_SERVER_BIND_TIMEOUT = float(os.environ.get("BFF_PULL_V2_SIG_BIND_TIMEOUT", "5"))
 # Full ACL graph is refused by default even though v2 does no forward-path work — see
 # MooncakeConnectorFFv2.requires_piecewise_for_cudagraph for why the GPU v2 reasoning does not carry
 # over, and what setting this to 1 actually tests.
@@ -142,7 +155,7 @@ try:
     import msgspec
     import zmq
     from vllm.config import VllmConfig  # noqa: F401
-    from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole  # noqa: F401
     from vllm.utils.network_utils import make_zmq_path, make_zmq_socket
     from vllm.v1.kv_cache_interface import KVCacheConfig  # noqa: F401
     from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import (
@@ -178,12 +191,40 @@ if _ASCEND_AVAILABLE:
             self._worker = worker
             self._dec = msgspec.msgpack.Decoder()
             self._enc = msgspec.msgpack.Encoder()
+            # Set once the REP socket is actually bound. Without it a bind failure kills this thread
+            # with nothing but an unraisable traceback, and the only visible symptom is a timeout on
+            # the OTHER node thousands of requests later — which is exactly how the first on-box run
+            # left "did P ever listen?" undecidable.
+            self.ready = threading.Event()
+            self.bind_error: Exception | None = None
+            # The producer's own tally. Deliberately NOT a DedupStats dump: the decode is the only
+            # side that decides here, and a second ledger in the same stats directory would
+            # double-count every figure the collector sums. P's unique information is just whether
+            # it could answer.
+            self.served = 0
+            self.failed = 0
+            self.fail_reasons: dict[str, int] = {}
+            self._next_report = 1
 
         def run(self):
             path = make_zmq_path("tcp", self._host, self._port)
-            logger.info("BFF pull-v2 signature server (REP) on %s", path)
             ctx = zmq.Context()
-            sock = make_zmq_socket(ctx=ctx, path=path, socket_type=zmq.REP, bind=True)
+            try:
+                sock = make_zmq_socket(ctx=ctx, path=path, socket_type=zmq.REP, bind=True)
+            except Exception as e:
+                # Named loudly rather than left to an unraisable traceback. The likeliest cause is a
+                # port already taken — the offset puts us in Linux's ephemeral range (32768-60999),
+                # so a collision with a transient socket is possible; BFF_MOONCAKE_FF_PULL_V2_PORT_
+                # OFFSET moves us out of the way. The decode degrades to full reads either way.
+                self.bind_error = e
+                logger.error("BFF pull-v2: signature server could NOT bind %s (%s). This producer "
+                             "cannot answer signature requests, so every decode that asks it will "
+                             "time out and read in full. Move the port with "
+                             "BFF_MOONCAKE_FF_PULL_V2_PORT_OFFSET.", path, e)
+                ctx.destroy(linger=0)
+                return
+            logger.info("BFF pull-v2 signature server (REP) bound on %s", path)
+            self.ready.set()
             try:
                 while True:
                     try:
@@ -199,22 +240,42 @@ if _ASCEND_AVAILABLE:
             finally:
                 ctx.destroy(linger=0)
 
+        def _note_failure(self, reason: str) -> None:
+            self.failed += 1
+            self.fail_reasons[reason] = self.fail_reasons.get(reason, 0) + 1
+            self._worker.note_sig_failure(reason)
+
+        def _report(self) -> None:
+            """Log the tally on a widening cadence: the first request (the one that says D reached
+            us at all), then 10, 100, 1000..."""
+            if self.served + self.failed < self._next_report:
+                return
+            self._next_report *= 10
+            logger.info("BFF pull-v2 signature server: served %d request(s), %d failed%s.",
+                        self.served, self.failed,
+                        (" " + str(self.fail_reasons)) if self.fail_reasons else "")
+
         def _handle(self, msg):
             if not msg or msg[0] != MSG_SIG_REQUEST:
                 return sig_reply_msg({})
             groups_to_ids = msg[1] or {}
             out = {}
+            ok = False
             for gi, ids in groups_to_ids.items():
                 try:
                     out[int(gi)] = self._worker.signatures_for_group(int(gi), ids)
+                    ok = True
                 except KVLayoutError as e:
                     # Counted, not swallowed: it means the cache cannot be indexed by connector
                     # block ids, which would make every signature in the run meaningless.
-                    self._worker.note_sig_failure("kv_layout")
+                    self._note_failure("kv_layout")
                     logger.warning("BFF pull-v2: cannot index KV for group %s (%s).", gi, e)
                 except Exception as e:  # pragma: no cover - defensive
-                    self._worker.note_sig_failure("sig_error")
+                    self._note_failure("sig_error")
                     logger.warning("BFF pull-v2: signature build failed for group %s: %s", gi, e)
+            if ok:
+                self.served += 1
+            self._report()
             return sig_reply_msg(out)
 
     class _SigClient:
@@ -229,12 +290,14 @@ if _ASCEND_AVAILABLE:
             self._socks: dict[tuple, Any] = {}
             self._enc = msgspec.msgpack.Encoder()
             self._dec = msgspec.msgpack.Decoder()
+            self._announced: set = set()
 
         def ask(self, host, port, groups_to_ids: dict) -> dict:
             """Return ``{group: signature payload}``, or ``{}`` on any failure."""
             if host is None or port is None or not groups_to_ids:
                 return {}
             with self._lock:
+                t0 = time.perf_counter()
                 try:
                     sock = self._sock_for(host, int(port))
                     sock.send(self._enc.encode(sig_request_msg(groups_to_ids)))
@@ -242,8 +305,15 @@ if _ASCEND_AVAILABLE:
                 except Exception as e:
                     # A REQ socket that timed out is stuck in the wrong state; drop it so the next
                     # exchange starts clean, and read this request whole.
-                    logger.warning("BFF pull-v2: signature exchange with %s:%s failed (%s) — "
-                                   "reading the request in full.", host, port, e)
+                    #
+                    # The elapsed time is the diagnosis: at (or just over) SIG_EXCHANGE_TIMEOUT the
+                    # producer never answered — either it is not listening or it is too slow, which
+                    # its own log distinguishes. Well under it means the socket was refused outright,
+                    # a different problem entirely.
+                    logger.warning("BFF pull-v2: signature exchange with %s:%s failed after "
+                                   "%.0f ms of a %.0f ms budget (%s) — reading the request in "
+                                   "full.", host, port, (time.perf_counter() - t0) * 1e3,
+                                   SIG_EXCHANGE_TIMEOUT * 1e3, e)
                     self._drop(host, port)
                     return {}
 
@@ -254,6 +324,12 @@ if _ASCEND_AVAILABLE:
                 if self._ctx is None:
                     self._ctx = zmq.Context()
                 path = make_zmq_path("tcp", host, port)
+                if key not in self._announced:
+                    # Says out loud which address D derived, so a port-arithmetic drift between the
+                    # two sides is a one-line comparison against the producer's bind log rather than
+                    # an inference from a timeout.
+                    self._announced.add(key)
+                    logger.info("BFF pull-v2: signature peer for this producer is %s", path)
                 s = make_zmq_socket(ctx=self._ctx, path=path, socket_type=zmq.REQ, bind=False)
                 s.setsockopt(zmq.LINGER, 0)
                 s.setsockopt(zmq.SNDTIMEO, int(SIG_EXCHANGE_TIMEOUT * 1000))
@@ -275,8 +351,14 @@ if _ASCEND_AVAILABLE:
         Injected after construction by the worker's ``register_kv_caches``, same as
         ``base_addr_groups``: neither is knowable until the caches are registered."""
 
+        # NOT `engine`. The vendored KVCacheRecvingThread keeps the Mooncake TransferEngine under
+        # that exact name (mooncake_connector.py:326) and v1's _transfer_kv_cache calls
+        # `self.engine.batch_transfer_sync_read` — injecting the dedup engine as `engine` replaced
+        # the transport with an object that cannot transfer, and every request on the node died with
+        # "'DedupEngine' object has no attribute 'batch_transfer_sync_read'". Any attribute added
+        # here has to be checked against that __init__; the test suite does it mechanically.
         sig_client: "_SigClient | None" = None
-        engine: "DedupEngine | None" = None
+        dedup_engine: "DedupEngine | None" = None
         sig_port_offset: int = FF_PULL_V2_PORT_OFFSET
         _logged_first_decline = False
 
@@ -291,7 +373,8 @@ if _ASCEND_AVAILABLE:
 
             Returns ``{group: planned_ids}`` with SENTINEL in the declined positions, or ``{}`` on
             every failure path, which leaves the read whole."""
-            if self.engine is None or self.sig_client is None or not pd_dedup_v2.V2_ENABLED:
+            if (self.dedup_engine is None or self.sig_client is None
+                    or not pd_dedup_v2.V2_ENABLED):
                 return {}
             groups_to_ids = {gi: list(remote_ids)
                              for gi, (remote_ids, local_ids) in enumerate(aligned)
@@ -304,20 +387,25 @@ if _ASCEND_AVAILABLE:
             # stripped form is common to both. Keying the engine on P's id would mean no alias ever
             # resolved, with no error anywhere.
             ext_id = v1._ext_of(req_meta["remote_request_id"])
+            # Counted BEFORE the ask, so it counts attempts. DedupStats.is_inert() reads
+            # `exchanges == 0` as "v2 is installed but never ran", which is the difference between
+            # "nothing was worth merging" and "the mechanism never engaged" — the two readings of an
+            # all-zero saving that a benchmark cannot otherwise tell apart.
+            self.dedup_engine.stats.exchanges += 1
             sigs = self.sig_client.ask(
                 req_meta["remote_host"],
                 int(req_meta["remote_handshake_port"]) + self.sig_port_offset,
                 groups_to_ids)
             if not sigs:
-                self.engine.stats.sig_phase_failed += 1
+                self.dedup_engine.stats.sig_phase_failed += 1
                 return {}
             n_groups = max(groups_to_ids) + 1
             wrapped = [groups_to_ids.get(gi, []) for gi in range(n_groups)]
             try:
-                planned = self.engine.plan({ext_id: wrapped}, {ext_id: sigs})
+                planned = self.dedup_engine.plan({ext_id: wrapped}, {ext_id: sigs})
             except Exception as e:  # pragma: no cover - defensive
                 logger.warning("BFF pull-v2: planning failed (%s) — reading in full.", e)
-                self.engine.forget([ext_id])
+                self.dedup_engine.forget([ext_id])
                 return {}
             out = planned.get(ext_id)
             return {gi: out[gi] for gi in groups_to_ids if gi < len(out)} if out else {}
@@ -350,8 +438,8 @@ if _ASCEND_AVAILABLE:
                     KVCacheRecvingThreadFFv2._logged_first_decline = True
                     logger.info("BFF pull-v2: first declined read — %d block(s) satisfied locally "
                                 "and never fetched.", n_declined)
-                if self.engine is not None:
-                    self.engine.stats.note_skip("declined", n_declined)
+                if self.dedup_engine is not None:
+                    self.dedup_engine.stats.note_skip("declined", n_declined)
             return grouped
 
         def _after_transfer(self, req_meta) -> None:
@@ -362,8 +450,8 @@ if _ASCEND_AVAILABLE:
             earlier is the bug that made the first GPU v2 run apply 22 of 26,531 aliases — the apply
             path expires a map whose owner has not been batched, and an owner cannot be batched
             until its KV has actually arrived."""
-            if self.engine is not None:
-                self.engine.release(v1._ext_of(req_meta["remote_request_id"]))
+            if self.dedup_engine is not None:
+                self.dedup_engine.release(v1._ext_of(req_meta["remote_request_id"]))
 
     class MooncakeConnectorWorkerFFv2(v1.MooncakeConnectorWorkerFF):
         """v1's worker plus the signature server (on P) and the dedup engine (on D)."""
@@ -371,7 +459,10 @@ if _ASCEND_AVAILABLE:
         _RECV_THREAD_CLS = KVCacheRecvingThreadFFv2
 
         def __init__(self, vllm_config, engine_id, kv_cache_config=None):
-            self._engine = None
+            # `_dedup_engine`, never `_engine`: the vendored worker's `self.engine` is the Mooncake
+            # TransferEngine, and keeping the two one underscore apart is how the recv thread's
+            # collision got written in the first place.
+            self._dedup_engine = None
             self._sig_client = None
             self._sig_server = None
             self._jl = [None]        # JL projection cache, must outlive the calls
@@ -395,14 +486,51 @@ if _ASCEND_AVAILABLE:
             if self.kv_role == "kv_producer":
                 self._sig_server = _SigServer(host, port, self)
                 self._sig_server.start()
+                self._await_sig_server()
+                self._warm_signatures()
             else:
-                self._engine = DedupEngine()
+                self._dedup_engine = DedupEngine()
                 self._sig_client = _SigClient()
                 if self.kv_recv_thread is not None:
-                    self.kv_recv_thread.engine = self._engine
+                    self.kv_recv_thread.dedup_engine = self._dedup_engine
                     self.kv_recv_thread.sig_client = self._sig_client
-                logger.info("BFF pull-v2: decode dedup engine armed (V2_DEDUP=%s).",
-                            pd_dedup_v2.V2_ENABLED)
+                logger.info("BFF pull-v2: decode dedup engine armed (V2_DEDUP=%s, sig timeout "
+                            "%.1fs).", pd_dedup_v2.V2_ENABLED, SIG_EXCHANGE_TIMEOUT)
+
+        def _await_sig_server(self) -> None:
+            """Fail loudly at startup instead of silently at request time.
+
+            The server binds on its own thread, so without this a bind failure surfaces only as a
+            decode-side timeout on some later node — which is undecidable from that node's log."""
+            if self._sig_server.ready.wait(SIG_SERVER_BIND_TIMEOUT):
+                return
+            logger.error("BFF pull-v2: signature server did not come up within %.0fs (%s). This "
+                         "producer will not answer signature requests; decodes reading from it fall "
+                         "back to full reads and v2 buys nothing here.",
+                         SIG_SERVER_BIND_TIMEOUT, self._sig_server.bind_error or "no bind error "
+                         "reported — still starting?")
+
+        def _warm_signatures(self) -> None:
+            """Build the projections once, now, rather than inside the decode's first timeout.
+
+            signatures_for_group ends in an NPU->CPU sync and, on its first call, also builds the
+            fixed-seed JL and SimHash projections. Paying that on the first real request means paying
+            it on a side thread of a node that is by then busy with prefill, inside a bounded window
+            — a slow first answer that costs compression for no reason. The result is discarded; only
+            the cached projections in _jl/_proj are wanted."""
+            gi = next((g for g in sorted(self._group_layers) if self._group_layers[g]), None)
+            if gi is None or not getattr(self, "num_blocks", 0):
+                return
+            try:
+                _t0 = time.perf_counter()
+                self.signatures_for_group(gi, [0])
+                logger.info("BFF pull-v2: signature path warmed on group %d in %.0f ms.",
+                            gi, (time.perf_counter() - _t0) * 1e3)
+            except Exception as e:
+                # Never fatal: a producer that cannot warm up can still try per request, and if it
+                # cannot do that either the decode degrades to full reads.
+                logger.warning("BFF pull-v2: signature warm-up failed (%s); the first real exchange "
+                               "will pay for it instead.", e)
 
         # -- producer side ----------------------------------------------------------------
         def signatures_for_group(self, gi: int, block_ids):
@@ -419,7 +547,10 @@ if _ASCEND_AVAILABLE:
                 self._jl, num_blocks=self.num_blocks, proj_holder=self._proj)
 
         def note_sig_failure(self, reason: str) -> None:
-            eng = self._engine
+            # On the producer `_dedup_engine` is always None (only the decode decides), so this is a
+            # no-op there by design — _SigServer keeps and logs its own tally instead. Kept for the
+            # symmetric case and for tests that drive the server against a decode-side worker.
+            eng = self._dedup_engine
             if eng is not None:
                 eng.stats.note_failure(reason)
 
@@ -452,6 +583,7 @@ if _ASCEND_AVAILABLE:
             # nothing in v2 ever drains.
             self._ff_producer = None
             self._ff_applier = None
+            self._ff_step = 0
 
         def save_kv_layer(self, layer_name, kv_layer, attn_metadata, **kwargs) -> None:
             """No-op: signatures are computed on demand from the registered KV cache."""
@@ -479,7 +611,7 @@ if _ASCEND_AVAILABLE:
             if a is None:
                 worker = self.connector_worker
                 a = self._ff_applier = AliasApplier(
-                    worker._engine, _write_block_table, worker.note_failed_blocks,
+                    worker._dedup_engine, _write_block_table, worker.note_failed_blocks,
                     normalize_req_id=v1._ext_of,
                     group_layers=worker._group_layers)
             return a
@@ -487,9 +619,17 @@ if _ASCEND_AVAILABLE:
         def start_load_kv(self, forward_context, **kwargs) -> None:
             # Connector-level signature (forward_context), NOT the worker's start_load_kv(metadata).
             super().start_load_kv(forward_context, **kwargs)
-            if self.connector_worker is None or self.connector_worker._engine is None:
+            self._ff_step += 1
+            if self.connector_worker is None or self.connector_worker._dedup_engine is None:
                 return
             self._v2_apply()
+            # Dumped from here, on the engine's own cadence. Without it this arm produces no
+            # bff_stats_*.json at all and the whole verification ladder — wire saving, applied vs
+            # recomputed, inert-or-not — is unreadable, which is exactly how an earlier run came back
+            # as "bff stats: none found (fusion may not have engaged)".
+            stats = self.connector_worker._dedup_engine.stats
+            if stats.should_dump(self._ff_step):
+                stats.dump()
 
         def _v2_apply(self) -> None:
             """Apply landed aliases; see :class:`~kv_fast_fusion.pd_dedup_v2.AliasApplier`."""

@@ -13,6 +13,10 @@ The file is organised around the two things that can silently corrupt KV:
   * filtering after the runs have been coalesced instead of before.
 """
 
+import ast
+import os
+import re
+
 import pytest
 
 from kv_fast_fusion_ascend.connectors import mooncake_connector_ff_v2 as v2
@@ -197,6 +201,112 @@ def test_groups_are_keyed_by_index_and_empties_dropped():
 
 def test_wrapping_an_all_empty_request_yields_nothing_to_ask_about():
     assert v2.wrap_groups_for_engine([[], []]) == {}
+
+
+# =====================================================================================
+# attribute collision with the vendored thread we subclass
+# =====================================================================================
+def _vendored_recv_thread_source():
+    """The vendored mooncake_connector.py, or None if this box has no vllm_ascend checkout."""
+    import importlib.util
+
+    candidates = []
+    try:
+        spec = importlib.util.find_spec("vllm_ascend")
+        if spec is not None and spec.submodule_search_locations:
+            candidates.append(next(iter(spec.submodule_search_locations)))
+    except Exception:  # noqa: BLE001 - find_spec raises for a half-installed package
+        pass
+    root = os.environ.get("VLLM_ASCEND_ROOT")
+    if root:
+        candidates.append(os.path.join(root, "vllm_ascend"))
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(os.path.dirname(here))
+    candidates.append(os.path.join(os.path.dirname(repo), "vllm-ascend", "vllm_ascend"))
+    for base in candidates:
+        fp = os.path.join(base, "distributed", "kv_transfer", "kv_p2p", "mooncake_connector.py")
+        if os.path.isfile(fp):
+            return open(fp, errors="replace").read()
+    return None
+
+
+def _self_assigned_in_init(source: str, class_name: str) -> set:
+    """Every ``self.X = ...`` target in ``class_name.__init__``."""
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.ClassDef) and node.name == class_name):
+            continue
+        for fn in node.body:
+            if not (isinstance(fn, ast.FunctionDef) and fn.name == "__init__"):
+                continue
+            names = set()
+            for stmt in ast.walk(fn):
+                targets = (stmt.targets if isinstance(stmt, ast.Assign)
+                           else [stmt.target] if isinstance(stmt, ast.AnnAssign) else [])
+                for t in targets:
+                    if (isinstance(t, ast.Attribute) and isinstance(t.value, ast.Name)
+                            and t.value.id == "self"):
+                        names.add(t.attr)
+            return names
+    return set()
+
+
+def _v2_injected_attributes() -> set:
+    """Names v2 puts onto the recv thread: its own class-level attributes, plus everything the
+    worker assigns through ``self.kv_recv_thread.<name> = ...``."""
+    import inspect
+
+    src = inspect.getsource(v2)
+    names = set(re.findall(r"self\.kv_recv_thread\.(\w+)\s*=", src))
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == "KVCacheRecvingThreadFFv2":
+            for stmt in node.body:
+                if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                    names.add(stmt.target.id)
+                elif isinstance(stmt, ast.Assign):
+                    names |= {t.id for t in stmt.targets if isinstance(t, ast.Name)}
+    return names
+
+
+def test_v2_injects_no_attribute_the_vendored_thread_already_owns():
+    """The bug that killed the first on-box run, generalised.
+
+    v2 declared ``engine`` on its recv-thread subclass and the worker assigned the DedupEngine into
+    it — but the vendored ``KVCacheRecvingThread.__init__`` keeps the Mooncake TransferEngine under
+    that exact name, and v1's transfer calls ``self.engine.batch_transfer_sync_read``. Every request
+    on the node died with ``'DedupEngine' object has no attribute 'batch_transfer_sync_read'``.
+
+    Asserted against the vendored SOURCE rather than a name list, because the hazard is that the
+    vendored file changes under us: a future upstream ``self.sig_client = ...`` would collide just as
+    silently. Skipped where there is no vllm_ascend checkout to read."""
+    source = _vendored_recv_thread_source()
+    if source is None:
+        pytest.skip("no vllm_ascend checkout on this box")
+
+    vendored = _self_assigned_in_init(source, "KVCacheRecvingThread")
+    assert "engine" in vendored, "sanity: the vendored thread should still own `engine`"
+
+    injected = _v2_injected_attributes()
+    assert injected, "sanity: v2 should inject something onto the recv thread"
+
+    collisions = injected & vendored
+    assert not collisions, (
+        f"v2 injects {sorted(collisions)} onto KVCacheRecvingThread, which the vendored "
+        f"__init__ already assigns. Overwriting one of those replaces a piece of the transport; "
+        f"`engine` is the TransferEngine itself.")
+
+
+def test_the_dedup_engine_is_reachable_under_its_new_name():
+    """Renaming is only half the fix — the worker has to inject the new name, and the thread has to
+    read the same one. A rename that missed either side would leave dedup permanently off with no
+    error at all."""
+    import inspect
+
+    src = inspect.getsource(v2)
+    assert "self.kv_recv_thread.dedup_engine = self._dedup_engine" in src
+    assert "self.dedup_engine.plan(" in src, "the planner must read the injected attribute"
+    assert "self.kv_recv_thread.engine = " not in src, "the fatal assignment must not come back"
 
 
 # =====================================================================================

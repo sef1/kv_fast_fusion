@@ -22,6 +22,12 @@
 #                          is ACCURACY, not throughput: a wrong per-group block table does not
 #                          raise, it silently transfers the wrong KV. Compare CodeBLEU/N-gram
 #                          against mooncakev1 before reading a single req/s figure.
+#   bff_pull_v2          → MooncakeConnectorFFv2: the same pull transport with the merge decision
+#                          moved to the DECODE. D asks P for signatures of the blocks it is about
+#                          to read and simply does not read the ones it can satisfy locally — so
+#                          unlike bff_pull (which saves KV capacity only) this saves wire bandwidth
+#                          too, and needs no producer forward-path work. Its control arm is
+#                          `bff_pull`; BFF_V2_DEDUP=0 is the within-arm ablation.
 #   layerwise            → stock MooncakeLayerwiseConnector (layerwise transfer, no fusion)
 #   mooncakev1           → stock MooncakeConnectorV1 (whole-request transfer)
 #   vanilla              → true stock: launches via `vllm.entrypoints.cli.main`, so
@@ -64,7 +70,7 @@ DECODE_KV_PORT_BASE=${DECODE_KV_PORT_BASE:-30000}
 
 # ---- Engine sizing ----
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-65536}
-MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-8192}   # was 64 in the original (a typo) — 64 starves prefill
+MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-65536}   # was 64 in the original (a typo) — 64 starves prefill
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-48}
 GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.92}
 BLOCK_SIZE=${BLOCK_SIZE:-128}         # BFF requires 128
@@ -79,11 +85,12 @@ case "$BASELINE" in
   layerwise)   CONNECTOR="MooncakeLayerwiseConnector";   LAYER_WISE=true;  BFF_ON=0; LAUNCHER="kv_fast_fusion.fast_fusion_main" ;;
   mooncakev1)  CONNECTOR="MooncakeConnectorV1";          LAYER_WISE=false; BFF_ON=0; LAUNCHER="kv_fast_fusion.fast_fusion_main" ;;
   bff_pull)    CONNECTOR="MooncakeConnectorFF";          LAYER_WISE=false; BFF_ON=1; LAUNCHER="kv_fast_fusion.fast_fusion_main" ;;
+  bff_pull_v2) CONNECTOR="MooncakeConnectorFFv2";        LAYER_WISE=false; BFF_ON=1; LAUNCHER="kv_fast_fusion.fast_fusion_main" ;;
   vanilla)
     CONNECTOR="$VANILLA_CONNECTOR"
     [[ "$CONNECTOR" == "MooncakeLayerwiseConnector" ]] && LAYER_WISE=true || LAYER_WISE=false
     BFF_ON=0; LAUNCHER="vllm.entrypoints.cli.main" ;;
-  *) echo "Unknown BASELINE=$BASELINE (use bff|bff_v2|bff_pull|layerwise|mooncakev1|vanilla)"; exit 1 ;;
+  *) echo "Unknown BASELINE=$BASELINE (use bff|bff_v2|bff_pull|bff_pull_v2|layerwise|mooncakev1|vanilla)"; exit 1 ;;
 esac
 
 # Wrap the mover in MultiConnector + AscendStoreConnector (external KV pool)?
@@ -91,20 +98,26 @@ esac
 # AscendMultiConnector/AscendStoreConnector may not implement SupportsHMA — so bff runs the FF mover
 # standalone (it IS HMA-capable). For an apples-to-apples comparison set USE_ASCEND_STORE=0 on the
 # stock baselines too.
-if [[ "$BASELINE" == "bff" || "$BASELINE" == "bff_v2" || "$BASELINE" == "bff_pull" ]]; then
+if [[ "$BASELINE" == "bff" || "$BASELINE" == "bff_v2" || "$BASELINE" == "bff_pull" \
+      || "$BASELINE" == "bff_pull_v2" ]]; then
   USE_ASCEND_STORE=${USE_ASCEND_STORE:-0}
 else
   USE_ASCEND_STORE=${USE_ASCEND_STORE:-1}
 fi
 
 # ---- BFF knobs (only take effect when BASELINE=bff) ----
+BFF_PD_DEBUG=${BFF_PD_DEBUG:-0}            # 
+BFF_FF_REP_SAFE=${BFF_FF_REP_SAFE:-1}            # rep-lifetime fix: resolve rep only from live state (default ON) 
+BFF_FF_AUDIT=${BFF_FF_AUDIT:-1}            # 
+# BFF_FF_GROUPS=${BFF_FF_GROUPS:-None}            # 
+BFF_FF_RID_LIVE=${BFF_FF_RID_LIVE:-0}            # 
 BFF_PD_FUSE=${BFF_PD_FUSE:-1}            # connector-level fusion + redirect propagation to D
 BFF_SCALE_MODE=${BFF_SCALE_MODE:-raw}    # NPU supports raw only (ratio needs a CUDA Triton kernel)
 BFF_PD_MERGE=${BFF_PD_MERGE:-cc}         # within-batch clustering: cc | nr_tree
 BFF_PD_REPR=${BFF_PD_REPR:-proj}         # block repr for similarity: full | proj | mean
-BFF_THRESHOLD=${BFF_THRESHOLD:-0.75}     # cosine merge threshold (0..1)
+BFF_THRESHOLD=${BFF_THRESHOLD:-0.85}     # cosine merge threshold (0..1)
 BFF_GROUP_SIZE=${BFF_GROUP_SIZE:-4}      # fusion layers packed per KV-cache group
-BFF_PD_ENCODED_BATCH_SIZE=${BFF_PD_ENCODED_BATCH_SIZE:-128}   # cross-batch registry window (0=within-batch only)
+BFF_PD_ENCODED_BATCH_SIZE=${BFF_PD_ENCODED_BATCH_SIZE:-8}   # cross-batch registry window (0=within-batch only)
 
 # ---- v2 knobs (BASELINE=bff_v2 only) ----
 # v2 moves the merge decision to the DECODE: P ships per-block signatures, D replies with the blocks
@@ -115,6 +128,12 @@ BFF_V2_RESIDENT=${BFF_V2_RESIDENT:-1}    # alias to blocks left over from earlie
 BFF_SIG_DIM=${BFF_SIG_DIM:-128}          # signature width; ~256 B/block against ~1.6 MB of KV
 BFF_V2_MAX_RESIDENT=${BFF_V2_MAX_RESIDENT:-32768}
 BFF_V2_SIG_TIMEOUT=${BFF_V2_SIG_TIMEOUT:-2}   # no answer in this long -> send the group whole
+# bff_pull_v2's own budget, and much larger than the layerwise one above on purpose: there the
+# DECODE answers from a dict it already holds, here the PRODUCER has to gather blocks on the NPU and
+# sync them to the host, on a side thread of a node saturated with prefill. The exchange runs on the
+# recv thread, never the forward path, so a generous budget costs one request's KV latency while a
+# tight one silently costs the whole optimisation.
+BFF_PULL_V2_SIG_TIMEOUT=${BFF_PULL_V2_SIG_TIMEOUT:-10}
 # Ceiling on the relative substitution error a merge may inject:
 #   rel_err = ||k_owner - k_rep|| / ||k_owner|| = sqrt(1 + r^2 - 2*r*cos),  r = |k_rep|/|k_owner|
 # This, not BFF_THRESHOLD, governs accuracy — cosine is scale-free, so a pair can clear any cosine
@@ -135,16 +154,21 @@ BFF_SIG_LAYERS=${BFF_SIG_LAYERS:-first}
 KV_LOAD_FAILURE_POLICY=${KV_LOAD_FAILURE_POLICY:-recompute}
 
 # ---- Benchmark knobs ----
-NUM_PROMPTS=${NUM_PROMPTS:-1024}
-MAX_CONCURRENCY=${MAX_CONCURRENCY:-256}
+NUM_PROMPTS=${NUM_PROMPTS:-512}
+MAX_CONCURRENCY=${MAX_CONCURRENCY:-530}
+PREFILL_MAX_CONCURRENCY=${PREFILL_MAX_CONCURRENCY:-${MAX_CONCURRENCY}}
+DECODE_MAX_CONCURRENCY=${DECODE_MAX_CONCURRENCY:-${MAX_CONCURRENCY}}
 REQUEST_RATE=${REQUEST_RATE:-64}
 BURSTINESS=${BURSTINESS:-0.1}
-MIN_TOKENS=${MIN_TOKENS:-500}
+MIN_TOKENS=${MIN_TOKENS:-2048}
 REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-6000.0}
-F1_DATASET=${F1_DATASET:-m-a-p/CodeFeedback-Filtered-Instruction}
+# F1_DATASET=${F1_DATASET:-m-a-p/CodeFeedback-Filtered-Instruction}
+# F1_DATASET=${F1_DATASET:-codeparrot_f1_benchmark.jsonl}
+F1_DATASET=${F1_DATASET:-ise-uiuc/Magicoder-Evol-Instruct-110K}
+
 F1_SPLIT=${F1_SPLIT:-train}
-F1_INPUT_KEY=${F1_INPUT_KEY:-query}
-F1_OUTPUT_KEY=${F1_OUTPUT_KEY:-answer}
+F1_INPUT_KEY=${F1_INPUT_KEY:-instruction}
+F1_OUTPUT_KEY=${F1_OUTPUT_KEY:-response}
 
 # ---- SSD offload (opt-in; only meaningful when USE_ASCEND_STORE=1) ----
 # Spills the AscendStore KV pool to SSD via Mooncake. Requires the SSD patches applied on the host:
@@ -179,11 +203,9 @@ PROXY_DIR=${PROXY_DIR:-${VLLM_ASCEND_ROOT}/examples/disaggregated_prefill_v1}
 MOONCAKE_CONFIG_PATH=${MOONCAKE_CONFIG_PATH:-}
 LOG_ROOT=${LOG_ROOT:-logs}
 RESULT_ROOT=${RESULT_ROOT:-results}
-MIN_FREE_MEMORY_MB=${MIN_FREE_MEMORY_MB:-40000}
+MIN_FREE_MEMORY_MB=${MIN_FREE_MEMORY_MB:-50000}
 KILL_ONLY=false
 
-export no_proxy="localhost,127.0.0.1,${no_proxy}"
-export NO_PROXY="localhost,127.0.0.1,${NO_PROXY}"
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH}"
 
 # ============================================================
@@ -216,6 +238,8 @@ resolve_host_ip() {
     VLLM_HOST_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{print $7}')
   fi
   export VLLM_HOST_IP=${VLLM_HOST_IP:-127.0.0.1}
+  export no_proxy="localhost,127.0.0.1,${VLLM_HOST_IP},${no_proxy}"
+  export NO_PROXY="localhost,127.0.0.1,${VLLM_HOST_IP},${NO_PROXY}"
 }
 
 # ============================================================
@@ -261,7 +285,7 @@ get_free_npus() {
       clean_c2=$2; gsub(/[^0-9]+/," ",clean_c2); split(clean_c2,c2," "); phy_id=c2[2]
       clean_c4=$4; gsub(/[^0-9]+/," ",clean_c4); split(clean_c4,c4," ")
       if (length(c4)>=2) { used=c4[length(c4)-1]; total=c4[length(c4)]
-        if (phy_id!="" && total>0 && (total-used)>=min_free)
+        if (phy_id!="" && phy_id!="0" && total>0 && (total-used)>=min_free)
           free_list=(free_list==""?phy_id:free_list","phy_id) } }
     END { print free_list }'
 }
@@ -272,7 +296,7 @@ assign_npu_for_node() {
 
 kill_all_nodes() {
   echo "Wiping existing cluster..."
-  destroy_node_by_port_and_pattern ${PROXY_PORT} "proxy_server"
+  destroy_node_by_port_and_pattern ${PROXY_PORT} "proxy"
   destroy_node_by_port_and_pattern ${MASTER_PORT} "mooncake_master"
   for ((i=0; i<NUM_PREFILL; i++)); do destroy_node_by_port_and_pattern $((PREFILL_PORT_BASE + i)) "$LAUNCHER"; done
   for ((i=0; i<NUM_DECODE; i++));  do destroy_node_by_port_and_pattern $((DECODE_PORT_BASE + i))  "$LAUNCHER"; done
@@ -300,6 +324,7 @@ export_ascend_env() {
   # COMPILATION_CONFIG (cudagraph) is DECODE-ONLY (FULL_DECODE_ONLY); prefill launches without it.
   export COMPILATION_CONFIG='{"cudagraph_capture_sizes":[1,4,8,12,16,20,24,28,32,36,40,48,56,64,80,96],"cudagraph_mode":"FULL_DECODE_ONLY"}'
   export_ssd_offload_env   # no-op unless ENABLE_SSD_OFFLOAD=1
+  unset HCCL_INTRA_ROCE_ENABLE
 }
 
 # Export the MOONCAKE_OFFLOAD_* env consumed by the Mooncake store/master when SSD offload is on.
@@ -384,7 +409,7 @@ export_bff_env() {
   export BFF_MAX_REL_ERR=$BFF_MAX_REL_ERR BFF_V2_DEDUP=$BFF_V2_DEDUP \
          BFF_V2_RESIDENT=$BFF_V2_RESIDENT BFF_SIG_DIM=$BFF_SIG_DIM \
          BFF_V2_MAX_RESIDENT=$BFF_V2_MAX_RESIDENT BFF_V2_SIG_TIMEOUT=$BFF_V2_SIG_TIMEOUT \
-         BFF_SIG_LAYERS=$BFF_SIG_LAYERS
+         BFF_PULL_V2_SIG_TIMEOUT=$BFF_PULL_V2_SIG_TIMEOUT BFF_SIG_LAYERS=$BFF_SIG_LAYERS
   # BOTH roles dump fuse stats: the producer counts blocks + redirects shipped, the decode side counts
   # the redirects that actually landed and the REAL freed-block delta (the measured compression).
   export BFF_PD_STATS_DIR="$results_root"
@@ -444,6 +469,12 @@ JSON
 # $1 = tag (prefill|decode). --compilation-config (cudagraph) is DECODE-ONLY.
 common_args() {
   local tag=$1 extra=""
+  local max_concurrency
+  if [[ "$tag" == "prefill" ]]; then
+    max_concurrency=${PREFILL_MAX_CONCURRENCY}
+  else
+    max_concurrency=${DECODE_MAX_CONCURRENCY}
+  fi
   if [[ "$BFF_ON" == "1" ]]; then
     extra="--enable-prefix-caching --no-disable-hybrid-kv-cache-manager"
   fi
@@ -457,8 +488,9 @@ common_args() {
     --block-size ${BLOCK_SIZE} \
     --max-model-len ${MAX_MODEL_LEN} \
     --max-num-batched-tokens ${MAX_NUM_BATCHED_TOKENS} \
-    --max-num-seqs ${MAX_NUM_SEQS} \
+    --max-num-seqs ${max_concurrency} \
     ${extra}"
+    # --num_gpu_blocks_override 6000 \
 }
 
 # ============================================================
@@ -482,11 +514,17 @@ launch_mooncake_master() {
 
 launch_engines() {
   local role=$1 count=$2 port_base=$3 kv_base=$4 npu_offset=$5 tag=$6
-  echo "Launching ${count} ${tag} node(s)..."
+  local max_concurrency
+  if [[ "$tag" == "prefill" ]]; then
+    max_concurrency=${PREFILL_MAX_CONCURRENCY}
+  else
+    max_concurrency=${DECODE_MAX_CONCURRENCY}
+  fi
+  echo "Launching ${count} ${tag} node(s) (max_concurrency=${max_concurrency})..."
   for ((i=0; i<count; i++)); do
     local port=$((port_base + i)) kv_port=$((kv_base + i))
     local npu; npu=$(assign_npu_for_node $((npu_offset + i)))
-    echo "  ${tag} $i: NPU ${npu}, HTTP ${port}, KV ${kv_port}"
+    echo "  ${tag} $i: NPU ${npu}, HTTP ${port}, KV ${kv_port}, max_num_seqs ${max_concurrency}"
 
     export_ascend_env
     export_bff_env "$role"
@@ -541,16 +579,16 @@ run_benchmark() {
   local npu; npu=$(assign_npu_for_node $target_index); [ -z "$npu" ] && npu=$(assign_npu_for_node 0)
   export ASCEND_RT_VISIBLE_DEVICES=$npu
   export VLLM_WORKER_MULTIPROC_METHOD="spawn" VLLM_USE_V1="1"
-  echo "Running F1 benchmark (concurrency=${MAX_CONCURRENCY}, prompts=${NUM_PROMPTS}) against proxy ${PROXY_PORT}..."
+  echo "Running F1 benchmark (prefill_concurrency=${PREFILL_MAX_CONCURRENCY}, decode_concurrency=${DECODE_MAX_CONCURRENCY}, prompts=${NUM_PROMPTS}) against proxy ${PROXY_PORT}..."
   python -m f1_benchmark.f1_main \
     --dataset-path "${F1_DATASET}" --hf-split "${F1_SPLIT}" \
     --input-key "${F1_INPUT_KEY}" --output-key "${F1_OUTPUT_KEY}" \
     --num-prompts ${NUM_PROMPTS} --request-rate ${REQUEST_RATE} --burstiness ${BURSTINESS} \
-    --max-concurrency ${MAX_CONCURRENCY} --request-timeout ${REQUEST_TIMEOUT} \
-    --min-tokens ${MIN_TOKENS} --compute-f1 \
+    --max-concurrency ${DECODE_MAX_CONCURRENCY} --request-timeout ${REQUEST_TIMEOUT} \
+    --min-tokens ${MIN_TOKENS} --compute-f1 --compute-code-metrics \
     --model "${MODEL}" --host ${VLLM_HOST_IP} --port ${PROXY_PORT} \
     --result-dir "${results_root}" \
-    > "${logs_root}/${BASELINE}-${NUM_PREFILL}Px${NUM_DECODE}D-con${MAX_CONCURRENCY}-serving.txt" 2>&1
+    > "${logs_root}/${BASELINE}-${NUM_PREFILL}Px${NUM_DECODE}D-con${DECODE_MAX_CONCURRENCY}-serving.txt" 2>&1
 }
 
 # Post-run BFF stats (producer dumps bff_stats_<pid>.json into results_root when BASELINE=bff).
@@ -569,56 +607,81 @@ if not files:
 
 # vLLM v1 logs: "<prefix>Avg prompt throughput: .., Avg generation throughput: .., Running: N reqs,
 # Waiting: N reqs[, Preemptions: N], GPU KV cache usage: X%, Prefix cache hit rate: Y%"
-# (Preemptions only appears when >0). Fields are matched independently — order/optionality safe.
-pk = pw = pr = 0.0
+# (Preemptions only appears when >0).
+#
+# Parsed as ONE regex per line so running/waiting/kv are known to CO-OCCUR. The previous version
+# matched each field independently and compared their independent maxima, which is unsound: it
+# reported "peak running 150, peak waiting 67" for moments that never happened together, and drew a
+# verdict from the pair. `.` does not match newline, so each match is confined to one log line.
+LINE = re.compile(r"Running: (\d+) reqs.*?Waiting: (\d+) reqs.*?GPU KV cache usage: ([0-9.]+)%")
+
+rows = []                       # (running, waiting, kv_pct), co-occurring
 preempt_samples = preempt_max = 0
-samples = 0
 for fp in files:
     try:
         txt = open(fp, errors="replace").read()
     except Exception:
         continue
-    for m in re.finditer(r"GPU KV cache usage: ([0-9.]+)%", txt):
-        pk = max(pk, float(m.group(1))); samples += 1
-    for m in re.finditer(r"Waiting: (\d+) reqs", txt):
-        pw = max(pw, int(m.group(1)))
-    for m in re.finditer(r"Running: (\d+) reqs", txt):
-        pr = max(pr, int(m.group(1)))
+    rows += [(int(a), int(b), float(c)) for a, b, c in LINE.findall(txt)]
     for m in re.finditer(r"Preemptions: (\d+)", txt):
         preempt_samples += 1
         preempt_max = max(preempt_max, int(m.group(1)))
 
-if not samples:
+if not rows:
     print("  capacity: no scheduler stats in decode logs (is log-stats disabled?)"); raise SystemExit
 
-# A full KV cache is NOT by itself evidence that KV is the binding constraint. If `Running` is
-# pinned at MAX_CONCURRENCY with zero preemptions, the client's concurrency cap is what limits the
-# system: the scheduler had exactly enough KV, and freeing more cannot admit a single extra request.
-# The old rule (pk >= 90 => YES) reported "capacity-bound: YES" for a con32 run with 99.9% KV,
-# preemptions 0 and running pinned at 32 — a regime where fusion's 614 freed blocks provably could
-# not raise throughput. Distinguish the two, because only one of them can demonstrate value.
-conc_capped = max_conc > 0 and pr >= max_conc and preempt_samples == 0
+samples = len(rows)
+pr = max(r[0] for r in rows)
+pw = max(r[1] for r in rows)
+pk = max(r[2] for r in rows)
+
+# THE signal, and the one the old rule got wrong: vLLM does not preempt under admission pressure —
+# it declines to admit and the queue grows. So "preemptions > 0" is sufficient evidence of capacity
+# binding but NOT necessary, and requiring it made the check tell users to raise MAX_CONCURRENCY in
+# runs that were already KV-bound. A sample with the cache full AND requests queued is the scheduler
+# saying, in the only way it can, that it wants blocks it does not have.
+KV_FULL = 95.0
+kv_blocked = sum(1 for r in rows if r[2] >= KV_FULL and r[1] > 0)
+kv_blocked_frac = kv_blocked / samples
+
+# Concurrency-capped means the CLIENT is the limit: running is at the cap and nothing is queued
+# behind it. Both conditions must hold in the SAME sample — running at the cap while a queue exists
+# means the queue is blocked on something else, which is the KV case above.
+capped = (sum(1 for r in rows if r[0] >= max_conc and r[1] == 0) / samples) if max_conc > 0 else 0.0
+
 if preempt_samples > 0:
     verdict = "YES"
-elif conc_capped:
+elif kv_blocked_frac >= 0.10:
+    verdict = "YES"
+elif capped >= 0.50:
     verdict = "NO (concurrency-capped)"
 elif pk >= 90.0:
-    verdict = "YES"
+    verdict = "MARGINAL"
 else:
     verdict = "MARGINAL" if pk >= 70.0 else "NO"
+
 print(f"  capacity-bound: {verdict} (peak KV {pk:.1f}%, peak waiting {int(pw)}, "
       f"peak running {int(pr)}, preemptions {preempt_max} in {preempt_samples} samples"
       + (f", MAX_CONCURRENCY={max_conc}" if max_conc else "") + ")")
-if conc_capped:
-    print(f"    -> Running is pinned at MAX_CONCURRENCY={max_conc} with 0 preemptions: the "
-          f"CLIENT's concurrency cap binds, not KV — even at {pk:.1f}% KV usage.")
-    print(f"    -> freeing blocks cannot raise throughput here no matter how well fusion works. "
-          f"Raise MAX_CONCURRENCY (and/or lower GPU_MEM_UTIL) until preemptions > 0.")
+print(f"    KV>={KV_FULL:.0f}% with a non-empty queue: {kv_blocked}/{samples} samples "
+      f"({100*kv_blocked_frac:.1f}%) — the admission-pressure signal")
+
+if verdict == "YES" and preempt_samples == 0:
+    print(f"    -> KV is blocking ADMISSION: the scheduler is queueing rather than preempting, so "
+          f"preemptions stay 0. Freed blocks should raise the sustained Running count here.")
+elif verdict.startswith("NO (conc"):
+    print(f"    -> Running sits at MAX_CONCURRENCY={max_conc} with an EMPTY queue in "
+          f"{100*capped:.0f}% of samples: the CLIENT's cap binds, not KV "
+          f"(KV peaks at {pk:.1f}%, i.e. {100-pk:.0f}% headroom).")
+    print(f"    -> raise MAX_CONCURRENCY until the queue stays non-empty while KV is full.")
 elif verdict.startswith("NO"):
     print(f"    -> KV cache never filled ({pk:.1f}%): capacity is NOT the bottleneck, so freeing "
           f"blocks cannot raise throughput here.")
     print(f"    -> to make fusion matter: lower GPU_MEM_UTIL (shrink the pool) or raise "
           f"MAX_CONCURRENCY/MAX_NUM_SEQS/prompt length until this says YES.")
+else:
+    print(f"    -> KV peaks high ({pk:.1f}%) but rarely blocks admission "
+          f"({100*kv_blocked_frac:.1f}% of samples): fusion has little room to prove itself.")
 PY
 }
 
@@ -644,6 +707,45 @@ dec = load("bff_decode_stats_*.json")     # decode scheduler: REAL freed-block d
 app = load("bff_apply_stats_*.json")      # decode worker: which redirects landed, and why not
 if not prod:
     print("  bff stats: none found (fusion may not have engaged)"); raise SystemExit
+
+# v2 writes into the SAME bff_stats_*.json but with a completely different schema (it has no
+# redirects at all — a block it declines is simply never transferred). Split them off first: fed to
+# the v1 reader below they trip the schema-mismatch guard, which then refuses to report anything,
+# and that is what a bff_v2 / bff_pull_v2 run has been silently doing.
+v2 = [s for s in prod if s.get("bff_version") == 2]
+prod = [s for s in prod if s.get("bff_version") != 2]
+
+if v2:
+    P = sum(s.get("blocks_planned", 0) for s in v2)
+    D = sum(s.get("blocks_not_requested", 0) for s in v2)
+    RES = sum(s.get("blocks_not_requested_resident", 0) for s in v2)
+    SAME = sum(s.get("blocks_not_requested_same_pull", 0) for s in v2)
+    AP = sum(s.get("aliases_applied", 0) for s in v2)
+    RC = sum(s.get("aliases_recomputed", 0) for s in v2)
+    EX = sum(s.get("exchanges", 0) for s in v2)
+    FAIL = sum(s.get("signature_phase_failed", 0) for s in v2)
+    print(f"  bff v2 wire saving: {100.0*D/P if P else 0.0:.1f}% of blocks never requested "
+          f"({D} of {P}; {RES} from resident, {SAME} within the same pull) over {len(v2)} node(s)")
+    # An all-zero saving reads two completely different ways, and only these separate them:
+    # exchanges>0 means v2 ran and found nothing worth merging; exchanges==0 means it never ran.
+    print(f"    exchanges: {EX} ({FAIL} fell back to a full read) | aliases applied {AP}, "
+          f"recomputed {RC}"
+          + (f" ({100.0*AP/(AP+RC):.1f}% resolved)" if (AP + RC) else ""))
+    if EX == 0:
+        print("    -> v2 NEVER ASKED: the mechanism did not engage at all. Check BFF_V2_DEDUP and "
+              "the producer's 'signature server (REP) bound on' line in the prefill log.")
+    elif FAIL >= 0.5 * EX:
+        print(f"    -> {100.0*FAIL/EX:.0f}% of exchanges failed. Grep the PREFILL log: no 'bound on'"
+              f" line = the producer never listened; 'bound on' but no 'served' = the decode never "
+              f"reached it; both = it answered too slowly (raise BFF_PULL_V2_SIG_TIMEOUT).")
+    reasons = {}
+    for s in v2:
+        for k, n in (s.get("alias_failure_reasons") or {}).items():
+            reasons[k] = reasons.get(k, 0) + n
+    if reasons:
+        print("    alias failures: " + " ".join(f"{k}={n}" for k, n in sorted(reasons.items())))
+    if not prod:
+        raise SystemExit
 
 B = sum(s.get("total_blocks", 0) for s in prod)
 
@@ -767,6 +869,7 @@ main() {
   echo "BFF Ascend config: BASELINE=$BASELINE launcher=$LAUNCHER connector=$CONNECTOR ${NUM_PREFILL}Px${NUM_DECODE}D tp=$TP_SIZE use_ascend_store=$USE_ASCEND_STORE"
   [[ "$BFF_ON" == "1" ]] && echo "  BFF: fuse=$BFF_PD_FUSE scale=$BFF_SCALE_MODE merge=$BFF_PD_MERGE repr=$BFF_PD_REPR thr=$BFF_THRESHOLD gs=$BFF_GROUP_SIZE eb=$BFF_PD_ENCODED_BATCH_SIZE max_rel_err=$BFF_MAX_REL_ERR"
   [[ "$BASELINE" == "bff_v2" ]] && echo "  BFF v2: dedup=$BFF_V2_DEDUP resident=$BFF_V2_RESIDENT sig_dim=$BFF_SIG_DIM sig_layers=$BFF_SIG_LAYERS sig_timeout=${BFF_V2_SIG_TIMEOUT}s"
+  [[ "$BASELINE" == "bff_pull_v2" ]] && echo "  BFF pull-v2: dedup=$BFF_V2_DEDUP resident=$BFF_V2_RESIDENT sig_dim=$BFF_SIG_DIM sig_timeout=${BFF_PULL_V2_SIG_TIMEOUT}s (D asks P; sig port = kv_port+22000)"
 
   rm -rf "${logs_root}" "${results_root}"; mkdir -p "${logs_root}" "${results_root}"
   rm -f "${results_root}"/bff_stats_*.json
