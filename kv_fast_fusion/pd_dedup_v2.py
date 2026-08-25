@@ -73,7 +73,21 @@ STATS_DIR = os.environ.get("BFF_PD_STATS_DIR", ".")
 # reported a single number for all four and the root cause (maps staged a whole transfer too early)
 # had to be inferred from the step rate instead of read off the run.
 FAIL_REASONS = ("owner_never_batched", "rep_not_resident", "victim_not_in_table",
-                "block_table_write_refused", "owner_id_ambiguous", "rep_recycled")
+                "block_table_write_refused", "owner_id_ambiguous", "rep_recycled",
+                "victim_still_writing")
+
+# Refuse to alias a block the request has not finished writing. See AliasApplier._hot_from.
+#
+# A request's LAST prompt block is almost always partially filled, and the decode keeps writing its
+# newly generated K/V into the free slots. Substituting it points those writes at the
+# representative's physical block, so the request corrupts the representative for its owner, every
+# request aliasing that representative writes its own new tokens to the SAME slots, and they all
+# then read whichever wrote last. Attention stops seeing distinct K/V for new tokens and the model
+# locks into a verbatim repetition loop, after a window as long as the block had slots left.
+#
+# On by default: the cost is at most one block per request-group of compression, against a
+# correctness bug. Set to 0 to reproduce the old behaviour — the counter still fires either way.
+PROTECT_HOT_BLOCKS = os.environ.get("BFF_V2_PROTECT_HOT_BLOCKS", "1") == "1"
 
 # Why an exchange did not happen at all. A connector that never ASKS produces exactly the same
 # all-zero stats as one that asked and found nothing, and the first Ascend run was the former for
@@ -326,6 +340,12 @@ class DedupStats:
         # ratio spoiled" and "unrelated blocks that a shared common component floated to cos ~0.9".
         self.reject_cos: dict[int, list] = {}
         self.index_blocks: dict[int, int] = {}
+        # Aliases whose victim was a block the request was still writing into. Counted whether or
+        # not PROTECT_HOT_BLOCKS refused them, so one run measures the exposure AND is safe.
+        # `hot_slots` totals the slots that were still free in those blocks — the length of the
+        # window before the output would degenerate.
+        self.hot_block_aliases: dict[int, int] = {}
+        self.hot_slots = 0
         self._last_dump = 0.0
 
     def absorb(self, gi: int, plan) -> None:
@@ -408,6 +428,13 @@ class DedupStats:
             "aliases_applied": self.applied,
             "aliases_recomputed": self.recomputed,
             "alias_failure_reasons": dict(self.fail_reasons),
+            # Non-zero means the run was aliasing blocks the decode was still writing into — two
+            # requests sharing the same physical slots for their newly generated tokens. Zero means
+            # that mechanism was never live, whatever else the run did.
+            "hot_block_aliases": sum(self.hot_block_aliases.values()),
+            "hot_block_aliases_per_group": dict(sorted(self.hot_block_aliases.items())),
+            "hot_block_free_slots": self.hot_slots,
+            "hot_block_guarded": PROTECT_HOT_BLOCKS,
             "signature_phase_failed": self.sig_phase_failed,
             # An all-zero saving means one of two very different things. These separate them:
             # exchanges>0 with no drops = nothing worth merging; exchanges==0 = v2 never ran.
@@ -707,11 +734,15 @@ class AliasApplier:
     joined."""
 
     def __init__(self, engine: DedupEngine, write_block_table, note_failed_blocks,
-                 normalize_req_id=None, group_layers=None) -> None:
+                 normalize_req_id=None, group_layers=None, block_size=None) -> None:
         self._engine = engine
         self._write = write_block_table
         self._note_failed = note_failed_blocks
         self._norm = normalize_req_id or (lambda rid: rid)
+        # KV block size, used only to locate each request's write frontier (see _hot_from). None
+        # leaves the whole hot-block check inert, so a caller that does not pass it behaves exactly
+        # as before.
+        self._block_size = int(block_size) if block_size else None
         # ratio mode only: ``{group: iterable_of_layer_names}``, the connector worker's own
         # ``_group_layers`` passed by reference (it is filled during register_kv_caches, possibly
         # after this object is built, and mutated in place). Without it there is nowhere to put a
@@ -751,6 +782,9 @@ class AliasApplier:
         # block-table write and the merge channel both address the runner/scheduler by local id.
         rid2blocks: dict[str, Any] = {}
         rid2local: dict[str, str] = {}
+        # Per request: the index of the first block it has NOT finished writing. Captured in the
+        # same pass as the block ids so the hot-block check costs one division per batched request.
+        rid2hot: dict[str, tuple] = {}
         # Normalisation only has to be injective ACROSS THIS BATCH, and the transport's own keying
         # already assumes that. If it ever is not, the alias map cannot be attributed to a request
         # and resolving it anyway would rewrite the wrong request's block table — the one failure in
@@ -768,6 +802,7 @@ class AliasApplier:
                     continue
                 rid2blocks[key] = bids
                 rid2local[key] = rid_r
+                rid2hot[key] = self._hot_from(st)
 
         updated: dict[str, dict[int, list[int]]] = {}
         failed: set[int] = set()
@@ -792,6 +827,23 @@ class AliasApplier:
             local_rid = rid2local[rid]
             # Mutated in place, so a group that is retried keeps this request's original deadline.
             for gi, mapping in list(by_group.items()):
+                # Aliases onto blocks this request is still writing into are refused before
+                # anything else looks at them: substituting one sends the request's newly generated
+                # K/V into the representative's physical slots, shared with its owner and with
+                # every other request aliasing it. The victim was never fetched, so it genuinely
+                # holds nothing and recompute is the correct outcome.
+                mapping, hot_victims = self._split_hot_victims(
+                    rid2blocks, rid, gi, mapping, rid2hot.get(rid, (None, 0)))
+                if hot_victims:
+                    failed.update(hot_victims)
+                    stats.note_failure("victim_still_writing", len(hot_victims))
+                    # Written back so a group that goes on to retry (rep_not_resident) does not see
+                    # the refused victims again and count them on every step — `by_group` is the
+                    # retry state, and `mapping` is now only what survived.
+                    by_group[gi] = mapping
+                if not mapping:
+                    del by_group[gi]
+                    continue
                 new_blocks, scales, why = self._substitute(rid2blocks, rid, gi, mapping)
                 # Free ONLY when the device table was really rewritten — and recompute whenever it
                 # was not, because unlike v1 the victim block holds nothing.
@@ -829,6 +881,54 @@ class AliasApplier:
         if n_applied:
             stats.applied += n_applied
         return
+
+    def _hot_from(self, st) -> tuple:
+        """``(first unfinished block index, free slots in it)`` for one request state.
+
+        Positions strictly below the returned index hold tokens whose K/V is written and will never
+        be touched again — those are the blocks aliasing exists to share. From that index on, the
+        decode is still writing, and a block there must not be substituted: see PROTECT_HOT_BLOCKS.
+
+        ``num_computed_tokens`` is the count of tokens whose K/V is in the cache, so it is exactly
+        the position the next token writes to. Returns ``(None, 0)`` when the block size was not
+        supplied or the runner state does not carry the field, which disables the check rather than
+        guessing — a wrong frontier would refuse safe aliases and hide the real ones."""
+        if self._block_size is None:
+            return (None, 0)
+        n = getattr(st, "num_computed_tokens", None)
+        if not isinstance(n, int) or n < 0:
+            return (None, 0)
+        bs = self._block_size
+        return (n // bs, (bs - n % bs) % bs)
+
+    def _split_hot_victims(self, rid2blocks, rid, gi, mapping, hot):
+        """Separate the aliases whose victim the request has not finished writing.
+
+        Returns ``(safe_mapping, hot_victims)``. Counted whether or not :data:`PROTECT_HOT_BLOCKS`
+        refuses them, so one run measures the exposure and is safe at the same time; when the guard
+        is off, ``safe_mapping`` is the input unchanged and only the counter moves.
+
+        Done here rather than inside :meth:`_substitute` so that ONE hot victim costs one recompute
+        instead of the whole group's: `_substitute` reports a single reason for the entire mapping,
+        and the caller then fails every alias in it. With ~8 aliases per request-group that would
+        turn one unsafe block into eight recomputes."""
+        hot_from, free_slots = hot
+        if hot_from is None:
+            return mapping, {}
+        groups = rid2blocks.get(rid) or ()
+        if gi >= len(groups):
+            return mapping, {}
+        pos = {int(b): i for i, b in enumerate(groups[gi])}
+        hot_victims = {v: m for v, m in mapping.items()
+                       if pos.get(int(v), -1) >= hot_from}
+        if not hot_victims:
+            return mapping, {}
+        stats = self._engine.stats
+        stats.hot_block_aliases[gi] = stats.hot_block_aliases.get(gi, 0) + len(hot_victims)
+        stats.hot_slots += free_slots * len(hot_victims)
+        if not PROTECT_HOT_BLOCKS:
+            return mapping, {}
+        return {v: m for v, m in mapping.items() if v not in hot_victims}, hot_victims
 
     def _substitute(self, rid2blocks, rid, gi, mapping):
         """Build this request's new per-group block list, or name the reason it cannot.

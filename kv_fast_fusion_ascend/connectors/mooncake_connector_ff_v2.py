@@ -78,6 +78,14 @@ SIG_SERVER_BIND_TIMEOUT = float(os.environ.get("BFF_PULL_V2_SIG_BIND_TIMEOUT", "
 # MooncakeConnectorFFv2.requires_piecewise_for_cudagraph for why the GPU v2 reasoning does not carry
 # over, and what setting this to 1 actually tests.
 ALLOW_FULL_GRAPH = os.environ.get("BFF_V2_ALLOW_FULL_GRAPH", "0") == "1"
+# Check, after each apply, that no physical block sits in two live requests' write frontiers. Cheap
+# (one pass over each request's last block or two) and it is the one check that can refute the
+# "new tokens share KV" theory outright rather than merely failing to confirm it.
+AUDIT_HOT_BLOCKS = os.environ.get("BFF_V2_AUDIT_HOT_BLOCKS", "1") == "1"
+# Trace the physical write slot of the first N requests to decode, step by step. Off by default
+# because it logs once per request per step; on, it is the direct test of "new K/V is written to an
+# invalid address, or to the same slot over and over".
+TRACE_SLOTS = int(os.environ.get("BFF_V2_TRACE_SLOTS", "0"))
 
 # Message tags for our own channel.
 MSG_SIG_REQUEST = b"bff_pull_v2_sig_req"
@@ -113,6 +121,92 @@ def filter_sentinels(planned, *paired):
     kept = [i for i, b in enumerate(planned) if b >= 0]
     return ([planned[i] for i in kept],
             *([lst[i] for i in kept if i < len(lst)] for lst in paired))
+
+
+def hot_block_collisions(per_request, block_size):
+    """Physical blocks two live requests are both still writing into.
+
+    ``per_request`` is ``{req_id: (num_computed_tokens, [per-group block id lists])}``. For each
+    request the blocks from ``num_computed_tokens // block_size`` onward are its **hot** region: the
+    decode writes newly generated K/V there, at ``position % block_size``. Two requests can never
+    legitimately share such a block — each owns its own tail — so any overlap means both are writing
+    to the same physical slots, last write wins, and attention stops seeing distinct K/V for their
+    new tokens. That is the reported symptom stated as an assertion, and it is the check that can
+    also *refute* the theory: a clean run says addressing is fine and the damage is substitution
+    error instead.
+
+    Returns ``{(group, block_id): [req_id, ...]}`` for the colliding blocks only, so a healthy step
+    allocates nothing. Pure, so the whole audit is testable with a dict."""
+    seen: dict[tuple, list] = {}
+    out: dict[tuple, list] = {}
+    if not block_size:
+        return out
+    for rid, (n_computed, groups) in per_request.items():
+        hot_from = int(n_computed) // int(block_size)
+        for gi, ids in enumerate(groups or ()):
+            for b in list(ids)[hot_from:]:
+                b = int(b)
+                if b < 0:
+                    continue          # the null block is shared by construction
+                key = (gi, b)
+                holders = seen.setdefault(key, [])
+                # ONE entry per request. A single request holding the same block twice is a merge
+                # inside its own table — the normal result of aliasing — not two writers racing.
+                # Counting it would make the audit fire on every successful merge and bury the
+                # signal it exists to carry.
+                if rid in holders:
+                    continue
+                holders.append(rid)
+                if len(holders) > 1:
+                    out[key] = holders
+    return out
+
+
+def write_slot(n_computed, group_blocks, block_size):
+    """The physical KV slot the request's NEXT token will be written to, or None.
+
+    ``num_computed_tokens`` is the position of that token, so it lands at
+    ``block_table[pos // block_size] * block_size + pos % block_size`` — the same arithmetic the
+    attention backend's slot mapping does. Exposed as a pure function so the trace can be checked
+    without an NPU, and so the check is the arithmetic itself rather than a paraphrase of it."""
+    if not block_size or not group_blocks:
+        return None
+    idx, off = divmod(int(n_computed), int(block_size))
+    if idx >= len(group_blocks):
+        return None               # the block for this position has not been allocated yet
+    return int(group_blocks[idx]) * int(block_size) + off
+
+
+def slot_trace_fault(prev, cur, block_size):
+    """Name what is wrong between two consecutive ``(n_computed, slot)`` observations, or None.
+
+    The conjecture in its literal form. If the decode's new K/V goes to the same address over and
+    over, or fails to move to the next physical block at a boundary, attention sees static K/V for
+    new tokens and the model locks into a repetition loop. Three things can go wrong, and they are
+    distinguishable:
+
+    * ``slot_repeated`` — the position advanced but the slot did not: every new token overwrites the
+      previous one.
+    * ``slot_not_advanced_in_block`` — one token forward WITHIN a block must be exactly one slot
+      forward.
+    * ``block_not_advanced`` — the position crossed a block boundary but the slot stayed inside the
+      same physical block, which is precisely "fails to index the next physical block".
+
+    Only consecutive single-token steps are judged; anything else returns None rather than guessing,
+    because a resumed or chunked request legitimately jumps."""
+    if prev is None or cur is None or not block_size:
+        return None
+    (p_pos, p_slot), (c_pos, c_slot) = prev, cur
+    if p_slot is None or c_slot is None or c_pos != p_pos + 1:
+        return None
+    if c_slot == p_slot:
+        return "slot_repeated"
+    if p_pos // block_size == c_pos // block_size:
+        return None if c_slot == p_slot + 1 else "slot_not_advanced_in_block"
+    # A boundary crossing: the new slot must be the base of a DIFFERENT physical block.
+    if c_slot // block_size == p_slot // block_size:
+        return "block_not_advanced"
+    return None if c_slot % block_size == 0 else "slot_not_advanced_in_block"
 
 
 def signature_request_and_plan_groups(aligned, groups=None):
@@ -649,6 +743,9 @@ if _ASCEND_AVAILABLE:
         there is nothing to resolve, hold, or expire."""
 
         _WORKER_CLS = MooncakeConnectorWorkerFFv2
+        # One ERROR for the run, not one per step: a collision repeats every step until the
+        # requests finish, and the first occurrence is the one worth reading.
+        _logged_hot_collision = False
 
         def __init__(self, vllm_config, role, kv_cache_config=None):
             super().__init__(vllm_config, role, kv_cache_config)
@@ -659,6 +756,8 @@ if _ASCEND_AVAILABLE:
             self._ff_producer = None
             self._ff_applier = None
             self._ff_step = 0
+            self._hot_collisions = 0
+            self._traced: dict = {}          # BFF_V2_TRACE_SLOTS: rid -> (position, slot)
 
         def save_kv_layer(self, layer_name, kv_layer, attn_metadata, **kwargs) -> None:
             """No-op: signatures are computed on demand from the registered KV cache."""
@@ -688,8 +787,15 @@ if _ASCEND_AVAILABLE:
                 a = self._ff_applier = AliasApplier(
                     worker._dedup_engine, _write_block_table, worker.note_failed_blocks,
                     normalize_req_id=v1._ext_of,
-                    group_layers=worker._group_layers)
+                    group_layers=worker._group_layers,
+                    # Lets the applier locate each request's write frontier and refuse to alias a
+                    # block the decode has not finished writing. See pd_dedup_v2.PROTECT_HOT_BLOCKS.
+                    block_size=self._block_size())
             return a
+
+        def _block_size(self) -> int:
+            cache = getattr(self.connector_worker.vllm_config, "cache_config", None)
+            return int(getattr(cache, "block_size", 0) or 0)
 
         def start_load_kv(self, forward_context, **kwargs) -> None:
             # Connector-level signature (forward_context), NOT the worker's start_load_kv(metadata).
@@ -711,14 +817,90 @@ if _ASCEND_AVAILABLE:
             try:
                 from kv_fast_fusion import fast_fusion_block_pool as _bp
                 applier = self._applier()
+                runner = getattr(_bp, "_ACTIVE_RUNNER", None)
                 before = applier._engine.stats.applied
-                applier.apply(getattr(_bp, "_ACTIVE_RUNNER", None))
+                applier.apply(runner)
                 n = applier._engine.stats.applied - before
                 if n:
-                    logger.info("BFF pull-v2 apply | aliases_applied=%d | recompute(cum)=%d",
-                                n, applier._engine.stats.recomputed)
+                    hot = sum(applier._engine.stats.hot_block_aliases.values())
+                    logger.info("BFF pull-v2 apply | aliases_applied=%d | recompute(cum)=%d | "
+                                "hot-block refused(cum)=%d", n,
+                                applier._engine.stats.recomputed, hot)
+                self._audit_hot_blocks(runner)
+                self._trace_slots(runner)
             except Exception as e:  # pragma: no cover - defensive
                 logger.warning("BFF pull-v2 consumer apply failed: %s", e)
+
+        def _trace_slots(self, runner) -> None:
+            """Follow a few requests' physical write slot step by step (BFF_V2_TRACE_SLOTS=N).
+
+            Off by default — it logs per request per step. On, it is the check that catches an
+            addressing bug which has NOTHING to do with aliasing, so a run cannot come back
+            inconclusive: if the hot-block audit is clean and this is clean, new tokens are getting
+            distinct K/V and the damage is substitution error instead."""
+            if TRACE_SLOTS <= 0 or runner is None:
+                return
+            batched = getattr(getattr(runner, "input_batch", None), "req_id_to_index", None)
+            if not batched:
+                return
+            bs = self._block_size()
+            for rid in batched:
+                if rid not in self._traced and len(self._traced) >= TRACE_SLOTS:
+                    continue
+                st = getattr(runner, "requests", {}).get(rid)
+                n = getattr(st, "num_computed_tokens", None) if st is not None else None
+                bids = getattr(st, "block_ids", None) if st is not None else None
+                if not isinstance(n, int) or not bids:
+                    continue
+                # Group 1: the first fusion group, i.e. one that aliasing can actually touch.
+                gi = 1 if len(bids) > 1 else 0
+                cur = (n, write_slot(n, bids[gi], bs))
+                fault = slot_trace_fault(self._traced.get(rid), cur, bs)
+                self._traced[rid] = cur
+                logger.info("BFF pull-v2 slot | %s g%d pos=%d slot=%s%s",
+                            rid, gi, n, cur[1], f" FAULT={fault}" if fault else "")
+                if fault:
+                    logger.error("BFF pull-v2: %s wrote token %d to slot %s — %s. New K/V is not "
+                                 "reaching a fresh address, which is what a repetition loop looks "
+                                 "like from the attention's side.", rid, n, cur[1], fault)
+
+        def _audit_hot_blocks(self, runner) -> None:
+            """After applying: is any physical block in two live requests' write frontiers?
+
+            The direct test of "attention is no longer receiving distinct K/V for newly generated
+            tokens". Two requests writing their new tokens into the same physical block overwrite
+            each other slot for slot, so both read whichever wrote last, and the model locks into a
+            repetition loop. Distinct requests never legitimately share a hot block, so this has no
+            false-positive mode — and a clean run refutes the theory rather than merely failing to
+            confirm it.
+
+            Runs AFTER apply, deliberately: the question is whether the block tables we just wrote
+            put two requests on the same slots. Costs one pass over each request's last block or
+            two."""
+            if not AUDIT_HOT_BLOCKS or runner is None:
+                return
+            batched = getattr(getattr(runner, "input_batch", None), "req_id_to_index", None)
+            if not batched:
+                return
+            per_request = {}
+            for rid in batched:
+                st = getattr(runner, "requests", {}).get(rid)
+                bids = getattr(st, "block_ids", None) if st is not None else None
+                n = getattr(st, "num_computed_tokens", None) if st is not None else None
+                if bids is not None and isinstance(n, int):
+                    per_request[rid] = (n, bids)
+            hits = hot_block_collisions(per_request, self._block_size())
+            if not hits:
+                return
+            self._hot_collisions += len(hits)
+            if not MooncakeConnectorFFv2._logged_hot_collision:
+                MooncakeConnectorFFv2._logged_hot_collision = True
+                (gi, blk), rids = next(iter(hits.items()))
+                logger.error(
+                    "BFF pull-v2: %d physical block(s) are in the write frontier of MORE THAN ONE "
+                    "live request — e.g. group %d block %d shared by %s. Both will write their "
+                    "newly generated K/V to the same slots, so neither sees its own. This is KV "
+                    "corruption, not a compression trade-off.", len(hits), gi, blk, sorted(rids))
 
         def get_block_ids_with_load_errors(self) -> set:
             worker = self.connector_worker

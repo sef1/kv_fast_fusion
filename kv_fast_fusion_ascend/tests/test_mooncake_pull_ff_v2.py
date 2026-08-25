@@ -415,6 +415,140 @@ def test_the_helper_feeds_the_engine_the_space_that_actually_applies():
 
 
 # =====================================================================================
+# hot-block collisions: are two live requests writing new tokens to the same slots?
+#
+# The direct test of "attention is no longer receiving distinct K/V for newly generated tokens".
+# Each request writes its new K/V at `position % 128` of block `position // 128`, so two requests
+# sharing a block in their write frontier overwrite each other slot for slot and both read whichever
+# wrote last. Block size 128 throughout, matching BFF's requirement.
+# =====================================================================================
+def test_two_requests_writing_into_the_same_block_are_reported():
+    """rA has computed 300 tokens and rB 300, so both are writing into their block index 2 — and
+    aliasing has pointed both at physical block 99."""
+    hits = v2.hot_block_collisions({"rA": (300, [[], [10, 11, 99]]),
+                                    "rB": (300, [[], [20, 21, 99]])}, 128)
+
+    assert list(hits) == [(1, 99)]
+    assert sorted(hits[(1, 99)]) == ["rA", "rB"]
+
+
+def test_sharing_a_finished_block_is_not_a_collision():
+    """The intended, correct state after aliasing: both requests read block 99 for a region neither
+    will write again. Reporting this would make the audit fire on every successful merge and drown
+    the signal it exists to carry."""
+    hits = v2.hot_block_collisions({"rA": (300, [[], [99, 11, 12]]),
+                                    "rB": (300, [[], [99, 21, 22]])}, 128)
+
+    assert hits == {}
+
+
+def test_the_frontier_moves_with_the_request_s_progress():
+    """Same block list, different `num_computed_tokens`, opposite verdicts — and the boundary is
+    exact. The shared block sits at index 1. At 255 computed tokens the frontier is index 1, so the
+    requests are still writing there and it collides; one token later the frontier is index 2, the
+    shared block is finished, and sharing it is the intended result of a merge.
+
+    Note the frontier covers every block from there ON, not just the partial one: a block that has
+    not been written yet is as unsafe to alias as one being written."""
+    blocks = {"rA": [[], [10, 99, 12]], "rB": [[], [20, 99, 22]]}
+
+    assert v2.hot_block_collisions({r: (255, b) for r, b in blocks.items()}, 128) != {}
+    assert v2.hot_block_collisions({r: (256, b) for r, b in blocks.items()}, 128) == {}
+
+
+def test_a_request_never_collides_with_itself():
+    """One request legitimately holds the same block twice after aliasing — that is a merge within
+    its own table, not two writers. Only DISTINCT requests can corrupt each other."""
+    hits = v2.hot_block_collisions({"rA": (0, [[], [99, 99, 99]])}, 128)
+
+    assert hits == {}, "the same rid appearing twice is not two writers"
+
+
+def test_groups_are_kept_apart():
+    """Each KV-cache group has its own block table and its own block-id space, so block 99 of group
+    1 and block 99 of group 2 are different memory. Pooling them would invent collisions."""
+    hits = v2.hot_block_collisions({"rA": (0, [[], [99], []]),
+                                    "rB": (0, [[], [], [99]])}, 128)
+
+    assert hits == {}
+
+
+def test_the_null_block_is_not_a_collision():
+    """Padding positions carry -1 (or the null block) and are shared by construction."""
+    hits = v2.hot_block_collisions({"rA": (0, [[], [-1, 5]]), "rB": (0, [[], [-1, 6]])}, 128)
+
+    assert hits == {}
+
+
+def test_a_healthy_step_allocates_no_result():
+    """This runs after every apply on the decode's critical path, so the common case has to be a
+    scan and nothing more."""
+    assert v2.hot_block_collisions({"rA": (0, [[], [1, 2]]), "rB": (0, [[], [3, 4]])}, 128) == {}
+
+
+def test_an_unknown_block_size_disables_the_audit():
+    """Without it there is no frontier, and guessing one would report collisions on cold blocks —
+    i.e. on every successful merge."""
+    assert v2.hot_block_collisions({"rA": (300, [[], [99]]), "rB": (300, [[], [99]])}, 0) == {}
+
+
+# =====================================================================================
+# the slot trace: is each new token reaching a fresh address?
+#
+# The conjecture in its literal form, and the check that keeps a run from coming back inconclusive:
+# it catches an addressing fault that has nothing to do with aliasing.
+# =====================================================================================
+def test_the_write_slot_is_the_block_table_arithmetic():
+    """position 300 with block size 128 -> block index 2, offset 44. If the table's third entry is
+    block 7, the token lands at 7*128 + 44."""
+    assert v2.write_slot(300, [10, 11, 7, 12], 128) == 7 * 128 + 44
+
+
+def test_a_position_with_no_block_yet_has_no_slot():
+    """The block for the next token is allocated by the scheduler, not by us. Reporting a slot here
+    would invent an address."""
+    assert v2.write_slot(300, [10, 11], 128) is None
+    assert v2.write_slot(0, [], 128) is None
+
+
+def test_advancing_one_token_inside_a_block_advances_one_slot():
+    assert v2.slot_trace_fault((300, 940), (301, 941), 128) is None
+
+
+def test_a_slot_that_does_not_move_is_the_reported_symptom():
+    """Every new token overwriting the previous one — attention then sees static K/V for all of
+    them, which is what a hard verbatim loop looks like from the inside."""
+    assert v2.slot_trace_fault((300, 940), (301, 940), 128) == "slot_repeated"
+
+
+def test_a_slot_that_moves_by_the_wrong_amount_inside_a_block_is_caught():
+    assert v2.slot_trace_fault((300, 940), (301, 999), 128) == "slot_not_advanced_in_block"
+
+
+def test_crossing_a_block_boundary_must_reach_a_different_physical_block():
+    """position 255 -> 256 crosses from block index 1 to 2. Landing at the base of a different
+    physical block is correct; staying inside the same one is exactly 'fails to index the next
+    physical block'."""
+    assert v2.slot_trace_fault((255, 7 * 128 + 127), (256, 9 * 128), 128) is None
+    assert v2.slot_trace_fault((255, 7 * 128 + 127), (256, 7 * 128), 128) == "block_not_advanced"
+
+
+def test_a_non_consecutive_step_is_not_judged():
+    """A resumed or chunked request legitimately jumps. Guessing there would report faults on
+    healthy requests and discredit the ones that matter."""
+    assert v2.slot_trace_fault((300, 940), (400, 1040), 128) is None
+    assert v2.slot_trace_fault(None, (301, 941), 128) is None
+    assert v2.slot_trace_fault((300, 940), (301, 941), 0) is None
+
+
+def test_a_missing_slot_is_not_a_fault():
+    """`write_slot` returns None when the block is not allocated yet; that is absence of evidence,
+    not a fault."""
+    assert v2.slot_trace_fault((300, None), (301, 941), 128) is None
+    assert v2.slot_trace_fault((300, 940), (301, None), 128) is None
+
+
+# =====================================================================================
 # attribute collision with the vendored thread we subclass
 # =====================================================================================
 def _vendored_recv_thread_source():

@@ -455,15 +455,20 @@ class _FakeBlockTable:
             np=numpy.array(padded), gpu=torch.tensor(padded))
 
 
-def _fake_runner(blocks_by_rid, batched=None):
-    """blocks_by_rid: {req_id: [per-group block id lists]}; group 1 only, one row per request."""
+def _fake_runner(blocks_by_rid, batched=None, computed=None):
+    """blocks_by_rid: {req_id: [per-group block id lists]}; group 1 only, one row per request.
+
+    `computed` sets each request's num_computed_tokens, which is what locates its write frontier.
+    Left unset it is 0, and since the frontier check is inert unless the applier was given a block
+    size, that keeps every pre-existing test byte-identical."""
     order = list(blocks_by_rid)
     rows = [blocks_by_rid[r][1] for r in order]
     ib = types.SimpleNamespace(
         req_id_to_index={r: i for i, r in enumerate(order)
                          if batched is None or r in batched},
         block_table=types.SimpleNamespace(block_tables={1: _FakeBlockTable(rows)}))
-    reqs = {r: types.SimpleNamespace(block_ids=[list(g) for g in blocks_by_rid[r]])
+    reqs = {r: types.SimpleNamespace(block_ids=[list(g) for g in blocks_by_rid[r]],
+                                     num_computed_tokens=(computed or {}).get(r, 0))
             for r in order}
     return types.SimpleNamespace(input_batch=ib, requests=reqs, _updated_block_tables=None)
 
@@ -726,6 +731,158 @@ def test_the_num_blocks_guard_is_inert_when_the_caller_omits_it():
     sig_b, norms_b = pd_dedup_v2.signature_matrix(layers, [1, 2, 3], False, [None], num_blocks=None)
 
     assert torch.equal(sig_a, sig_b) and torch.equal(norms_a, norms_b)
+
+
+# =====================================================================================
+# aliasing a block the decode is still writing into
+#
+# A request's last prompt block is almost always partially filled, and the decode keeps writing its
+# newly generated K/V into the free slots. Substituting THAT block points those writes at the
+# representative's physical slots — shared with its owner and with every other request aliasing it —
+# so they overwrite each other and all read whichever wrote last. Attention stops seeing distinct
+# K/V for new tokens and the model locks into a verbatim repetition loop, after a window as long as
+# the block had slots left. Block size 128 throughout, matching BFF's requirement.
+# =====================================================================================
+def _hot_applier(engine, block_size=128):
+    written, failed = [], set()
+    applier = pd_dedup_v2.AliasApplier(
+        engine,
+        lambda r, rid, gi, blocks: (written.append((rid, gi, list(blocks))) or True),
+        failed.update, block_size=block_size)
+    return applier, written, failed
+
+
+def _staged(victim, rep, owner="rA"):
+    engine = pd_dedup_v2.DedupEngine(resident=False)
+    engine._alias_ready = {"rB": {1: {victim: (rep, owner, None)}}}
+    engine._planner._resident.setdefault(1, set()).add(rep)
+    engine._resident_owner[(1, rep)] = owner
+    return engine
+
+
+def test_a_finished_block_is_still_aliased():
+    """The safe, common case — and where all of v2's compression comes from. rB holds four blocks
+    (512 tokens) and has computed 512, so nothing is left to write: every position is cold."""
+    engine = _staged(victim=51, rep=41)
+    applier, written, failed = _hot_applier(engine)
+
+    applier.apply(_fake_runner({"rA": [[], [41]], "rB": [[], [50, 51, 52, 53]]},
+                               computed={"rA": 128, "rB": 512}))
+
+    assert written == [("rB", 1, [50, 41, 52, 53])], "a cold block must still alias"
+    assert not failed
+    assert engine.stats.hot_block_aliases == {}
+
+
+def test_the_block_the_request_is_still_writing_is_refused():
+    """rB has computed 300 of its 512 slots, so the next token goes to block index 2 — position 2
+    and beyond are hot. Aliasing position 2 would send rB's new K/V into rA's block 41."""
+    engine = _staged(victim=52, rep=41)
+    applier, written, failed = _hot_applier(engine)
+
+    applier.apply(_fake_runner({"rA": [[], [41]], "rB": [[], [50, 51, 52, 53]]},
+                               computed={"rA": 128, "rB": 300}))
+
+    assert written == [], "the block table must not be rewritten"
+    assert failed == {52}, "the victim holds nothing, so it must go to recompute"
+    assert engine.stats.fail_reasons["victim_still_writing"] == 1
+    assert engine.stats.hot_block_aliases == {1: 1}
+    assert engine.stats.hot_slots == 128 - 300 % 128, "the window before output degenerates"
+
+
+def test_one_hot_victim_does_not_cost_the_whole_group_its_aliases():
+    """`_substitute` reports a single reason for an entire mapping, so refusing inside it would fail
+    every alias in the group. With ~8 aliases per request-group that turns one unsafe block into
+    eight recomputes — the guard has to be finer than the reason it reports."""
+    engine = _staged(victim=52, rep=41)
+    engine._alias_ready["rB"][1][50] = (42, "rA", None)      # a second, COLD victim
+    engine._planner._resident[1].add(42)
+    engine._resident_owner[(1, 42)] = "rA"
+    applier, written, failed = _hot_applier(engine)
+
+    applier.apply(_fake_runner({"rA": [[], [41, 42]], "rB": [[], [50, 51, 52, 53]]},
+                               computed={"rA": 256, "rB": 300}))
+
+    assert written == [("rB", 1, [42, 51, 52, 53])], "the cold alias survives, the hot one does not"
+    assert failed == {52}
+    assert engine.stats.applied == 1
+
+
+def test_the_guard_can_be_turned_off_and_still_counts(monkeypatch):
+    """The reproduce configuration. BFF_V2_PROTECT_HOT_BLOCKS=0 restores the old behaviour so the
+    damage can be observed deliberately — but the counter still fires, so a run measures the
+    exposure either way."""
+    monkeypatch.setattr(pd_dedup_v2, "PROTECT_HOT_BLOCKS", False)
+    engine = _staged(victim=52, rep=41)
+    applier, written, failed = _hot_applier(engine)
+
+    applier.apply(_fake_runner({"rA": [[], [41]], "rB": [[], [50, 51, 52, 53]]},
+                               computed={"rA": 128, "rB": 300}))
+
+    assert written == [("rB", 1, [50, 51, 41, 53])], "unguarded, the hot block IS substituted"
+    assert not failed
+    assert engine.stats.hot_block_aliases == {1: 1}, "and it is still counted"
+
+
+def test_without_a_block_size_the_check_is_inert():
+    """Every caller that does not pass one — the GPU and layerwise connectors today — must behave
+    exactly as before. A frontier guessed from a wrong block size would refuse safe aliases and hide
+    the real ones, so not knowing it disables the check rather than approximating it."""
+    engine = _staged(victim=52, rep=41)
+    applier, written, _failed = _hot_applier(engine, block_size=None)
+
+    applier.apply(_fake_runner({"rA": [[], [41]], "rB": [[], [50, 51, 52, 53]]},
+                               computed={"rA": 128, "rB": 300}))
+
+    assert written == [("rB", 1, [50, 51, 41, 53])]
+    assert engine.stats.hot_block_aliases == {}
+
+
+def test_a_partially_filled_last_block_is_hot_but_a_full_one_is_not():
+    """The boundary that decides how often this fires at all. 512 computed tokens over four
+    128-blocks leaves nothing partial, so block 3 is finished; one token more and block 4 opens."""
+    engine = pd_dedup_v2.DedupEngine(resident=False)
+    applier = pd_dedup_v2.AliasApplier(engine, lambda *a: True, set().update, block_size=128)
+
+    assert applier._hot_from(types.SimpleNamespace(num_computed_tokens=512)) == (4, 0)
+    assert applier._hot_from(types.SimpleNamespace(num_computed_tokens=513)) == (4, 127)
+    assert applier._hot_from(types.SimpleNamespace(num_computed_tokens=500)) == (3, 12)
+
+
+def test_a_refused_hot_victim_is_counted_once_even_when_its_group_retries():
+    """A group whose representative is not resident YET is retried for APPLY_MAX_AGE steps. If the
+    refused victim stayed in the retry state it would be re-counted on every one of those steps, and
+    the run would report an exposure several times larger than it was — the number this whole
+    exercise exists to read."""
+    engine = _staged(victim=52, rep=41)
+    engine._alias_ready["rB"][1][50] = (77, "rA", None)     # cold victim, rep NOT resident -> retry
+    applier, written, failed = _hot_applier(engine)
+    runner = _fake_runner({"rA": [[], [41]], "rB": [[], [50, 51, 52, 53]]},
+                          computed={"rA": 128, "rB": 300})
+
+    for _ in range(3):
+        applier.apply(runner)
+
+    assert written == [], "the cold alias keeps retrying, the hot one is gone"
+    assert engine.stats.hot_block_aliases == {1: 1}, "counted once, not once per retry"
+    assert engine.stats.fail_reasons["victim_still_writing"] == 1
+    assert failed == {52}
+
+
+def test_the_stats_report_the_exposure_and_whether_it_was_blocked():
+    """The two numbers the run has to come back with: non-zero says the mechanism was live, and the
+    guard flag says whether this run was measuring it or suffering it."""
+    engine = _staged(victim=52, rep=41)
+    applier, _w, _f = _hot_applier(engine)
+    applier.apply(_fake_runner({"rA": [[], [41]], "rB": [[], [50, 51, 52, 53]]},
+                               computed={"rA": 128, "rB": 300}))
+
+    s = engine.stats.stats_dict()
+
+    assert s["hot_block_aliases"] == 1
+    assert s["hot_block_aliases_per_group"] == {1: 1}
+    assert s["hot_block_guarded"] is True
+    assert s["alias_failure_reasons"]["victim_still_writing"] == 1
 
 
 def test_the_default_applier_never_reaches_the_ambiguity_branch():
