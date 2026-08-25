@@ -86,6 +86,9 @@ AUDIT_HOT_BLOCKS = os.environ.get("BFF_V2_AUDIT_HOT_BLOCKS", "1") == "1"
 # because it logs once per request per step; on, it is the direct test of "new K/V is written to an
 # invalid address, or to the same slot over and over".
 TRACE_SLOTS = int(os.environ.get("BFF_V2_TRACE_SLOTS", "0"))
+# Ceiling on how much of ONE request may be satisfied from other requests' blocks. Above it the
+# request is read whole. See cap_request_decline for why a per-block cosine bar cannot express this.
+MAX_REQ_DECLINE = float(os.environ.get("BFF_V2_MAX_REQ_DECLINE", "0.5"))
 
 # Message tags for our own channel.
 MSG_SIG_REQUEST = b"bff_pull_v2_sig_req"
@@ -160,6 +163,40 @@ def hot_block_collisions(per_request, block_size):
                 if len(holders) > 1:
                     out[key] = holders
     return out
+
+
+def decline_fraction(planned):
+    """``(declined, total)`` over one request's whole plan — every group, not one at a time.
+
+    The harm is per REQUEST: a prompt whose blocks are individually replaceable is still a prompt
+    the model never sees if enough of them are replaced at once."""
+    declined = total = 0
+    for plan_g in planned.values():
+        total += len(plan_g)
+        declined += sum(1 for b in plan_g if b < 0)
+    return declined, total
+
+
+def cap_request_decline(planned, max_frac=None):
+    """Refuse a plan that replaces most of a request, keeping the rest untouched.
+
+    Returns ``(planned, capped)``. Over the ceiling the plan is dropped whole and the request is
+    read normally; the caller must also ``forget()`` its staged aliases so none are applied later.
+
+    A per-block cosine bar cannot express this, because the bar is per block while the harm is per
+    request. At ``BFF_MAX_REL_ERR=0.3`` the floor is cosine 0.954, which is a reasonable bar for one
+    block and a catastrophic one for nineteen of twenty: the model then attends to a coherent prompt
+    that is not the one it was asked. A run measured exactly that — 19 of 20 blocks declined in all
+    six fusion groups of one request — with the local prefix cache at 0.5%, so the blocks were
+    similar, not identical. Fetching one request in full is cheap; answering the wrong prompt is
+    not."""
+    frac = MAX_REQ_DECLINE if max_frac is None else max_frac
+    if not planned or frac >= 1.0:
+        return planned, False
+    declined, total = decline_fraction(planned)
+    if total <= 0 or declined <= frac * total:
+        return planned, False
+    return {}, True
 
 
 def write_slot(n_computed, group_blocks, block_size):
@@ -495,6 +532,7 @@ if _ASCEND_AVAILABLE:
         dedup_engine: "DedupEngine | None" = None
         sig_port_offset: int = FF_PULL_V2_PORT_OFFSET
         _logged_first_decline = False
+        _logged_first_cap = False
         # Groups already reported by _warn_on_runaway_groups. Deliberately class-level and shared:
         # the warning is once per group for the process, not once per request or per thread.
         _warned_runaway: ClassVar[set] = set()
@@ -552,6 +590,25 @@ if _ASCEND_AVAILABLE:
             if not out:
                 return {}
             result = {gi: out[gi] for gi in plan_groups if gi < len(out)}
+            stats = self.dedup_engine.stats
+            declined, total = decline_fraction(result)
+            stats.note_request_decline(declined, total)
+            result, capped = cap_request_decline(result)
+            if capped:
+                # The aliases are already staged in the engine, so dropping the plan is not enough —
+                # forget() must retract them or they would be applied to blocks this request is now
+                # going to fetch normally.
+                self.dedup_engine.forget([ext_id])
+                stats.requests_capped += 1
+                if not KVCacheRecvingThreadFFv2._logged_first_cap:
+                    KVCacheRecvingThreadFFv2._logged_first_cap = True
+                    logger.warning(
+                        "BFF pull-v2: a request would have had %d of %d blocks (%.0f%%) replaced by "
+                        "other requests' KV — over the %.0f%% ceiling, so it is being read in full. "
+                        "That much substitution answers a neighbouring prompt, however similar each "
+                        "block is on its own. Tune with BFF_V2_MAX_REQ_DECLINE.",
+                        declined, total, 100.0 * declined / total, 100.0 * MAX_REQ_DECLINE)
+                return {}
             self._warn_on_runaway_groups(result)
             return result
 
@@ -746,6 +803,7 @@ if _ASCEND_AVAILABLE:
         # One ERROR for the run, not one per step: a collision repeats every step until the
         # requests finish, and the first occurrence is the one worth reading.
         _logged_hot_collision = False
+        _logged_mirror_drift = False
 
         def __init__(self, vllm_config, role, kv_cache_config=None):
             super().__init__(vllm_config, role, kv_cache_config)
@@ -854,6 +912,7 @@ if _ASCEND_AVAILABLE:
                     continue
                 # Group 1: the first fusion group, i.e. one that aliasing can actually touch.
                 gi = 1 if len(bids) > 1 else 0
+                self._check_mirror_matches_device(runner, rid, gi, bids[gi])
                 cur = (n, write_slot(n, bids[gi], bs))
                 fault = slot_trace_fault(self._traced.get(rid), cur, bs)
                 self._traced[rid] = cur
@@ -863,6 +922,35 @@ if _ASCEND_AVAILABLE:
                     logger.error("BFF pull-v2: %s wrote token %d to slot %s — %s. New K/V is not "
                                  "reaching a fresh address, which is what a repetition loop looks "
                                  "like from the attention's side.", rid, n, cur[1], fault)
+
+        def _check_mirror_matches_device(self, runner, rid, gi, mirror_row) -> None:
+            """The trace reads ``runner.requests[rid].block_ids[gi]``; attention reads the DEVICE
+            table. ``_ff_write_runner_block_table`` writes both from the same row, so they must
+            agree — but if they ever did not, every slot this trace reports would be an address the
+            hardware never used, and the whole trace would be reassuring about the wrong table.
+
+            Compared over the row's real length only: the device table is rectangular and padded to
+            the widest request in the batch."""
+            if MooncakeConnectorFFv2._logged_mirror_drift:
+                return
+            try:
+                ridx = runner.input_batch.req_id_to_index.get(rid)
+                bt = runner.input_batch.block_table[gi]
+                n = min(len(mirror_row), int(bt.num_blocks_per_row[ridx]))
+                device_row = [int(x) for x in bt.block_table.np[ridx, :n]]
+            except Exception:       # noqa: BLE001 - a diagnostic must never break the step
+                return
+            mirror = [int(x) for x in mirror_row[:n]]
+            if mirror == device_row:
+                return
+            MooncakeConnectorFFv2._logged_mirror_drift = True
+            bad = next((i for i, (a, b) in enumerate(zip(mirror, device_row)) if a != b), None)
+            logger.error(
+                "BFF pull-v2: %s group %d — the runner's block list and the DEVICE block table "
+                "disagree at position %s (%s vs %s). Attention reads the device table, so the "
+                "addresses this trace reports are not the ones being written.",
+                rid, gi, bad, mirror[bad] if bad is not None else "?",
+                device_row[bad] if bad is not None else "?")
 
         def _audit_hot_blocks(self, runner) -> None:
             """After applying: is any physical block in two live requests' write frontiers?

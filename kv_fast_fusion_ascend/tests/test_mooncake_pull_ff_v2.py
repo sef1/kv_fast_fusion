@@ -493,6 +493,73 @@ def test_an_unknown_block_size_disables_the_audit():
 
 
 # =====================================================================================
+# the per-request ceiling: compression vs. replacing the request
+#
+# The cosine bar is per BLOCK; the harm is per REQUEST. At BFF_MAX_REL_ERR=0.3 the floor is cosine
+# 0.954 — a reasonable bar for one block and a catastrophic one for nineteen of twenty, because the
+# model then attends to a coherent prompt that is not the one it was asked.
+# =====================================================================================
+def test_the_declined_fraction_is_counted_across_every_group():
+    """A request half-replaced in each of six groups is a half-replaced request. Counting per group
+    would report six modest numbers and hide the one that matters."""
+    planned = {1: [70, SENT, 72, SENT], 2: [80, SENT, 82, 83]}
+
+    assert v2.decline_fraction(planned) == (3, 8)
+
+
+def test_an_untouched_request_reports_nothing_declined():
+    assert v2.decline_fraction({1: [70, 71]}) == (0, 2)
+    assert v2.decline_fraction({}) == (0, 0)
+
+
+def test_a_request_mostly_replaced_is_read_in_full():
+    """The measured case: 19 of 20 blocks declined in every group. Dropping the plan means the
+    request transfers exactly as stock would — one full read, against answering someone else's
+    prompt."""
+    planned = {1: [SENT] * 19 + [99], 2: [SENT] * 19 + [98]}
+
+    out, capped = v2.cap_request_decline(planned, max_frac=0.5)
+
+    assert capped is True
+    assert out == {}, "nothing is declined, so every block is fetched"
+
+
+def test_ordinary_compression_passes_through_untouched():
+    """Where all of v2's saving comes from — this must not be disturbed."""
+    planned = {1: [70, SENT, 72, 73], 2: [80, 81, 82, 83]}
+
+    out, capped = v2.cap_request_decline(planned, max_frac=0.5)
+
+    assert capped is False
+    assert out is planned, "no copying on the common path"
+
+
+def test_the_ceiling_is_exact_and_inclusive():
+    """Exactly at the ceiling is allowed; one block past it is not. An off-by-one here silently
+    moves the policy by a whole block on short requests."""
+    at = {1: [70, 71, SENT, SENT]}                       # 2 of 4 = 0.50
+    over = {1: [70, SENT, SENT, SENT]}                   # 3 of 4 = 0.75
+
+    assert v2.cap_request_decline(at, max_frac=0.5)[1] is False
+    assert v2.cap_request_decline(over, max_frac=0.5)[1] is True
+
+
+def test_a_ceiling_of_one_disables_the_cap():
+    """1.0 must be inert, so the cap can be taken out of the picture for an A/B without also
+    changing the code path."""
+    planned = {1: [SENT] * 20}
+
+    assert v2.cap_request_decline(planned, max_frac=1.0) == (planned, False)
+
+
+def test_an_empty_plan_is_not_capped():
+    """A request nobody planned for must not be counted as a capped one — that would report the
+    guard firing on requests it never saw."""
+    assert v2.cap_request_decline({}, max_frac=0.5) == ({}, False)
+    assert v2.cap_request_decline({1: []}, max_frac=0.5)[1] is False
+
+
+# =====================================================================================
 # the slot trace: is each new token reaching a fresh address?
 #
 # The conjecture in its literal form, and the check that keeps a run from coming back inconclusive:

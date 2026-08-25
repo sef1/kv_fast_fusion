@@ -885,6 +885,69 @@ def test_the_stats_report_the_exposure_and_whether_it_was_blocked():
     assert s["alias_failure_reasons"]["victim_still_writing"] == 1
 
 
+# =====================================================================================
+# the per-request decline histogram
+#
+# The run-level wire saving cannot tell "every request gives up a little" from "a few requests give
+# up nearly everything", and only the second destroys those requests. This is the number that can.
+# =====================================================================================
+def test_each_request_lands_in_the_bucket_for_its_own_fraction():
+    s = pd_dedup_v2.DedupStats()
+
+    s.note_request_decline(1, 20)        # 5%
+    s.note_request_decline(4, 20)        # 20%
+    s.note_request_decline(19, 20)       # 95%
+
+    assert s.request_decline_frac["0-10%"] == 1
+    assert s.request_decline_frac["10-25%"] == 1
+    assert s.request_decline_frac["90-100%"] == 1
+
+
+def test_the_same_average_reads_differently_when_it_is_concentrated():
+    """Ten requests at 10% and ten at 5%+95% both average ~10% overall. The histogram is what makes
+    those two runs distinguishable — the second has ten ruined requests."""
+    spread, concentrated = pd_dedup_v2.DedupStats(), pd_dedup_v2.DedupStats()
+    for _ in range(20):
+        spread.note_request_decline(2, 20)
+    for _ in range(10):
+        concentrated.note_request_decline(0, 20)
+        concentrated.note_request_decline(19, 20)
+
+    assert spread.request_decline_frac["90-100%"] == 0
+    assert concentrated.request_decline_frac["90-100%"] == 10
+
+
+def test_bucket_edges_fall_on_the_lower_bound():
+    s = pd_dedup_v2.DedupStats()
+
+    for declined in (0, 10, 25, 50, 75, 90, 100):
+        s.note_request_decline(declined, 100)
+
+    assert s.request_decline_frac == {"0-10%": 1, "10-25%": 1, "25-50%": 1,
+                                      "50-75%": 1, "75-90%": 1, "90-100%": 2}
+
+
+def test_a_request_with_nothing_planned_is_not_recorded():
+    """Otherwise every request the connector declined to plan for would pile into the 0-10% bucket
+    and dilute the distribution the run is being read for."""
+    s = pd_dedup_v2.DedupStats()
+
+    s.note_request_decline(0, 0)
+
+    assert sum(s.request_decline_frac.values()) == 0
+
+
+def test_the_histogram_and_the_cap_count_reach_the_stats_file():
+    s = pd_dedup_v2.DedupStats()
+    s.note_request_decline(19, 20)
+    s.requests_capped = 3
+
+    d = s.stats_dict()
+
+    assert d["request_decline_frac"]["90-100%"] == 1
+    assert d["requests_capped"] == 3
+
+
 def test_the_default_applier_never_reaches_the_ambiguity_branch():
     """`normalize_req_id` defaults to identity and the runner's batch is a dict, so two entries can
     never collide. The GPU stats reporting owner_id_ambiguous=0 is not luck — it is unreachable."""

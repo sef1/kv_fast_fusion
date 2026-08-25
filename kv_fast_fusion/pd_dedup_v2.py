@@ -95,6 +95,13 @@ PROTECT_HOT_BLOCKS = os.environ.get("BFF_V2_PROTECT_HOT_BLOCKS", "1") == "1"
 SKIP_REASONS = ("no_kv_tensors", "no_signature", "length_mismatch", "kv_layout_refused",
                 "no_peer", "empty_group", "no_kv_norms")
 
+# Buckets for the per-request declined fraction (see DedupStats.note_request_decline). The top ones
+# are deliberately narrow: the difference between a request giving up 75% and 95% of its prompt is
+# the difference between a damaged answer and an answer to someone else's question.
+DECLINE_BUCKETS = ("0-10%", "10-25%", "25-50%", "50-75%", "75-90%", "90-100%")
+DECLINE_BUCKETS_ORDERED = ((0.90, "90-100%"), (0.75, "75-90%"), (0.50, "50-75%"),
+                           (0.25, "25-50%"), (0.10, "10-25%"), (0.0, "0-10%"))
+
 # How a substituted block is read on the decode.
 #   "raw"   : the victim reads the representative's block verbatim. The substitution error is
 #             ``sqrt(1 + r^2 - 2*r*cos)`` with r the norm ratio as it happens to fall, which is why
@@ -346,7 +353,24 @@ class DedupStats:
         # window before the output would degenerate.
         self.hot_block_aliases: dict[int, int] = {}
         self.hot_slots = 0
+        # How much of EACH request was declined, bucketed. The run-level saving cannot distinguish
+        # "every request gives up a little" from "a few requests give up nearly everything", and
+        # only the second destroys those requests: replacing most of a prompt with merely-similar
+        # blocks makes the model answer a neighbouring prompt. One run measured 19 of 20 blocks
+        # declined in all six groups of a single request while the run-level figure read 6.5%.
+        self.request_decline_frac = dict.fromkeys(DECLINE_BUCKETS, 0)
+        self.requests_capped = 0     # requests read whole because they exceeded MAX_REQ_DECLINE
         self._last_dump = 0.0
+
+    def note_request_decline(self, declined: int, planned: int) -> None:
+        """Record one request's declined fraction. ``planned`` of 0 is not a request we touched."""
+        if planned <= 0:
+            return
+        frac = declined / planned
+        for lo, label in DECLINE_BUCKETS_ORDERED:
+            if frac >= lo:
+                self.request_decline_frac[label] += 1
+                return
 
     def absorb(self, gi: int, plan) -> None:
         """Fold in one group's plan histograms.
@@ -435,6 +459,10 @@ class DedupStats:
             "hot_block_aliases_per_group": dict(sorted(self.hot_block_aliases.items())),
             "hot_block_free_slots": self.hot_slots,
             "hot_block_guarded": PROTECT_HOT_BLOCKS,
+            # A long tail in the top buckets means requests are being REPLACED, not compressed —
+            # the distinction the run-level wire saving cannot make.
+            "request_decline_frac": dict(self.request_decline_frac),
+            "requests_capped": self.requests_capped,
             "signature_phase_failed": self.sig_phase_failed,
             # An all-zero saving means one of two very different things. These separate them:
             # exchanges>0 with no drops = nothing worth merging; exchanges==0 = v2 never ran.
