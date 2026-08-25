@@ -671,6 +671,32 @@ if _ASCEND_AVAILABLE:
         base_addr_groups: list[list[int]] | None = None
         _logged_amplification: bool = False
 
+        def _align_and_group(self, req_meta, local_groups, remote_groups, tp_num_need_pulls):
+            """Per group: tail-align, then coalesce contiguous runs.
+
+            Both are per group because the groups have independent block tables — one group's run of
+            consecutive ids says nothing about another's.
+
+            Factored out as a seam for v2, which drops the blocks the decode can satisfy locally in
+            between the two steps. That position is not negotiable: after the tail-align so the
+            pair's indices already correspond, and before the coalesce so a dropped block breaks a
+            contiguous run instead of being silently absorbed into one."""
+            aligned = align_per_group(local_groups, remote_groups)
+            grouped: list[tuple[list, list]] = []
+            for remote_ids, local_ids in aligned:
+                if not local_ids:
+                    grouped.append(([], []))
+                elif tp_num_need_pulls == 1:
+                    gr, gl = group_concurrent_contiguous(remote_ids, local_ids)
+                    grouped.append((gr, gl))
+                else:
+                    grouped.append(([[b] for b in remote_ids], [[b] for b in local_ids]))
+            return grouped
+
+        def _after_transfer(self, req_meta) -> None:
+            """Called once this request's KV has actually landed. No-op in v1; v2 releases the
+            request's aliases and residency here."""
+
         def _transfer_kv_cache(self, req_meta):
             local_groups = req_meta["local_block_ids"]
             remote_groups = req_meta["remote_block_ids"]
@@ -692,19 +718,8 @@ if _ASCEND_AVAILABLE:
                     or remote_handshake_port not in self.kv_caches_base_addr[remote_engine_id]):
                 self._get_remote_metadata(remote_host, remote_handshake_port)
 
-            # Per group: tail-align, then coalesce contiguous runs. Both are per group because the
-            # groups have independent block tables — one group's run of consecutive ids says
-            # nothing about another's.
-            aligned = align_per_group(local_groups, remote_groups)
-            grouped: list[tuple[list, list]] = []
-            for remote_ids, local_ids in aligned:
-                if not local_ids:
-                    grouped.append(([], []))
-                elif tp_num_need_pulls == 1:
-                    gr, gl = group_concurrent_contiguous(remote_ids, local_ids)
-                    grouped.append((gr, gl))
-                else:
-                    grouped.append(([[b] for b in remote_ids], [[b] for b in local_ids]))
+            grouped = self._align_and_group(
+                req_meta, local_groups, remote_groups, tp_num_need_pulls)
 
             prefill_pp_rank = offset // tp_num_need_pulls
             inner_offset = offset % tp_num_need_pulls
@@ -783,6 +798,11 @@ if _ASCEND_AVAILABLE:
                     "would decode against stale KV with no other symptom than wrong output.")
 
             if not src_list:
+                # Nothing to read. Under v2 this is the fully-deduped case — every block was
+                # satisfied locally — and its aliases are ready NOW, so the landed-hook still has to
+                # fire. Returning without it would strand the request's aliases until they expired
+                # and send every one of its blocks to recompute.
+                self._after_transfer(req_meta)
                 return
             ret = self.engine.batch_transfer_sync_read(session_id, src_list, dst_list, length_list)
             if ret < 0:
@@ -791,6 +811,7 @@ if _ASCEND_AVAILABLE:
                     f"(ret={ret}, {len(src_list)} segments)")
 
             self._reformat_after_pull(grouped, offset, tp_num_need_pulls)
+            self._after_transfer(req_meta)
 
         def _reformat_after_pull(self, grouped, offset, tp_num_need_pulls):
             """Stock's post-pull NZ/cat reformat, unchanged except for the block list it is given.
@@ -910,6 +931,13 @@ if _ASCEND_AVAILABLE:
         scheduler's ``_connector_finished`` asserts ``len(kv_cache_groups) == 1`` and dies on the
         first finished request."""
 
+        # Named so a subclass can substitute its own halves. Constructing the classes by name here
+        # instead would make an override silently ineffective — v2 would run v1's worker, with no
+        # dedup engine and no signature server, and the only symptom would be a benchmark that shows
+        # no improvement.
+        _WORKER_CLS = MooncakeConnectorWorkerFF
+        _SCHEDULER_CLS = MooncakeConnectorSchedulerFF
+
         def __init__(self, vllm_config: "VllmConfig", role: "KVConnectorRole",
                      kv_cache_config: "KVCacheConfig | None" = None):
             assert vllm_config.kv_transfer_config is not None
@@ -917,14 +945,14 @@ if _ASCEND_AVAILABLE:
             self._connector_metadata = MooncakeConnectorMetadataFF()
             self._kv_cache_config = kv_cache_config
             if role == KVConnectorRole.SCHEDULER:
-                self.connector_scheduler = MooncakeConnectorSchedulerFF(
+                self.connector_scheduler = self._SCHEDULER_CLS(
                     vllm_config, str(self.engine_id))
                 self.connector_worker = None
             else:
                 self.connector_scheduler = None
                 # The worker is where the group layout is read; hand it the config the factory gave
                 # us so it never has to depend on _ACTIVE_RUNNER being published in this process.
-                self.connector_worker = MooncakeConnectorWorkerFF(
+                self.connector_worker = self._WORKER_CLS(
                     vllm_config, str(self.engine_id), kv_cache_config)
 
             # Fusion accumulator: producer-side worker role only. MooncakeFFProducer is documented

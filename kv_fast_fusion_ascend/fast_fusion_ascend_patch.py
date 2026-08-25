@@ -505,6 +505,18 @@ def apply_fast_fusion_ascend_patch() -> None:
     except Exception as e:  # pragma: no cover
         _registration_failed("MooncakeConnectorFF", e)
 
+    # v2 of the pull transport: the DECODE decides which blocks are worth reading, so a deduplicated
+    # block is never fetched at all (v1 still transfers everything and only saves KV capacity).
+    # Registered alongside v1 rather than replacing it, so the two are one --kv-transfer-config
+    # apart in an A/B.
+    try:
+        from kv_fast_fusion_ascend.connectors.mooncake_connector_ff_v2 import (
+            register_mooncake_connector_ff_v2,
+        )
+        register_mooncake_connector_ff_v2()
+    except Exception as e:  # pragma: no cover
+        _registration_failed("MooncakeConnectorFFv2", e)
+
     if os.environ.get("BFF_PD_FUSE", "0") != "1":
         logger.info("BFF Ascend: BFF_PD_FUSE!=1 → stock (no KV-cache group split, no patches).")
         return

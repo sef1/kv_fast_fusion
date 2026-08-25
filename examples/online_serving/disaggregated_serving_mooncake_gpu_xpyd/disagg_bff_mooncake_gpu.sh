@@ -21,9 +21,13 @@
 #     to find that prefill's workers. The proxy is told these statically —
 #     Mooncake has no ZMQ service discovery, so there is no PROXY ZMQ port and
 #     no ___decode_addr_ request-id rewriting.
-#   * No NCCL env (VLLM_NCCL_SO_PATH / NCCL_P2P_DISABLE / custom all-reduce),
-#     and no kv_buffer_size — Mooncake reads registered memory directly, so
-#     there is no recv-buffer threshold to tune on D.
+#   * No kv_buffer_size — Mooncake reads registered memory directly, so there is
+#     no recv-buffer threshold to tune on D.
+#   * NCCL still matters at TP>1, and this script used to say it did not. Mooncake
+#     replaces NCCL for the KV TRANSFER, not for the TENSOR-PARALLEL all-reduce
+#     inside each instance — a separate layer that uses NCCL whatever the KV
+#     connector is. At TP=1 no TP group exists, so the omission was invisible
+#     until the first TP=2 run wedged in startup. See the TP>1 collectives block.
 #   * BFF_SCALE_MODE=ratio needs BASELINE=bff_v2. On v1 the redirect maps ride
 #     the transfer ACK, which carries no float payload, so there is nowhere to
 #     put the per-block scales and the connector downgrades to raw with a
@@ -200,6 +204,66 @@ BFF_PD_AUDIT=${BFF_PD_AUDIT:-0}
 BFF_PD_AUDIT_STEPS=${BFF_PD_AUDIT_STEPS:-8}
 BFF_PD_AUDIT_PAIRS=${BFF_PD_AUDIT_PAIRS:-512}
 
+# ---- TP>1 collectives --------------------------------------------------------
+# Mooncake does not use NCCL to move KV — but TENSOR PARALLELISM does, and that is a different
+# layer. At TP=1 there is no TP group, which is why this script ran for months without any of the
+# NCCL handling the P2P-NCCL script carries; the first TP=2 run wedged in startup with both workers
+# spinning (R state, 100% GPU util on ~700 MiB) and no log output for 12+ minutes.
+#
+# Two independent causes on this host, both reproduced on 2026-08-24:
+#
+#   1. NCCL over a topologically-close (PIX) GPU pair hangs. Verified with a bare 2-GPU all_reduce,
+#      no vLLM involved: default settings time out on both ranks; NCCL_P2P_DISABLE=1 completes.
+#      Cross-socket (SYS) pairs already fall back to SHM and are unaffected — hence the probe below
+#      rather than an unconditional export.
+#   2. vLLM's CUSTOM all-reduce is its own CUDA-IPC spin-flag kernel, NOT NCCL, so no NCCL_* env
+#      reaches it, and its IPC delivery is unreliable on this driver (610.43.02). See the same
+#      finding in disagg_bff_p2p_nccl_xpyd.sh, where it was diagnosed on 2026-07-23.
+#
+# Both default ON for TP>1 and are no-ops at TP=1 (no TP collective exists there). Set
+# DISABLE_CUSTOM_AR=0 / NCCL_P2P_DISABLE=0 to re-enable after a driver realignment.
+DISABLE_CUSTOM_AR=${DISABLE_CUSTOM_AR:-1}
+
+_tp_pairs_need_p2p_disable() {
+    # Unlike the NCCL script, the pairs that matter here are the TP peers WITHIN each instance —
+    # Mooncake carries the KV, so there is no cross-instance NCCL comm to consider.
+    python3 - "$PREFILL_GPUS" "$DECODE_GPUS" "$TP" <<'PY' 2>/dev/null
+import re, subprocess, sys
+tp = int(sys.argv[3])
+if tp < 2:
+    print("0"); raise SystemExit
+groups = []
+for spec in sys.argv[1:3]:
+    ids = [int(x) for x in spec.split(",") if x != ""]
+    groups += [ids[i:i + tp] for i in range(0, len(ids), tp)]
+out = subprocess.check_output(["nvidia-smi", "topo", "-m"], text=True)
+ansi, gpu = re.compile(r"\x1b\[[0-9;]*m"), re.compile(r"GPU(\d+)$")
+cols, link = None, {}
+for line in out.splitlines():
+    toks = ansi.sub("", line).split()
+    if not toks:
+        continue
+    if cols is None and toks[0] == "GPU0" and "X" not in toks:
+        cols = [int(m.group(1)) for t in toks if (m := gpu.match(t))]
+        continue
+    if cols and gpu.match(toks[0]) and "X" in toks:
+        g = int(gpu.match(toks[0]).group(1))
+        for c, v in zip(cols, toks[1:1 + len(cols)]):
+            link[(g, c)] = v
+need = any(link.get((a, b), "SYS") not in ("SYS", "X")
+           for grp in groups for a in grp for b in grp if a != b)
+print("1" if need else "0")
+PY
+}
+_NEED_P2P_DISABLE=$(_tp_pairs_need_p2p_disable)
+if [[ "$_NEED_P2P_DISABLE" == "1" ]]; then
+    export NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-1}
+elif [[ -z "$_NEED_P2P_DISABLE" && "$TP" -gt 1 ]]; then
+    # Probe could not run (no nvidia-smi/python). Disabling P2P costs bandwidth; hanging costs the
+    # whole run, so prefer the slow-but-working transport.
+    export NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-1}
+fi
+
 # ---- GPU memory --------------------------------------------------------------
 # No kv_buffer_size here: Mooncake transfers straight out of registered KV memory, so D has no
 # recv-buffer threshold to tune (the NCCL script's DECODE_KV_BUFFER has no counterpart).
@@ -252,6 +316,10 @@ _MEM_TAG=""
 # the second would have silently overwritten the first — the failure the _re comment below records.
 # ab_summarise.py refuses to pool across it; the tag is what stops the .json being lost first.
 [[ "$MAX_TOKENS" != "8192" ]] && _MEM_TAG+="_mt${MAX_TOKENS}"
+# `1Px1D` counts INSTANCES, not GPUs — TP is invisible in it, so 1P×1D at TP=1 (2 GPUs) and at TP=2
+# (4 GPUs) wrote the same filename. Throughput roughly doubles with TP, so that collision silently
+# replaces a result with one from twice the hardware. Same conditional idiom: TP=1 tags are unchanged.
+[[ "$TP" != "1" ]] && _MEM_TAG+="_tp${TP}"
 
 if [[ "$BASELINE" == "vanilla" ]]; then
     RUN_TAG=${RUN_TAG:-mooncake_vanilla${_MEM_TAG}_con_${MAX_CONCURRENCY}_${NUM_PREFILL}Px${NUM_DECODE}D${RUN_SET:+_s${RUN_SET}}${RUN_REPEAT:+_r${RUN_REPEAT}}}
@@ -332,6 +400,8 @@ echo "  BFF:          BFF_PD_MERGE=$BFF_PD_MERGE  BFF_SCALE_MODE=$BFF_SCALE_MODE
 echo "  BFF fusion:   cross_index=$BFF_PD_CROSS_INDEX  ff_groups=${BFF_FF_GROUPS:-<all>}  lsh=${BFF_LSH_TABLES}x${BFF_LSH_BITS_PER_TABLE} max_entries=$BFF_LSH_MAX_ENTRIES"
 fi
 echo "  GPU util:     P=$PREFILL_GPU_UTIL  D=$DECODE_GPU_UTIL"
+# Printed only at TP>1, where they are the difference between a run and a 12-minute wedge.
+[[ "$TP" -gt 1 ]] && echo "  TP collectives: NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-unset} (TP-pair topo probe: ${_NEED_P2P_DISABLE:-probe-failed})  custom_all_reduce=$([ "$DISABLE_CUSTOM_AR" = "1" ] && echo disabled || echo enabled)"
 echo ""
 
 PIDS=()
@@ -434,6 +504,7 @@ common_args() {
         --max-model-len $MAX_MODEL_LEN \
         --max-num-batched-tokens $MAX_NUM_BATCHED_TOKENS \
         ${ATTENTION_BACKEND:+--attention-backend $ATTENTION_BACKEND} \
+        $([ "$DISABLE_CUSTOM_AR" = "1" ] && [ "$TP" -gt 1 ] && echo --disable-custom-all-reduce) \
         --max-num-seqs $MAX_CONCURRENCY"
 }
 
