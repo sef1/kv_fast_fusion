@@ -87,37 +87,61 @@ MSG_SIG_REPLY = b"bff_pull_v2_sig_rep"
 # =================================================================================================
 # pure helpers (no NPU, no vllm_ascend)
 # =================================================================================================
-def filter_sentinels(remote_ids, local_ids):
-    """Drop the positions D declined, from BOTH sides of the pairing.
+def filter_sentinels(planned, *paired):
+    """Drop the positions D declined, from EVERY list in the pairing.
 
-    ``remote_ids`` and ``local_ids`` are paired POSITIONALLY by the transfer that follows, so a
-    declined block has to be removed from both lists at the same index. Returning a shortened
-    ``remote_ids`` alone — or filtering after ``group_concurrent_contiguous`` has coalesced runs —
-    pairs every subsequent survivor with the wrong source block and reads the wrong KV into it, with
-    no error anywhere. This is the whole reason the sentinel is a placeholder rather than a deletion.
+    ``planned`` is the block list the engine planned over, with :data:`SENTINEL` where the decode
+    declined; each list in ``paired`` is positionally paired with it by the transfer that follows.
+    A declined block has to be removed from all of them at the same index. Dropping it from one list
+    only — or filtering after ``group_concurrent_contiguous`` has coalesced runs — pairs every
+    subsequent survivor with the wrong source block and reads the wrong KV into it, with no error
+    anywhere. That is the whole reason the sentinel is a placeholder rather than a deletion.
 
-    ``local_ids`` may be SHORTER than ``remote_ids``: a prefix-cache hit on D shortens it from the
-    front and ``align_per_group`` has already tail-aligned the pair, so indices line up but the
+    Two lists reach this function on the pull transport and they are in DIFFERENT block-id spaces:
+    ``planned`` holds D's ids (that is what the engine records, so that is what it must be given)
+    and its companion holds P's. They line up only positionally, which is exactly why the filter is
+    written in terms of positions and never re-derives one list from the other.
+
+    A companion may be SHORTER than ``planned``: a prefix-cache hit on D shortens its side from the
+    front and ``align_per_group`` has already tail-aligned the pair, so indices correspond but the
     lengths need not. Kept index-safe rather than assuming equal length.
 
-    Returns ``(remote_kept, local_kept)``, both unchanged when nothing was declined — so a request
-    the producer never answered for costs one ``any()`` scan."""
-    if not remote_ids or not any(b < 0 for b in remote_ids):
-        return remote_ids, local_ids
-    kept = [i for i, b in enumerate(remote_ids) if b >= 0]
-    n_local = len(local_ids)
-    return ([remote_ids[i] for i in kept],
-            [local_ids[i] for i in kept if i < n_local])
+    Returns ``(planned_kept, *paired_kept)``, everything unchanged when nothing was declined — so a
+    request the producer never answered for costs one ``any()`` scan."""
+    if not planned or not any(b < 0 for b in planned):
+        return (planned, *paired)
+    kept = [i for i, b in enumerate(planned) if b >= 0]
+    return ([planned[i] for i in kept],
+            *([lst[i] for i in kept if i < len(lst)] for lst in paired))
 
 
-def wrap_groups_for_engine(per_group_ids) -> dict:
-    """One request's per-group block ids → the ``{group: [ids]}`` shape ``DedupEngine`` speaks.
+def signature_request_and_plan_groups(aligned):
+    """The two block-id spaces this transport has to keep apart, from one aligned pair per group.
 
-    The engine plans a dict of requests at once; this transport decides one request at a time (see
-    the module docstring on granularity), so the wrapper is trivial — but it is kept as a named
-    function because the engine's contract is positional per group and a silent off-by-one here
-    would mis-attribute every block in the request."""
-    return {int(gi): [int(b) for b in ids] for gi, ids in enumerate(per_group_ids) if ids}
+    Returns ``(ask, plan)``, both ``{group: [block ids]}``:
+
+    * ``ask`` is keyed by the **producer's** ids, because P answers by indexing its own KV cache;
+    * ``plan`` is keyed by the **decode's**, because everything ``DedupEngine`` records from the
+      answer addresses D — the alias victim, the representative, the residency index, and the ids
+      handed to ``get_block_ids_with_load_errors``, which vLLM reads as D's own blocks.
+
+    Getting this backwards does not raise. It cost a whole run: the engine planned over P's ids, so
+    ``AliasApplier`` could not find a single victim in D's block table (709 of 726 aliases went to
+    recompute), the seventeen that matched by coincidence wrote a foreign block id into D's table,
+    and eighteen declined blocks were reported as failures against unrelated D blocks — which turned
+    into 31- and 35-request reschedule cascades.
+
+    Safe only because ``align_per_group`` has already made the two lists equal-length and
+    positionally paired, so P's signature rows line up with D's ids slot for slot. Groups with
+    nothing to pull are dropped from both: asking about them wastes a payload and invites an
+    empty-signature reply that looks like a failure."""
+    ask, plan = {}, {}
+    for gi, (remote_ids, local_ids) in enumerate(aligned):
+        if not remote_ids or not local_ids:
+            continue
+        ask[int(gi)] = [int(b) for b in remote_ids]
+        plan[int(gi)] = [int(b) for b in local_ids]
+    return ask, plan
 
 
 def sig_request_msg(groups_to_ids: dict) -> tuple:
@@ -371,15 +395,17 @@ if _ASCEND_AVAILABLE:
             transfer's slots are the same slots by construction — no re-keying, and no chance of an
             off-by-one between the two.
 
-            Returns ``{group: planned_ids}`` with SENTINEL in the declined positions, or ``{}`` on
-            every failure path, which leaves the read whole."""
+            Two block-id spaces meet here and are kept apart by
+            :func:`signature_request_and_plan_groups`: P is asked about ITS blocks, the engine is
+            given D's. See that function for what conflating them cost.
+
+            Returns ``{group: planned_ids}`` — D's ids with SENTINEL in the declined positions — or
+            ``{}`` on every failure path, which leaves the read whole."""
             if (self.dedup_engine is None or self.sig_client is None
                     or not pd_dedup_v2.V2_ENABLED):
                 return {}
-            groups_to_ids = {gi: list(remote_ids)
-                             for gi, (remote_ids, local_ids) in enumerate(aligned)
-                             if remote_ids and local_ids}
-            if not groups_to_ids:
+            ask, plan_groups = signature_request_and_plan_groups(aligned)
+            if not ask:
                 return {}
             # EXTERNAL id, not `remote_request_id` itself: that is P's local request id, while the
             # applier walks D's runner, whose requests carry D's local ids. vLLM appends a
@@ -395,12 +421,14 @@ if _ASCEND_AVAILABLE:
             sigs = self.sig_client.ask(
                 req_meta["remote_host"],
                 int(req_meta["remote_handshake_port"]) + self.sig_port_offset,
-                groups_to_ids)
+                ask)                                  # P's ids — P indexes its own KV cache
             if not sigs:
                 self.dedup_engine.stats.sig_phase_failed += 1
                 return {}
-            n_groups = max(groups_to_ids) + 1
-            wrapped = [groups_to_ids.get(gi, []) for gi in range(n_groups)]
+            # D's ids — row i of P's signature payload describes plan slot i, because
+            # align_per_group made the two lists equal-length and positionally paired.
+            n_groups = max(plan_groups) + 1
+            wrapped = [plan_groups.get(gi, []) for gi in range(n_groups)]
             try:
                 planned = self.dedup_engine.plan({ext_id: wrapped}, {ext_id: sigs})
             except Exception as e:  # pragma: no cover - defensive
@@ -408,7 +436,7 @@ if _ASCEND_AVAILABLE:
                 self.dedup_engine.forget([ext_id])
                 return {}
             out = planned.get(ext_id)
-            return {gi: out[gi] for gi in groups_to_ids if gi < len(out)} if out else {}
+            return {gi: out[gi] for gi in plan_groups if gi < len(out)} if out else {}
 
         def _align_and_group(self, req_meta, local_groups, remote_groups, tp_num_need_pulls):
             """v1's tail-align + coalesce, with the declined positions removed in between.
@@ -423,10 +451,13 @@ if _ASCEND_AVAILABLE:
             n_declined = 0
             for gi, (remote_ids, local_ids) in enumerate(aligned):
                 plan_g = planned.get(gi)
-                if plan_g is not None and len(plan_g) == len(remote_ids):
-                    before = len(remote_ids)
-                    remote_ids, local_ids = filter_sentinels(list(plan_g), local_ids)
-                    n_declined += before - len(remote_ids)
+                if plan_g is not None and len(plan_g) == len(local_ids):
+                    before = len(local_ids)
+                    # The planned list is D's, so it filters the LOCAL side directly and the remote
+                    # side by position. Reading the remote ids back out of `plan_g` instead would
+                    # feed D's block ids to the transfer as source addresses.
+                    local_ids, remote_ids = filter_sentinels(list(plan_g), remote_ids)
+                    n_declined += before - len(local_ids)
                 if not local_ids:
                     grouped.append(([], []))
                 elif tp_num_need_pulls == 1:
