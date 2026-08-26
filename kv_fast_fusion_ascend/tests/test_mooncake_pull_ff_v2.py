@@ -18,6 +18,7 @@ The file is organised around the three things that can silently corrupt KV:
 import ast
 import os
 import re
+import time
 
 import pytest
 
@@ -166,6 +167,262 @@ def test_segment_lengths_still_match_their_ids_after_filtering():
 
     assert [len(s) for s in gr] == [len(s) for s in gl]
     assert sum(len(s) for s in gl) == 4
+
+
+# =====================================================================================
+# the coalescer — concurrency, where a lost wakeup wedges a recv worker for the rest of the run
+# =====================================================================================
+def test_concurrent_callers_to_one_peer_share_round_trips():
+    """The whole point. 32 recv workers asking at once must not each pay the producer's latency;
+    whoever leads drains the queue and the rest ride along."""
+    import threading
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def send(_key, batch):
+        started.set()
+        release.wait(5)                      # hold the leader so the others pile up behind it
+        for it in batch:
+            it.result = f"ans-{it.payload}"
+
+    c = v2.BatchCoalescer(send, max_batch=32)
+    got, threads = {}, []
+    for i in range(8):
+        t = threading.Thread(target=lambda i=i: got.__setitem__(i, c.ask("p", i)))
+        t.start()
+        threads.append(t)
+        if i == 0:
+            started.wait(5)                  # make thread 0 the leader deterministically
+    release.set()
+    for t in threads:
+        t.join(5)
+
+    assert got == {i: f"ans-{i}" for i in range(8)}, "every caller gets its OWN answer"
+    assert c.batches < 8, f"callers must share round trips, got {c.batches} for 8 asks"
+    assert c.batched_items == 8
+
+
+def test_a_raising_sender_never_leaves_a_caller_waiting():
+    """A dead producer must cost compression, not liveness. If `done` were set only on the success
+    path, the recv worker that was waiting would block for the rest of the run."""
+    def send(_key, _batch):
+        raise RuntimeError("producer is gone")
+
+    c = v2.BatchCoalescer(send, max_batch=8)
+
+    assert c.ask("p", 1) is None, "no answer — and no exception, and no hang"
+    assert c.failures == 1
+
+
+def test_every_caller_of_a_failed_batch_returns_the_same_way():
+    """Containment has to be symmetric. If the exception propagated, the outcome would depend on
+    whether a caller happened to lead its batch or follow in one — and a future sender that forgot
+    its own try/except could wedge a recv worker. Leader and followers alike get no answer."""
+    import threading
+
+    started, release = threading.Event(), threading.Event()
+    seen = []
+
+    def send(_key, batch):
+        seen.append(len(batch))
+        if not started.is_set():
+            started.set()
+            release.wait(5)                  # hold leader #1 so the rest queue behind it
+        raise RuntimeError("boom")
+
+    c = v2.BatchCoalescer(send, max_batch=8)
+    got = {}
+    threads = [threading.Thread(target=lambda i=i: got.__setitem__(i, c.ask("p", i)))
+               for i in range(5)]
+    threads[0].start()
+    started.wait(5)
+    for t in threads[1:]:
+        t.start()
+        # Give each a moment to queue while leader #1 is still held, so they land in ONE batch.
+        time.sleep(0.02)
+    release.set()
+    for t in threads:
+        t.join(5)
+
+    assert not any(t.is_alive() for t in threads), "nobody hangs"
+    assert got == dict.fromkeys(range(5)), "every caller returns None"
+    assert max(seen) > 1, f"the followers really were batched together, saw {seen}"
+    assert c.failures == len(seen)
+
+
+def test_peers_are_batched_separately():
+    """Two producers are two sockets and two answers. Mixing their queues would send one peer's
+    block ids to the other, which owns entirely different blocks."""
+    seen = []
+
+    def send(key, batch):
+        seen.append((key, [it.payload for it in batch]))
+        for it in batch:
+            it.result = key
+
+    c = v2.BatchCoalescer(send, max_batch=8)
+
+    assert c.ask("pA", 1) == "pA"
+    assert c.ask("pB", 2) == "pB"
+    assert seen == [("pA", [1]), ("pB", [2])]
+
+
+def test_the_batch_size_is_capped():
+    """One exchange's device work has to stay bounded, or its timeout stops meaning anything."""
+    import threading
+
+    started, release = threading.Event(), threading.Event()
+    sizes = []
+
+    def send(_key, batch):
+        sizes.append(len(batch))
+        if not started.is_set():
+            started.set()
+            release.wait(5)
+        for it in batch:
+            it.result = it.payload
+
+    c = v2.BatchCoalescer(send, max_batch=2)
+    threads = [threading.Thread(target=lambda i=i: c.ask("p", i)) for i in range(6)]
+    threads[0].start()
+    started.wait(5)
+    for t in threads[1:]:
+        t.start()
+    release.set()
+    for t in threads:
+        t.join(5)
+
+    assert max(sizes) <= 2, f"batches must respect the cap, saw {sizes}"
+    assert sum(sizes) == 6, "and nothing is dropped"
+
+
+def test_a_single_uncontended_caller_costs_one_exchange():
+    """The common path when the decode is not busy — batching must not add a round trip."""
+    calls = []
+
+    def send(_key, batch):
+        calls.append(len(batch))
+        for it in batch:
+            it.result = "ok"
+
+    c = v2.BatchCoalescer(send, max_batch=32)
+
+    assert c.ask("p", 1) == "ok"
+    assert calls == [1]
+
+
+# =====================================================================================
+# splitting one group's rows back to the slots that asked
+# =====================================================================================
+def test_each_slot_gets_back_exactly_the_rows_it_asked_about():
+    """The producer computes a group ONCE for the batch, so the rows must be sliced back by the
+    same offsets they were concatenated at. A mis-slice does not raise — it hands one request's
+    signatures to another, the same silent mis-attribution the block-id spaces already cost us."""
+    plan = v2.signature_batch_plan({0: {1: [10, 11]}, 2: {1: [20, 21, 22]}})
+
+    slots, flat, lengths = plan[1]
+
+    assert flat == [10, 11, 20, 21, 22], "concatenated in slot order"
+    assert lengths == [2, 3]
+    # Replay the split the server does and check every slot recovers its own ids.
+    off, recovered = 0, {}
+    for slot, n in zip(slots, lengths):
+        recovered[slot] = flat[off:off + n]
+        off += n
+    assert recovered == {0: [10, 11], 2: [20, 21, 22]}
+
+
+def test_a_group_only_one_slot_asked_about_is_planned_alone():
+    plan = v2.signature_batch_plan({0: {1: [10], 2: [30]}, 1: {1: [20]}})
+
+    assert plan[1] == ([0, 1], [10, 20], [1, 1])
+    assert plan[2] == ([0], [30], [1])
+
+
+def test_empty_and_absent_groups_never_enter_the_plan():
+    """A group with no blocks contributes no rows; leaving it in would make `lengths` disagree with
+    the slots and shift every later slice."""
+    plan = v2.signature_batch_plan({0: {1: [], 2: [30]}, 1: {}, 2: None})
+
+    assert set(plan) == {2}
+    assert plan[2] == ([0], [30], [1])
+
+
+def test_the_lengths_always_sum_to_the_flat_ids():
+    """The invariant the server's zip depends on."""
+    plan = v2.signature_batch_plan({s: {1: list(range(s + 1))} for s in range(4)})
+
+    for _slots, flat, lengths in plan.values():
+        assert sum(lengths) == len(flat)
+
+
+def test_an_empty_batch_plans_nothing():
+    assert v2.signature_batch_plan({}) == {}
+
+
+# =====================================================================================
+# the BATCHED signature exchange
+#
+# The producer's cost is device-sync latency, not signature compute: signatures_for_group ends in a
+# `.cpu()`, so answering per request drained the NPU queue once per group PER REQUEST. Batching
+# collapses that, mirroring the GPU connector, which answers for every pending send in one reply.
+# =====================================================================================
+def test_the_batched_request_keeps_each_slot_s_groups_apart():
+    msg = v2.sig_request_batch_msg({0: {1: [10, 11]}, 1: {1: [20], 2: [30]}})
+
+    assert msg[0] == v2.MSG_SIG_REQUEST_BATCH
+    assert msg[1] == {0: {1: [10, 11]}, 1: {1: [20], 2: [30]}}
+
+
+def test_the_batched_tags_are_distinct_from_the_single_request_ones():
+    """Both payloads decode to an int-keyed dict of dicts, so the SHAPES cannot tell them apart:
+    single is {group: payload}, batched is {slot: {group: payload}}. A producer one version behind
+    would answer a batched question in the single shape and the decode would read group indices as
+    slot numbers — handing request 0's signatures to whichever request sat in slot 0, silently.
+
+    Separate tags are what make that impossible: the old producer does not recognise the batched
+    tag, replies with the single one, and the parser below rejects it."""
+    assert v2.MSG_SIG_REQUEST_BATCH != v2.MSG_SIG_REQUEST
+    assert v2.MSG_SIG_REPLY_BATCH != v2.MSG_SIG_REPLY
+    assert v2.parse_sig_reply_batch(v2.sig_reply_msg({1: {"s": 1}})) == {}, \
+        "a single-shaped reply must never be read as a batch"
+    assert v2.parse_sig_reply(v2.sig_reply_batch_msg({0: {1: {"s": 1}}})) == {}, \
+        "and the converse"
+
+
+def test_a_batched_reply_round_trips_per_slot():
+    reply = v2.sig_reply_batch_msg({0: {1: "pa"}, 2: {1: "pb", 3: "pc"}})
+
+    assert v2.parse_sig_reply_batch(reply) == {0: {1: "pa"}, 2: {1: "pb", 3: "pc"}}
+
+
+def test_a_slot_the_producer_could_not_answer_is_absent_not_empty():
+    """Absence is how the decode learns to pull that request in full. An empty dict left in place
+    would say the same thing, but only by accident of truthiness."""
+    assert v2.sig_reply_batch_msg({0: {1: "p"}, 1: {}, 2: None})[1] == {0: {1: "p"}}
+
+
+def test_slots_are_dropped_from_the_request_when_they_have_no_blocks():
+    assert v2.sig_request_batch_msg({0: {1: [10]}, 1: {1: []}, 2: {}})[1] == {0: {1: [10]}}
+
+
+@pytest.mark.parametrize("bad", [
+    None, (), (b"wrong", {}), (v2.MSG_SIG_REPLY_BATCH,), (v2.MSG_SIG_REPLY_BATCH, None),
+    (v2.MSG_SIG_REPLY_BATCH, "nope"), (v2.MSG_SIG_REPLY_BATCH, {0: "not-a-dict"}),
+])
+def test_any_malformed_batched_reply_reads_as_no_signatures(bad):
+    """Every unrecognisable answer degrades the WHOLE batch to full reads. Refusing to serve
+    requests over a compression optimisation is never acceptable, and a batch multiplies that."""
+    assert v2.parse_sig_reply_batch(bad) == {}
+
+
+def test_json_style_string_keys_are_coerced_at_both_levels():
+    """msgpack preserves int keys, but nothing guarantees a future transport will. String slots or
+    groups would silently find no signatures and quietly disable v2 for the batch."""
+    got = v2.parse_sig_reply_batch((v2.MSG_SIG_REPLY_BATCH, {"1": {"3": {"s": 1}}}))
+
+    assert got == {1: {3: {"s": 1}}}
 
 
 # =====================================================================================

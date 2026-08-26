@@ -93,6 +93,21 @@ MAX_REQ_DECLINE = float(os.environ.get("BFF_V2_MAX_REQ_DECLINE", "0.5"))
 # Message tags for our own channel.
 MSG_SIG_REQUEST = b"bff_pull_v2_sig_req"
 MSG_SIG_REPLY = b"bff_pull_v2_sig_rep"
+# Batched form: one message carries several requests, mirroring the GPU connector's signature phase
+# (which answers for every pending send in one reply).
+#
+# DISTINCT TAGS, not a reshaped payload, because the two shapes are indistinguishable once decoded:
+# single is ``{group: payload}`` and batched is ``{slot: {group: payload}}``, both int-keyed dicts.
+# A producer one version behind would answer a batched question in the single shape and the decode
+# would read group indices as batch slots — silently handing request 0's signatures to whichever
+# request sat in slot 0. With its own tag an older producer simply does not recognise it, replies
+# empty, and every request is read in full.
+MSG_SIG_REQUEST_BATCH = b"bff_pull_v2_sig_req_batch"
+MSG_SIG_REPLY_BATCH = b"bff_pull_v2_sig_rep_batch"
+# Most requests an exchange may carry. The recv thread's executor runs 32 workers, so that is the
+# most that can ever be waiting at once; the cap exists so one exchange's device work stays bounded
+# and its timeout stays meaningful.
+MAX_SIG_BATCH = int(os.environ.get("BFF_PULL_V2_SIG_BATCH", "32"))
 
 
 # =================================================================================================
@@ -319,11 +334,178 @@ def parse_sig_reply(msg) -> dict:
     return out
 
 
+class PendingAsk:
+    """One caller's slot in a batched exchange.
+
+    ``done`` is set exactly once, by whichever thread served the batch, and ALWAYS — a caller left
+    unset would block its recv worker for the rest of the run."""
+
+    __slots__ = ("done", "payload", "result")
+
+    def __init__(self, payload):
+        self.payload = payload
+        self.result: Any = None
+        self.done = threading.Event()
+
+
+class BatchCoalescer:
+    """Serve concurrent callers to the same peer with one round trip.
+
+    Leader/follower, no background thread and no timer: whoever wins a peer's lock drains everything
+    queued for it and serves the lot. Because the leader holds that lock across the round trip, the
+    next batch grows to exactly what arrived while it was in flight — the batch size self-tunes to
+    the load with no tuning knob.
+
+    ``send(key, items)`` is injected: it sets ``item.result`` on each item it can answer. It is
+    allowed to raise, and a raise is CONTAINED here rather than propagated — otherwise the outcome
+    would depend on whether a caller happened to be the leader (exception) or a follower (no
+    answer), and a future sender that forgot its own try/except could take down a recv worker. Every
+    caller gets the same thing on failure: no answer, which reads as "ask for it all". Kept
+    transport-free so this logic — the part that can hang a recv worker — is testable with threads
+    and no NPU.
+
+    The wait is a plain lock acquisition rather than a condition variable because there is no lost
+    wakeup to guard against: a caller either finds its item already done, or acquires the lock and
+    becomes the leader for whatever remains."""
+
+    def __init__(self, send, max_batch: int = 32):
+        self._send = send
+        self._max_batch = max(1, int(max_batch))
+        self._lock = threading.Lock()
+        self._peer_locks: dict[Any, Any] = {}
+        self._queue: dict[Any, list] = {}
+        self.batches = 0
+        self.batched_items = 0
+        self.failures = 0
+
+    def ask(self, key, payload):
+        """Queue ``payload`` for ``key`` and return this caller's own result."""
+        item = PendingAsk(payload)
+        with self._lock:
+            self._queue.setdefault(key, []).append(item)
+
+        while not item.done.is_set():
+            with self._peer_lock(key):
+                # Re-checked inside the lock: while we waited for it, the previous leader may have
+                # picked our item up and answered it.
+                if item.done.is_set():
+                    break
+                with self._lock:
+                    queued = self._queue.get(key) or []
+                    batch, rest = queued[:self._max_batch], queued[self._max_batch:]
+                    if rest:
+                        self._queue[key] = rest
+                    else:
+                        self._queue.pop(key, None)
+                if not batch:
+                    continue     # taken by a leader still in flight; wait for the lock again
+                try:
+                    self._send(key, batch)
+                    self.batches += 1
+                    self.batched_items += len(batch)
+                except Exception as e:      # noqa: BLE001 - see the class docstring
+                    self.failures += 1
+                    logger.warning("BFF: batched exchange with %s failed for %d caller(s) (%s) — "
+                                   "they proceed without an answer.", key, len(batch), e)
+                finally:
+                    # Unconditional: a raising sender costs these callers their compression, never
+                    # their liveness.
+                    for it in batch:
+                        it.done.set()
+        return item.result
+
+    def _peer_lock(self, key):
+        with self._lock:
+            lk = self._peer_locks.get(key)
+            if lk is None:
+                lk = self._peer_locks[key] = threading.Lock()
+            return lk
+
+
+def signature_batch_plan(per_slot: dict) -> dict:
+    """``{slot: {group: ids}}`` → ``{group: (slots, flat_ids, lengths)}``, one entry per group.
+
+    The producer computes each GROUP once for the whole batch, so every slot's ids for that group
+    are concatenated in a fixed order and the resulting rows are sliced back by ``lengths``. This is
+    the arithmetic that keeps slots apart, and getting it wrong does not raise — it hands one
+    request's signatures to another, which is the same class of silent mis-attribution that the
+    producer/decode block-id spaces already cost this connector once.
+
+    ``slots`` and ``lengths`` are positionally paired with each other and with the slices of
+    ``flat_ids``: slot ``slots[i]`` owns ``lengths[i]`` rows, starting after all earlier lengths."""
+    out: dict[int, tuple] = {}
+    for slot, per_group in (per_slot or {}).items():
+        for gi, ids in (per_group or {}).items():
+            if not ids:
+                continue
+            slots, flat, lengths = out.setdefault(int(gi), ([], [], []))
+            slots.append(int(slot))
+            flat.extend(int(b) for b in ids)
+            lengths.append(len(ids))
+    return out
+
+
+def sig_request_batch_msg(per_slot: dict) -> tuple:
+    """D → P: ``(tag, {slot: {group: [P block ids]}})`` for several requests at once.
+
+    ``slot`` is the caller's position in this exchange, nothing more — it is minted per message and
+    means nothing outside it. Request ids are deliberately NOT sent: the producer needs only "which
+    blocks", and keeping ids off the wire means a slot can never be confused with an identity."""
+    out = {}
+    for slot, groups in (per_slot or {}).items():
+        one = {int(gi): [int(b) for b in ids] for gi, ids in (groups or {}).items() if ids}
+        if one:
+            out[int(slot)] = one
+    return (MSG_SIG_REQUEST_BATCH, out)
+
+
+def sig_reply_batch_msg(per_slot: dict) -> tuple:
+    """P → D: ``(tag, {slot: {group: payload}})``, answering in the slots it was asked in.
+
+    A slot the producer could not describe is omitted rather than nulled, and the decode reads its
+    absence as "no signatures" — that request is then pulled in full, which is always safe."""
+    out = {}
+    for slot, payloads in (per_slot or {}).items():
+        one = {int(gi): p for gi, p in (payloads or {}).items() if p is not None}
+        if one:
+            out[int(slot)] = one
+    return (MSG_SIG_REPLY_BATCH, out)
+
+
+def parse_sig_reply_batch(msg) -> dict:
+    """P's batched reply → ``{slot: {group: payload}}``, or ``{}`` for anything unrecognisable.
+
+    Total for the same reason as :func:`parse_sig_reply`, and it is the path an older producer lands
+    on: it does not know :data:`MSG_SIG_REQUEST_BATCH`, so it answers with the single-request tag,
+    which fails the tag check here and every request in the batch is read in full."""
+    if (not msg or len(msg) < 2 or msg[0] != MSG_SIG_REPLY_BATCH
+            or not isinstance(msg[1], dict)):
+        return {}
+    out: dict[int, dict] = {}
+    for slot, groups in msg[1].items():
+        if not isinstance(groups, dict):
+            continue
+        try:
+            key = int(slot)
+        except (TypeError, ValueError):
+            continue
+        one = {}
+        for gi, payload in groups.items():
+            try:
+                one[int(gi)] = payload
+            except (TypeError, ValueError):
+                continue
+        if one:
+            out[key] = one
+    return out
+
+
 # =================================================================================================
 # Ascend/NPU-only section
 # =================================================================================================
 try:
     import msgspec
+    import torch
     import zmq
     from vllm.config import VllmConfig  # noqa: F401
     from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole  # noqa: F401
@@ -333,8 +515,14 @@ try:
         group_concurrent_contiguous,
     )
 
-    from kv_fast_fusion import pd_dedup_v2
-    from kv_fast_fusion.pd_dedup_v2 import AliasApplier, DedupEngine, KVLayoutError
+    from kv_fast_fusion import pd_dedup_v2, pd_lsh
+    from kv_fast_fusion.pd_dedup_v2 import (
+        AliasApplier,
+        DedupEngine,
+        KVLayoutError,
+        SignatureCodec,
+        signature_matrix,
+    )
     from kv_fast_fusion_ascend.connectors import mooncake_connector_ff as v1
     from kv_fast_fusion_ascend.connectors.mooncake_layerwise_connector_ff_v2 import (
         signatures_for_group,
@@ -374,6 +562,7 @@ if _ASCEND_AVAILABLE:
             # it could answer.
             self.served = 0
             self.failed = 0
+            self.batches = 0
             self.fail_reasons: dict[str, int] = {}
             self._next_report = 1
 
@@ -422,38 +611,82 @@ if _ASCEND_AVAILABLE:
             if self.served + self.failed < self._next_report:
                 return
             self._next_report *= 10
-            logger.info("BFF pull-v2 signature server: served %d request(s), %d failed%s.",
-                        self.served, self.failed,
+            logger.info("BFF pull-v2 signature server: served %d request(s) in %d exchange(s) "
+                        "(%.1f per exchange), %d failed%s.", self.served, self.batches,
+                        self.served / self.batches if self.batches else 0.0, self.failed,
                         (" " + str(self.fail_reasons)) if self.fail_reasons else "")
 
         def _handle(self, msg):
-            if not msg or msg[0] != MSG_SIG_REQUEST:
+            """Answer either shape. Both tags are served so a decode one version behind still
+            works; the decode only ever sends the batched one."""
+            if not msg:
                 return sig_reply_msg({})
-            groups_to_ids = msg[1] or {}
-            out = {}
-            ok = False
-            for gi, ids in groups_to_ids.items():
+            if msg[0] == MSG_SIG_REQUEST_BATCH:
+                return self._handle_batch(msg[1] or {})
+            if msg[0] != MSG_SIG_REQUEST:
+                return sig_reply_msg({})
+            out = self._signatures_for({0: msg[1] or {}}).get(0, {})
+            return sig_reply_msg(out)
+
+        def _handle_batch(self, per_slot: dict):
+            return sig_reply_batch_msg(self._signatures_for(per_slot))
+
+        def _signatures_for(self, per_slot: dict) -> dict:
+            """``{slot: {group: ids}}`` → ``{slot: {group: payload}}``, computing each GROUP once
+            for the whole batch.
+
+            This is where batching pays. ``signatures_for_group`` ends in a device-to-host sync, so
+            answering per request meant draining the NPU queue once per group PER REQUEST — 7 syncs
+            each, ~3,600 for a 512-request run, on a producer that is simultaneously prefilling.
+            Gathering every slot's blocks for a group into one call makes it 7 syncs per batch.
+
+            Slots are kept apart by construction: the ids are concatenated in slot order and the
+            resulting rows are sliced back by the same offsets, so row *i* of a slot's payload is
+            still that slot's block *i*. A group one slot did not ask about simply contributes no
+            rows and is absent from its answer."""
+            out: dict[int, dict] = {slot: {} for slot in per_slot}
+            for gi, (slots, flat, lengths) in signature_batch_plan(per_slot).items():
                 try:
-                    out[int(gi)] = self._worker.signatures_for_group(int(gi), ids)
-                    ok = True
+                    payloads = self._worker.signatures_for_group_split(gi, flat, lengths)
                 except KVLayoutError as e:
                     # Counted, not swallowed: it means the cache cannot be indexed by connector
                     # block ids, which would make every signature in the run meaningless.
                     self._note_failure("kv_layout")
                     logger.warning("BFF pull-v2: cannot index KV for group %s (%s).", gi, e)
+                    continue
                 except Exception as e:  # pragma: no cover - defensive
                     self._note_failure("sig_error")
                     logger.warning("BFF pull-v2: signature build failed for group %s: %s", gi, e)
-            if ok:
-                self.served += 1
+                    continue
+                for slot, payload in zip(slots, payloads):
+                    if payload is not None:
+                        out[slot][gi] = payload
+
+            served = sum(1 for v in out.values() if v)
+            if served:
+                self.served += served
+            self.batches += 1
             self._report()
-            return sig_reply_msg(out)
+            return out
 
     class _SigClient:
         """Decode side: one REQ socket per producer peer, used from the recv thread.
 
-        Synchronous by nature — D must know the answer before it reads — but it runs on the transfer
-        thread, so the round trip delays one request's KV rather than the model."""
+        **Callers waiting at the same time are served by one exchange.** The recv thread runs 32
+        workers, so up to 32 requests sit in here concurrently; asking one at a time made them queue
+        behind each other and each pay the producer's full latency. That latency is not signature
+        compute — it is a device sync: ``signatures_for_group`` ends in a ``.cpu()``, once per group
+        per request, so a busy producer drained its NPU queue 7 times for every request. At con512
+        that measured 211 ms per exchange (up from ~100 ms at con128, tracking how busy P was, not
+        how many blocks were asked about) — about 108 s of the 725 s run, in front of every
+        request's KV read, which is what put TTFT at 165 s against the baseline's 91 s.
+
+        Batching collapses the sync count by the batch size, mirroring the GPU connector, which
+        answers for every pending send in one reply.
+
+        Leader/follower, no background thread: whoever wins ``_peer_lock`` drains everything that
+        has queued and serves it. Because the leader holds that lock across the round trip, the
+        batch naturally grows to whatever arrived during the previous exchange."""
 
         def __init__(self):
             self._lock = threading.Lock()
@@ -462,31 +695,56 @@ if _ASCEND_AVAILABLE:
             self._enc = msgspec.msgpack.Encoder()
             self._dec = msgspec.msgpack.Decoder()
             self._announced: set = set()
+            self._batcher = BatchCoalescer(self._exchange, MAX_SIG_BATCH)
+
+        @property
+        def batches(self) -> int:
+            return self._batcher.batches
+
+        @property
+        def batched_requests(self) -> int:
+            return self._batcher.batched_items
 
         def ask(self, host, port, groups_to_ids: dict) -> dict:
-            """Return ``{group: signature payload}``, or ``{}`` on any failure."""
+            """Return ``{group: signature payload}`` for THIS caller, or ``{}`` on any failure.
+
+            Batching is invisible from here: the caller asks about one request and gets one
+            request's answer."""
             if host is None or port is None or not groups_to_ids:
                 return {}
-            with self._lock:
-                t0 = time.perf_counter()
-                try:
-                    sock = self._sock_for(host, int(port))
-                    sock.send(self._enc.encode(sig_request_msg(groups_to_ids)))
-                    return parse_sig_reply(self._dec.decode(sock.recv()))
-                except Exception as e:
-                    # A REQ socket that timed out is stuck in the wrong state; drop it so the next
-                    # exchange starts clean, and read this request whole.
-                    #
-                    # The elapsed time is the diagnosis: at (or just over) SIG_EXCHANGE_TIMEOUT the
-                    # producer never answered — either it is not listening or it is too slow, which
-                    # its own log distinguishes. Well under it means the socket was refused outright,
-                    # a different problem entirely.
-                    logger.warning("BFF pull-v2: signature exchange with %s:%s failed after "
-                                   "%.0f ms of a %.0f ms budget (%s) — reading the request in "
-                                   "full.", host, port, (time.perf_counter() - t0) * 1e3,
-                                   SIG_EXCHANGE_TIMEOUT * 1e3, e)
-                    self._drop(host, port)
-                    return {}
+            return self._batcher.ask((host, int(port)), groups_to_ids) or {}
+
+        def _exchange(self, key, batch) -> None:
+            """One round trip for ``batch``, filling in each item's result.
+
+            Raising here is safe and deliberate on failure: :class:`BatchCoalescer` marks every item
+            done regardless, so a dead producer costs these requests their compression rather than
+            their liveness — they are simply read in full."""
+            host, port = key
+            t0 = time.perf_counter()
+            try:
+                sock = self._sock_for(host, port)
+                # The producer's work scales with the batch, so the budget does too. Set per call
+                # rather than at socket creation, since the batch size is only known here.
+                sock.setsockopt(zmq.RCVTIMEO, int(SIG_EXCHANGE_TIMEOUT * 1000 * len(batch)))
+                sock.send(self._enc.encode(
+                    sig_request_batch_msg({i: it.payload for i, it in enumerate(batch)})))
+                answer = parse_sig_reply_batch(self._dec.decode(sock.recv()))
+                for i, it in enumerate(batch):
+                    it.result = answer.get(i, {})
+            except Exception as e:
+                # A REQ socket that timed out is stuck in the wrong state; drop it so the next
+                # exchange starts clean, and read these requests whole.
+                #
+                # The elapsed time is the diagnosis: at (or just over) the budget the producer never
+                # answered — either it is not listening or it is too slow, which its own log
+                # distinguishes. Well under it means the socket was refused outright, a different
+                # problem entirely.
+                logger.warning("BFF pull-v2: signature exchange with %s:%s for %d request(s) "
+                               "failed after %.0f ms of a %.0f ms budget (%s) — reading them in "
+                               "full.", host, port, len(batch), (time.perf_counter() - t0) * 1e3,
+                               SIG_EXCHANGE_TIMEOUT * 1e3 * len(batch), e)
+                self._drop(host, port)
 
         def _sock_for(self, host, port):
             key = (host, port)
@@ -771,6 +1029,48 @@ if _ASCEND_AVAILABLE:
             return signatures_for_group(
                 self.kv_caches, layer_names, [int(b) for b in block_ids], is_mla,
                 self._jl, num_blocks=self.num_blocks, proj_holder=self._proj)
+
+        def signatures_for_group_split(self, gi: int, block_ids, lengths):
+            """One group's signatures for SEVERAL requests at once, split back by ``lengths``.
+
+            Same result as calling :meth:`signatures_for_group` once per request, at a fraction of
+            the cost: every device-to-host transfer is hoisted out of the per-request loop.
+
+            There are three of them per call — the SimHash bucket ids, the fp16 vectors, and the
+            norms — and each is a full NPU queue drain on a producer that is busy prefilling. Paid
+            per request per group they came to ~3,600 drains in a 512-request run, which is what
+            made an exchange cost 211 ms and put ~108 s of the run in front of the decode's KV
+            reads. Paid once per group per batch they cost 3.
+
+            ``lengths`` are consumed in order and must sum to ``len(block_ids)``; the caller built
+            both from the same list, so slot *i*'s rows are ``block_ids[offset:offset+lengths[i]]``.
+            Returns one payload (or None) per length."""
+            n_out = len(lengths)
+            layer_names = sorted(self._group_layers.get(int(gi), ()))
+            layers = [self.kv_caches[ln] for ln in layer_names if ln in self.kv_caches]
+            if not layers or not block_ids:
+                return [None] * n_out
+            is_mla = bool(getattr(self.vllm_config.model_config, "use_mla", False))
+            sig, norms = signature_matrix(layers, [int(b) for b in block_ids], is_mla,
+                                          self._jl, num_blocks=self.num_blocks)
+            if sig is None:
+                return [None] * n_out
+            proj = pd_lsh.get_proj(self._proj, sig.shape[1], sig.device)
+            # The three syncs, together, once.
+            hashes = pd_lsh.sub_hashes_device(sig, proj).cpu().tolist()
+            sig_host = sig.to(torch.float16).cpu()
+            norms_host = norms.detach().float().cpu()
+            # Sliced on the HOST from here on, so SignatureCodec.encode's own `.cpu()` calls are
+            # no-ops rather than a fourth and fifth drain per slot.
+            out, off = [], 0
+            for n in lengths:
+                if n <= 0:
+                    out.append(None)
+                    continue
+                out.append(SignatureCodec.encode(
+                    sig_host[off:off + n], norms_host[off:off + n], hashes[off:off + n]))
+                off += n
+            return out
 
         def note_sig_failure(self, reason: str) -> None:
             # On the producer `_dedup_engine` is always None (only the decode decides), so this is a
