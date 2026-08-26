@@ -46,6 +46,7 @@ codec logic stay unit-testable without an NPU. v1 is untouched; this registers a
 """
 
 import os
+import queue
 import threading
 import time
 from typing import Any, ClassVar
@@ -104,10 +105,21 @@ MSG_SIG_REPLY = b"bff_pull_v2_sig_rep"
 # empty, and every request is read in full.
 MSG_SIG_REQUEST_BATCH = b"bff_pull_v2_sig_req_batch"
 MSG_SIG_REPLY_BATCH = b"bff_pull_v2_sig_rep_batch"
-# Most requests an exchange may carry. The recv thread's executor runs 32 workers, so that is the
-# most that can ever be waiting at once; the cap exists so one exchange's device work stays bounded
-# and its timeout stays meaningful.
+# Most requests an exchange may carry.
+#
+# This cap BINDS during ramp-up. The vendored recv thread is strictly serial (see
+# KVCacheRecvingThreadFFv2.run), so the batch is not made of concurrent callers — it is made of
+# whatever has piled up in `request_queue`, and at con512 that measured 214 deep while the decode
+# was still filling its KV. The cap exists so one exchange's device work on the producer stays
+# bounded and its timeout, which scales with the batch, stays meaningful.
 MAX_SIG_BATCH = int(os.environ.get("BFF_PULL_V2_SIG_BATCH", "32"))
+# Milliseconds to wait for a SECOND request when the queue drains empty. Zero, and deliberately so:
+# the drain window is already the previous batch's transfer time, which is free, and the phase where
+# batching pays has a 214-deep queue that fills the batch with no waiting at all. Once past ramp-up
+# arrivals fall to ~0.75/s and no amount of lingering can build a batch — it would only delay a
+# request that is holding allocated KV blocks, which is the scarce resource here. A knob, not a
+# recommendation.
+SIG_LINGER_MS = float(os.environ.get("BFF_PULL_V2_SIG_LINGER_MS", "0"))
 
 
 # =================================================================================================
@@ -332,6 +344,93 @@ def parse_sig_reply(msg) -> dict:
         except (TypeError, ValueError):
             continue
     return out
+
+
+def drain_queue(get_nowait, first, max_items=None, linger_ms=None):
+    """``first`` plus everything already queued behind it, up to ``max_items`` in total.
+
+    This is what actually creates a batch on this transport. The vendored recv thread handles one
+    request at a time, so no two signature exchanges are ever in flight together and a coalescer
+    built for concurrent callers batched exactly one request, 512 times. Taking the queue in drained
+    runs instead makes the batch size equal to the backlog — which during ramp-up is the whole point,
+    because that backlog IS the requests sitting on allocated KV blocks waiting for their turn.
+
+    ``get_nowait`` is injected (rather than the queue itself) so the drain is testable with a list,
+    and ``queue.Empty`` — not ``Exception`` — ends the drain: anything else coming out of the queue
+    is a real fault and must not be silently read as "nothing left".
+
+    ``linger_ms`` waits that long for a second item when the queue is immediately empty. Off by
+    default; see :data:`SIG_LINGER_MS`."""
+    limit = max(1, int(MAX_SIG_BATCH if max_items is None else max_items))
+    wait = (SIG_LINGER_MS if linger_ms is None else linger_ms) / 1000.0
+    batch = [first]
+    deadline = None
+    while len(batch) < limit:
+        try:
+            batch.append(get_nowait())
+            continue
+        except queue.Empty:
+            pass
+        # Nothing queued. Lingering can only ever help the very first item: once anything has been
+        # drained we are working a backlog rather than waiting for one, so the wait must not restart
+        # per item — that would make a 32-deep drain pay the linger 32 times.
+        if wait <= 0 or len(batch) > 1:
+            break
+        now = time.monotonic()
+        if deadline is None:
+            deadline = now + wait
+        elif now >= deadline:
+            break
+        time.sleep(0.001)
+    return batch
+
+
+def group_by_peer(keys):
+    """``[key, ...]`` → ``{key: [positions]}``, in first-seen order, skipping ``None``.
+
+    One exchange per producer, with each request's answer found again by its position. Positions
+    rather than request ids for the same reason the wire carries slots and not ids: a position is
+    minted here and cannot be confused with an identity."""
+    out: dict = {}
+    for i, k in enumerate(keys):
+        if k is None:
+            continue
+        out.setdefault(k, []).append(i)
+    return out
+
+
+def ask_shape(ask):
+    """``{group: ids}`` → ``{group: len(ids)}``, the cheap fingerprint of a signature request.
+
+    The prefetch builds a request's ask on the recv loop and the plan rebuilds it moments later
+    inside ``_plan_aligned``. Both derive it from the same ``req_meta`` through the same pure
+    functions, so they agree by construction — but "agree by construction" is exactly what was
+    believed about the producer and decode block-id spaces, and that cost a run: signatures were
+    applied against the wrong table with no error anywhere. Comparing shapes at the point of use
+    turns any future divergence into a full read instead of a silent mis-pairing."""
+    return {int(gi): len(ids) for gi, ids in (ask or {}).items()}
+
+
+def claim_prefetched(cache, rid, ask):
+    """Take ``rid``'s prefetched signatures out of ``cache``. Returns ``(sigs, mismatch)``.
+
+    POP, never peek. A cached answer that outlived its request would be handed to a later one —
+    the same failure mode as confusing the producer's block ids with the decode's, which resolved no
+    aliases, applied 17 wrong ones, and reported nothing anywhere.
+
+    The shape check is the other half of that guard. The prefetch builds a request's ask from
+    ``req_meta`` and the plan rebuilds it moments later from the aligned lists; they agree by
+    construction today, but "agrees by construction" is precisely what was believed about the two
+    block-id spaces. If they ever diverge, row *i* of the payload describes a different block than
+    plan slot *i*, so ``mismatch`` is returned and the caller reads the request in full."""
+    entry = (cache or {}).pop(rid, None)
+    if entry is None:
+        return {}, None
+    shape, sigs = entry
+    want = ask_shape(ask)
+    if shape != want:
+        return {}, (shape, want)
+    return sigs, None
 
 
 class PendingAsk:
@@ -672,21 +771,26 @@ if _ASCEND_AVAILABLE:
     class _SigClient:
         """Decode side: one REQ socket per producer peer, used from the recv thread.
 
-        **Callers waiting at the same time are served by one exchange.** The recv thread runs 32
-        workers, so up to 32 requests sit in here concurrently; asking one at a time made them queue
-        behind each other and each pay the producer's full latency. That latency is not signature
-        compute — it is a device sync: ``signatures_for_group`` ends in a ``.cpu()``, once per group
-        per request, so a busy producer drained its NPU queue 7 times for every request. At con512
-        that measured 211 ms per exchange (up from ~100 ms at con128, tracking how busy P was, not
-        how many blocks were asked about) — about 108 s of the 725 s run, in front of every
-        request's KV read, which is what put TTFT at 165 s against the baseline's 91 s.
+        **Several requests are served by one exchange.** An exchange costs ~222 ms at con512, and
+        that is not signature compute — it is a device sync: ``signatures_for_group`` ends in a
+        ``.cpu()``, once per group per request, so a producer busy prefilling drained its NPU queue
+        7 times for every request. Batching collapses the sync count by the batch size, mirroring
+        the GPU connector, which answers for every pending send in one reply.
 
-        Batching collapses the sync count by the batch size, mirroring the GPU connector, which
-        answers for every pending send in one reply.
+        **Where the batch comes from.** Not from concurrent callers: the vendored recv thread is a
+        single thread handling one request at a time (its ``ThreadPoolExecutor(max_workers=32)`` is
+        constructed and never referenced), so :meth:`ask` and its coalescer can only ever see one
+        caller and measured exactly that — 512 requests in 512 exchanges, "1.0 per exchange" in the
+        producer's own log. The batch comes from :meth:`ask_many`, which the recv loop calls with a
+        drained run of the request queue. :class:`BatchCoalescer` is kept because it is correct for
+        any future caller that does run threads, and because :meth:`ask_many` reuses its item
+        protocol.
 
-        Leader/follower, no background thread: whoever wins ``_peer_lock`` drains everything that
-        has queued and serves it. Because the leader holds that lock across the round trip, the
-        batch naturally grows to whatever arrived during the previous exchange."""
+        Why it is worth doing on a thread that has slack: during ramp-up it does not. At con512 the
+        decode reached 99.8% KV usage at **5 running requests with 214 waiting**, because every one
+        of those held its allocated blocks while queued behind this serialized exchange — where the
+        baseline's ``waiting`` was 0 for its entire KV fill. That is ~52 s of full-concurrency time
+        lost out of a 138 s gap, and it is also the phase where a drained batch fills instantly."""
 
         def __init__(self):
             self._lock = threading.Lock()
@@ -696,14 +800,40 @@ if _ASCEND_AVAILABLE:
             self._dec = msgspec.msgpack.Decoder()
             self._announced: set = set()
             self._batcher = BatchCoalescer(self._exchange, MAX_SIG_BATCH)
+            self._direct_batches = 0
+            self._direct_items = 0
 
         @property
         def batches(self) -> int:
-            return self._batcher.batches
+            return self._batcher.batches + self._direct_batches
 
         @property
         def batched_requests(self) -> int:
-            return self._batcher.batched_items
+            return self._batcher.batched_items + self._direct_items
+
+        def ask_many(self, host, port, payloads: list) -> list:
+            """One round trip for several requests at once; answers come back positionally.
+
+            The batched path, and the only one this transport actually uses. A payload that is
+            empty takes no slot on the wire but still gets its ``{}`` back in place, so the caller's
+            indexing into ``payloads`` never has to account for who was skipped.
+
+            Failure is total and safe: :meth:`_exchange` contains its own errors, so a dead or slow
+            producer leaves every result ``{}`` and every request in the batch is read in full."""
+            out: list = [{} for _ in payloads]
+            if host is None or port is None:
+                return out
+            live = [(i, p) for i, p in enumerate(payloads) if p]
+            if not live:
+                return out
+            key = (host, int(port))
+            items = [PendingAsk(p) for _, p in live]
+            self._exchange(key, items)
+            self._direct_batches += 1
+            self._direct_items += len(items)
+            for (i, _), item in zip(live, items):
+                out[i] = item.result or {}
+            return out
 
         def ask(self, host, port, groups_to_ids: dict) -> dict:
             """Return ``{group: signature payload}`` for THIS caller, or ``{}`` on any failure.
@@ -795,6 +925,138 @@ if _ASCEND_AVAILABLE:
         # the warning is once per group for the process, not once per request or per thread.
         _warned_runaway: ClassVar[set] = set()
 
+        @property
+        def _sig_cache(self) -> dict:
+            """This batch's prefetched signatures, ``{remote_request_id: (shape, sigs)}``.
+
+            Lazy rather than set in ``__init__`` because we deliberately do not override the
+            vendored constructor — see the class docstring on what injecting into it cost."""
+            cache = self.__dict__.get("_sig_cache_d")
+            if cache is None:
+                cache = self.__dict__["_sig_cache_d"] = {}
+            return cache
+
+        def run(self):
+            """The vendored loop, taking the queue in DRAINED RUNS so the exchange can batch.
+
+            Vendored ``KVCacheRecvingThread.run`` pops one request and handles it synchronously.
+            That is what made the batched signature protocol inert: with a single thread there is
+            never a second caller to batch with, and the producer logged "1.0 per exchange" for all
+            512 requests. Draining the queue first turns the backlog into the batch.
+
+            The backlog is real and it is the expensive part of the run. At con512 the decode hit
+            99.8% KV usage at 5 running requests with 214 waiting — those 214 were holding allocated
+            blocks while queued behind a 222 ms-per-request serialized exchange, where the baseline's
+            waiting count was 0 for its entire KV fill.
+
+            Everything else is kept faithful to the vendored body on purpose, because this is
+            control-plane code we do not own: ``ready_event`` is still set first, ``task_done`` is
+            still called for a ``None``, and ``_handle_request`` is still wrapped PER REQUEST so one
+            failure costs one request — batching must not turn a single fault into a lost batch.
+            A test parses the vendored source and fails if that shape changes underneath us."""
+            self.ready_event.set()
+            while True:
+                try:
+                    first = self.request_queue.get()
+                except Exception as e:  # pragma: no cover - defensive
+                    logger.error(f"Error in KVCacheTransferThread: {e}")
+                    continue
+                try:
+                    batch = drain_queue(self.request_queue.get_nowait, first)
+                except Exception as e:  # pragma: no cover - defensive
+                    # Separate from the get above on purpose: the head is already off the queue, so
+                    # a failed drain must not drop it — that would leak its blocks and never signal
+                    # the producer. Handle it alone and let the backlog wait.
+                    logger.error(f"Error in KVCacheTransferThread: {e}")
+                    batch = [first]
+                live = []
+                for req_data in batch:
+                    if req_data is None:
+                        logger.warning("Received a None request!")
+                        self.request_queue.task_done()
+                    else:
+                        live.append(req_data)
+                if not live:
+                    continue
+                try:
+                    self._prefetch_signatures(live)
+                except Exception as e:  # pragma: no cover - defensive
+                    # Never fatal: with no cached signatures every request is read in full.
+                    logger.warning("BFF pull-v2: signature prefetch failed (%s) — this batch is "
+                                   "read in full.", e)
+                for req_data in live:
+                    try:
+                        self._handle_request(req_data)
+                    except Exception as e:
+                        logger.error(f"Error in KVCacheTransferThread: {e}")
+
+        def _peer_of(self, req_meta):
+            """The producer's signature endpoint for this request, or ``None`` if unaddressable."""
+            host = req_meta.get("remote_host")
+            port = req_meta.get("remote_handshake_port")
+            if host is None or port is None:
+                return None
+            return (host, int(port) + self.sig_port_offset)
+
+        def _ask_for(self, req_meta) -> dict:
+            """This request's signature question, ``{group: P block ids}``, or ``{}``.
+
+            Pure list math on ``req_meta`` — no device, and none of the remote metadata that
+            ``_transfer_kv_cache`` fetches — which is why it can run a whole batch ahead of the
+            transfer."""
+            local_groups = req_meta.get("local_block_ids")
+            remote_groups = req_meta.get("remote_block_ids")
+            if not local_groups or not v1.flatten_group_lists(local_groups):
+                return {}       # full prefix-cache hit: nothing to pull, so nothing to ask about
+            try:
+                aligned = v1.align_per_group(local_groups, remote_groups)
+                ask, _plan = signature_request_and_plan_groups(aligned, v1._FF_GROUPS)
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning("BFF pull-v2: could not build a signature request (%s) — this "
+                               "request is read in full.", e)
+                return {}
+            return ask
+
+        def _prefetch_signatures(self, batch) -> None:
+            """Ask each producer once for the whole drained run, before any of it is transferred.
+
+            One exchange per peer, answers matched back by position. The cache is cleared at entry,
+            not at exit: anything left from a previous batch is by definition an answer nobody
+            claimed, and letting it survive would offer one request another request's signatures."""
+            cache = self._sig_cache
+            cache.clear()
+            if (self.dedup_engine is None or self.sig_client is None
+                    or not pd_dedup_v2.V2_ENABLED):
+                return
+            asks = [self._ask_for(req_meta) for req_meta in batch]
+            keys = [self._peer_of(req_meta) if ask else None
+                    for req_meta, ask in zip(batch, asks)]
+            stats = self.dedup_engine.stats
+            for (host, port), positions in group_by_peer(keys).items():
+                answers = self.sig_client.ask_many(host, port, [asks[i] for i in positions])
+                for i, sigs in zip(positions, answers):
+                    # Counted here, and counted as ATTEMPTS: DedupStats.is_inert() reads
+                    # `exchanges == 0` as "v2 is installed but never ran", which is the difference
+                    # between "nothing was worth merging" and "the mechanism never engaged" — the
+                    # two readings of an all-zero saving a benchmark cannot otherwise tell apart.
+                    stats.exchanges += 1
+                    if sigs:
+                        cache[batch[i]["remote_request_id"]] = (ask_shape(asks[i]), sigs)
+                    else:
+                        stats.sig_phase_failed += 1
+
+        def _take_prefetched(self, req_meta, ask) -> dict:
+            """Claim this request's prefetched signatures, or ``{}`` to read it in full."""
+            sigs, mismatch = claim_prefetched(
+                self._sig_cache, req_meta.get("remote_request_id"), ask)
+            if mismatch is not None:
+                self.dedup_engine.stats.sig_phase_failed += 1
+                logger.warning(
+                    "BFF pull-v2: prefetched signatures do not match the planned request (%s vs "
+                    "%s) — reading it in full rather than pairing rows against the wrong blocks.",
+                    *mismatch)
+            return sigs
+
         def _plan_aligned(self, req_meta, aligned):
             """Ask P for signatures of the blocks we are about to read, and decide.
 
@@ -822,17 +1084,11 @@ if _ASCEND_AVAILABLE:
             # stripped form is common to both. Keying the engine on P's id would mean no alias ever
             # resolved, with no error anywhere.
             ext_id = v1._ext_of(req_meta["remote_request_id"])
-            # Counted BEFORE the ask, so it counts attempts. DedupStats.is_inert() reads
-            # `exchanges == 0` as "v2 is installed but never ran", which is the difference between
-            # "nothing was worth merging" and "the mechanism never engaged" — the two readings of an
-            # all-zero saving that a benchmark cannot otherwise tell apart.
-            self.dedup_engine.stats.exchanges += 1
-            sigs = self.sig_client.ask(
-                req_meta["remote_host"],
-                int(req_meta["remote_handshake_port"]) + self.sig_port_offset,
-                ask)                                  # P's ids — P indexes its own KV cache
+            # Already fetched, by `run` for this whole drained batch — P was asked about ITS ids.
+            # `exchanges` and `sig_phase_failed` are counted there, at the point the question is
+            # actually put to the producer.
+            sigs = self._take_prefetched(req_meta, ask)
             if not sigs:
-                self.dedup_engine.stats.sig_phase_failed += 1
                 return {}
             # D's ids — row i of P's signature payload describes plan slot i, because
             # align_per_group made the two lists equal-length and positionally paired.
@@ -1180,6 +1436,13 @@ if _ASCEND_AVAILABLE:
             # as "bff stats: none found (fusion may not have engaged)".
             stats = self.connector_worker._dedup_engine.stats
             if stats.should_dump(self._ff_step):
+                # Carried over here rather than counted in the engine: the client is the only thing
+                # that knows how many requests rode each round trip, and the producer's own log
+                # stops reporting at 100 served — which is inside the ramp, not the whole run.
+                client = self.connector_worker._sig_client
+                if client is not None:
+                    stats.sig_batches = client.batches
+                    stats.sig_batched_requests = client.batched_requests
                 stats.dump()
 
         def _v2_apply(self) -> None:

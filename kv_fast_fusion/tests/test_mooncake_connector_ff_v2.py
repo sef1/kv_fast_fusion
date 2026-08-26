@@ -966,3 +966,38 @@ def test_the_default_applier_never_reaches_the_ambiguity_branch():
 
     assert written == [("rB", 1, [50, 41])]
     assert engine.stats.fail_reasons["owner_id_ambiguous"] == 0
+
+
+# =====================================================================================
+# batching visibility in the stats file
+# =====================================================================================
+def test_a_transport_that_does_not_batch_reports_none_not_zero():
+    """0 round trips and 1.0 requests-per-round-trip are very different findings, and the GPU
+    connector produces neither — it has no batched signature phase at all. Reporting 0 would read as
+    "batching never engaged", which is the exact failure the Ascend pull transport had."""
+    st = pd_dedup_v2.DedupStats()
+
+    got = st.stats_dict()
+
+    assert got["sig_batches"] is None
+    assert got["sig_requests_per_exchange"] is None
+
+
+def test_the_requests_per_round_trip_ratio_is_reported():
+    st = pd_dedup_v2.DedupStats()
+    st.sig_batches = 20
+    st.sig_batched_requests = 512
+
+    got = st.stats_dict()
+
+    assert got["sig_batches"] == 20
+    assert got["sig_requests_per_exchange"] == 25.6
+
+
+def test_one_request_per_round_trip_is_visible_as_exactly_that():
+    """The inert case, which cost a whole run before anyone noticed: it must read 1.0, not blank."""
+    st = pd_dedup_v2.DedupStats()
+    st.sig_batches = 512
+    st.sig_batched_requests = 512
+
+    assert st.stats_dict()["sig_requests_per_exchange"] == 1.0

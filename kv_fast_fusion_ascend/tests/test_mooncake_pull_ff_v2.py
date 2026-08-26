@@ -17,6 +17,7 @@ The file is organised around the three things that can silently corrupt KV:
 
 import ast
 import os
+import queue
 import re
 import time
 
@@ -999,3 +1000,269 @@ def test_the_connector_builds_its_halves_from_overridable_attributes():
     assert "self._WORKER_CLS(" in ctor, "the worker must come from the overridable attribute"
     assert "self._SCHEDULER_CLS(" in ctor, "so must the scheduler"
     assert "= MooncakeConnectorWorkerFF(" not in ctor, "no hard-coded construction by name"
+
+
+# =====================================================================================
+# drain_queue — where the batch actually comes from
+# =====================================================================================
+# The batched signature protocol shipped inert: the producer logged "served 512 request(s) in 512
+# exchange(s) (1.0 per exchange)". It was built for concurrent callers, and the vendored recv thread
+# has none — it is one thread handling one request at a time. The batch has to be taken from the
+# QUEUE BACKLOG instead, which at con512 measured 214 deep while the decode was still filling KV.
+def _popper(items):
+    """A queue's get_nowait over a list, raising Empty the way queue.Queue does."""
+    box = list(items)
+
+    def get_nowait():
+        if not box:
+            raise queue.Empty
+        return box.pop(0)
+
+    return get_nowait, box
+
+
+def test_the_drain_takes_the_whole_backlog_up_to_the_cap():
+    get_nowait, left = _popper(range(1, 100))
+
+    batch = v2.drain_queue(get_nowait, 0, max_items=8)
+
+    assert batch == [0, 1, 2, 3, 4, 5, 6, 7], "the head plus seven, in arrival order"
+    assert left[0] == 8, "and the rest stays queued for the next round"
+
+
+def test_an_empty_queue_yields_the_head_alone():
+    """The steady-state case: arrivals fall to ~0.75/s and there is nothing to batch with. It must
+    cost nothing — this request is holding allocated KV blocks while it waits."""
+    get_nowait, _ = _popper([])
+
+    assert v2.drain_queue(get_nowait, "only", max_items=8) == ["only"]
+
+
+def test_the_drain_stops_at_the_backlog_not_the_cap():
+    get_nowait, _ = _popper(["b", "c"])
+
+    assert v2.drain_queue(get_nowait, "a", max_items=32) == ["a", "b", "c"]
+
+
+def test_a_cap_of_one_still_yields_the_head():
+    get_nowait, left = _popper(["b"])
+
+    assert v2.drain_queue(get_nowait, "a", max_items=1) == ["a"]
+    assert left == ["b"], "and nothing was taken off the queue and dropped"
+
+
+def test_the_drain_does_not_swallow_a_real_queue_fault():
+    """`queue.Empty` means "nothing left"; anything else is a fault and must not be read as one.
+    Catching Exception here would silently truncate every batch after a transient failure."""
+    def get_nowait():
+        raise RuntimeError("queue is broken")
+
+    with pytest.raises(RuntimeError):
+        v2.drain_queue(get_nowait, "head", max_items=8)
+
+
+def test_the_linger_is_off_by_default_and_bounded_when_on():
+    get_nowait, _ = _popper([])
+
+    t0 = time.monotonic()
+    v2.drain_queue(get_nowait, "a", max_items=8, linger_ms=0)
+    assert time.monotonic() - t0 < 0.05, "the default must not delay a request that cannot batch"
+
+    t0 = time.monotonic()
+    batch = v2.drain_queue(get_nowait, "a", max_items=8, linger_ms=30)
+    waited = time.monotonic() - t0
+    assert batch == ["a"]
+    assert 0.02 <= waited < 1.0, f"lingered {waited:.3f}s, expected ~0.03s and bounded"
+
+
+def test_the_linger_stops_as_soon_as_the_queue_produces():
+    """Once anything arrives we are draining a backlog, not waiting for one, so the wait must not
+    restart per item — that would make a 32-deep drain pay the linger 32 times."""
+    get_nowait, _ = _popper(["b", "c"])
+
+    t0 = time.monotonic()
+    batch = v2.drain_queue(get_nowait, "a", max_items=8, linger_ms=50)
+
+    assert batch == ["a", "b", "c"]
+    assert time.monotonic() - t0 < 0.2, "at most one linger, not one per drained item"
+
+
+# =====================================================================================
+# group_by_peer / ask_shape
+# =====================================================================================
+def test_requests_are_grouped_into_one_exchange_per_producer():
+    keys = [("p1", 1), ("p2", 2), ("p1", 1), ("p1", 1), ("p2", 2)]
+
+    assert v2.group_by_peer(keys) == {("p1", 1): [0, 2, 3], ("p2", 2): [1, 4]}
+
+
+def test_a_request_with_nothing_to_ask_takes_no_slot_but_holds_its_place():
+    """A full prefix-cache hit has no blocks to ask about. It must not occupy a slot on the wire,
+    and the positions of everyone else must still index the original batch."""
+    assert v2.group_by_peer([("p", 1), None, ("p", 1)]) == {("p", 1): [0, 2]}
+
+
+def test_grouping_keeps_first_seen_order():
+    got = v2.group_by_peer([("b", 1), ("a", 1), ("b", 1)])
+
+    assert list(got) == [("b", 1), ("a", 1)]
+
+
+def test_the_ask_fingerprint_is_group_lengths():
+    assert v2.ask_shape({1: [10, 11, 12], 2: [20]}) == {1: 3, 2: 1}
+    assert v2.ask_shape({}) == {}
+    assert v2.ask_shape(None) == {}
+
+
+# =====================================================================================
+# claim_prefetched — the pairing guard
+# =====================================================================================
+def test_a_prefetched_answer_is_claimed_once_and_then_gone():
+    """Popped, never peeked. An answer that outlived its request would be handed to a later one —
+    the same silent mis-pairing as confusing P's block ids with D's."""
+    ask = {1: [10, 11]}
+    cache = {"req-a": (v2.ask_shape(ask), {1: b"payload"})}
+
+    sigs, mismatch = v2.claim_prefetched(cache, "req-a", ask)
+    assert sigs == {1: b"payload"} and mismatch is None
+    assert cache == {}, "the entry must not survive its request"
+
+    again, _ = v2.claim_prefetched(cache, "req-a", ask)
+    assert again == {}, "a second claim gets nothing, not the previous request's signatures"
+
+
+def test_a_request_nobody_prefetched_reads_in_full():
+    sigs, mismatch = v2.claim_prefetched({}, "req-a", {1: [10]})
+
+    assert sigs == {} and mismatch is None, "absence is not a fault, it is a full read"
+
+
+def test_signatures_that_do_not_match_the_plan_are_refused():
+    """Row i of the payload describes plan slot i. If the prefetch and the plan ever built different
+    asks, that pairing is broken and every alias would be against the wrong block."""
+    cache = {"req-a": ({1: 2}, {1: b"two rows"})}
+
+    sigs, mismatch = v2.claim_prefetched(cache, "req-a", {1: [10, 11, 12]})
+
+    assert sigs == {}, "refuse rather than pair three blocks against two rows"
+    assert mismatch == ({1: 2}, {1: 3}), "and say what disagreed"
+    assert cache == {}, "a refused entry is still consumed, never left for the next request"
+
+
+def test_a_differing_group_set_is_a_mismatch_too():
+    cache = {"req-a": ({1: 2}, {1: b"x"})}
+
+    _sigs, mismatch = v2.claim_prefetched(cache, "req-a", {2: [10, 11]})
+
+    assert mismatch is not None, "same lengths, different groups, is still the wrong pairing"
+
+
+# =====================================================================================
+# the vendored recv loop we reimplemented
+# =====================================================================================
+def _vendored_run_body():
+    """Source of the vendored KVCacheRecvingThread.run, or None without a vllm_ascend checkout."""
+    source = _vendored_recv_thread_source()
+    if source is None:
+        return None
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.ClassDef) and node.name == "KVCacheRecvingThread"):
+            continue
+        for fn in node.body:
+            if isinstance(fn, ast.FunctionDef) and fn.name == "run":
+                return ast.dump(fn)
+    return None
+
+
+def test_the_vendored_recv_loop_still_has_the_shape_we_reimplemented():
+    """Overriding `run` couples us to vendored control-plane code, which this module's docstring
+    records as having broken the decode node outright once before.
+
+    We reimplement that loop to drain the queue, so we must keep its contract: set `ready_event`,
+    read `request_queue`, hand each item to `_handle_request`, and call `task_done` for a None. If
+    upstream grows a step we do not mirror, the failure is a decode that hangs or leaks — this test
+    is how that becomes a red suite instead."""
+    body = _vendored_run_body()
+    if body is None:
+        pytest.skip("no vllm_ascend checkout on this box")
+
+    assert "ready_event" in body, "the vendored loop signals readiness before looping"
+    assert "request_queue" in body, "and takes its work from request_queue"
+    assert "_handle_request" in body, "and dispatches through _handle_request"
+    assert "task_done" in body, "and acknowledges the None sentinel"
+
+
+def test_the_override_mirrors_that_contract():
+    """The other half: our loop must do all four of those things, and must isolate failures per
+    request — batching several requests into one iteration must not let one fault lose the rest."""
+    import inspect
+
+    src = inspect.getsource(v2)
+    run = src[src.index("        def run(self):"):]
+    run = run[:run.index("        def _peer_of(")]
+
+    assert "self.ready_event.set()" in run
+    assert "self.request_queue.get()" in run, "still blocks on the queue, as vendored"
+    assert "drain_queue(self.request_queue.get_nowait" in run, "and drains the backlog behind it"
+    assert "self.request_queue.task_done()" in run, "None is still acknowledged"
+    assert run.count("self._handle_request(") == 1
+    assert run.index("self._prefetch_signatures(") < run.index("self._handle_request("), \
+        "signatures must be fetched for the whole batch BEFORE any of it transfers"
+    handled = run[run.index("for req_data in live:"):]
+    assert "try:" in handled and "except Exception" in handled, \
+        "each request keeps its own failure, exactly as the vendored loop gave it"
+
+
+def test_the_prefetch_asks_each_peer_once_and_caches_by_request_id():
+    import inspect
+
+    src = inspect.getsource(v2)
+    fn = src[src.index("        def _prefetch_signatures(self, batch)"):]
+    fn = fn[:fn.index("        def _take_prefetched(")]
+
+    assert "cache.clear()" in fn, "nothing from a previous batch may survive into this one"
+    assert "group_by_peer(keys)" in fn, "one exchange per producer"
+    assert "self.sig_client.ask_many(" in fn, "the batched call, not the one-at-a-time ask"
+    assert "stats.exchanges += 1" in fn, "attempts are still counted, for DedupStats.is_inert"
+    assert "stats.sig_phase_failed += 1" in fn
+    assert 'cache[batch[i]["remote_request_id"]]' in fn, "keyed by the id the plan will claim with"
+
+
+def test_the_planner_no_longer_talks_to_the_producer_itself():
+    """The exchange moved to the batch loop. If `_plan_aligned` kept its own `ask`, every request
+    would pay the 222 ms round trip again on top of the prefetched one."""
+    import inspect
+
+    src = inspect.getsource(v2)
+    fn = src[src.index("        def _plan_aligned(self, req_meta, aligned):"):]
+    fn = fn[:fn.index("        def _warn_on_runaway_groups(")]
+
+    assert "self._take_prefetched(req_meta, ask)" in fn
+    assert "self.sig_client.ask(" not in fn, "no second round trip on the per-request path"
+
+
+def test_ask_many_answers_positionally_and_skips_empty_payloads():
+    """A request with nothing to ask must take no slot on the wire yet still get its {} back in
+    place, or the caller's indexing silently shifts onto another request's signatures."""
+    import inspect
+
+    src = inspect.getsource(v2)
+    fn = src[src.index("        def ask_many(self, host, port, payloads: list)"):]
+    fn = fn[:fn.index("        def ask(self, host, port, groups_to_ids: dict)")]
+
+    assert "out: list = [{} for _ in payloads]" in fn, "every position is answered"
+    assert "if p]" in fn, "empty payloads take no slot"
+    assert "for (i, _), item in zip(live, items)" in fn, "answers go back to their own positions"
+    assert "self._exchange(key, items)" in fn, "reuses the tested batched wire path"
+
+
+def test_the_dead_executor_claim_is_gone_from_the_comments():
+    """The 32-worker premise is what made the batching inert, and it was written down in two places.
+    A wrong comment that explains a design is worse than no comment."""
+    import inspect
+
+    src = inspect.getsource(v2)
+
+    assert "executor runs 32 workers" not in src
+    assert "recv thread runs 32 workers" not in src

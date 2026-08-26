@@ -747,6 +747,15 @@ if v2:
     print(f"    exchanges: {EX} ({FAIL} fell back to a full read) | aliases applied {AP}, "
           f"recomputed {RC}"
           + (f" ({100.0*AP/(AP+RC):.1f}% resolved)" if (AP + RC) else ""))
+    RT = sum(s.get("sig_batches") or 0 for s in v2)
+    if RT:
+        # The batched protocol shipped INERT once: 512 requests in 512 round trips, because the
+        # thread it runs on handles one at a time. This ratio is the only thing that says otherwise.
+        print(f"    signature round trips: {RT} for {EX} request(s) "
+              f"({EX/RT:.1f} per exchange, cap BFF_PULL_V2_SIG_BATCH)")
+        if EX / RT < 1.5:
+            print("    -> BATCHING DID NOT ENGAGE: the recv queue is never deep enough to drain. "
+                  "Nothing downstream of this is worth tuning until it is.")
     if EX == 0:
         print("    -> v2 NEVER ASKED: the mechanism did not engage at all. Check BFF_V2_DEDUP and "
               "the producer's 'signature server (REP) bound on' line in the prefill log.")

@@ -332,6 +332,11 @@ class DedupStats:
         self.fail_reasons = dict.fromkeys(FAIL_REASONS, 0)
         self.sig_phase_failed = 0   # exchanges that fell back to a full transfer
         self.exchanges = 0          # exchanges actually attempted
+        # Round trips, and requests carried by them, on transports that batch the signature phase.
+        # Left at zero elsewhere and reported as None rather than 0, because "this transport does
+        # not batch" and "batching never engaged" are the two readings that matter and 0 says both.
+        self.sig_batches = 0
+        self.sig_batched_requests = 0
         self.skip_reasons = dict.fromkeys(SKIP_REASONS, 0)
         # Producer-side only: blocks the decode told it to skip. An independent cross-check that
         # the two sides agree — it should track the decode's blocks_not_requested, and a divergence
@@ -467,6 +472,13 @@ class DedupStats:
             # An all-zero saving means one of two very different things. These separate them:
             # exchanges>0 with no drops = nothing worth merging; exchanges==0 = v2 never ran.
             "exchanges": self.exchanges,
+            # How many requests one round trip actually carried. The Ascend pull transport shipped a
+            # batched protocol that measured exactly 1.0 here for a whole run, because the thread it
+            # ran on handles one request at a time and there was never a second caller to batch with.
+            # The ratio is the only number that says whether batching engaged at all.
+            "sig_batches": self.sig_batches or None,
+            "sig_requests_per_exchange": (round(self.sig_batched_requests / self.sig_batches, 2)
+                                          if self.sig_batches else None),
             "exchange_skip_reasons": dict(self.skip_reasons),
             "blocks_withheld": self.blocks_withheld,
             "inert": self.is_inert(),
