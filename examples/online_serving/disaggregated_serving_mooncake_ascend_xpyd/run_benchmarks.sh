@@ -169,6 +169,12 @@ DECODE_MAX_CONCURRENCY=${DECODE_MAX_CONCURRENCY:-${MAX_CONCURRENCY}}
 REQUEST_RATE=${REQUEST_RATE:-64}
 BURSTINESS=${BURSTINESS:-0.1}
 MIN_TOKENS=${MIN_TOKENS:-2048}
+# Generation cap. NOT the same knob as MIN_TOKENS, which filters INPUT length. It decides which
+# regime the benchmark measures: the GPU comparison runs used 1024, where ~72% of requests hit the
+# cap, so generation length is pinned and the run measures pure token throughput. This default of
+# 6000 caps only ~9%, which leaves length free — and therefore exposes any effect BFF has on when
+# the model stops, which the GPU runs truncate away. Match it to 1024 to compare the two platforms.
+MAX_TOKENS=${MAX_TOKENS:-6000}
 REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-6000.0}
 # F1_DATASET=${F1_DATASET:-m-a-p/CodeFeedback-Filtered-Instruction}
 # F1_DATASET=${F1_DATASET:-codeparrot_f1_benchmark.jsonl}
@@ -595,7 +601,7 @@ run_benchmark() {
     --input-key "${F1_INPUT_KEY}" --output-key "${F1_OUTPUT_KEY}" \
     --num-prompts ${NUM_PROMPTS} --request-rate ${REQUEST_RATE} --burstiness ${BURSTINESS} \
     --max-concurrency ${DECODE_MAX_CONCURRENCY} --request-timeout ${REQUEST_TIMEOUT} \
-    --min-tokens ${MIN_TOKENS} --compute-f1 --compute-code-metrics \
+    --min-tokens ${MIN_TOKENS} --max-tokens ${MAX_TOKENS} --compute-f1 --compute-code-metrics \
     --model "${MODEL}" --host ${VLLM_HOST_IP} --port ${PROXY_PORT} \
     --result-dir "${results_root}" \
     > "${logs_root}/${BASELINE}-${NUM_PREFILL}Px${NUM_DECODE}D-con${DECODE_MAX_CONCURRENCY}-serving.txt" 2>&1

@@ -74,9 +74,9 @@ FF_PULL_V2_PORT_OFFSET = int(os.environ.get("BFF_MOONCAKE_FF_PULL_V2_PORT_OFFSET
 SIG_EXCHANGE_TIMEOUT = float(os.environ.get("BFF_PULL_V2_SIG_TIMEOUT", "10"))
 # How long register_kv_caches waits for the producer's REP socket to bind before saying so.
 SIG_SERVER_BIND_TIMEOUT = float(os.environ.get("BFF_PULL_V2_SIG_BIND_TIMEOUT", "5"))
-# Full ACL graph is refused by default even though v2 does no forward-path work — see
-# MooncakeConnectorFFv2.requires_piecewise_for_cudagraph for why the GPU v2 reasoning does not carry
-# over, and what setting this to 1 actually tests.
+# Full ACL graph is refused, and this escape hatch is now known to produce GARBAGE — see
+# MooncakeConnectorFFv2.requires_piecewise_for_cudagraph. Kept only so the experiment stays
+# reproducible; it is not a tuning knob.
 ALLOW_FULL_GRAPH = os.environ.get("BFF_V2_ALLOW_FULL_GRAPH", "0") == "1"
 # Check, after each apply, that no physical block sits in two live requests' write frontiers. Cheap
 # (one pass over each request's last block or two) and it is the one check that can refute the
@@ -822,20 +822,32 @@ if _ASCEND_AVAILABLE:
 
         @classmethod
         def requires_piecewise_for_cudagraph(cls, extra_config: dict) -> bool:
-            """Still True by default, for a DIFFERENT reason than v1's.
+            """Always True in practice, for a DIFFERENT reason than v1's — and now a MEASURED one.
 
             v1 demanded PIECEWISE because it ran real Python per layer inside ``save_kv_layer``; the
             GPU v2 therefore returns False, since v2 does no forward-path work. That reasoning does
-            not carry to Ascend: the full-graph corruption measured here (garbage from the first
-            decoded token, clean at one KV-cache group, broken at seven) was tied to the seven block
-            tables in ``AscendAttentionBackendImpl.update_graph_params``, which re-reads only
-            ``seq_lens`` per replay and takes ``block_table`` from the tuple frozen at capture. That
-            has nothing to do with save_kv_layer and v2 does not fix it.
+            not carry to Ascend, and ``BFF_V2_ALLOW_FULL_GRAPH=1`` was added to find out which of the
+            two candidate explanations was right. **The experiment has been run and it settled the
+            question against full graph.** v2 has no ``save_kv_layer`` at all, and full graph still
+            produced token-level garbage from the first decoded token — F1 0.2704 against 0.4947 for
+            the identical configuration under PIECEWISE, AST validity 8.61% against 15.43%.
 
-            Set ``BFF_V2_ALLOW_FULL_GRAPH=1`` to test exactly that: v2 removes one of the two
-            candidate explanations, so a clean full-graph run under v2 would prove the corruption was
-            save_kv_layer, and a corrupt one would prove it is the block tables. Off by default
-            because the failure mode is silent."""
+            So the cause is the seven block tables in
+            ``AscendAttentionBackendImpl.update_graph_params``, which re-reads only ``seq_lens`` per
+            replay and takes ``block_table`` from the tuple frozen at capture. Note what that
+            implies, and why it is invisible to every check in this file: the connector writes
+            correct block ids into the LIVE table — the slot trace saw 1,008,893 clean observations
+            and the device-vs-host check saw no divergence — while the replayed graph reads the
+            table captured earlier. We validate a table the graph does not use.
+
+            The knob is kept so the result stays reproducible, not as something to tune. Turning it
+            on costs half the F1 and the failure is silent unless you read the text."""
+            if ALLOW_FULL_GRAPH:
+                logger.warning(
+                    "BFF pull-v2: BFF_V2_ALLOW_FULL_GRAPH=1 permits FULL_DECODE_ONLY, which is "
+                    "KNOWN BROKEN with BFF's multi-group block tables — a measured run gave F1 "
+                    "0.2704 against 0.4947 under PIECEWISE, with token-level garbage from the "
+                    "first decoded token. Unset it unless you are deliberately reproducing that.")
             return not ALLOW_FULL_GRAPH
 
         def _applier(self) -> "AliasApplier":
