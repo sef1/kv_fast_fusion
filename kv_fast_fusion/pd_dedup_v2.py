@@ -337,6 +337,22 @@ class DedupStats:
         # not batch" and "batching never engaged" are the two readings that matter and 0 says both.
         self.sig_batches = 0
         self.sig_batched_requests = 0
+        # Where dedup's per-step cost actually lives. Measured at con512: the group split alone
+        # costs +4.5% per decode step and dedup a further +26% (68.2 -> 71.3 -> 89.6 ms/step,
+        # per-sample over Running>=60), i.e. ~18 ms/step or ~160 s of a run. `apply_ms` is 1.57 s of
+        # that and the hot-block audit runs in BOTH configurations, so neither explains it. The rest
+        # is on the decode's RECV THREAD, which shares a process — and the GIL — with the forward
+        # loop. These separate the candidates instead of inferring between them.
+        self.plan_ms = 0.0          # DedupEngine.plan, matching against the residency index
+        self.sig_decode_ms = 0.0    # unpacking the producer's payload (a subset of plan_ms)
+        self.exchange_ms = 0.0      # the round trip itself, which is I/O and should NOT dominate
+        self.audit_ms = 0.0         # _audit_hot_blocks, on the forward path every step
+        self.hook_ms = 0.0          # the whole forward-path hook, bounding the above directly
+        # Transfer verification (BFF_V2_VERIFY_TRANSFER): does the KV that landed on D match what P
+        # had? Compared through the signatures both sides already know how to compute.
+        self.verify_checked = 0
+        self.verify_mismatched = 0
+        self.verify_worst_cos = 1.0
         self.skip_reasons = dict.fromkeys(SKIP_REASONS, 0)
         # Producer-side only: blocks the decode told it to skip. An independent cross-check that
         # the two sides agree — it should track the decode's blocks_not_requested, and a divergence
@@ -479,6 +495,20 @@ class DedupStats:
             "sig_batches": self.sig_batches or None,
             "sig_requests_per_exchange": (round(self.sig_batched_requests / self.sig_batches, 2)
                                           if self.sig_batches else None),
+            # The per-step arithmetic. `hook_ms_total` bounds the forward path; everything else is
+            # recv-thread work that competes with it for the GIL. If plan+sig_decode+exchange
+            # approaches the run's measured dedup penalty, that is where the cost is.
+            "plan_ms_total": round(self.plan_ms, 1),
+            "sig_decode_ms_total": round(self.sig_decode_ms, 1),
+            "exchange_ms_total": round(self.exchange_ms, 1),
+            "audit_ms_total": round(self.audit_ms, 1),
+            "hook_ms_total": round(self.hook_ms, 1),
+            # Did the KV that landed on D match what P had? None when verification was not asked
+            # for, so "not measured" never reads as "measured and clean".
+            "verify_checked": self.verify_checked or None,
+            "verify_mismatched": self.verify_mismatched if self.verify_checked else None,
+            "verify_worst_cos": (round(self.verify_worst_cos, 5)
+                                 if self.verify_checked else None),
             "exchange_skip_reasons": dict(self.skip_reasons),
             "blocks_withheld": self.blocks_withheld,
             "inert": self.is_inert(),
@@ -582,6 +612,14 @@ class DedupEngine:
         transfer is not readable until then."""
         if not V2_ENABLED or not signatures:
             return req_blocks
+        _plan_t0 = time.perf_counter()
+        try:
+            return self._plan(req_blocks, signatures, threshold)
+        finally:
+            self.stats.plan_ms += (time.perf_counter() - _plan_t0) * 1e3
+
+    def _plan(self, req_blocks: dict, signatures: dict, threshold=None) -> dict:
+        """:meth:`plan` without the timing wrapper — see there for the contract."""
         planned = {rid: [list(g) for g in groups] for rid, groups in req_blocks.items()}
         groups = sorted({int(gi) for per in signatures.values() for gi in per})
 
@@ -599,8 +637,10 @@ class DedupEngine:
                 if payload is None:
                     continue
                 ids = per_group[gi] if gi < len(per_group) else []
+                _dec_t0 = time.perf_counter()
                 sig, nrm, hsh = SignatureCodec.decode(payload)
                 pk = SignatureCodec.kv_norms(payload) if SCALE_MODE == "ratio" else None
+                self.stats.sig_decode_ms += (time.perf_counter() - _dec_t0) * 1e3
                 if sig.shape[0] != len(ids):
                     # P and D disagree about this request's block count. Never guess: leave the
                     # request alone and it transfers exactly as vanilla would.

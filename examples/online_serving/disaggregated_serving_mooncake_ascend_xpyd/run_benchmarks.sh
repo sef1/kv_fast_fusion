@@ -763,6 +763,36 @@ if v2:
         print(f"    -> {100.0*FAIL/EX:.0f}% of exchanges failed. Grep the PREFILL log: no 'bound on'"
               f" line = the producer never listened; 'bound on' but no 'served' = the decode never "
               f"reached it; both = it answered too slowly (raise BFF_PULL_V2_SIG_TIMEOUT).")
+    # Did the KV that landed on the decode match what the producer had? The only CONTENT check in
+    # the whole transfer path; everything else is structural (lengths, coverage, reachability).
+    VC = sum(s.get("verify_checked") or 0 for s in v2)
+    if VC:
+        VM = sum(s.get("verify_mismatched") or 0 for s in v2)
+        WC = min([s.get("verify_worst_cos") for s in v2 if s.get("verify_worst_cos") is not None]
+                 or [1.0])
+        print(f"    transfer verify: {VM} of {VC} block(s) MISMATCHED (worst cos {WC:.5f})")
+        print("    -> the transfer is delivering the WRONG KV. Everything else is downstream of "
+              "this." if VM else
+              "    -> the KV arriving on the decode is the KV the producer had. Any quality loss "
+              "is downstream of the transfer.")
+
+    # Where dedup's per-step cost lives. At con512 the group split alone costs +4.5% per decode step
+    # and dedup a further +26%, i.e. ~18ms/step; apply_ms is ~1.5s of that, so the rest is elsewhere.
+    # hook_ms bounds the forward path, the others are recv-thread work competing with it for the GIL.
+    HOOK = sum(s.get("hook_ms_total") or 0 for s in v2)
+    APPLY_MS = sum(s.get("apply_ms_total") or 0 for s in v2)
+    PLAN = sum(s.get("plan_ms_total") or 0 for s in v2)
+    SDEC = sum(s.get("sig_decode_ms_total") or 0 for s in v2)
+    EXMS = sum(s.get("exchange_ms_total") or 0 for s in v2)
+    AUD = sum(s.get("audit_ms_total") or 0 for s in v2)
+    if HOOK or PLAN or EXMS:
+        print(f"    dedup time: forward-path hook {HOOK/1000:.1f}s (apply {APPLY_MS/1000:.1f}s, "
+              f"audit {AUD/1000:.1f}s) | recv thread: plan {PLAN/1000:.1f}s "
+              f"(decode {SDEC/1000:.1f}s), exchange {EXMS/1000:.1f}s")
+        if PLAN + EXMS > 5 * HOOK and PLAN + EXMS > 30000:
+            print("    -> the cost is on the RECV THREAD, not the forward path: that work shares a "
+                  "process and the GIL with the decode loop, so it steals from every step.")
+
     reasons = {}
     for s in v2:
         for k, n in (s.get("alias_failure_reasons") or {}).items():

@@ -1008,7 +1008,9 @@ def test_the_connector_builds_its_halves_from_overridable_attributes():
 # The batched signature protocol shipped inert: the producer logged "served 512 request(s) in 512
 # exchange(s) (1.0 per exchange)". It was built for concurrent callers, and the vendored recv thread
 # has none — it is one thread handling one request at a time. The batch has to be taken from the
-# QUEUE BACKLOG instead, which at con512 measured 214 deep while the decode was still filling KV.
+# QUEUE BACKLOG instead. These tests pin the drain because it is easy to get subtly wrong, not
+# because it is a throughput lever: with it live the producer reached 21.6 requests per exchange and
+# the run came back throughput-neutral. See _SigClient for the measurement.
 def _popper(items):
     """A queue's get_nowait over a list, raising Empty the way queue.Queue does."""
     box = list(items)
@@ -1266,3 +1268,141 @@ def test_the_dead_executor_claim_is_gone_from_the_comments():
 
     assert "executor runs 32 workers" not in src
     assert "recv thread runs 32 workers" not in src
+
+
+# =====================================================================================
+# compare_signature_rows — the arithmetic that decides "the transfer is correct"
+# =====================================================================================
+# Every other check in the transfer path is structural: lengths, coverage, group reachability. None
+# of them is about CONTENT, which is why a run could regress 0.045 F1 with nothing anywhere
+# reporting a fault. This is the one that compares what landed against what the producer had.
+def _unit(vec):
+    n = sum(x * x for x in vec) ** 0.5
+    return [x / n for x in vec]
+
+
+def test_an_identical_transfer_matches():
+    sig = [_unit([1.0, 2.0, 3.0]), _unit([0.0, 1.0, 0.0])]
+    norms = [10.0, 4.0]
+
+    bad, worst_cos, worst_err = v2.compare_signature_rows(sig, norms, sig, norms)
+
+    assert bad == []
+    assert worst_cos > 0.9999 and worst_err < 1e-9
+
+
+def test_fp16_wire_noise_still_matches():
+    """The producer ships fp16 and the two devices need not reduce in the same order. The bar has to
+    absorb that or every clean run reports corruption."""
+    sig_p = [_unit([1.0, 2.0, 3.0])]
+    sig_d = [_unit([1.0005, 1.999, 3.001])]
+
+    bad, worst_cos, _ = v2.compare_signature_rows(sig_p, [10.0], sig_d, [10.002])
+
+    assert bad == [], f"clean transfer flagged at cos {worst_cos}"
+
+
+def test_two_rows_swapped_between_blocks_is_caught():
+    """The failure the whole exercise is about: row i on the two sides describing different blocks.
+    Nothing structural notices, because the lengths still agree."""
+    a, b = _unit([1.0, 0.0, 0.0]), _unit([0.0, 1.0, 0.0])
+
+    bad, worst_cos, _ = v2.compare_signature_rows([a, b], [1.0, 1.0], [b, a], [1.0, 1.0])
+
+    assert len(bad) == 2, "both crossed rows must be reported"
+    assert worst_cos < 0.01
+
+
+def test_the_same_direction_at_the_wrong_scale_is_caught():
+    """signature_matrix normalises, so cosine alone is blind to magnitude — a partially written or
+    wrongly scaled block still points the same way. The norms are what carry it."""
+    sig = [_unit([1.0, 2.0, 3.0])]
+
+    bad, _cos, worst_err = v2.compare_signature_rows(sig, [10.0], sig, [13.0])
+
+    assert len(bad) == 1, "cosine matched perfectly; only the norm disagreed"
+    assert worst_err > 0.2
+
+
+def test_a_length_disagreement_is_itself_the_fault():
+    """Comparing the overlap would report a clean prefix and hide the fact that the two sides do not
+    agree about how many blocks this request has."""
+    a = _unit([1.0, 0.0])
+
+    bad, worst_cos, _ = v2.compare_signature_rows([a, a], [1.0, 1.0], [a], [1.0])
+
+    assert bad == [(-1, 0.0, 1.0)], "reported as a whole-request fault, not a per-row one"
+    assert worst_cos == 0.0
+
+
+def test_the_bar_is_configurable_for_a_deliberate_sweep():
+    a = _unit([1.0, 0.0])
+    b = _unit([0.98, 0.199])          # cos ~0.98 with a
+
+    assert v2.compare_signature_rows([a], [1.0], [b], [1.0], min_cos=0.99)[0], "0.98 < 0.99"
+    assert not v2.compare_signature_rows([a], [1.0], [b], [1.0], min_cos=0.95)[0]
+
+
+# =====================================================================================
+# verification wiring — it must observe, never alter
+# =====================================================================================
+def test_verification_never_plans_and_never_aliases():
+    """With dedup off the transfer must be exactly what vanilla would do. If verification planned,
+    it would alias blocks and then measure its own substitution as if it were the transport's."""
+    import inspect
+
+    src = inspect.getsource(v2)
+    fn = src[src.index("        def _plan_aligned(self, req_meta, aligned):"):]
+    fn = fn[:fn.index("        def _warn_on_runaway_groups(")]
+
+    stash = fn.index("self._verify_stash[")
+    guard = fn.index("if not pd_dedup_v2.V2_ENABLED:")
+    plan = fn.index("self.dedup_engine.plan(")
+    assert stash < guard < plan, \
+        "the dedup-off return must sit between stashing for verification and planning"
+
+
+def test_the_fetch_is_gated_on_verification_but_the_plan_is_not():
+    """Verification needs P's signatures with dedup off, so the FETCH has to run. Planning must
+    still be gated on V2_ENABLED alone, or 'dedup off' would stop meaning dedup off."""
+    import inspect
+
+    src = inspect.getsource(v2)
+
+    assert src.count("or not (pd_dedup_v2.V2_ENABLED or self._verify_on())") == 2, \
+        "both the prefetch and the plan entry gate open for verification"
+
+
+def test_verification_happens_before_release():
+    """Once a request is released its blocks may be aliased onto by later requests, and a mismatch
+    then cannot be told apart from a bad alias."""
+    import inspect
+
+    src = inspect.getsource(v2)
+    fn = src[src.index("        def _after_transfer(self, req_meta) -> None:"):]
+    fn = fn[:fn.index("        def _verify_transfer(")]
+
+    assert fn.index("self._verify_transfer(req_meta)") < fn.index("self.dedup_engine.release(")
+
+
+def test_the_verify_budget_is_shared_and_finite():
+    """A per-thread or per-instance budget would multiply by however many recv threads exist, and
+    the setting is an allowance for the run."""
+    import inspect
+
+    src = inspect.getsource(v2)
+
+    assert '_verify_left: ClassVar[list] = [VERIFY_TRANSFER]' in src
+    assert "KVCacheRecvingThreadFFv2._verify_left[0] -= 1" in src, "each check must consume budget"
+    assert 'VERIFY_TRANSFER = int(os.environ.get("BFF_V2_VERIFY_TRANSFER", "0"))' in src, \
+        "off by default — it recomputes signatures on the decode's own device"
+
+
+def test_the_hot_block_audit_is_off_by_default():
+    """O(batch x groups) on the forward path every step, and its question is closed: 0 collisions
+    across 1,008,893 slot observations and every run since."""
+    import inspect
+
+    src = inspect.getsource(v2)
+
+    assert 'os.environ.get("BFF_V2_AUDIT_HOT_BLOCKS", "0")' in src

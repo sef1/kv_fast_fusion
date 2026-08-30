@@ -79,10 +79,26 @@ SIG_SERVER_BIND_TIMEOUT = float(os.environ.get("BFF_PULL_V2_SIG_BIND_TIMEOUT", "
 # MooncakeConnectorFFv2.requires_piecewise_for_cudagraph. Kept only so the experiment stays
 # reproducible; it is not a tuning knob.
 ALLOW_FULL_GRAPH = os.environ.get("BFF_V2_ALLOW_FULL_GRAPH", "0") == "1"
-# Check, after each apply, that no physical block sits in two live requests' write frontiers. Cheap
-# (one pass over each request's last block or two) and it is the one check that can refute the
-# "new tokens share KV" theory outright rather than merely failing to confirm it.
-AUDIT_HOT_BLOCKS = os.environ.get("BFF_V2_AUDIT_HOT_BLOCKS", "1") == "1"
+# Check, after each apply, that no physical block sits in two live requests' write frontiers.
+#
+# OFF by default now: its question is closed. It found 0 collisions across 1,008,893 slot
+# observations and every run since, and it is O(batch x groups) on the FORWARD PATH every step
+# — ~700 inner iterations per step at con512, paid whether or not a single alias was applied. Kept
+# as a knob so the check stays reproducible, not as something to leave on.
+AUDIT_HOT_BLOCKS = os.environ.get("BFF_V2_AUDIT_HOT_BLOCKS", "0") == "1"
+# Verify, for the first N requests, that the KV which landed on D is the KV P had.
+#
+# Every other check in the transfer path is structural — lengths, coverage, group reachability —
+# and none of them is about CONTENT. This one recomputes D's own signatures for the blocks it just
+# received and compares them, row for row, against the producer's. The JL projection is fixed-seed
+# (signature_matrix), so both sides derive the same one and a correct transfer agrees to fp16
+# round-trip noise; crossed layers or groups do not come close. Diagnostic only: it never plans, it
+# never aliases, and a mismatch is reported rather than raised.
+VERIFY_TRANSFER = int(os.environ.get("BFF_V2_VERIFY_TRANSFER", "0"))
+# Cosine below this (or a norm off by more than 2%) is called a mismatch. Loose enough to absorb the
+# fp16 wire format and the NPU's own reduction order, tight enough that a wrong block cannot pass:
+# unrelated KV blocks in these runs sit far below it, which is why dedup needs a 0.75+ bar to alias.
+VERIFY_MIN_COS = float(os.environ.get("BFF_V2_VERIFY_MIN_COS", "0.99"))
 # Trace the physical write slot of the first N requests to decode, step by step. Off by default
 # because it logs once per request per step; on, it is the direct test of "new K/V is written to an
 # invalid address, or to the same slot over and over".
@@ -105,20 +121,20 @@ MSG_SIG_REPLY = b"bff_pull_v2_sig_rep"
 # empty, and every request is read in full.
 MSG_SIG_REQUEST_BATCH = b"bff_pull_v2_sig_req_batch"
 MSG_SIG_REPLY_BATCH = b"bff_pull_v2_sig_rep_batch"
-# Most requests an exchange may carry.
+# Most requests an exchange may carry. The batch is not made of concurrent callers — the vendored
+# recv thread is strictly serial (see KVCacheRecvingThreadFFv2.run) — it is whatever has piled up in
+# `request_queue`.
 #
-# This cap BINDS during ramp-up. The vendored recv thread is strictly serial (see
-# KVCacheRecvingThreadFFv2.run), so the batch is not made of concurrent callers — it is made of
-# whatever has piled up in `request_queue`, and at con512 that measured 214 deep while the decode
-# was still filling its KV. The cap exists so one exchange's device work on the producer stays
-# bounded and its timeout, which scales with the batch, stays meaningful.
-MAX_SIG_BATCH = int(os.environ.get("BFF_PULL_V2_SIG_BATCH", "32"))
-# Milliseconds to wait for a SECOND request when the queue drains empty. Zero, and deliberately so:
-# the drain window is already the previous batch's transfer time, which is free, and the phase where
-# batching pays has a 214-deep queue that fills the batch with no waiting at all. Once past ramp-up
-# arrivals fall to ~0.75/s and no amount of lingering can build a batch — it would only delay a
-# request that is holding allocated KV blocks, which is the scarce resource here. A knob, not a
-# recommendation.
+# 8, NOT the 32 this shipped with, because the exchange head-of-line blocks. The recv thread starts
+# no transfer at all while the producer works, which the one-at-a-time path never did: a 32-request
+# batch measured up to ~5 s of that. 8 keeps most of the saving at a quarter of the stall. The cap
+# also bounds one exchange's device work on the producer and keeps its batch-scaled timeout
+# meaningful.
+MAX_SIG_BATCH = int(os.environ.get("BFF_PULL_V2_SIG_BATCH", "8"))
+# Milliseconds to wait for a SECOND request when the queue drains empty. Zero, and measurement says
+# keep it there: batching is throughput-neutral (see _SigClient), so paying latency to manufacture a
+# batch buys nothing, and the request kept waiting is holding allocated KV blocks — the scarce
+# resource here. A knob so the question stays answerable without a rebuild, not a recommendation.
 SIG_LINGER_MS = float(os.environ.get("BFF_PULL_V2_SIG_LINGER_MS", "0"))
 
 
@@ -352,8 +368,11 @@ def drain_queue(get_nowait, first, max_items=None, linger_ms=None):
     This is what actually creates a batch on this transport. The vendored recv thread handles one
     request at a time, so no two signature exchanges are ever in flight together and a coalescer
     built for concurrent callers batched exactly one request, 512 times. Taking the queue in drained
-    runs instead makes the batch size equal to the backlog — which during ramp-up is the whole point,
-    because that backlog IS the requests sitting on allocated KV blocks waiting for their turn.
+    runs instead makes the batch size equal to the backlog.
+
+    What that is worth is settled and modest: see :class:`_SigClient` — it cuts the producer's
+    per-request cost ~30% and leaves end-to-end throughput unchanged. Draining costs nothing, so it
+    stays; it is not a lever to pull on when a run is slow.
 
     ``get_nowait`` is injected (rather than the queue itself) so the drain is testable with a list,
     and ``queue.Empty`` — not ``Exception`` — ends the drain: anything else coming out of the queue
@@ -409,6 +428,39 @@ def ask_shape(ask):
     applied against the wrong table with no error anywhere. Comparing shapes at the point of use
     turns any future divergence into a full read instead of a silent mis-pairing."""
     return {int(gi): len(ids) for gi, ids in (ask or {}).items()}
+
+
+def compare_signature_rows(sig_p, norms_p, sig_d, norms_d, min_cos=None, max_norm_err=0.02):
+    """Row-for-row agreement between the producer's signatures and the decode's own.
+
+    Returns ``(mismatches, worst_cos, worst_norm_err)``, where each mismatch is
+    ``(row, cos, norm_err)``. Row *i* on both sides is the same block — ``align_per_group`` made the
+    two lists equal-length and positionally paired — so a correct transfer agrees to fp16 noise.
+
+    BOTH halves are compared on purpose. The vectors are unit-normalised by ``signature_matrix``, so
+    cosine alone is blind to scale: a block whose KV was transferred at the wrong magnitude, or a
+    partially-written block, can still point the same way. The norms carry that, and comparing them
+    costs one subtraction per row.
+
+    A length disagreement is itself the fault, not a reason to compare the overlap — it means the
+    two sides do not agree about how many blocks this request has, so it is reported as row ``-1``
+    rather than silently truncating to the shorter list.
+
+    Pure Python over sequences of floats, with no torch and no NPU, so the arithmetic that decides
+    "the transfer is correct" is testable on CPU like ``align_per_group`` and ``filter_sentinels``."""
+    bar = VERIFY_MIN_COS if min_cos is None else min_cos
+    if len(sig_p) != len(sig_d):
+        return [(-1, 0.0, 1.0)], 0.0, 1.0
+    mismatches, worst_cos, worst_err = [], 1.0, 0.0
+    for i, (a, b) in enumerate(zip(sig_p, sig_d)):
+        cos = sum(float(x) * float(y) for x, y in zip(a, b))
+        np_i, nd_i = float(norms_p[i]), float(norms_d[i])
+        err = abs(np_i - nd_i) / max(abs(np_i), abs(nd_i), 1e-6)
+        worst_cos = min(worst_cos, cos)
+        worst_err = max(worst_err, err)
+        if cos < bar or err > max_norm_err:
+            mismatches.append((i, cos, err))
+    return mismatches, worst_cos, worst_err
 
 
 def claim_prefetched(cache, rid, ask):
@@ -734,10 +786,13 @@ if _ASCEND_AVAILABLE:
             """``{slot: {group: ids}}`` → ``{slot: {group: payload}}``, computing each GROUP once
             for the whole batch.
 
-            This is where batching pays. ``signatures_for_group`` ends in a device-to-host sync, so
-            answering per request meant draining the NPU queue once per group PER REQUEST — 7 syncs
-            each, ~3,600 for a 512-request run, on a producer that is simultaneously prefilling.
-            Gathering every slot's blocks for a group into one call makes it 7 syncs per batch.
+            This is where batching pays, and the size of the prize is known: ~30% of the producer's
+            per-request cost, no more. ``signatures_for_group`` ends in a device-to-host sync, so
+            answering per request drained the NPU queue once per group PER REQUEST, and gathering
+            every slot's blocks for a group into one call makes that once per batch. Measured
+            222 ms → ~156 ms per request; the remainder is per-request gather/LSH/encode that no
+            amount of batching removes. End to end it is throughput-neutral — see :class:`_SigClient`
+            before spending anything more here.
 
             Slots are kept apart by construction: the ids are concatenated in slot order and the
             resulting rows are sliced back by the same offsets, so row *i* of a slot's payload is
@@ -771,11 +826,10 @@ if _ASCEND_AVAILABLE:
     class _SigClient:
         """Decode side: one REQ socket per producer peer, used from the recv thread.
 
-        **Several requests are served by one exchange.** An exchange costs ~222 ms at con512, and
-        that is not signature compute — it is a device sync: ``signatures_for_group`` ends in a
-        ``.cpu()``, once per group per request, so a producer busy prefilling drained its NPU queue
-        7 times for every request. Batching collapses the sync count by the batch size, mirroring
-        the GPU connector, which answers for every pending send in one reply.
+        **Several requests are served by one exchange**, which cuts the producer's per-request cost
+        from ~222 ms to ~156 ms at con512. Some of that is a device sync — ``signatures_for_group``
+        ends in a ``.cpu()``, once per group per request — but only about a third of it; the rest is
+        per-request device work (gather, LSH, encode) that batching cannot remove.
 
         **Where the batch comes from.** Not from concurrent callers: the vendored recv thread is a
         single thread handling one request at a time (its ``ThreadPoolExecutor(max_workers=32)`` is
@@ -786,11 +840,17 @@ if _ASCEND_AVAILABLE:
         any future caller that does run threads, and because :meth:`ask_many` reuses its item
         protocol.
 
-        Why it is worth doing on a thread that has slack: during ramp-up it does not. At con512 the
-        decode reached 99.8% KV usage at **5 running requests with 214 waiting**, because every one
-        of those held its allocated blocks while queued behind this serialized exchange — where the
-        baseline's ``waiting`` was 0 for its entire KV fill. That is ~52 s of full-concurrency time
-        lost out of a 138 s gap, and it is also the phase where a drained batch fills instantly."""
+        **MEASURED: batching this is throughput-neutral. Do not expect a run to get faster.**
+        With it live the producer reported 21.6 requests per exchange during ramp-up and 3.26 over
+        the run, and con512 came back at 83.6 ms per decode step against 81.3 ms with the identical
+        code batching nothing — a difference fully explained by that run's 4.2% longer sequences.
+
+        It also does NOT fix the decode's ramp. The theory it was built on was that the ~200
+        requests holding allocated KV at ``running=1`` were queued behind this exchange; batching it
+        21x left the ramp unchanged (``running`` still 1 for the first 40 s), so they were waiting on
+        something else. Do not re-derive that theory. At con512 the exchange is at most a fifth of
+        the gap; per-step cost is the other four fifths (83.6 vs the baseline's 61.6 ms, at identical
+        concurrency). Kept because a 30% cut in producer load is real and costs nothing to hold."""
 
         def __init__(self):
             self._lock = threading.Lock()
@@ -802,6 +862,10 @@ if _ASCEND_AVAILABLE:
             self._batcher = BatchCoalescer(self._exchange, MAX_SIG_BATCH)
             self._direct_batches = 0
             self._direct_items = 0
+            # Wall time inside the round trip. Mostly waiting on the producer, so it should NOT
+            # dominate dedup's per-step cost — if it does, the recv thread is the bottleneck and
+            # not the CPU work around it.
+            self.exchange_ms = 0.0
 
         @property
         def batches(self) -> int:
@@ -875,6 +939,8 @@ if _ASCEND_AVAILABLE:
                                "full.", host, port, len(batch), (time.perf_counter() - t0) * 1e3,
                                SIG_EXCHANGE_TIMEOUT * 1e3 * len(batch), e)
                 self._drop(host, port)
+            finally:
+                self.exchange_ms += (time.perf_counter() - t0) * 1e3
 
         def _sock_for(self, host, port):
             key = (host, port)
@@ -918,9 +984,17 @@ if _ASCEND_AVAILABLE:
         # here has to be checked against that __init__; the test suite does it mechanically.
         sig_client: "_SigClient | None" = None
         dedup_engine: "DedupEngine | None" = None
+        # The worker's signatures_for_group_split, for BFF_V2_VERIFY_TRANSFER only. The decode uses
+        # the producer's own method against its OWN cache, which is what makes the two sides
+        # comparable: same code, same fixed-seed projection, same group layout.
+        local_sigs = None
         sig_port_offset: int = FF_PULL_V2_PORT_OFFSET
         _logged_first_decline = False
         _logged_first_cap = False
+        _logged_verify_ok = False
+        # Requests left to verify, for the process. Class-level because the budget is a debugging
+        # allowance for the run, not per thread.
+        _verify_left: ClassVar[list] = [VERIFY_TRANSFER]
         # Groups already reported by _warn_on_runaway_groups. Deliberately class-level and shared:
         # the warning is once per group for the process, not once per request or per thread.
         _warned_runaway: ClassVar[set] = set()
@@ -936,6 +1010,17 @@ if _ASCEND_AVAILABLE:
                 cache = self.__dict__["_sig_cache_d"] = {}
             return cache
 
+        @property
+        def _verify_stash(self) -> dict:
+            """``{remote_request_id: (plan_groups, sigs)}`` awaiting post-transfer verification."""
+            st = self.__dict__.get("_verify_stash_d")
+            if st is None:
+                st = self.__dict__["_verify_stash_d"] = {}
+            return st
+
+        def _verify_on(self) -> bool:
+            return VERIFY_TRANSFER > 0 and KVCacheRecvingThreadFFv2._verify_left[0] > 0
+
         def run(self):
             """The vendored loop, taking the queue in DRAINED RUNS so the exchange can batch.
 
@@ -944,10 +1029,11 @@ if _ASCEND_AVAILABLE:
             never a second caller to batch with, and the producer logged "1.0 per exchange" for all
             512 requests. Draining the queue first turns the backlog into the batch.
 
-            The backlog is real and it is the expensive part of the run. At con512 the decode hit
-            99.8% KV usage at 5 running requests with 214 waiting — those 214 were holding allocated
-            blocks while queued behind a 222 ms-per-request serialized exchange, where the baseline's
-            waiting count was 0 for its entire KV fill.
+            The backlog is real — at con512 the decode reached 99.8% KV usage at 5 running requests
+            while the baseline's waiting count stayed 0 for its entire KV fill — but draining it is
+            NOT what fixes that. Batching the exchange 21x left the ramp unchanged; what removed it
+            was cutting the KV-cache group count. Keep the drain (it is free and it does cut producer
+            load ~30%), and do not reach for it again when a run is slow.
 
             Everything else is kept faithful to the vendored body on purpose, because this is
             control-plane code we do not own: ``ready_event`` is still set first, ``task_done`` is
@@ -1026,7 +1112,7 @@ if _ASCEND_AVAILABLE:
             cache = self._sig_cache
             cache.clear()
             if (self.dedup_engine is None or self.sig_client is None
-                    or not pd_dedup_v2.V2_ENABLED):
+                    or not (pd_dedup_v2.V2_ENABLED or self._verify_on())):
                 return
             asks = [self._ask_for(req_meta) for req_meta in batch]
             keys = [self._peer_of(req_meta) if ask else None
@@ -1073,7 +1159,7 @@ if _ASCEND_AVAILABLE:
             Returns ``{group: planned_ids}`` — D's ids with SENTINEL in the declined positions — or
             ``{}`` on every failure path, which leaves the read whole."""
             if (self.dedup_engine is None or self.sig_client is None
-                    or not pd_dedup_v2.V2_ENABLED):
+                    or not (pd_dedup_v2.V2_ENABLED or self._verify_on())):
                 return {}
             ask, plan_groups = signature_request_and_plan_groups(aligned, v1._FF_GROUPS)
             if not ask:
@@ -1089,6 +1175,14 @@ if _ASCEND_AVAILABLE:
             # actually put to the producer.
             sigs = self._take_prefetched(req_meta, ask)
             if not sigs:
+                return {}
+            if self._verify_on():
+                # Held for _after_transfer: the comparison is only meaningful once the KV has
+                # actually landed. plan_groups is D's ids, positionally paired with P's rows.
+                self._verify_stash[req_meta.get("remote_request_id")] = (plan_groups, sigs)
+            if not pd_dedup_v2.V2_ENABLED:
+                # Verification only. It must never plan and never alias — the whole point is to
+                # observe an unmodified transfer.
                 return {}
             # D's ids — row i of P's signature payload describes plan slot i, because
             # align_per_group made the two lists equal-length and positionally paired.
@@ -1190,8 +1284,66 @@ if _ASCEND_AVAILABLE:
             earlier is the bug that made the first GPU v2 run apply 22 of 26,531 aliases — the apply
             path expires a map whose owner has not been batched, and an owner cannot be batched
             until its KV has actually arrived."""
+            self._verify_transfer(req_meta)
             if self.dedup_engine is not None:
                 self.dedup_engine.release(v1._ext_of(req_meta["remote_request_id"]))
+
+        def _verify_transfer(self, req_meta) -> None:
+            """Is the KV that just landed the KV the producer had? (BFF_V2_VERIFY_TRANSFER)
+
+            Recomputes this decode's own signatures for the blocks it received and compares them,
+            row for row, against the producer's. Both sides run the same ``signature_matrix`` over
+            the same group's layers with the same fixed-seed projection, so a correct transfer
+            agrees to fp16 noise — and layers or groups crossed anywhere between P's cache and D's
+            do not come close.
+
+            Called after the transfer and BEFORE ``release``, so the blocks are still exactly what
+            arrived: once released they may be aliased onto by later requests, and a mismatch then
+            would be ambiguous between a bad transfer and a bad alias.
+
+            Never raises. A diagnostic that can fail a request is worse than no diagnostic."""
+            rid = req_meta.get("remote_request_id")
+            entry = self._verify_stash.pop(rid, None)
+            if entry is None or self.local_sigs is None or self.dedup_engine is None:
+                return
+            if KVCacheRecvingThreadFFv2._verify_left[0] <= 0:
+                return
+            KVCacheRecvingThreadFFv2._verify_left[0] -= 1
+            plan_groups, sigs = entry
+            stats = self.dedup_engine.stats
+            try:
+                for gi, payload in sorted(sigs.items()):
+                    local_ids = plan_groups.get(int(gi)) or []
+                    if not local_ids or payload is None:
+                        continue
+                    mine = self.local_sigs(int(gi), local_ids, [len(local_ids)])[0]
+                    if mine is None:
+                        continue
+                    sig_p, norms_p, _h = SignatureCodec.decode(payload)
+                    sig_d, norms_d, _h2 = SignatureCodec.decode(mine)
+                    bad, worst_cos, worst_err = compare_signature_rows(
+                        sig_p.tolist(), norms_p, sig_d.tolist(), norms_d)
+                    stats.verify_checked += len(local_ids)
+                    stats.verify_mismatched += len(bad)
+                    stats.verify_worst_cos = min(stats.verify_worst_cos, worst_cos)
+                    if bad:
+                        row, cos, err = bad[0]
+                        logger.error(
+                            "BFF pull-v2 VERIFY: group %d, %d of %d block(s) do not match the "
+                            "producer's KV — first at row %d (cos %.4f, norm err %.1f%%), decode "
+                            "block %s. The transfer is delivering the wrong KV, not merely a "
+                            "lossy one.", gi, len(bad), len(local_ids), row, cos, 100.0 * err,
+                            local_ids[row] if 0 <= row < len(local_ids) else "n/a")
+                    elif not KVCacheRecvingThreadFFv2._logged_verify_ok:
+                        KVCacheRecvingThreadFFv2._logged_verify_ok = True
+                        logger.info(
+                            "BFF pull-v2 VERIFY: group %d matched the producer on all %d block(s) "
+                            "(worst cos %.5f, worst norm err %.2f%%). %d request(s) left to check.",
+                            gi, len(local_ids), worst_cos, 100.0 * worst_err,
+                            KVCacheRecvingThreadFFv2._verify_left[0])
+            except Exception as e:  # noqa: BLE001 - a diagnostic must never fail a request
+                logger.warning("BFF pull-v2: transfer verification failed for %s (%s); the "
+                               "request itself is unaffected.", rid, e)
 
     class MooncakeConnectorWorkerFFv2(v1.MooncakeConnectorWorkerFF):
         """v1's worker plus the signature server (on P) and the dedup engine (on D)."""
@@ -1234,8 +1386,16 @@ if _ASCEND_AVAILABLE:
                 if self.kv_recv_thread is not None:
                     self.kv_recv_thread.dedup_engine = self._dedup_engine
                     self.kv_recv_thread.sig_client = self._sig_client
+                    # The producer's own method, pointed at THIS node's cache — that sameness is
+                    # what makes the two sides' signatures comparable at all.
+                    self.kv_recv_thread.local_sigs = self.signatures_for_group_split
                 logger.info("BFF pull-v2: decode dedup engine armed (V2_DEDUP=%s, sig timeout "
                             "%.1fs).", pd_dedup_v2.V2_ENABLED, SIG_EXCHANGE_TIMEOUT)
+                if VERIFY_TRANSFER > 0:
+                    logger.warning(
+                        "BFF pull-v2: TRANSFER VERIFICATION on for the first %d request(s). Each "
+                        "one recomputes signatures on this device after its KV lands, so this is a "
+                        "diagnostic setting, not a benchmark one.", VERIFY_TRANSFER)
 
         def _await_sig_server(self) -> None:
             """Fail loudly at startup instead of silently at request time.
@@ -1429,7 +1589,13 @@ if _ASCEND_AVAILABLE:
             self._ff_step += 1
             if self.connector_worker is None or self.connector_worker._dedup_engine is None:
                 return
+            # Bounds the FORWARD-PATH share of dedup's cost directly. Everything else the mechanism
+            # does runs on the recv thread, so `hook_ms_total` staying small is what says the cost
+            # is over there competing for the GIL rather than in here.
+            _hook_t0 = time.perf_counter()
             self._v2_apply()
+            self.connector_worker._dedup_engine.stats.hook_ms += (
+                time.perf_counter() - _hook_t0) * 1e3
             # Dumped from here, on the engine's own cadence. Without it this arm produces no
             # bff_stats_*.json at all and the whole verification ladder — wire saving, applied vs
             # recomputed, inert-or-not — is unreadable, which is exactly how an earlier run came back
@@ -1443,6 +1609,7 @@ if _ASCEND_AVAILABLE:
                 if client is not None:
                     stats.sig_batches = client.batches
                     stats.sig_batched_requests = client.batched_requests
+                    stats.exchange_ms = client.exchange_ms
                 stats.dump()
 
         def _v2_apply(self) -> None:
@@ -1459,7 +1626,9 @@ if _ASCEND_AVAILABLE:
                     logger.info("BFF pull-v2 apply | aliases_applied=%d | recompute(cum)=%d | "
                                 "hot-block refused(cum)=%d", n,
                                 applier._engine.stats.recomputed, hot)
+                _audit_t0 = time.perf_counter()
                 self._audit_hot_blocks(runner)
+                applier._engine.stats.audit_ms += (time.perf_counter() - _audit_t0) * 1e3
                 self._trace_slots(runner)
             except Exception as e:  # pragma: no cover - defensive
                 logger.warning("BFF pull-v2 consumer apply failed: %s", e)
