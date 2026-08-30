@@ -353,6 +353,10 @@ class DedupStats:
         self.verify_checked = 0
         self.verify_mismatched = 0
         self.verify_worst_cos = 1.0
+        # What a surviving mismatch turned out to be, once the producer was re-asked. See
+        # mooncake_connector_ff_v2.classify_mismatch: "the decode's KV does not match the signature"
+        # has three causes needing three different fixes, and the counts are how they are told apart.
+        self.verify_verdicts: dict = {}
         self.skip_reasons = dict.fromkeys(SKIP_REASONS, 0)
         # Producer-side only: blocks the decode told it to skip. An independent cross-check that
         # the two sides agree — it should track the decode's blocks_not_requested, and a divergence
@@ -509,6 +513,7 @@ class DedupStats:
             "verify_mismatched": self.verify_mismatched if self.verify_checked else None,
             "verify_worst_cos": (round(self.verify_worst_cos, 5)
                                  if self.verify_checked else None),
+            "verify_verdicts": dict(self.verify_verdicts) or None,
             "exchange_skip_reasons": dict(self.skip_reasons),
             "blocks_withheld": self.blocks_withheld,
             "inert": self.is_inert(),
