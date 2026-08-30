@@ -789,7 +789,14 @@ if v2:
         print(f"    dedup time: forward-path hook {HOOK/1000:.1f}s (apply {APPLY_MS/1000:.1f}s, "
               f"audit {AUD/1000:.1f}s) | recv thread: plan {PLAN/1000:.1f}s "
               f"(decode {SDEC/1000:.1f}s), exchange {EXMS/1000:.1f}s")
-        if PLAN + EXMS > 5 * HOOK and PLAN + EXMS > 30000:
+        if not PLAN:
+            # Dedup off. The exchange then runs ONLY while the verification budget lasts, so
+            # exchange_ms covers a handful of requests and comparing it against a whole run's hook
+            # time is comparing two different denominators. A previous version printed the
+            # recv-thread verdict from 45.9s over 33 requests, which meant nothing.
+            print(f"    -> dedup is OFF: the {EXMS/1000:.1f}s of exchange above covers only the "
+                  f"{EX} verified request(s), not the run. Not comparable to the hook time.")
+        elif PLAN + EXMS > 5 * HOOK and PLAN + EXMS > 30000:
             print("    -> the cost is on the RECV THREAD, not the forward path: that work shares a "
                   "process and the GIL with the decode loop, so it steals from every step.")
 

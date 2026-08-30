@@ -1369,7 +1369,7 @@ def test_the_fetch_is_gated_on_verification_but_the_plan_is_not():
 
     src = inspect.getsource(v2)
 
-    assert src.count("or not (pd_dedup_v2.V2_ENABLED or self._verify_on())") == 2, \
+    assert src.count("or not (pd_dedup_v2.V2_ENABLED or self._verify_ready())") == 2, \
         "both the prefetch and the plan entry gate open for verification"
 
 
@@ -1385,17 +1385,36 @@ def test_verification_happens_before_release():
     assert fn.index("self._verify_transfer(req_meta)") < fn.index("self.dedup_engine.release(")
 
 
-def test_the_verify_budget_is_shared_and_finite():
-    """A per-thread or per-instance budget would multiply by however many recv threads exist, and
-    the setting is an allowance for the run."""
+def test_the_verify_budget_is_shared_and_spread_across_the_run():
+    """A per-thread budget would multiply by however many recv threads exist, and a budget that is
+    merely counted down lands every check on the first N requests — which is what happened, and it
+    sampled only the ramp."""
     import inspect
 
     src = inspect.getsource(v2)
 
-    assert '_verify_left: ClassVar[list] = [VERIFY_TRANSFER]' in src
-    assert "KVCacheRecvingThreadFFv2._verify_left[0] -= 1" in src, "each check must consume budget"
+    assert '_verify_sampler: ClassVar = VerifySampler(VERIFY_TRANSFER, VERIFY_SPACING_S)' in src
+    assert "KVCacheRecvingThreadFFv2._verify_sampler.take()" in src, \
+        "the claim must come from the sampler, not a bare counter"
     assert 'VERIFY_TRANSFER = int(os.environ.get("BFF_V2_VERIFY_TRANSFER", "0"))' in src, \
         "off by default — it recomputes signatures on the decode's own device"
+    assert 'VERIFY_SPACING_S = float(os.environ.get("BFF_V2_VERIFY_SPACING_S", "15"))' in src
+
+
+def test_the_check_is_claimed_where_the_signatures_are_still_in_hand():
+    """The sampler decides WHICH requests get checked, and that decision has to be made while the
+    producer's signatures are held — claiming at verification time instead would check whichever
+    requests happened to finish transferring, which is not a sample of anything."""
+    import inspect
+
+    src = inspect.getsource(v2)
+    fn = src[src.index("        def _plan_aligned(self, req_meta, aligned):"):]
+    fn = fn[:fn.index("        def _warn_on_runaway_groups(")]
+
+    assert fn.index("_verify_sampler.take()") < fn.index("self._verify_stash["), \
+        "claim, then stash"
+    verify = src[src.index("        def _verify_transfer(self, req_meta) -> None:"):]
+    assert ".take()" not in verify, "verification must consume the stash, never the budget"
 
 
 def test_the_hot_block_audit_is_off_by_default():
@@ -1406,3 +1425,108 @@ def test_the_hot_block_audit_is_off_by_default():
     src = inspect.getsource(v2)
 
     assert 'os.environ.get("BFF_V2_AUDIT_HOT_BLOCKS", "0")' in src
+
+
+# =====================================================================================
+# VerifySampler — spend the budget across the run, not on the front of it
+# =====================================================================================
+# The first version counted down from N, so all 32 checks landed on the first 32 requests. On a
+# con512 run those all finish during ramp-up, before the KV cache has ever reached 100%. It reported
+# "4,368 blocks, 0 mismatched" — true, and evidence about the wrong window: a fault that needs blocks
+# to be recycled under pressure could not have appeared in that sample.
+class _Clock:
+    def __init__(self, t=1000.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+    def advance(self, dt):
+        self.t += dt
+
+
+def test_the_first_check_is_due_immediately():
+    """A short run must verify something rather than waiting out one interval and checking nothing."""
+    clk = _Clock()
+    s = v2.VerifySampler(budget=4, spacing_s=15, clock=clk)
+
+    assert s.ready() and s.take()
+
+
+def test_a_second_check_waits_for_the_spacing():
+    """This is the whole fix: back-to-back checks are what confined the sample to the ramp."""
+    clk = _Clock()
+    s = v2.VerifySampler(budget=4, spacing_s=15, clock=clk)
+    assert s.take()
+
+    assert not s.ready(), "a second check immediately after the first defeats the spacing"
+    assert not s.take()
+
+    clk.advance(14.9)
+    assert not s.take(), "still inside the interval"
+    clk.advance(0.2)
+    assert s.take(), "due once the interval has elapsed"
+
+
+def test_the_budget_is_the_total_number_of_checks():
+    clk = _Clock()
+    s = v2.VerifySampler(budget=3, spacing_s=10, clock=clk)
+
+    taken = 0
+    for _ in range(100):
+        if s.take():
+            taken += 1
+        clk.advance(10)
+
+    assert taken == 3
+    assert not s.ready() and s.left == 0
+
+
+def test_a_spent_sampler_stops_gating_the_fetch_open():
+    """`ready` gates the signature FETCH. Left true after the budget is spent, every request would
+    keep paying a round trip for a check that will never happen."""
+    clk = _Clock()
+    s = v2.VerifySampler(budget=1, spacing_s=5, clock=clk)
+    s.take()
+    clk.advance(1000)
+
+    assert not s.ready()
+
+
+def test_zero_budget_is_off():
+    s = v2.VerifySampler(budget=0, spacing_s=15, clock=_Clock())
+
+    assert not s.ready() and not s.take()
+
+
+def test_zero_spacing_degrades_to_back_to_back():
+    """The old behaviour stays reachable, so the previous runs' sampling can be reproduced."""
+    clk = _Clock()
+    s = v2.VerifySampler(budget=3, spacing_s=0, clock=clk)
+
+    assert [s.take(), s.take(), s.take(), s.take()] == [True, True, True, False]
+
+
+def test_the_clock_is_only_read_not_slept_on():
+    """The sampler runs on the recv thread, between a request's signature fetch and its transfer.
+    Anything that blocks there delays KV the decode is waiting on."""
+    clk = _Clock()
+    s = v2.VerifySampler(budget=2, spacing_s=30, clock=clk)
+
+    t0 = time.monotonic()
+    s.take()
+    s.take()
+    s.ready()
+
+    assert time.monotonic() - t0 < 0.05, "must never wait for its own interval"
+
+
+def test_nonsense_env_values_cannot_break_the_sampler():
+    """Both fields come straight from env vars. A negative budget must read as off, and a negative
+    spacing as no spacing — never as an interval that can never elapse or a budget that never ends."""
+    clk = _Clock()
+
+    assert not v2.VerifySampler(budget=-5, spacing_s=15, clock=clk).ready()
+
+    s = v2.VerifySampler(budget=2, spacing_s=-30, clock=clk)
+    assert [s.take(), s.take(), s.take()] == [True, True, False]

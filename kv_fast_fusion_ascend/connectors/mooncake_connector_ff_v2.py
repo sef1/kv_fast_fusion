@@ -95,6 +95,10 @@ AUDIT_HOT_BLOCKS = os.environ.get("BFF_V2_AUDIT_HOT_BLOCKS", "0") == "1"
 # round-trip noise; crossed layers or groups do not come close. Diagnostic only: it never plans, it
 # never aliases, and a mismatch is reported rather than raised.
 VERIFY_TRANSFER = int(os.environ.get("BFF_V2_VERIFY_TRANSFER", "0"))
+# Seconds between checks, so the budget is spent ACROSS the run. See VerifySampler for why this
+# exists: the first version spent all 32 checks on the first 32 requests, which all ran before the
+# KV cache had ever filled, and reported a clean result about the wrong window.
+VERIFY_SPACING_S = float(os.environ.get("BFF_V2_VERIFY_SPACING_S", "15"))
 # Cosine below this (or a norm off by more than 2%) is called a mismatch. Loose enough to absorb the
 # fp16 wire format and the NPU's own reduction order, tight enough that a wrong block cannot pass:
 # unrelated KV blocks in these runs sit far below it, which is why dedup needs a 0.75+ bar to alias.
@@ -428,6 +432,43 @@ def ask_shape(ask):
     applied against the wrong table with no error anywhere. Comparing shapes at the point of use
     turns any future divergence into a full read instead of a silent mis-pairing."""
     return {int(gi): len(ids) for gi, ids in (ask or {}).items()}
+
+
+class VerifySampler:
+    """A fixed verification budget, spent ACROSS the run rather than on the front of it.
+
+    The first version simply counted down from N, so all N checks landed on the first N requests —
+    which on a con512 run all complete during ramp-up, before the KV cache has ever reached 100%. It
+    returned "4,368 blocks, 0 mismatched" and that was true, but it was evidence about the
+    unsaturated phase only. A transfer fault that needs blocks to be recycled under pressure could
+    not have shown up in that sample, and the phase it missed is exactly the one where the quality
+    regression lives.
+
+    Spaced in TIME, not by request index, for two reasons: saturation is a time phenomenon (KV fills
+    60-80 s in, whatever the request rate), and spacing by index would need to know in advance how
+    many requests the run will have.
+
+    ``clock`` is injected so the tests are deterministic instead of sleeping."""
+
+    def __init__(self, budget, spacing_s, clock=None):
+        self.left = max(0, int(budget))
+        self.spacing_s = max(0.0, float(spacing_s))
+        self._clock = clock or time.monotonic
+        # None rather than a timestamp: the first check is due immediately, so a short run still
+        # verifies something instead of waiting out one spacing interval and checking nothing.
+        self._next = None
+
+    def ready(self) -> bool:
+        """Would :meth:`take` succeed right now? Gates the *fetch*, which happens a batch early."""
+        return self.left > 0 and (self._next is None or self._clock() >= self._next)
+
+    def take(self) -> bool:
+        """Claim one check, re-arming the spacing. False when spent or too soon."""
+        if not self.ready():
+            return False
+        self.left -= 1
+        self._next = self._clock() + self.spacing_s
+        return True
 
 
 def compare_signature_rows(sig_p, norms_p, sig_d, norms_d, min_cos=None, max_norm_err=0.02):
@@ -992,9 +1033,9 @@ if _ASCEND_AVAILABLE:
         _logged_first_decline = False
         _logged_first_cap = False
         _logged_verify_ok = False
-        # Requests left to verify, for the process. Class-level because the budget is a debugging
-        # allowance for the run, not per thread.
-        _verify_left: ClassVar[list] = [VERIFY_TRANSFER]
+        # Verification budget for the PROCESS, spaced across the run. Class-level because it is an
+        # allowance for the run, not per thread. See VerifySampler for why it is spaced at all.
+        _verify_sampler: ClassVar = VerifySampler(VERIFY_TRANSFER, VERIFY_SPACING_S)
         # Groups already reported by _warn_on_runaway_groups. Deliberately class-level and shared:
         # the warning is once per group for the process, not once per request or per thread.
         _warned_runaway: ClassVar[set] = set()
@@ -1018,8 +1059,9 @@ if _ASCEND_AVAILABLE:
                 st = self.__dict__["_verify_stash_d"] = {}
             return st
 
-        def _verify_on(self) -> bool:
-            return VERIFY_TRANSFER > 0 and KVCacheRecvingThreadFFv2._verify_left[0] > 0
+        def _verify_ready(self) -> bool:
+            """Gates the FETCH, which runs a batch ahead of the claim in _plan_aligned."""
+            return VERIFY_TRANSFER > 0 and KVCacheRecvingThreadFFv2._verify_sampler.ready()
 
         def run(self):
             """The vendored loop, taking the queue in DRAINED RUNS so the exchange can batch.
@@ -1112,7 +1154,7 @@ if _ASCEND_AVAILABLE:
             cache = self._sig_cache
             cache.clear()
             if (self.dedup_engine is None or self.sig_client is None
-                    or not (pd_dedup_v2.V2_ENABLED or self._verify_on())):
+                    or not (pd_dedup_v2.V2_ENABLED or self._verify_ready())):
                 return
             asks = [self._ask_for(req_meta) for req_meta in batch]
             keys = [self._peer_of(req_meta) if ask else None
@@ -1159,7 +1201,7 @@ if _ASCEND_AVAILABLE:
             Returns ``{group: planned_ids}`` — D's ids with SENTINEL in the declined positions — or
             ``{}`` on every failure path, which leaves the read whole."""
             if (self.dedup_engine is None or self.sig_client is None
-                    or not (pd_dedup_v2.V2_ENABLED or self._verify_on())):
+                    or not (pd_dedup_v2.V2_ENABLED or self._verify_ready())):
                 return {}
             ask, plan_groups = signature_request_and_plan_groups(aligned, v1._FF_GROUPS)
             if not ask:
@@ -1176,8 +1218,10 @@ if _ASCEND_AVAILABLE:
             sigs = self._take_prefetched(req_meta, ask)
             if not sigs:
                 return {}
-            if self._verify_on():
-                # Held for _after_transfer: the comparison is only meaningful once the KV has
+            if KVCacheRecvingThreadFFv2._verify_sampler.take():
+                # Claimed HERE, not at verification time: the sampler decides which requests get
+                # checked, and that decision has to be made while the signatures are still in hand.
+                # Held for _after_transfer, because the comparison is only meaningful once the KV has
                 # actually landed. plan_groups is D's ids, positionally paired with P's rows.
                 self._verify_stash[req_meta.get("remote_request_id")] = (plan_groups, sigs)
             if not pd_dedup_v2.V2_ENABLED:
@@ -1306,11 +1350,10 @@ if _ASCEND_AVAILABLE:
             entry = self._verify_stash.pop(rid, None)
             if entry is None or self.local_sigs is None or self.dedup_engine is None:
                 return
-            if KVCacheRecvingThreadFFv2._verify_left[0] <= 0:
-                return
-            KVCacheRecvingThreadFFv2._verify_left[0] -= 1
             plan_groups, sigs = entry
             stats = self.dedup_engine.stats
+            checked = mismatched = 0
+            worst = 1.0
             try:
                 for gi, payload in sorted(sigs.items()):
                     local_ids = plan_groups.get(int(gi)) or []
@@ -1326,6 +1369,9 @@ if _ASCEND_AVAILABLE:
                     stats.verify_checked += len(local_ids)
                     stats.verify_mismatched += len(bad)
                     stats.verify_worst_cos = min(stats.verify_worst_cos, worst_cos)
+                    checked += len(local_ids)
+                    mismatched += len(bad)
+                    worst = min(worst, worst_cos)
                     if bad:
                         row, cos, err = bad[0]
                         logger.error(
@@ -1335,12 +1381,25 @@ if _ASCEND_AVAILABLE:
                             "lossy one.", gi, len(bad), len(local_ids), row, cos, 100.0 * err,
                             local_ids[row] if 0 <= row < len(local_ids) else "n/a")
                     elif not KVCacheRecvingThreadFFv2._logged_verify_ok:
+                        # Only the first clean check is logged in full; the rest would be noise.
+                        # The per-request line below still fires for every check, so the decode log
+                        # shows WHEN the checks landed — which is the whole point of spacing them,
+                        # and the only way to tell a run that reached saturation from one that did
+                        # not.
                         KVCacheRecvingThreadFFv2._logged_verify_ok = True
                         logger.info(
                             "BFF pull-v2 VERIFY: group %d matched the producer on all %d block(s) "
-                            "(worst cos %.5f, worst norm err %.2f%%). %d request(s) left to check.",
-                            gi, len(local_ids), worst_cos, 100.0 * worst_err,
-                            KVCacheRecvingThreadFFv2._verify_left[0])
+                            "(worst cos %.5f, worst norm err %.2f%%).",
+                            gi, len(local_ids), worst_cos, 100.0 * worst_err)
+                if checked:
+                    # One line per CHECK, always. Its timestamp is what says which phase of the run
+                    # was sampled: correlate it against the scheduler's "GPU KV cache usage" lines
+                    # to tell a check taken under saturation from one taken during ramp-up. A clean
+                    # result from the ramp alone is evidence about the wrong window.
+                    logger.info("BFF pull-v2 VERIFY: %d block(s) checked, %d mismatched (worst cos "
+                                "%.5f) | %d check(s) left in the budget.",
+                                checked, mismatched, worst,
+                                KVCacheRecvingThreadFFv2._verify_sampler.left)
             except Exception as e:  # noqa: BLE001 - a diagnostic must never fail a request
                 logger.warning("BFF pull-v2: transfer verification failed for %s (%s); the "
                                "request itself is unaffected.", rid, e)
