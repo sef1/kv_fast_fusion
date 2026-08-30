@@ -771,10 +771,28 @@ if v2:
         WC = min([s.get("verify_worst_cos") for s in v2 if s.get("verify_worst_cos") is not None]
                  or [1.0])
         print(f"    transfer verify: {VM} of {VC} block(s) MISMATCHED (worst cos {WC:.5f})")
-        print("    -> the transfer is delivering the WRONG KV. Everything else is downstream of "
-              "this." if VM else
-              "    -> the KV arriving on the decode is the KV the producer had. Any quality loss "
-              "is downstream of the transfer.")
+        if not VM:
+            print("    -> the KV arriving on the decode is the KV the producer had. Any quality "
+                  "loss is downstream of the transfer.")
+        else:
+            # NOT "the transfer is wrong" — that was overclaimed once already. A mismatch says the
+            # decode's KV differs from the SIGNATURE the producer gave for it, which has three
+            # causes; the verdicts are the re-check that tells them apart.
+            VV = {}
+            for s in v2:
+                for k, n in (s.get("verify_verdicts") or {}).items():
+                    VV[k] = VV.get(k, 0) + n
+            print(f"    -> the decode's KV does not match the signature the producer gave for it. "
+                  f"Cause: {VV or 'not diagnosed'}")
+            if VV.get("transfer_wrong"):
+                print("    -> TRANSFER_WRONG: the producer was stable and the decode still differs."
+                      " Everything else is downstream of this.")
+            elif VV.get("producer_moved"):
+                print("    -> PRODUCER_MOVED: the transfer is faithful, the signature was stale. "
+                      "Dedup decides what to skip from those same signatures.")
+            elif VV.get("transient"):
+                print("    -> TRANSIENT: everything agreed on re-check, so the first read saw the "
+                      "block before it settled. Points at the reader, not the transfer.")
 
     # Where dedup's per-step cost lives. At con512 the group split alone costs +4.5% per decode step
     # and dedup a further +26%, i.e. ~18ms/step; apply_ms is ~1.5s of that, so the rest is elsewhere.

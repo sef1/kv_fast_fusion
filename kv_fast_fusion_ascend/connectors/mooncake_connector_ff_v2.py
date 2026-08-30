@@ -434,6 +434,29 @@ def ask_shape(ask):
     return {int(gi): len(ids) for gi, ids in (ask or {}).items()}
 
 
+def classify_mismatch(producer_moved: bool, decode_matches_new: bool) -> str:
+    """Name the cause of a surviving mismatch from two follow-up comparisons.
+
+    A mismatch on its own says only "the decode's KV does not match the signature the producer gave
+    for it". That has three very different causes and they need different fixes, so the diagnostic
+    re-asks the producer for the same blocks and compares three ways:
+
+    * ``producer_moved`` — P's blocks changed between the signature and the read, and the decode
+      holds P's *current* content. The transfer is faithful; the signature was stale. This is not
+      only a reporting nicety: dedup decides what to skip from those same signatures, so stale ones
+      mean it is aliasing against KV that has since moved.
+    * ``transfer_wrong`` — P is stable and the decode still differs. The bytes that arrived are not
+      the bytes P had, and the block ids in the report localise it.
+    * ``producer_unstable`` — P moved AND the decode matches neither. Nothing can be concluded about
+      the transfer until P holds still.
+    * ``transient`` — everything agrees on the re-check, so the first read saw the block before it
+      had settled. Points at the reader, not the transfer.
+    """
+    if producer_moved:
+        return "producer_moved" if decode_matches_new else "producer_unstable"
+    return "transient" if decode_matches_new else "transfer_wrong"
+
+
 class VerifySampler:
     """A fixed verification budget, spent ACROSS the run rather than on the front of it.
 
@@ -728,6 +751,37 @@ except Exception as _e:  # pragma: no cover - optional dependency
 
 
 if _ASCEND_AVAILABLE:
+
+    _SYNC_WARNED = False
+
+    def _sync_device() -> None:
+        """Wait for the device before reading KV that arrived by RDMA.
+
+        VERIFICATION ONLY — never on the transfer path. The one ``torch.npu.synchronize()`` in the
+        vendored receive path sits inside ``reformat_kv_cache``
+        (vllm_ascend/.../kv_p2p/mooncake_connector.py) under a FIXME saying that skipping it crashes
+        GQA scenarios and that upstream has not found the root cause. At tp=1 with NZ off,
+        ``_reformat_after_pull`` returns before reaching it, so nothing orders the RDMA write against
+        the next NPU read.
+
+        That makes an unsynchronised read after the transfer a candidate for seeing memory that is
+        not yet visible — which is exactly what this diagnostic does, so it has to rule itself out
+        before its mismatches mean anything about the transfer.
+
+        Defensive about the API: a build without ``torch.npu`` must degrade to "no barrier", not
+        take the diagnostic down."""
+        global _SYNC_WARNED
+        try:
+            npu = getattr(torch, "npu", None)
+            if npu is not None:
+                npu.synchronize()
+        except Exception as e:  # noqa: BLE001 - a barrier that cannot run must not fail the check
+            # Said once, and worth saying: without the barrier a mismatch cannot be told apart from
+            # an unsynchronised read, which is the entire question this diagnostic exists to settle.
+            if not _SYNC_WARNED:
+                _SYNC_WARNED = True
+                logger.warning("BFF pull-v2: device barrier unavailable (%s) — verification "
+                               "mismatches cannot be distinguished from unsynchronised reads.", e)
 
     class _SigServer(threading.Thread):
         """Producer side: answer "give me signatures for these blocks".
@@ -1222,8 +1276,9 @@ if _ASCEND_AVAILABLE:
                 # Claimed HERE, not at verification time: the sampler decides which requests get
                 # checked, and that decision has to be made while the signatures are still in hand.
                 # Held for _after_transfer, because the comparison is only meaningful once the KV has
-                # actually landed. plan_groups is D's ids, positionally paired with P's rows.
-                self._verify_stash[req_meta.get("remote_request_id")] = (plan_groups, sigs)
+                # actually landed. plan_groups is D's ids, positionally paired with P's rows; `ask`
+                # is P's ids for the same rows, kept so a failing group can be re-requested.
+                self._verify_stash[req_meta.get("remote_request_id")] = (ask, plan_groups, sigs)
             if not pd_dedup_v2.V2_ENABLED:
                 # Verification only. It must never plan and never alias — the whole point is to
                 # observe an unmodified transfer.
@@ -1332,6 +1387,31 @@ if _ASCEND_AVAILABLE:
             if self.dedup_engine is not None:
                 self.dedup_engine.release(v1._ext_of(req_meta["remote_request_id"]))
 
+        def _diagnose_mismatch(self, req_meta, gi, ask, rows_p, norms_p, rows_d, norms_d) -> str:
+            """Re-ask the producer for the failing group and name the cause. See classify_mismatch.
+
+            Only ever reached from the mismatch path, so the common case pays nothing. A second
+            round trip is cheap next to being unable to tell "the transfer is broken" from "the
+            signature was stale"."""
+            ids = (ask or {}).get(int(gi)) or []
+            peer = self._peer_of(req_meta)
+            if not ids or peer is None or self.sig_client is None:
+                return "unknown"
+            try:
+                again = (self.sig_client.ask_many(peer[0], peer[1], [{int(gi): ids}]) or [{}])[0]
+                payload = (again or {}).get(int(gi))
+                if payload is None:
+                    return "unknown"
+                sig_p2, norms_p2, _h = SignatureCodec.decode(payload)
+                rows_p2 = sig_p2.tolist()
+                moved, _c, _e = compare_signature_rows(rows_p2, norms_p2, rows_p, norms_p)
+                vs_decode, _c2, _e2 = compare_signature_rows(rows_p2, norms_p2, rows_d, norms_d)
+                return classify_mismatch(bool(moved), not vs_decode)
+            except Exception as e:  # noqa: BLE001 - diagnosis must never fail a request
+                logger.warning("BFF pull-v2: could not re-check group %s with the producer (%s).",
+                               gi, e)
+                return "unknown"
+
         def _verify_transfer(self, req_meta) -> None:
             """Is the KV that just landed the KV the producer had? (BFF_V2_VERIFY_TRANSFER)
 
@@ -1345,12 +1425,23 @@ if _ASCEND_AVAILABLE:
             arrived: once released they may be aliased onto by later requests, and a mismatch then
             would be ambiguous between a bad transfer and a bad alias.
 
+            **What it has measured so far.** Sampling only the first 32 requests reported 0 of 4,368
+            mismatched — but those all completed during ramp-up, before the KV cache ever filled, so
+            it was evidence about the wrong window (see :class:`VerifySampler`). Spread across the
+            run at 98-100% KV it reported **3 of 1,518, worst cos 0.90538**, with per-check worst
+            cosines drifting from 0.9998 early to 0.992-0.994 under load. That gradient is the
+            interesting part: a transfer reading the WRONG block would sit near the unrelated-block
+            range (mostly <0.75 in this workload, which is why dedup at a 0.75 bar finds only ~4%
+            aliasable) and would not degrade smoothly with load. Partial visibility does look like
+            this, which is why the barrier above goes in ahead of any conclusion, and why a
+            surviving mismatch is classified rather than asserted.
+
             Never raises. A diagnostic that can fail a request is worse than no diagnostic."""
             rid = req_meta.get("remote_request_id")
             entry = self._verify_stash.pop(rid, None)
             if entry is None or self.local_sigs is None or self.dedup_engine is None:
                 return
-            plan_groups, sigs = entry
+            ask, plan_groups, sigs = entry
             stats = self.dedup_engine.stats
             checked = mismatched = 0
             worst = 1.0
@@ -1359,13 +1450,15 @@ if _ASCEND_AVAILABLE:
                     local_ids = plan_groups.get(int(gi)) or []
                     if not local_ids or payload is None:
                         continue
+                    _sync_device()
                     mine = self.local_sigs(int(gi), local_ids, [len(local_ids)])[0]
                     if mine is None:
                         continue
                     sig_p, norms_p, _h = SignatureCodec.decode(payload)
                     sig_d, norms_d, _h2 = SignatureCodec.decode(mine)
+                    rows_p, rows_d = sig_p.tolist(), sig_d.tolist()
                     bad, worst_cos, worst_err = compare_signature_rows(
-                        sig_p.tolist(), norms_p, sig_d.tolist(), norms_d)
+                        rows_p, norms_p, rows_d, norms_d)
                     stats.verify_checked += len(local_ids)
                     stats.verify_mismatched += len(bad)
                     stats.verify_worst_cos = min(stats.verify_worst_cos, worst_cos)
@@ -1374,11 +1467,15 @@ if _ASCEND_AVAILABLE:
                     worst = min(worst, worst_cos)
                     if bad:
                         row, cos, err = bad[0]
+                        verdict = self._diagnose_mismatch(
+                            req_meta, int(gi), ask, rows_p, norms_p, rows_d, norms_d)
+                        stats.verify_verdicts[verdict] = (
+                            stats.verify_verdicts.get(verdict, 0) + 1)
                         logger.error(
-                            "BFF pull-v2 VERIFY: group %d, %d of %d block(s) do not match the "
-                            "producer's KV — first at row %d (cos %.4f, norm err %.1f%%), decode "
-                            "block %s. The transfer is delivering the wrong KV, not merely a "
-                            "lossy one.", gi, len(bad), len(local_ids), row, cos, 100.0 * err,
+                            "BFF pull-v2 VERIFY [%s]: group %d, %d of %d block(s) do not match the "
+                            "signature the producer gave for them — first at row %d (cos %.4f, "
+                            "norm err %.1f%%), decode block %s.",
+                            verdict, gi, len(bad), len(local_ids), row, cos, 100.0 * err,
                             local_ids[row] if 0 <= row < len(local_ids) else "n/a")
                     elif not KVCacheRecvingThreadFFv2._logged_verify_ok:
                         # Only the first clean check is logged in full; the rest would be noise.

@@ -1530,3 +1530,110 @@ def test_nonsense_env_values_cannot_break_the_sampler():
 
     s = v2.VerifySampler(budget=2, spacing_s=-30, clock=clk)
     assert [s.take(), s.take(), s.take()] == [True, True, False]
+
+
+# =====================================================================================
+# classify_mismatch — a mismatch alone does not say what went wrong
+# =====================================================================================
+# The spread sample found 3 of 1518 blocks mismatched, worst cos 0.90538. That number on its own is
+# compatible with a broken transfer, with the producer's blocks having moved since it signed them,
+# and with the check reading memory before it was visible. Those need three different fixes, so the
+# diagnostic re-asks the producer and compares three ways.
+def test_the_producer_moved_and_the_decode_holds_its_new_content():
+    """The transfer is faithful; the signature was stale. Matters beyond reporting — dedup decides
+    what to skip from these same signatures."""
+    assert v2.classify_mismatch(producer_moved=True, decode_matches_new=True) == "producer_moved"
+
+
+def test_a_stable_producer_and_a_differing_decode_is_the_transfer():
+    assert v2.classify_mismatch(producer_moved=False, decode_matches_new=False) == "transfer_wrong"
+
+
+def test_a_producer_that_moved_and_still_does_not_match_concludes_nothing():
+    """Refusing to name a cause is the correct output here: with P moving under us, the transfer has
+    not been tested at all."""
+    assert v2.classify_mismatch(producer_moved=True, decode_matches_new=False) == "producer_unstable"
+
+
+def test_everything_agreeing_on_the_recheck_points_at_the_reader():
+    """The first read saw the block before it settled — which is exactly what an unsynchronised read
+    of RDMA-written device memory would do, and why the barrier goes in first."""
+    assert v2.classify_mismatch(producer_moved=False, decode_matches_new=True) == "transient"
+
+
+def test_every_verdict_is_one_of_the_documented_four():
+    got = {v2.classify_mismatch(m, d) for m in (True, False) for d in (True, False)}
+
+    assert got == {"producer_moved", "transfer_wrong", "producer_unstable", "transient"}
+
+
+# =====================================================================================
+# the barrier, and when the re-ask fires
+# =====================================================================================
+def test_the_decode_signature_is_taken_behind_a_barrier():
+    """Nothing in the vendored receive path orders the RDMA write against the next NPU read at tp=1:
+    its only torch.npu.synchronize() is inside reformat_kv_cache, which _reformat_after_pull returns
+    before reaching. An unsynchronised read here could report the transfer as broken when it is the
+    check that raced."""
+    import inspect
+
+    src = inspect.getsource(v2)
+    fn = src[src.index("        def _verify_transfer(self, req_meta) -> None:"):]
+    fn = fn[:fn.index("            except Exception as e:")]
+
+    assert fn.index("_sync_device()") < fn.index("mine = self.local_sigs("), \
+        "the barrier must precede the read it protects"
+
+
+def test_the_barrier_is_verification_only():
+    """It is a diagnostic. Putting a device-wide synchronize on the transfer path would serialise
+    every request's KV read behind the whole device."""
+    import inspect
+
+    src = inspect.getsource(v2)
+
+    calls = src.count("_sync_device()") - src.count("def _sync_device()")
+    assert calls == 1, f"exactly one call site, inside verification (found {calls})"
+    transfer = src[src.index("        def _after_transfer(self, req_meta) -> None:"):]
+    transfer = transfer[:transfer.index("        def _diagnose_mismatch(")]
+    assert "_sync_device()" not in transfer, "not on the request's own path"
+
+
+def test_the_producer_is_re_asked_only_when_a_check_fails():
+    """A second round trip per request would double the exchange cost the batching work just spent
+    two rounds measuring."""
+    import inspect
+
+    src = inspect.getsource(v2)
+    fn = src[src.index("        def _verify_transfer(self, req_meta) -> None:"):]
+    fn = fn[:fn.index("            except Exception as e:")]
+
+    assert "self._diagnose_mismatch(" in fn
+    assert fn.index("if bad:") < fn.index("self._diagnose_mismatch("), \
+        "the re-ask sits inside the mismatch branch"
+
+
+def test_the_re_ask_needs_the_producers_ids_so_the_stash_carries_them():
+    """plan_groups holds D's ids; the producer must be asked about its OWN. Confusing the two is the
+    defect that cost a whole run before."""
+    import inspect
+
+    src = inspect.getsource(v2)
+
+    assert 'self._verify_stash[req_meta.get("remote_request_id")] = (ask, plan_groups, sigs)' in src
+    fn = src[src.index("        def _diagnose_mismatch("):]
+    fn = fn[:fn.index("        def _verify_transfer(")]
+    assert 'ids = (ask or {}).get(int(gi)) or []' in fn, "re-asks with P's ids"
+    assert "plan_groups" not in fn, "D's ids must never reach the producer"
+
+
+def test_a_failed_re_ask_reports_unknown_rather_than_guessing():
+    """No peer, no answer, or an exception must not be reported as either a clean transfer or a
+    broken one."""
+    import inspect
+
+    src = inspect.getsource(v2)
+    fn = src[src.index("        def _diagnose_mismatch("):]
+    fn = fn[:fn.index("        def _verify_transfer(")]
+
+    assert fn.count('return "unknown"') == 3, "no peer, no payload, and the exception path"
