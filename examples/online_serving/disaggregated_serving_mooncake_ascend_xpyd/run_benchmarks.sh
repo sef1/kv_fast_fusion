@@ -787,6 +787,21 @@ if v2:
             if VV.get("transfer_wrong"):
                 print("    -> TRANSFER_WRONG: the producer was stable and the decode still differs."
                       " Everything else is downstream of this.")
+                VL = {}
+                for s in v2:
+                    for k, n in (s.get("verify_localised") or {}).items():
+                        VL[k] = VL.get(k, 0) + n
+                if VL:
+                    # What the wrong block actually held. source/destination/group are descriptor
+                    # arithmetic and localise to an index; foreign is block ownership instead, and
+                    # the fix for that is not in the descriptor loop.
+                    print(f"       what it held: {VL}")
+                    if VL.get("foreign") and not any(
+                            VL.get(k) for k in ("source_permuted", "destination_permuted",
+                                                "group_permuted")):
+                        print("       -> FOREIGN only: the content belongs to no row of the "
+                              "request. That is block OWNERSHIP, not the descriptor arithmetic — "
+                              "check whether the stock connector has it too before changing ours.")
             elif VV.get("producer_moved"):
                 print("    -> PRODUCER_MOVED: the transfer is faithful, the signature was stale. "
                       "Dedup decides what to skip from those same signatures.")

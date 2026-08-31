@@ -494,6 +494,55 @@ class VerifySampler:
         return True
 
 
+def best_matching_row(vec, rows, skip=None):
+    """``(index, cos)`` of the row in ``rows`` closest to ``vec``, or ``(-1, -1.0)`` for none.
+
+    BEST, not first-above-a-bar: the question is *which* block this is, so a search that stopped at
+    the first plausible candidate could name a neighbour that merely passed the threshold while the
+    real one sat higher up. ``skip`` excludes the row we already know does not match, so a
+    near-duplicate of the expected block cannot be reported as the answer to "where did it come
+    from".
+
+    Rows are the unit vectors ``signature_matrix`` produces, so the cosine is a plain dot product."""
+    best_i, best_cos = -1, -1.0
+    for i, row in enumerate(rows or ()):
+        if skip is not None and i == skip:
+            continue
+        cos = sum(float(x) * float(y) for x, y in zip(vec, row))
+        if cos > best_cos:
+            best_i, best_cos = i, cos
+    return best_i, best_cos
+
+
+def cross_match(row, rows_p, rows_d, min_cos=None):
+    """Name what a wrong block actually holds. Returns ``(kind, index, cos)``.
+
+    A confirmed ``transfer_wrong`` says the decode's block *i* is not what the producer had there.
+    Three things it could be instead, and they need different fixes:
+
+    * ``source_permuted`` — the decode's block holds one of the producer's OTHER blocks, so the
+      transfer read the wrong source address. ``index`` is the producer row it actually got.
+    * ``destination_permuted`` — the producer's block *i* turned up in a different one of the
+      decode's blocks, so the data landed at the wrong destination and that block was clobbered too.
+      ``index`` is where it went.
+    * ``foreign`` — neither search finds it. The content belongs to no row of this request: another
+      request's KV, or a block reallocated mid-transfer. That points at ownership, not arithmetic.
+
+    Source is checked first because it is the narrower claim: if the decode's block is exactly one of
+    the producer's other blocks, that is a read-side address fault regardless of where anything else
+    ended up."""
+    bar = VERIFY_MIN_COS if min_cos is None else min_cos
+    if row < 0 or row >= len(rows_d or ()) or row >= len(rows_p or ()):
+        return "foreign", -1, -1.0
+    src_i, src_cos = best_matching_row(rows_d[row], rows_p, skip=row)
+    if src_cos >= bar:
+        return "source_permuted", src_i, src_cos
+    dst_i, dst_cos = best_matching_row(rows_p[row], rows_d, skip=row)
+    if dst_cos >= bar:
+        return "destination_permuted", dst_i, dst_cos
+    return "foreign", -1, max(src_cos, dst_cos)
+
+
 def compare_signature_rows(sig_p, norms_p, sig_d, norms_d, min_cos=None, max_norm_err=0.02):
     """Row-for-row agreement between the producer's signatures and the decode's own.
 
@@ -1412,6 +1461,36 @@ if _ASCEND_AVAILABLE:
                                gi, e)
                 return "unknown"
 
+        def _localise(self, gi, row, p_rows, rows_d, stats) -> str:
+            """Say what the wrong block actually holds, as a phrase to append to the report.
+
+            Only reached on a confirmed ``transfer_wrong``, so the O(rows^2) search runs a handful of
+            times in a run at most. Reuses :func:`cross_match` within the failing group first — a
+            permuted source or destination there is the narrowest and most actionable answer — and
+            widens to the OTHER groups only when the content is foreign to this one, which is where a
+            group-index fault would show up. All groups share one JL projection (same layer count,
+            same input width), so their signatures live in the same space and are comparable."""
+            rows_p, _norms_p = p_rows.get(int(gi), ([], []))
+            kind, idx, cos = cross_match(row, rows_p, rows_d)
+            if kind != "foreign":
+                stats.verify_localised[kind] = stats.verify_localised.get(kind, 0) + 1
+                return f" It holds this request's {kind.split('_')[0]} row {idx} (cos {cos:.4f})."
+            best = (None, -1, cos)
+            for other, (rows_o, _n) in p_rows.items():
+                if int(other) == int(gi):
+                    continue
+                i, c = best_matching_row(rows_d[row], rows_o)
+                if c > best[2]:
+                    best = (int(other), i, c)
+            if best[0] is not None and best[2] >= VERIFY_MIN_COS:
+                stats.verify_localised["group_permuted"] = (
+                    stats.verify_localised.get("group_permuted", 0) + 1)
+                return (f" It holds GROUP {best[0]} row {best[1]} (cos {best[2]:.4f}) — the block id "
+                        f"was read against the wrong group.")
+            stats.verify_localised["foreign"] = stats.verify_localised.get("foreign", 0) + 1
+            return (f" It matches no row of this request in any group (best cos {best[2]:.4f}) — the "
+                    f"content belongs to another request or to a block reallocated mid-transfer.")
+
         def _verify_transfer(self, req_meta) -> None:
             """Is the KV that just landed the KV the producer had? (BFF_V2_VERIFY_TRANSFER)
 
@@ -1446,6 +1525,14 @@ if _ASCEND_AVAILABLE:
             checked = mismatched = 0
             worst = 1.0
             try:
+                # Decoded up front, all groups, because a cross-group source search needs the
+                # producer's rows for groups other than the failing one. Cheap: unpacking a payload
+                # is host work over a few hundred fp16 rows.
+                p_rows = {}
+                for gi, payload in sigs.items():
+                    if payload is not None:
+                        sp, np_, _hh = SignatureCodec.decode(payload)
+                        p_rows[int(gi)] = (sp.tolist(), np_)
                 for gi, payload in sorted(sigs.items()):
                     local_ids = plan_groups.get(int(gi)) or []
                     if not local_ids or payload is None:
@@ -1454,9 +1541,9 @@ if _ASCEND_AVAILABLE:
                     mine = self.local_sigs(int(gi), local_ids, [len(local_ids)])[0]
                     if mine is None:
                         continue
-                    sig_p, norms_p, _h = SignatureCodec.decode(payload)
                     sig_d, norms_d, _h2 = SignatureCodec.decode(mine)
-                    rows_p, rows_d = sig_p.tolist(), sig_d.tolist()
+                    rows_p, norms_p = p_rows[int(gi)]
+                    rows_d = sig_d.tolist()
                     bad, worst_cos, worst_err = compare_signature_rows(
                         rows_p, norms_p, rows_d, norms_d)
                     stats.verify_checked += len(local_ids)
@@ -1471,12 +1558,15 @@ if _ASCEND_AVAILABLE:
                             req_meta, int(gi), ask, rows_p, norms_p, rows_d, norms_d)
                         stats.verify_verdicts[verdict] = (
                             stats.verify_verdicts.get(verdict, 0) + 1)
+                        where = ""
+                        if verdict == "transfer_wrong":
+                            where = self._localise(int(gi), row, p_rows, rows_d, stats)
                         logger.error(
                             "BFF pull-v2 VERIFY [%s]: group %d, %d of %d block(s) do not match the "
                             "signature the producer gave for them — first at row %d (cos %.4f, "
-                            "norm err %.1f%%), decode block %s.",
+                            "norm err %.1f%%), decode block %s.%s",
                             verdict, gi, len(bad), len(local_ids), row, cos, 100.0 * err,
-                            local_ids[row] if 0 <= row < len(local_ids) else "n/a")
+                            local_ids[row] if 0 <= row < len(local_ids) else "n/a", where)
                     elif not KVCacheRecvingThreadFFv2._logged_verify_ok:
                         # Only the first clean check is logged in full; the rest would be noise.
                         # The per-request line below still fires for every check, so the decode log

@@ -357,6 +357,10 @@ class DedupStats:
         # mooncake_connector_ff_v2.classify_mismatch: "the decode's KV does not match the signature"
         # has three causes needing three different fixes, and the counts are how they are told apart.
         self.verify_verdicts: dict = {}
+        # What a confirmed transfer_wrong block actually turned out to contain — see
+        # mooncake_connector_ff_v2.cross_match. "source"/"destination" are descriptor arithmetic and
+        # localise to an index; "foreign" is neither, which points at block ownership instead.
+        self.verify_localised: dict = {}
         self.skip_reasons = dict.fromkeys(SKIP_REASONS, 0)
         # Producer-side only: blocks the decode told it to skip. An independent cross-check that
         # the two sides agree — it should track the decode's blocks_not_requested, and a divergence
@@ -514,6 +518,7 @@ class DedupStats:
             "verify_worst_cos": (round(self.verify_worst_cos, 5)
                                  if self.verify_checked else None),
             "verify_verdicts": dict(self.verify_verdicts) or None,
+            "verify_localised": dict(self.verify_localised) or None,
             "exchange_skip_reasons": dict(self.skip_reasons),
             "blocks_withheld": self.blocks_withheld,
             "inert": self.is_inert(),

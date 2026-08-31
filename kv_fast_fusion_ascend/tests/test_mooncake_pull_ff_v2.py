@@ -1637,3 +1637,118 @@ def test_a_failed_re_ask_reports_unknown_rather_than_guessing():
     fn = fn[:fn.index("        def _verify_transfer(")]
 
     assert fn.count('return "unknown"') == 3, "no peer, no payload, and the exception path"
+
+
+# =====================================================================================
+# cross_match — what is actually IN the wrong block
+# =====================================================================================
+# A confirmed transfer_wrong says the decode's block is not what the producer had. Three things it
+# could be instead, needing three different fixes: the producer's OTHER block (a source-address
+# fault), this block's data having landed elsewhere (a destination fault), or content belonging to
+# no row of this request at all (ownership). Measured: 5 of 1434 blocks, cos 0.659-0.784, one per
+# affected request, at arbitrary rows, clustered in a 90s window of allocation churn.
+def _rows(*seeds):
+    """Unit rows that are mutually near-orthogonal, so a match means identity, not similarity."""
+    out = []
+    for s in seeds:
+        v = [0.0] * 8
+        v[s % 8] = 1.0
+        v[(s * 3 + 1) % 8] = 0.15
+        out.append(_unit(v))
+    return out
+
+
+def test_a_swapped_source_block_is_named_with_its_index():
+    """The decode's row 2 holds what the producer had at row 5 — a read from the wrong source
+    address, and the index is what localises it."""
+    rows_p = _rows(1, 2, 3, 4, 5, 6)
+    rows_d = list(rows_p)
+    rows_d[2] = rows_p[5]
+
+    kind, idx, cos = v2.cross_match(2, rows_p, rows_d)
+
+    assert kind == "source_permuted"
+    assert idx == 5 and cos > 0.99
+
+
+def test_data_landing_in_the_wrong_local_block_is_named_too():
+    """The producer's row 1 turned up in the decode's row 4, so row 4 was clobbered as well — a
+    different fault from reading the wrong source, and it has to be reported differently."""
+    rows_p = _rows(1, 2, 3, 4, 5, 6)
+    rows_d = list(rows_p)
+    rows_d[4] = rows_p[1]
+    rows_d[1] = _unit([0.3, 0.2, 0.9, 0.1, 0.0, 0.0, 0.0, 0.0])   # row 1 itself is junk
+
+    kind, idx, cos = v2.cross_match(1, rows_p, rows_d)
+
+    assert kind == "destination_permuted"
+    assert idx == 4 and cos > 0.99
+
+
+def test_content_belonging_to_no_row_is_foreign():
+    """Neither search finds it: another request's KV, or a block reallocated mid-transfer. That is
+    ownership, not descriptor arithmetic, and the two need different fixes."""
+    rows_p = _rows(1, 2, 3, 4)
+    rows_d = list(rows_p)
+    rows_d[0] = _unit([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8])
+
+    kind, idx, cos = v2.cross_match(0, rows_p, rows_d)
+
+    assert kind == "foreign"
+    assert idx == -1
+    assert cos < 0.99, "and it reports how close the best candidate got"
+
+
+def test_the_row_itself_is_excluded_from_the_search():
+    """Without the skip, a block that is merely a degraded copy of itself would be reported as
+    'it holds row i' — answering the question with the question."""
+    rows_p = _rows(1, 2, 3)
+    rows_d = list(rows_p)
+
+    idx, _cos = v2.best_matching_row(rows_d[1], rows_p, skip=1)
+
+    assert idx != 1
+
+
+def test_best_matching_row_returns_the_best_not_the_first_acceptable():
+    """The question is WHICH block this is. A search that stopped at the first row over the bar could
+    name a neighbour while the real source sat higher up."""
+    target = _unit([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    rows = [_unit([0.99, 0.14, 0, 0, 0, 0, 0, 0]), _unit([1.0, 0.0, 0, 0, 0, 0, 0, 0])]
+
+    idx, cos = v2.best_matching_row(target, rows)
+
+    assert idx == 1 and cos > 0.9999
+
+
+def test_an_empty_or_out_of_range_search_is_foreign_not_a_crash():
+    assert v2.cross_match(9, _rows(1, 2), _rows(1, 2))[0] == "foreign"
+    assert v2.cross_match(0, [], [])[0] == "foreign"
+    assert v2.best_matching_row([1.0, 0.0], []) == (-1, -1.0)
+
+
+def test_localisation_runs_only_for_a_confirmed_transfer_fault():
+    """producer_moved and transient are already explained; searching for a source block on those
+    would report a coincidence as a finding, and the search is O(rows^2)."""
+    import inspect
+
+    src = inspect.getsource(v2)
+    fn = src[src.index("        def _verify_transfer(self, req_meta) -> None:"):]
+    fn = fn[:fn.index("            except Exception as e:")]
+
+    assert 'if verdict == "transfer_wrong":' in fn
+    assert fn.index('if verdict == "transfer_wrong":') < fn.index("self._localise("), \
+        "the search sits behind the transfer_wrong check"
+
+
+def test_the_cross_group_search_is_the_fallback_not_the_first_answer():
+    """Within-group is the narrower and more actionable claim; a group-index fault only explains a
+    block that matches nothing in its own group."""
+    import inspect
+
+    src = inspect.getsource(v2)
+    fn = src[src.index("        def _localise(self, gi, row, p_rows, rows_d, stats) -> str:"):]
+    fn = fn[:fn.index("        def _verify_transfer(")]
+
+    assert fn.index("cross_match(row, rows_p, rows_d)") < fn.index("for other, (rows_o, _n) in")
+    assert 'if kind != "foreign":' in fn, "widen only when the content is foreign to its own group"
