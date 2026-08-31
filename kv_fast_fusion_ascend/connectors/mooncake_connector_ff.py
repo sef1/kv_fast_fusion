@@ -198,6 +198,26 @@ def descriptor_coverage(grouped, keep, addr_groups):
     return covered, descriptors
 
 
+def chunk_segments(src, dst, lengths, max_n):
+    """Split a transfer's three parallel lists into batches of at most ``max_n`` segments.
+
+    ``max_n <= 0`` means one chunk holding everything — today's exact behaviour, so the knob's
+    default changes nothing.
+
+    Why bound it at all: verification found ~0.19% of transferred blocks never written, with this
+    connector's descriptor list audited complete, so the write was lost inside
+    ``batch_transfer_sync_read``. A segment count beyond what the engine will carry in one call is
+    the obvious candidate, and issuing several bounded calls both tests that and fixes it if true.
+
+    A strict partition, and the tests say so, because an off-by-one here would silently drop the
+    tail — which is precisely the failure being chased, and it would look identical to it."""
+    n = len(src)
+    if max_n is None or max_n <= 0 or n <= max_n:
+        return [(src, dst, lengths)] if n else []
+    return [(src[i:i + max_n], dst[i:i + max_n], lengths[i:i + max_n])
+            for i in range(0, n, max_n)]
+
+
 def planned_blocks(grouped):
     """``{(group, local block)}`` the transfer intends to write — the set coverage must equal."""
     out: set = set()
@@ -740,6 +760,44 @@ if _ASCEND_AVAILABLE:
 
         _AUDIT_DESCRIPTORS = os.environ.get("BFF_AUDIT_DESCRIPTORS", "0") == "1"
         _descriptor_gaps = 0
+        _logged_descriptors = False
+        # Segments per batch_transfer_sync_read call. 0 = unlimited, i.e. exactly what this
+        # connector has always done. See chunk_segments for why bounding it is worth a knob.
+        _MAX_XFER_SEGMENTS = int(os.environ.get("BFF_MAX_XFER_SEGMENTS", "0"))
+        _logged_ret = False
+
+        def _issue_transfer(self, req_meta, session_id, src_list, dst_list, length_list):
+            """Run the batched read, in bounded chunks, and hold the engine to its return value.
+
+            The vendored call discards ``ret`` unless it is negative. That matters here: verification
+            found ~0.19% of transferred blocks never written while this connector's descriptor list
+            audited COMPLETE, so a write was lost inside the engine and nothing reported it. If
+            ``ret`` ever carries a completed-segment count, checking it against the segments we
+            handed over catches that on every request in production, with none of the signature
+            machinery. We do not know the convention, so the first value is logged rather than
+            assumed, and only a NEGATIVE ret is still treated as fatal — the vendored contract."""
+            for src, dst, lengths in chunk_segments(
+                    src_list, dst_list, length_list, self._MAX_XFER_SEGMENTS):
+                ret = self.engine.batch_transfer_sync_read(session_id, src, dst, lengths)
+                if ret < 0:
+                    raise RuntimeError(
+                        f"KV transfer failed for request {req_meta['remote_request_id']} "
+                        f"(ret={ret}, {len(src)} segments)")
+                if not KVCacheRecvingThreadFF._logged_ret:
+                    KVCacheRecvingThreadFF._logged_ret = True
+                    logger.info(
+                        "MooncakeConnectorFF: batch_transfer_sync_read returned %r for %d "
+                        "segment(s). If that is a completed-segment count rather than a status "
+                        "code, a silently dropped write is detectable here on every request.",
+                        ret, len(src))
+                elif ret and ret != len(src):
+                    # Only fires if ret turns out to be a count AND it is short: the engine accepted
+                    # fewer segments than we gave it, which is a lost KV write, not a slow one.
+                    logger.error(
+                        "MooncakeConnectorFF: request %s handed %d segment(s) to "
+                        "batch_transfer_sync_read and it returned %r — if that is a count, %d "
+                        "block write(s) were dropped and the decode will read stale KV.",
+                        req_meta.get("remote_request_id"), len(src), ret, len(src) - ret)
 
         def _audit_descriptor_coverage(self, req_meta, grouped, keep, addr_groups, n_emitted):
             """Did every block the transfer planned to write actually get a descriptor?
@@ -765,6 +823,17 @@ if _ASCEND_AVAILABLE:
             except Exception as e:  # noqa: BLE001 - an audit must never break a transfer
                 logger.warning("MooncakeConnectorFF: descriptor audit failed (%s).", e)
                 return
+            if not KVCacheRecvingThreadFF._logged_descriptors:
+                # The scale has never been measured, and every batch-limit theory needs it. Note
+                # BFF's list is not obviously longer than stock's: BFF emits
+                # `distinct addresses x groups x runs-per-group` where stock emits
+                # `all addresses x runs`, so the address dedup may well make it shorter.
+                KVCacheRecvingThreadFF._logged_descriptors = True
+                logger.info(
+                    "MooncakeConnectorFF: request %s emitted %d transfer segment(s) over %d "
+                    "block(s) (cap BFF_MAX_XFER_SEGMENTS=%d, 0=unlimited).",
+                    req_meta.get("remote_request_id"), n_emitted, len(covered),
+                    self._MAX_XFER_SEGMENTS)
             if not missing:
                 return
             KVCacheRecvingThreadFF._descriptor_gaps += len(missing)
@@ -889,11 +958,7 @@ if _ASCEND_AVAILABLE:
                 # and send every one of its blocks to recompute.
                 self._after_transfer(req_meta)
                 return
-            ret = self.engine.batch_transfer_sync_read(session_id, src_list, dst_list, length_list)
-            if ret < 0:
-                raise RuntimeError(
-                    f"KV transfer failed for request {req_meta['remote_request_id']} "
-                    f"(ret={ret}, {len(src_list)} segments)")
+            self._issue_transfer(req_meta, session_id, src_list, dst_list, length_list)
 
             self._reformat_after_pull(grouped, offset, tp_num_need_pulls)
             self._after_transfer(req_meta)

@@ -591,3 +591,72 @@ def test_duplicate_addresses_do_not_inflate_coverage_or_hide_gaps():
 def test_coverage_is_empty_for_a_request_with_nothing_to_pull():
     assert mc.descriptor_coverage([], [], {}) == (set(), 0)
     assert mc.planned_blocks([]) == set()
+
+
+# =====================================================================================
+# chunk_segments — bounding the batch must not itself lose a write
+# =====================================================================================
+# Verification found ~0.19% of transferred blocks never written while this connector's descriptor
+# list audited COMPLETE, so the write was lost inside batch_transfer_sync_read. Splitting into
+# bounded calls tests whether segment count is the cause. An off-by-one here would silently drop the
+# tail — indistinguishable from the bug being chased, which is why this is pinned.
+def _flat(chunks):
+    src = [x for c in chunks for x in c[0]]
+    dst = [x for c in chunks for x in c[1]]
+    ln = [x for c in chunks for x in c[2]]
+    return src, dst, ln
+
+
+def test_chunking_is_a_strict_partition():
+    src, dst, ln = list(range(10)), list(range(100, 110)), list(range(200, 210))
+
+    chunks = mc.chunk_segments(src, dst, ln, 3)
+
+    assert [len(c[0]) for c in chunks] == [3, 3, 3, 1], "no segment lost, none duplicated"
+    assert _flat(chunks) == (src, dst, ln), "order preserved and every segment present exactly once"
+
+
+def test_the_three_lists_are_always_cut_at_the_same_boundaries():
+    """src[i], dst[i] and lengths[i] describe ONE segment. Cutting them differently would pair a
+    source address with another segment's destination — writing the right bytes to the wrong block."""
+    src, dst, ln = list(range(7)), list(range(100, 107)), list(range(200, 207))
+
+    for c_src, c_dst, c_ln in mc.chunk_segments(src, dst, ln, 2):
+        assert len(c_src) == len(c_dst) == len(c_ln)
+        for a, b, c in zip(c_src, c_dst, c_ln):
+            assert b == a + 100 and c == a + 200, "a segment's three fields stayed together"
+
+
+def test_an_exact_multiple_produces_no_empty_trailing_chunk():
+    """An empty final batch would be handed to the engine as a zero-segment transfer."""
+    chunks = mc.chunk_segments(list(range(6)), list(range(6)), list(range(6)), 3)
+
+    assert len(chunks) == 2
+    assert all(c[0] for c in chunks)
+
+
+def test_unlimited_is_the_default_and_means_one_call():
+    """0 must reproduce today's behaviour exactly, or turning the knob off changes the transport."""
+    src, dst, ln = list(range(5)), list(range(5)), list(range(5))
+
+    for cap in (0, -1, None):
+        assert mc.chunk_segments(src, dst, ln, cap) == [(src, dst, ln)]
+
+
+def test_a_list_shorter_than_the_cap_is_one_chunk():
+    src = [1, 2]
+    assert mc.chunk_segments(src, src, src, 100) == [(src, src, src)]
+
+
+def test_an_empty_transfer_issues_no_call_at_all():
+    """Zero segments must not become one empty batch_transfer_sync_read."""
+    assert mc.chunk_segments([], [], [], 0) == []
+    assert mc.chunk_segments([], [], [], 8) == []
+
+
+def test_a_cap_of_one_still_covers_everything():
+    src = [1, 2, 3]
+    chunks = mc.chunk_segments(src, src, src, 1)
+
+    assert len(chunks) == 3
+    assert _flat(chunks)[0] == src
