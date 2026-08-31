@@ -361,6 +361,12 @@ class DedupStats:
         # mooncake_connector_ff_v2.cross_match. "source"/"destination" are descriptor arithmetic and
         # localise to an index; "foreign" is neither, which points at block ownership instead.
         self.verify_localised: dict = {}
+        # PER-REQUEST corruption, which is the figure that touches output quality. The per-block
+        # rate reads ~0.3% and is nearly meaningless here: the damage is spread one block per
+        # request, so ~40% of requests decode against at least one wrong KV block. Reporting only
+        # blocks understated the impact by two orders of magnitude.
+        self.verify_requests = 0
+        self.verify_requests_bad = 0
         self.skip_reasons = dict.fromkeys(SKIP_REASONS, 0)
         # Producer-side only: blocks the decode told it to skip. An independent cross-check that
         # the two sides agree — it should track the decode's blocks_not_requested, and a divergence
@@ -519,6 +525,8 @@ class DedupStats:
                                  if self.verify_checked else None),
             "verify_verdicts": dict(self.verify_verdicts) or None,
             "verify_localised": dict(self.verify_localised) or None,
+            "verify_requests": self.verify_requests or None,
+            "verify_requests_bad": self.verify_requests_bad if self.verify_requests else None,
             "exchange_skip_reasons": dict(self.skip_reasons),
             "blocks_withheld": self.blocks_withheld,
             "inert": self.is_inert(),

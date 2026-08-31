@@ -771,6 +771,13 @@ if v2:
         WC = min([s.get("verify_worst_cos") for s in v2 if s.get("verify_worst_cos") is not None]
                  or [1.0])
         print(f"    transfer verify: {VM} of {VC} block(s) MISMATCHED (worst cos {WC:.5f})")
+        VR = sum(s.get("verify_requests") or 0 for s in v2)
+        VRB = sum(s.get("verify_requests_bad") or 0 for s in v2)
+        if VR:
+            # The number that connects this to output quality. Corruption lands one block per
+            # request, so the per-block rate (~0.3%) understates it by two orders of magnitude.
+            print(f"    ... which is {VRB} of {VR} verified request(s) "
+                  f"({100.0*VRB/VR:.0f}%) decoding against at least one wrong KV block.")
         if not VM:
             print("    -> the KV arriving on the decode is the KV the producer had. Any quality "
                   "loss is downstream of the transfer.")
@@ -809,11 +816,16 @@ if v2:
                               "descriptor returned identical content. The remote address does not "
                               "point at the intended block — this is OUR arithmetic. Read the "
                               "logged descriptor in the decode log.")
-                    if VL.get("retry_fixed"):
-                        print(f"       -> {VL['retry_fixed']} RETRY_FIXED: the same descriptor "
-                              "delivered correct KV on a second attempt. The first write was LOST "
-                              "inside batch_transfer_sync_read — upstream, and shared with the "
-                              "stock connector.")
+                    if VL.get("retry_matches_producer"):
+                        print(f"       -> {VL['retry_matches_producer']} RETRY_MATCHES_PRODUCER: "
+                              "the same descriptor delivered exactly the producer's KV on a second "
+                              "attempt. The first write was LOST inside batch_transfer_sync_read — "
+                              "upstream, and shared with the stock connector.")
+                    if VL.get("retry_changed_still_wrong"):
+                        print(f"       -> {VL['retry_changed_still_wrong']} RETRY_CHANGED_STILL_"
+                              "WRONG: the replay moved the block but it matches neither the old "
+                              "content nor the producer. Neither a lost write nor a wrong address "
+                              "explains that — look at these before anything else.")
                     if VL.get("foreign_changing"):
                         print(f"       -> {VL['foreign_changing']} CHANGED across a re-read: "
                               "another writer owns the block. That is a block-ownership bug, not "

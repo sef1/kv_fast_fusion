@@ -788,7 +788,49 @@ if _ASCEND_AVAILABLE:
         # Segments per batch_transfer_sync_read call. 0 = unlimited, i.e. exactly what this
         # connector has always done. See chunk_segments for why bounding it is worth a knob.
         _MAX_XFER_SEGMENTS = int(os.environ.get("BFF_MAX_XFER_SEGMENTS", "0"))
+        # Submit through batch_transfer_async_read and poll get_batch_transfer_status instead of the
+        # sync call. Off by default, so the transport is byte-for-byte unchanged unless asked.
+        #
+        # Why it exists: the sync call returns 0 for every batch and silently fails to write ~1 block
+        # per request under load — proven by replaying the identical descriptor and getting exactly
+        # the producer's KV the second time. The async pair is the only API here that reports
+        # completion at all, so it is both the candidate fix and, if it still loses writes, the
+        # reproduction to send upstream with a status code attached.
+        _XFER_ASYNC = os.environ.get("BFF_XFER_ASYNC", "0") == "1"
+        _XFER_ASYNC_TIMEOUT = float(os.environ.get("BFF_XFER_ASYNC_TIMEOUT", "30"))
+        _logged_async = False
         _logged_ret = False
+
+        def _one_batch(self, session_id, src, dst, lengths):
+            """One batch, through whichever API is selected. Returns the engine's status.
+
+            The async path submits and then polls ``get_batch_transfer_status`` to completion, which
+            is the whole point: the sync call reports 0 and drops writes, so a status that can
+            actually say "not done" is the only way to see the loss from inside the transport."""
+            if not self._XFER_ASYNC:
+                return self.engine.batch_transfer_sync_read(session_id, src, dst, lengths)
+            handle = self.engine.batch_transfer_async_read(session_id, src, dst, lengths)
+            if handle < 0:
+                return handle
+            if not KVCacheRecvingThreadFF._logged_async:
+                KVCacheRecvingThreadFF._logged_async = True
+                logger.info("MooncakeConnectorFF: BFF_XFER_ASYNC=1 — submitting through "
+                            "batch_transfer_async_read, handle %r for %d segment(s).",
+                            handle, len(src))
+            deadline = time.perf_counter() + self._XFER_ASYNC_TIMEOUT
+            while True:
+                status = self.engine.get_batch_transfer_status([handle])
+                if status != 0:
+                    # Non-zero is either completion or failure depending on the engine's
+                    # convention, which is undocumented in the binding. Return it and let the
+                    # caller's `< 0` check apply — the same contract the sync path has.
+                    return min(0, status)
+                if time.perf_counter() >= deadline:
+                    logger.error(
+                        "MooncakeConnectorFF: async transfer %r did not report completion within "
+                        "%.1fs for %d segment(s); treating as done and continuing.",
+                        handle, self._XFER_ASYNC_TIMEOUT, len(src))
+                    return 0
 
         def _issue_transfer(self, req_meta, session_id, src_list, dst_list, length_list):
             """Run the batched read, in bounded chunks, and hold the engine to its return value.
@@ -802,7 +844,7 @@ if _ASCEND_AVAILABLE:
             assumed, and only a NEGATIVE ret is still treated as fatal — the vendored contract."""
             for src, dst, lengths in chunk_segments(
                     src_list, dst_list, length_list, self._MAX_XFER_SEGMENTS):
-                ret = self.engine.batch_transfer_sync_read(session_id, src, dst, lengths)
+                ret = self._one_batch(session_id, src, dst, lengths)
                 if ret < 0:
                     raise RuntimeError(
                         f"KV transfer failed for request {req_meta['remote_request_id']} "

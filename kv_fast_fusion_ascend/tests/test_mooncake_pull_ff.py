@@ -721,3 +721,45 @@ def test_the_inner_offset_applies_only_to_the_local_side():
 
     assert src1 - src0 == 128
     assert dst1 == dst0
+
+
+def test_the_async_transfer_path_is_off_by_default():
+    """It changes how every KV byte is moved. A knob that alters the transport must not be on until
+    someone asks — the sync path is what nine runs of evidence were collected against."""
+    import inspect
+
+    src = inspect.getsource(mc)
+
+    assert 'os.environ.get("BFF_XFER_ASYNC", "0") == "1"' in src
+    fn = src[src.index("        def _one_batch(self, session_id, src, dst, lengths):"):]
+    fn = fn[:fn.index("        def _issue_transfer(")]
+    assert fn.index("if not self._XFER_ASYNC:") < fn.index("batch_transfer_async_read"), \
+        "the sync call stays the default branch"
+    assert "batch_transfer_sync_read" in fn, "and is still reachable unchanged"
+
+
+def test_the_async_poll_is_bounded():
+    """It runs on the recv thread, which every queued request is waiting behind. An unbounded poll
+    would turn a lost completion into a hung decode."""
+    import inspect
+
+    src = inspect.getsource(mc)
+    fn = src[src.index("        def _one_batch(self, session_id, src, dst, lengths):"):]
+    fn = fn[:fn.index("        def _issue_transfer(")]
+
+    assert "deadline = time.perf_counter() + self._XFER_ASYNC_TIMEOUT" in fn
+    assert "if time.perf_counter() >= deadline:" in fn, \
+        "the deadline must actually be compared, not merely computed"
+    assert "while True:" in fn and "return 0" in fn, "it exits, it does not spin forever"
+
+
+def test_a_negative_handle_is_returned_rather_than_polled():
+    """Polling a handle the engine refused to create would block for the whole timeout on every
+    failed submit."""
+    import inspect
+
+    src = inspect.getsource(mc)
+    fn = src[src.index("        def _one_batch(self, session_id, src, dst, lengths):"):]
+    fn = fn[:fn.index("        def _issue_transfer(")]
+
+    assert fn.index("if handle < 0:") < fn.index("deadline =")

@@ -1524,16 +1524,21 @@ if _ASCEND_AVAILABLE:
                 return (f" It holds GROUP {best[0]} row {best[1]} (cos {best[2]:.4f}) — the block id "
                         f"was read against the wrong group.")
             return (f" It matches no row of this request in any group (best cos {best[2]:.4f})."
-                    f"{self._stability(int(gi), row, rows_d, stats)}")
+                    f"{self._stability(int(gi), row, rows_p, rows_d, stats)}")
 
-        def _replay(self, gi, block_id, rows_d, row, stats) -> str:
+        def _replay(self, gi, block_id, rows_p, rows_d, row, stats) -> str:
             """Re-issue the failing block's OWN descriptor, then look again.
 
             The last question the passive checks cannot answer. Two causes survive a static-foreign
             verdict and they have different owners:
 
-            * ``retry_fixed`` — the same descriptor delivers correct KV on a second attempt, so the
-              first one was lost inside the engine. Upstream, and retry is a plausible mitigation.
+            * ``retry_matches_producer`` — the same descriptor delivers exactly the producer's KV on
+              a second attempt, so the first one was lost inside the engine. Upstream, and retry is a
+              plausible mitigation. Judged against the PRODUCER, not merely against the old bad
+              content: "it changed" is not "it is now right", and reporting the weaker comparison as
+              the stronger one would overstate the finding.
+            * ``retry_changed_still_wrong`` — it moved but landed on neither. Nothing in this model
+              explains that, so it is counted separately rather than folded into a success.
             * ``retry_same`` — the identical foreign content arrives again, deterministically. Then
               the remote address does not point at the block we believe it does, and the arithmetic
               is OURS. The cross-match cannot see this case: it compares only against the rows the
@@ -1562,8 +1567,12 @@ if _ASCEND_AVAILABLE:
                 if again is None:
                     return note + " Replay produced no signature to compare."
                 sig2, _n, _h = SignatureCodec.decode(again)
-                cos = sum(float(x) * float(y)
-                          for x, y in zip(rows_d[row], sig2.tolist()[row]))
+                fresh = sig2.tolist()[row]
+                # Two comparisons, not one. Against the OLD bad content says whether anything moved;
+                # against the PRODUCER says whether it moved to the right place. Only the second
+                # licenses "the write was lost" — the first was being reported as if it did.
+                cos = sum(float(x) * float(y) for x, y in zip(rows_d[row], fresh))
+                cos_p = sum(float(x) * float(y) for x, y in zip(rows_p[row], fresh))
             except Exception as e:  # noqa: BLE001 - a diagnostic must never fail a request
                 logger.warning("BFF pull-v2: descriptor replay failed for group %s (%s).", gi, e)
                 return note
@@ -1572,12 +1581,19 @@ if _ASCEND_AVAILABLE:
                     stats.verify_localised.get("retry_same", 0) + 1)
                 return note + (f" Replaying it returned the SAME content (cos {cos:.4f}) — the "
                                f"remote address does not point at the intended block. Ours.")
-            stats.verify_localised["retry_fixed"] = (
-                stats.verify_localised.get("retry_fixed", 0) + 1)
-            return note + (f" Replaying it CHANGED the block (cos {cos:.4f} against the bad "
-                           f"content) — the first write was lost, not misaddressed. Upstream.")
+            if cos_p >= VERIFY_MIN_COS:
+                stats.verify_localised["retry_matches_producer"] = (
+                    stats.verify_localised.get("retry_matches_producer", 0) + 1)
+                return note + (f" Replaying it delivered exactly the producer's KV (cos "
+                               f"{cos_p:.4f}) — the first write was LOST, not misaddressed. "
+                               f"Upstream.")
+            stats.verify_localised["retry_changed_still_wrong"] = (
+                stats.verify_localised.get("retry_changed_still_wrong", 0) + 1)
+            return note + (f" Replaying it changed the block (cos {cos:.4f} against the old "
+                           f"content) but it still does not match the producer (cos {cos_p:.4f}). "
+                           f"Neither a lost write nor a wrong address explains that.")
 
-        def _stability(self, gi, row, rows_d, stats) -> str:
+        def _stability(self, gi, row, rows_p, rows_d, stats) -> str:
             """Is the foreign content sitting still, or is something writing it?
 
             Two stories survive a foreign verdict and they need different fixes: the block was never
@@ -1607,7 +1623,7 @@ if _ASCEND_AVAILABLE:
                 # overwritten ONCE by another owner reads exactly the same. Replaying its own
                 # descriptor is what separates a lost write from a wrong address.
                 return (f" It is STATIC across a re-read (cos {cos:.4f})."
-                        f"{self._replay(gi, ids[row], rows_d, row, stats)}")
+                        f"{self._replay(gi, ids[row], rows_p, rows_d, row, stats)}")
             stats.verify_localised["foreign_changing"] = (
                 stats.verify_localised.get("foreign_changing", 0) + 1)
             return (f" It CHANGED across a re-read (cos {cos:.4f}): something else is writing this "
@@ -1701,6 +1717,12 @@ if _ASCEND_AVAILABLE:
                             "BFF pull-v2 VERIFY: group %d matched the producer on all %d block(s) "
                             "(worst cos %.5f, worst norm err %.2f%%).",
                             gi, len(local_ids), worst_cos, 100.0 * worst_err)
+                if checked:
+                    # Once per REQUEST, whatever the block count. A request with three bad blocks is
+                    # one damaged answer, not three.
+                    stats.verify_requests += 1
+                    if mismatched:
+                        stats.verify_requests_bad += 1
                 if checked and self.last_segment_count:
                     # Logged per VERIFIED request, not once per process. The first request of a run
                     # has the freshest, least fragmented block pool — it measured 56 segments over

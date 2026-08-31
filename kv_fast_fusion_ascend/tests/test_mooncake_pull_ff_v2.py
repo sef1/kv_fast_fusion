@@ -1846,7 +1846,7 @@ def test_the_replay_fires_only_for_a_static_foreign_block():
     import inspect
 
     src = inspect.getsource(v2)
-    fn = src[src.index("        def _stability(self, gi, row, rows_d, stats) -> str:"):]
+    fn = src[src.index("        def _stability(self, gi, row, rows_p, rows_d, stats) -> str:"):]
 
     assert fn.index("if cos >= VERIFY_MIN_COS:") < fn.index("self._replay("), \
         "replay sits inside the STATIC branch"
@@ -1860,7 +1860,7 @@ def test_the_replay_uses_every_address_of_the_block():
     import inspect
 
     src = inspect.getsource(v2)
-    fn = src[src.index("        def _replay(self, gi, block_id, rows_d, row, stats) -> str:"):]
+    fn = src[src.index("        def _replay(self, gi, block_id, rows_p, rows_d, row, stats) -> str:"):]
     fn = fn[:fn.index("        def _stability(")]
 
     assert "srcs = [d[0] for d in descs]" in fn
@@ -1868,17 +1868,36 @@ def test_the_replay_uses_every_address_of_the_block():
     assert "lens = [d[2] for d in descs]" in fn
 
 
-def test_both_replay_outcomes_are_recorded_and_named():
-    """retry_same and retry_fixed point at different owners; collapsing them would lose the finding."""
+def test_the_replay_is_judged_against_the_producer_not_just_against_the_old_content():
+    """"It changed" is not "it is now right". Only a match against the producer licenses "the write
+    was lost" — reporting the weaker comparison as if it were the stronger one is how a diagnostic
+    ends up overstating its own finding."""
     import inspect
 
     src = inspect.getsource(v2)
-    fn = src[src.index("        def _replay(self, gi, block_id, rows_d, row, stats) -> str:"):]
+    fn = src[src.index("        def _replay(self, gi, block_id, rows_p, rows_d, row, stats) -> str:"):]
     fn = fn[:fn.index("        def _stability(")]
 
-    assert 'stats.verify_localised["retry_same"]' in fn
-    assert 'stats.verify_localised["retry_fixed"]' in fn
+    assert "cos_p = sum(" in fn and "rows_p[row]" in fn, "the producer's row is compared"
+    assert 'stats.verify_localised["retry_matches_producer"]' in fn
+    assert (fn.index("if cos_p >= VERIFY_MIN_COS:")
+            < fn.index('stats.verify_localised["retry_changed_still_wrong"]')), \
+        "matching the producer is checked BEFORE falling through to the unexplained case"
+
+
+def test_all_three_replay_outcomes_are_distinguishable():
+    """They point at three different owners: our arithmetic, the transport, and something unmodelled.
+    Collapsing any pair loses the finding."""
+    import inspect
+
+    src = inspect.getsource(v2)
+    fn = src[src.index("        def _replay(self, gi, block_id, rows_p, rows_d, row, stats) -> str:"):]
+    fn = fn[:fn.index("        def _stability(")]
+
+    for k in ("retry_same", "retry_matches_producer", "retry_changed_still_wrong"):
+        assert f'stats.verify_localised["{k}"]' in fn, k
     assert "Ours." in fn and "Upstream." in fn
+    assert "retry_fixed" not in fn, "the weaker verdict must not survive alongside the stronger one"
 
 
 def test_the_descriptor_is_logged_even_when_the_replay_cannot_run():
@@ -1887,10 +1906,25 @@ def test_the_descriptor_is_logged_even_when_the_replay_cannot_run():
     import inspect
 
     src = inspect.getsource(v2)
-    fn = src[src.index("        def _replay(self, gi, block_id, rows_d, row, stats) -> str:"):]
+    fn = src[src.index("        def _replay(self, gi, block_id, rows_p, rows_d, row, stats) -> str:"):]
     fn = fn[:fn.index("        def _stability(")]
 
     note_at = fn.index("note = (")
     for early in ("Replay itself failed", "produced no signature"):
         assert fn.index(early) > note_at, f"{early!r} still reports the descriptor"
     assert fn.count("return note") >= 3
+
+
+def test_corruption_is_counted_per_request_not_per_block():
+    """The per-block rate reads ~0.3% and understates the impact by two orders of magnitude: the
+    damage lands one block per request, so ~40% of requests decode against a wrong block. A request
+    with three bad blocks is one damaged answer, not three."""
+    import inspect
+
+    src = inspect.getsource(v2)
+    fn = src[src.index("        def _verify_transfer(self, req_meta) -> None:"):]
+
+    assert "stats.verify_requests += 1" in fn, "one increment per request, whatever the block count"
+    assert "stats.verify_requests_bad += 1" in fn
+    assert "stats.verify_requests += checked" not in fn
+    assert "stats.verify_requests_bad += mismatched" not in fn
