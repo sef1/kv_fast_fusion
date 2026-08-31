@@ -660,3 +660,64 @@ def test_a_cap_of_one_still_covers_everything():
 
     assert len(chunks) == 3
     assert _flat(chunks)[0] == src
+
+
+# =====================================================================================
+# block_segment — replaying one block must target what the transfer targeted
+# =====================================================================================
+# _transfer_kv_cache coalesces consecutive blocks into ONE segment addressed by the run's first id.
+# Replaying a single block re-derives its address; if that arithmetic disagrees with the run's, the
+# replay answers a question nobody asked — and the replay is the test that decides whether a
+# ~0.2% never-written block is a lost write (upstream) or a wrong remote address (ours).
+def test_the_first_block_of_a_run_reproduces_the_runs_own_addresses():
+    """The run's segment uses local_id[0] and remote_id[0]. j=0 must land on exactly those."""
+    base_local, base_remote, block_len = 0x1000, 0x9000, 128
+    local_ids, remote_ids = [70, 71, 72], [10, 11, 12]
+
+    run_src = base_local + local_ids[0] * block_len + 0 * block_len
+    run_dst = base_remote + remote_ids[0] * block_len
+
+    src, dst, ln = mc.block_segment(base_local, base_remote, local_ids[0], remote_ids[0],
+                                    block_len, block_len)
+
+    assert (src, dst) == (run_src, run_dst)
+    assert ln == block_len, "one block's worth, not the whole run's"
+
+
+def test_later_blocks_stride_by_exactly_one_block():
+    base_local, base_remote, block_len = 0x1000, 0x9000, 128
+    first = mc.block_segment(base_local, base_remote, 70, 10, block_len, block_len)
+    third = mc.block_segment(base_local, base_remote, 72, 12, block_len, block_len)
+
+    assert third[0] - first[0] == 2 * block_len
+    assert third[1] - first[1] == 2 * block_len
+
+
+def test_the_run_length_equals_the_sum_of_its_blocks():
+    """The segment carries `inner_block_len * len(run)`; the per-block replays must tile it exactly,
+    or a replay would write a different number of bytes than the transfer did."""
+    block_len, ids = 128, [70, 71, 72, 73]
+    per_block = [mc.block_segment(0x1000, 0x9000, lb, rb, block_len, block_len)
+                 for lb, rb in zip(ids, [10, 11, 12, 13])]
+
+    assert sum(d[2] for d in per_block) == block_len * len(ids)
+    assert [d[0] for d in per_block] == [0x1000 + i * block_len for i in ids]
+
+
+def test_local_and_remote_use_their_own_id_spaces():
+    """src is the LOCAL destination, dst the REMOTE source. Deriving one from the other would send
+    the decode's block ids to the producer as addresses."""
+    src, dst, _ln = mc.block_segment(0x1000, 0x9000, 700, 10, 128, 128)
+
+    assert src == 0x1000 + 700 * 128
+    assert dst == 0x9000 + 10 * 128
+
+
+def test_the_inner_offset_applies_only_to_the_local_side():
+    """Mirrors the emission: src adds inner_offset * inner_block_len, dst does not. At tp=1 the
+    offset is 0 and the two coincide, which is why a mistake here would stay hidden."""
+    src0, dst0, _ = mc.block_segment(0x1000, 0x9000, 70, 10, 256, 128, inner_offset=0)
+    src1, dst1, _ = mc.block_segment(0x1000, 0x9000, 70, 10, 256, 128, inner_offset=1)
+
+    assert src1 - src0 == 128
+    assert dst1 == dst0

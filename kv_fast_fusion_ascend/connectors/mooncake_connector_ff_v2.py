@@ -1179,6 +1179,9 @@ if _ASCEND_AVAILABLE:
         # The block ids of the request being verified right now, so the stability re-read touches
         # exactly the block that failed. Set immediately before _localise, read only by it.
         _verify_ids: ClassVar[dict] = {}
+        # Ask v1's emission loop to record per-block descriptors. Only worth its cost when a
+        # mismatch might actually be replayed.
+        capture_descriptors: bool = VERIFY_TRANSFER > 0
 
         @property
         def _verify_stash(self) -> dict:
@@ -1523,6 +1526,57 @@ if _ASCEND_AVAILABLE:
             return (f" It matches no row of this request in any group (best cos {best[2]:.4f})."
                     f"{self._stability(int(gi), row, rows_d, stats)}")
 
+        def _replay(self, gi, block_id, rows_d, row, stats) -> str:
+            """Re-issue the failing block's OWN descriptor, then look again.
+
+            The last question the passive checks cannot answer. Two causes survive a static-foreign
+            verdict and they have different owners:
+
+            * ``retry_fixed`` — the same descriptor delivers correct KV on a second attempt, so the
+              first one was lost inside the engine. Upstream, and retry is a plausible mitigation.
+            * ``retry_same`` — the identical foreign content arrives again, deterministically. Then
+              the remote address does not point at the block we believe it does, and the arithmetic
+              is OURS. The cross-match cannot see this case: it compares only against the rows the
+              producer told us about, so KV fetched from another request's block on P is "foreign"
+              by construction.
+
+            The descriptor is logged either way. If the arithmetic is wrong, that line shows it
+            without needing the round trip at all."""
+            descs = (self.last_descriptors or {}).get((int(gi), int(block_id)))
+            if not descs or self.last_session_id is None:
+                return " Content is another request's KV or a reallocated block."
+            shown = descs[0]
+            note = (f" Descriptor: local=0x{shown[0]:x} remote=0x{shown[1]:x} len={shown[2]} "
+                    f"({len(descs)} address(es) for this block).")
+            try:
+                srcs = [d[0] for d in descs]
+                dsts = [d[1] for d in descs]
+                lens = [d[2] for d in descs]
+                ret = self.engine.batch_transfer_sync_read(
+                    self.last_session_id, srcs, dsts, lens)
+                if ret < 0:
+                    return note + f" Replay itself failed (ret={ret})."
+                _sync_device()
+                again = self.local_sigs(int(gi), self._verify_ids.get(int(gi)) or [],
+                                        [len(self._verify_ids.get(int(gi)) or [])])[0]
+                if again is None:
+                    return note + " Replay produced no signature to compare."
+                sig2, _n, _h = SignatureCodec.decode(again)
+                cos = sum(float(x) * float(y)
+                          for x, y in zip(rows_d[row], sig2.tolist()[row]))
+            except Exception as e:  # noqa: BLE001 - a diagnostic must never fail a request
+                logger.warning("BFF pull-v2: descriptor replay failed for group %s (%s).", gi, e)
+                return note
+            if cos >= VERIFY_MIN_COS:
+                stats.verify_localised["retry_same"] = (
+                    stats.verify_localised.get("retry_same", 0) + 1)
+                return note + (f" Replaying it returned the SAME content (cos {cos:.4f}) — the "
+                               f"remote address does not point at the intended block. Ours.")
+            stats.verify_localised["retry_fixed"] = (
+                stats.verify_localised.get("retry_fixed", 0) + 1)
+            return note + (f" Replaying it CHANGED the block (cos {cos:.4f} against the bad "
+                           f"content) — the first write was lost, not misaddressed. Upstream.")
+
         def _stability(self, gi, row, rows_d, stats) -> str:
             """Is the foreign content sitting still, or is something writing it?
 
@@ -1549,8 +1603,11 @@ if _ASCEND_AVAILABLE:
             if cos >= VERIFY_MIN_COS:
                 stats.verify_localised["foreign_static"] = (
                     stats.verify_localised.get("foreign_static", 0) + 1)
-                return (f" It is STATIC across a re-read (cos {cos:.4f}): never written by this "
-                        f"transfer, still holding a recycled tenant's KV.")
+                # STATIC does NOT mean "never written". A block written correctly and then
+                # overwritten ONCE by another owner reads exactly the same. Replaying its own
+                # descriptor is what separates a lost write from a wrong address.
+                return (f" It is STATIC across a re-read (cos {cos:.4f})."
+                        f"{self._replay(gi, ids[row], rows_d, row, stats)}")
             stats.verify_localised["foreign_changing"] = (
                 stats.verify_localised.get("foreign_changing", 0) + 1)
             return (f" It CHANGED across a re-read (cos {cos:.4f}): something else is writing this "
@@ -1644,6 +1701,14 @@ if _ASCEND_AVAILABLE:
                             "BFF pull-v2 VERIFY: group %d matched the producer on all %d block(s) "
                             "(worst cos %.5f, worst norm err %.2f%%).",
                             gi, len(local_ids), worst_cos, 100.0 * worst_err)
+                if checked and self.last_segment_count:
+                    # Logged per VERIFIED request, not once per process. The first request of a run
+                    # has the freshest, least fragmented block pool — it measured 56 segments over
+                    # 119 blocks — while the failures land minutes later under churn, where the run
+                    # count and so the segment count are higher. Any batch-size argument needs the
+                    # number from where it breaks, not from where it is smallest.
+                    logger.info("BFF pull-v2 VERIFY: this request used %d transfer segment(s).",
+                                self.last_segment_count)
                 if checked:
                     # One line per CHECK, always. Its timestamp is what says which phase of the run
                     # was sampled: correlate it against the scheduler's "GPU KV cache usage" lines

@@ -801,11 +801,19 @@ if v2:
                         print(f"       -> {VL['degraded']} of these still matched their OWN row: "
                               "content correct, magnitude drifted. Not wrong blocks.")
                     if VL.get("foreign_static"):
-                        print(f"       -> {VL['foreign_static']} STATIC across a re-read: never "
-                              "written by the transfer, still holding a recycled tenant's KV. "
-                              "Run with BFF_AUDIT_DESCRIPTORS=1 — if coverage is complete, the "
-                              "write was dropped inside batch_transfer_sync_read (upstream, and "
-                              "shared with the stock connector).")
+                        # STATIC alone does not mean "never written" — a block overwritten ONCE by
+                        # another owner reads the same. The replay verdicts below are what decide.
+                        print(f"       -> {VL['foreign_static']} STATIC across a re-read.")
+                    if VL.get("retry_same"):
+                        print(f"       -> {VL['retry_same']} RETRY_SAME: replaying the block's own "
+                              "descriptor returned identical content. The remote address does not "
+                              "point at the intended block — this is OUR arithmetic. Read the "
+                              "logged descriptor in the decode log.")
+                    if VL.get("retry_fixed"):
+                        print(f"       -> {VL['retry_fixed']} RETRY_FIXED: the same descriptor "
+                              "delivered correct KV on a second attempt. The first write was LOST "
+                              "inside batch_transfer_sync_read — upstream, and shared with the "
+                              "stock connector.")
                     if VL.get("foreign_changing"):
                         print(f"       -> {VL['foreign_changing']} CHANGED across a re-read: "
                               "another writer owns the block. That is a block-ownership bug, not "

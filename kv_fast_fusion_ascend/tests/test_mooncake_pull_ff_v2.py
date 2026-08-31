@@ -1593,7 +1593,7 @@ def test_the_barrier_is_verification_only():
     src = inspect.getsource(v2)
 
     calls = src.count("_sync_device()") - src.count("def _sync_device()")
-    assert calls == 2, f"one before each device read the diagnostic makes (found {calls})"
+    assert calls == 3, f"one before each device read the diagnostic makes (found {calls})"
     transfer = src[src.index("        def _after_transfer(self, req_meta) -> None:"):]
     transfer = transfer[:transfer.index("        def _diagnose_mismatch(")]
     assert "_sync_device()" not in transfer, "not on the request's own path"
@@ -1814,3 +1814,83 @@ def test_the_degraded_bar_sits_between_the_two_populations():
     inside either population would merge them."""
     assert 0.75 < v2.VERIFY_DEGRADED_COS < v2.VERIFY_MIN_COS
     assert v2.VERIFY_MAX_NORM_ERR >= 0.05, "2% was the measured drift of CORRECT blocks"
+
+
+# =====================================================================================
+# descriptor capture and replay — the test that assigns ownership
+# =====================================================================================
+# Two causes survive a static-foreign verdict and they have different owners. "Static" does NOT mean
+# "never written": a block written correctly and then overwritten ONCE reads identically. Replaying
+# the block's own descriptor is what separates a lost write (upstream) from a wrong remote address
+# (ours) — the latter is invisible to cross_match, which only compares against the rows the producer
+# was asked about.
+def test_capture_is_tied_to_verification_being_on():
+    """It allocates one entry per block per address in the emission loop. That is a diagnostic cost
+    and must not be paid by a normal run."""
+    import inspect
+
+    src = inspect.getsource(v2)
+
+    assert "capture_descriptors: bool = VERIFY_TRANSFER > 0" in src
+
+    v1_src = inspect.getsource(
+        __import__("kv_fast_fusion_ascend.connectors.mooncake_connector_ff",
+                   fromlist=["x"]))
+    assert "capture_descriptors: bool = False" in v1_src, "off in the base transport"
+    assert "if self.capture_descriptors:" in v1_src, "the emission loop is gated on it"
+
+
+def test_the_replay_fires_only_for_a_static_foreign_block():
+    """It issues a real transfer. Doing that for a degraded block, or one whose content merely
+    permuted, would be a round trip spent on a question already answered."""
+    import inspect
+
+    src = inspect.getsource(v2)
+    fn = src[src.index("        def _stability(self, gi, row, rows_d, stats) -> str:"):]
+
+    assert fn.index("if cos >= VERIFY_MIN_COS:") < fn.index("self._replay("), \
+        "replay sits inside the STATIC branch"
+    changing = fn[fn.index('stats.verify_localised["foreign_changing"]'):]
+    assert "_replay(" not in changing, "a block with a live writer is already explained"
+
+
+def test_the_replay_uses_every_address_of_the_block():
+    """A block spans one address per layer slot and cache. Replaying one address would restore only
+    a slice of it and the re-check would still fail, for the wrong reason."""
+    import inspect
+
+    src = inspect.getsource(v2)
+    fn = src[src.index("        def _replay(self, gi, block_id, rows_d, row, stats) -> str:"):]
+    fn = fn[:fn.index("        def _stability(")]
+
+    assert "srcs = [d[0] for d in descs]" in fn
+    assert "dsts = [d[1] for d in descs]" in fn
+    assert "lens = [d[2] for d in descs]" in fn
+
+
+def test_both_replay_outcomes_are_recorded_and_named():
+    """retry_same and retry_fixed point at different owners; collapsing them would lose the finding."""
+    import inspect
+
+    src = inspect.getsource(v2)
+    fn = src[src.index("        def _replay(self, gi, block_id, rows_d, row, stats) -> str:"):]
+    fn = fn[:fn.index("        def _stability(")]
+
+    assert 'stats.verify_localised["retry_same"]' in fn
+    assert 'stats.verify_localised["retry_fixed"]' in fn
+    assert "Ours." in fn and "Upstream." in fn
+
+
+def test_the_descriptor_is_logged_even_when_the_replay_cannot_run():
+    """If the arithmetic is wrong, the address line shows it without any round trip. It must survive
+    every early return."""
+    import inspect
+
+    src = inspect.getsource(v2)
+    fn = src[src.index("        def _replay(self, gi, block_id, rows_d, row, stats) -> str:"):]
+    fn = fn[:fn.index("        def _stability(")]
+
+    note_at = fn.index("note = (")
+    for early in ("Replay itself failed", "produced no signature"):
+        assert fn.index(early) > note_at, f"{early!r} still reports the descriptor"
+    assert fn.count("return note") >= 3

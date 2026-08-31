@@ -198,6 +198,23 @@ def descriptor_coverage(grouped, keep, addr_groups):
     return covered, descriptors
 
 
+def block_segment(base_local, base_remote, local_id, remote_id, block_len, inner_block_len,
+                  inner_offset=0):
+    """The ``(src, dst, length)`` for ONE block, using the run's own arithmetic.
+
+    ``_transfer_kv_cache`` coalesces consecutive blocks into a single segment addressed by the run's
+    FIRST id, so the wire carries one descriptor for many blocks. Replaying a single block needs the
+    same arithmetic applied to that block's own id, and it must agree with the run at ``j == 0`` or
+    the replay would target a different address than the transfer did — which would make the replay
+    answer a question nobody asked.
+
+    ``src`` is the LOCAL destination and ``dst`` the REMOTE source: ``batch_transfer_sync_read``
+    takes ``(buffers, peer_buffer_addresses)``, and the vendored names read backwards."""
+    return (base_local + local_id * block_len + inner_offset * inner_block_len,
+            base_remote + remote_id * inner_block_len,
+            inner_block_len)
+
+
 def chunk_segments(src, dst, lengths, max_n):
     """Split a transfer's three parallel lists into batches of at most ``max_n`` segments.
 
@@ -760,7 +777,14 @@ if _ASCEND_AVAILABLE:
 
         _AUDIT_DESCRIPTORS = os.environ.get("BFF_AUDIT_DESCRIPTORS", "0") == "1"
         _descriptor_gaps = 0
-        _logged_descriptors = False
+        # Set by v2 when BFF_V2_VERIFY_TRANSFER is on. Off, the emission loop does no extra work at
+        # all — this is a diagnostic, and it allocates one dict entry per block per address.
+        capture_descriptors: bool = False
+        # None, not {}: a shared mutable class default would be one dict across every recv thread,
+        # and this is overwritten per request anyway. Readers use `or {}`.
+        last_descriptors = None
+        last_session_id = None
+        last_segment_count = 0
         # Segments per batch_transfer_sync_read call. 0 = unlimited, i.e. exactly what this
         # connector has always done. See chunk_segments for why bounding it is worth a knob.
         _MAX_XFER_SEGMENTS = int(os.environ.get("BFF_MAX_XFER_SEGMENTS", "0"))
@@ -823,17 +847,6 @@ if _ASCEND_AVAILABLE:
             except Exception as e:  # noqa: BLE001 - an audit must never break a transfer
                 logger.warning("MooncakeConnectorFF: descriptor audit failed (%s).", e)
                 return
-            if not KVCacheRecvingThreadFF._logged_descriptors:
-                # The scale has never been measured, and every batch-limit theory needs it. Note
-                # BFF's list is not obviously longer than stock's: BFF emits
-                # `distinct addresses x groups x runs-per-group` where stock emits
-                # `all addresses x runs`, so the address dedup may well make it shorter.
-                KVCacheRecvingThreadFF._logged_descriptors = True
-                logger.info(
-                    "MooncakeConnectorFF: request %s emitted %d transfer segment(s) over %d "
-                    "block(s) (cap BFF_MAX_XFER_SEGMENTS=%d, 0=unlimited).",
-                    req_meta.get("remote_request_id"), n_emitted, len(covered),
-                    self._MAX_XFER_SEGMENTS)
             if not missing:
                 return
             KVCacheRecvingThreadFF._descriptor_gaps += len(missing)
@@ -917,6 +930,7 @@ if _ASCEND_AVAILABLE:
                             "(%.1fx transfer amplification avoided).", len(keep), len(local_base),
                             len(local_base) / len(keep) if keep else 1.0)
             groups_covered: set = set()
+            per_block: dict = {}
             for k in keep:
                 src_layer_base_addr = local_base[k]
                 dst_layer_base_addr = remote_base[k]
@@ -934,6 +948,15 @@ if _ASCEND_AVAILABLE:
                         dst_list.append(dst)
                         length_list.append(inner_block_len * len(local_block_id))
                         groups_covered.add(gi)
+                        if self.capture_descriptors:
+                            # One entry per BLOCK per address, so a single block can be replayed on
+                            # its own. A block spans every kept address (one per layer slot and
+                            # cache), so its list holds all of them — replaying one address would
+                            # restore only a slice of the block.
+                            for rb, lb in zip(remote_block_id, local_block_id):
+                                per_block.setdefault((int(gi), int(lb)), []).append(block_segment(
+                                    src_layer_base_addr, dst_layer_base_addr, lb, rb,
+                                    block_len, inner_block_len, inner_offset))
 
             # Per-request coverage check. `build_base_addr_groups` proves at startup that every
             # group is reachable through SOME address; this proves that for THIS request every group
@@ -941,6 +964,10 @@ if _ASCEND_AVAILABLE:
             # whose KV silently stays whatever was in the block — the decode then attends over stale
             # KV for those layers and the only symptom is the output text. Costs a set of small ints
             # per request.
+            if self.capture_descriptors:
+                self.last_descriptors = per_block
+                self.last_session_id = session_id
+                self.last_segment_count = len(src_list)
             self._audit_descriptor_coverage(req_meta, grouped, keep, addr_groups, len(src_list))
 
             wanted = {gi for gi, (_r, local_ids) in enumerate(grouped) if local_ids}
