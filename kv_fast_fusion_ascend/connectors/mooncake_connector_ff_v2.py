@@ -103,6 +103,17 @@ VERIFY_SPACING_S = float(os.environ.get("BFF_V2_VERIFY_SPACING_S", "15"))
 # fp16 wire format and the NPU's own reduction order, tight enough that a wrong block cannot pass:
 # unrelated KV blocks in these runs sit far below it, which is why dedup needs a 0.75+ bar to alias.
 VERIFY_MIN_COS = float(os.environ.get("BFF_V2_VERIFY_MIN_COS", "0.99"))
+# Norm-error bar. 10%, NOT the 2% this shipped with, and the difference was measured: correct blocks
+# drift to ~2% norm error and ~0.991 cosine once the decode is saturated, so a 2% bar sat exactly on
+# the noise floor and flagged a block at `cos 0.9956, norm err 2.0%` as corrupt while the check
+# twenty seconds later passed with a LOWER cosine (0.99141). The cosine bar is what actually
+# separates the populations — correct blocks 0.991+, wrong ones 0.74 — so the norm check is here to
+# catch a block whose content is right but whose magnitude is not, and it should fire on 20%, not on
+# drift.
+VERIFY_MAX_NORM_ERR = float(os.environ.get("BFF_V2_VERIFY_MAX_NORM_ERR", "0.10"))
+# How close a block must still be to ITS OWN row to be called merely degraded rather than foreign.
+# Below the mismatch bar but far above the ~0.75 that unrelated KV scores here.
+VERIFY_DEGRADED_COS = float(os.environ.get("BFF_V2_VERIFY_DEGRADED_COS", "0.95"))
 # Trace the physical write slot of the first N requests to decode, step by step. Off by default
 # because it logs once per request per step; on, it is the direct test of "new K/V is written to an
 # invalid address, or to the same slot over and over".
@@ -525,7 +536,10 @@ def cross_match(row, rows_p, rows_d, min_cos=None):
     * ``destination_permuted`` — the producer's block *i* turned up in a different one of the
       decode's blocks, so the data landed at the wrong destination and that block was clobbered too.
       ``index`` is where it went.
-    * ``foreign`` — neither search finds it. The content belongs to no row of this request: another
+    * ``degraded`` — it still matches its OWN row closely; only the magnitude moved. Checked first,
+      because the two searches below skip this row and would otherwise answer "no other row matches"
+      about a block that was essentially correct all along.
+    * ``foreign`` — nothing matches. The content belongs to no row of this request: another
       request's KV, or a block reallocated mid-transfer. That points at ownership, not arithmetic.
 
     Source is checked first because it is the narrower claim: if the decode's block is exactly one of
@@ -534,6 +548,13 @@ def cross_match(row, rows_p, rows_d, min_cos=None):
     bar = VERIFY_MIN_COS if min_cos is None else min_cos
     if row < 0 or row >= len(rows_d or ()) or row >= len(rows_p or ()):
         return "foreign", -1, -1.0
+    # Self FIRST. The searches below deliberately skip this row, so without this a block holding its
+    # own correct content — failed only on a norm error at the noise floor — finds no other row and
+    # is reported as belonging to another request. That happened: `cos 0.9956, norm err 2.0%` came
+    # back labelled `foreign`, which is a diagnostic being confidently wrong.
+    self_cos = sum(float(x) * float(y) for x, y in zip(rows_d[row], rows_p[row]))
+    if self_cos >= VERIFY_DEGRADED_COS:
+        return "degraded", row, self_cos
     src_i, src_cos = best_matching_row(rows_d[row], rows_p, skip=row)
     if src_cos >= bar:
         return "source_permuted", src_i, src_cos
@@ -543,7 +564,7 @@ def cross_match(row, rows_p, rows_d, min_cos=None):
     return "foreign", -1, max(src_cos, dst_cos)
 
 
-def compare_signature_rows(sig_p, norms_p, sig_d, norms_d, min_cos=None, max_norm_err=0.02):
+def compare_signature_rows(sig_p, norms_p, sig_d, norms_d, min_cos=None, max_norm_err=None):
     """Row-for-row agreement between the producer's signatures and the decode's own.
 
     Returns ``(mismatches, worst_cos, worst_norm_err)``, where each mismatch is
@@ -562,6 +583,7 @@ def compare_signature_rows(sig_p, norms_p, sig_d, norms_d, min_cos=None, max_nor
     Pure Python over sequences of floats, with no torch and no NPU, so the arithmetic that decides
     "the transfer is correct" is testable on CPU like ``align_per_group`` and ``filter_sentinels``."""
     bar = VERIFY_MIN_COS if min_cos is None else min_cos
+    nbar = VERIFY_MAX_NORM_ERR if max_norm_err is None else max_norm_err
     if len(sig_p) != len(sig_d):
         return [(-1, 0.0, 1.0)], 0.0, 1.0
     mismatches, worst_cos, worst_err = [], 1.0, 0.0
@@ -571,7 +593,7 @@ def compare_signature_rows(sig_p, norms_p, sig_d, norms_d, min_cos=None, max_nor
         err = abs(np_i - nd_i) / max(abs(np_i), abs(nd_i), 1e-6)
         worst_cos = min(worst_cos, cos)
         worst_err = max(worst_err, err)
-        if cos < bar or err > max_norm_err:
+        if cos < bar or err > nbar:
             mismatches.append((i, cos, err))
     return mismatches, worst_cos, worst_err
 
@@ -1154,6 +1176,10 @@ if _ASCEND_AVAILABLE:
                 cache = self.__dict__["_sig_cache_d"] = {}
             return cache
 
+        # The block ids of the request being verified right now, so the stability re-read touches
+        # exactly the block that failed. Set immediately before _localise, read only by it.
+        _verify_ids: ClassVar[dict] = {}
+
         @property
         def _verify_stash(self) -> dict:
             """``{remote_request_id: (plan_groups, sigs)}`` awaiting post-transfer verification."""
@@ -1472,8 +1498,11 @@ if _ASCEND_AVAILABLE:
             same input width), so their signatures live in the same space and are comparable."""
             rows_p, _norms_p = p_rows.get(int(gi), ([], []))
             kind, idx, cos = cross_match(row, rows_p, rows_d)
+            stats.verify_localised[kind] = stats.verify_localised.get(kind, 0) + 1
+            if kind == "degraded":
+                return (f" It still matches its OWN row at cos {cos:.4f} — the content is right and "
+                        f"only the magnitude moved. This is drift, not a wrong block.")
             if kind != "foreign":
-                stats.verify_localised[kind] = stats.verify_localised.get(kind, 0) + 1
                 return f" It holds this request's {kind.split('_')[0]} row {idx} (cos {cos:.4f})."
             best = (None, -1, cos)
             for other, (rows_o, _n) in p_rows.items():
@@ -1483,13 +1512,49 @@ if _ASCEND_AVAILABLE:
                 if c > best[2]:
                     best = (int(other), i, c)
             if best[0] is not None and best[2] >= VERIFY_MIN_COS:
+                # Reclassify: cross_match called it foreign for its own group, but it belongs to
+                # another one. Move the single count rather than clearing the tally.
+                stats.verify_localised["foreign"] = max(
+                    0, stats.verify_localised.get("foreign", 0) - 1)
                 stats.verify_localised["group_permuted"] = (
                     stats.verify_localised.get("group_permuted", 0) + 1)
                 return (f" It holds GROUP {best[0]} row {best[1]} (cos {best[2]:.4f}) — the block id "
                         f"was read against the wrong group.")
-            stats.verify_localised["foreign"] = stats.verify_localised.get("foreign", 0) + 1
-            return (f" It matches no row of this request in any group (best cos {best[2]:.4f}) — the "
-                    f"content belongs to another request or to a block reallocated mid-transfer.")
+            return (f" It matches no row of this request in any group (best cos {best[2]:.4f})."
+                    f"{self._stability(int(gi), row, rows_d, stats)}")
+
+        def _stability(self, gi, row, rows_d, stats) -> str:
+            """Is the foreign content sitting still, or is something writing it?
+
+            Two stories survive a foreign verdict and they need different fixes: the block was never
+            written and still holds a recycled tenant's KV, or it was written and then clobbered by a
+            concurrent owner. Reading it a second time separates them — a second owner keeps
+            generating tokens into it, a stale tenant does not.
+
+            The ids came from the same stash the first read used, so this re-reads exactly the block
+            that failed."""
+            ids = self._verify_ids.get(int(gi)) or []
+            if not ids or row >= len(ids) or self.local_sigs is None:
+                return " Content belongs to another request or to a block reallocated mid-transfer."
+            try:
+                _sync_device()
+                again = self.local_sigs(int(gi), ids, [len(ids)])[0]
+                if again is None:
+                    return " Content belongs to another request or a reallocated block."
+                sig2, _n2, _h = SignatureCodec.decode(again)
+                cos = sum(float(x) * float(y) for x, y in zip(rows_d[row], sig2.tolist()[row]))
+            except Exception as e:  # noqa: BLE001 - a diagnostic must never fail a request
+                logger.warning("BFF pull-v2: stability re-read failed for group %s (%s).", gi, e)
+                return ""
+            if cos >= VERIFY_MIN_COS:
+                stats.verify_localised["foreign_static"] = (
+                    stats.verify_localised.get("foreign_static", 0) + 1)
+                return (f" It is STATIC across a re-read (cos {cos:.4f}): never written by this "
+                        f"transfer, still holding a recycled tenant's KV.")
+            stats.verify_localised["foreign_changing"] = (
+                stats.verify_localised.get("foreign_changing", 0) + 1)
+            return (f" It CHANGED across a re-read (cos {cos:.4f}): something else is writing this "
+                    f"block, so two requests own it.")
 
         def _verify_transfer(self, req_meta) -> None:
             """Is the KV that just landed the KV the producer had? (BFF_V2_VERIFY_TRANSFER)
@@ -1560,6 +1625,7 @@ if _ASCEND_AVAILABLE:
                             stats.verify_verdicts.get(verdict, 0) + 1)
                         where = ""
                         if verdict == "transfer_wrong":
+                            self._verify_ids = plan_groups
                             where = self._localise(int(gi), row, p_rows, rows_d, stats)
                         logger.error(
                             "BFF pull-v2 VERIFY [%s]: group %d, %d of %d block(s) do not match the "

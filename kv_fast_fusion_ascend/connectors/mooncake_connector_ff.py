@@ -163,6 +163,51 @@ def build_base_addr_groups(base_addrs, layer_names, layer_group, caches_per_laye
     return out
 
 
+def descriptor_coverage(grouped, keep, addr_groups):
+    """Which ``(group, local block)`` pairs the transfer's descriptor loop actually writes.
+
+    Returns ``(covered, descriptors)`` — the set of pairs a segment was emitted for, and how many
+    segments that took. Mirrors the emission in ``_transfer_kv_cache`` exactly, and exists to be
+    compared against the blocks that were PLANNED: a block that receives no descriptor is never
+    written, so the decode reads whatever the block's previous tenant left there.
+
+    That is not hypothetical. Verification found blocks holding content matching no row of their
+    request in any group — ~0.19% of transferred blocks, one per affected request, clustered under
+    allocation churn — and a never-written block recycled from a finished request looks exactly like
+    that. The existing per-request check only asserts every GROUP emitted something, so one missing
+    block inside a group that emitted others passes it.
+
+    Two silent-skip paths in the emission make this worth proving rather than assuming:
+    ``if gi >= len(grouped): continue`` drops a whole group when ``addr_groups`` outruns the aligned
+    list, and ``zip(grouped_remote, grouped_local)`` truncates to the shorter side if the two
+    run-lists ever disagree. Neither raises, and neither is visible in the transferred bytes.
+
+    Pure: takes the same three structures the loop does and touches no device, no engine and no
+    addresses, so the arithmetic that decides "every block got written" is testable on CPU."""
+    covered: set = set()
+    descriptors = 0
+    for k in keep:
+        for gi in addr_groups[k]:
+            if gi >= len(grouped):
+                continue
+            grouped_remote, grouped_local = grouped[gi]
+            for _remote_run, local_run in zip(grouped_remote, grouped_local):
+                descriptors += 1
+                for b in local_run:
+                    covered.add((int(gi), int(b)))
+    return covered, descriptors
+
+
+def planned_blocks(grouped):
+    """``{(group, local block)}`` the transfer intends to write — the set coverage must equal."""
+    out: set = set()
+    for gi, (_remote, local_runs) in enumerate(grouped):
+        for run in local_runs:
+            for b in run:
+                out.add((int(gi), int(b)))
+    return out
+
+
 def align_per_group(local_groups, remote_groups) -> list[tuple[list[int], list[int]]]:
     """Tail-align D's and P's block lists, per group.
 
@@ -693,6 +738,44 @@ if _ASCEND_AVAILABLE:
                     grouped.append(([[b] for b in remote_ids], [[b] for b in local_ids]))
             return grouped
 
+        _AUDIT_DESCRIPTORS = os.environ.get("BFF_AUDIT_DESCRIPTORS", "0") == "1"
+        _descriptor_gaps = 0
+
+        def _audit_descriptor_coverage(self, req_meta, grouped, keep, addr_groups, n_emitted):
+            """Did every block the transfer planned to write actually get a descriptor?
+
+            Off by default (``BFF_AUDIT_DESCRIPTORS=1``): it is O(blocks) per request on the recv
+            thread, and the question it answers is a one-time one — whether the segment list this
+            connector builds is complete.
+
+            Why it matters. v2's transfer verification found blocks on the decode holding content
+            that matches no row of their request in any group, at ~0.19% of transferred blocks, one
+            per affected request. A block that never receives a descriptor is never written and
+            still holds its previous tenant's KV, which is indistinguishable from that. This check
+            decides where to look: if coverage is always complete, our segment list is right and the
+            lost write happened inside ``batch_transfer_sync_read`` — whose return value is a bare
+            int this code only tests for ``< 0``, and which serves the stock connector too.
+
+            Never raises. It reports; the transfer is already correct or already not."""
+            if not self._AUDIT_DESCRIPTORS:
+                return
+            try:
+                covered, expected_n = descriptor_coverage(grouped, keep, addr_groups)
+                missing = planned_blocks(grouped) - covered
+            except Exception as e:  # noqa: BLE001 - an audit must never break a transfer
+                logger.warning("MooncakeConnectorFF: descriptor audit failed (%s).", e)
+                return
+            if not missing:
+                return
+            KVCacheRecvingThreadFF._descriptor_gaps += len(missing)
+            logger.error(
+                "MooncakeConnectorFF: request %s planned %d block(s) that received NO transfer "
+                "descriptor — e.g. group %s block %s. They are never written, so the decode reads "
+                "whatever their previous tenant left. (%d segments emitted, %d expected; %d gap(s) "
+                "this process.)",
+                req_meta.get("remote_request_id"), len(missing), *min(missing),
+                n_emitted, expected_n, KVCacheRecvingThreadFF._descriptor_gaps)
+
         def _after_transfer(self, req_meta) -> None:
             """Called once this request's KV has actually landed. No-op in v1; v2 releases the
             request's aliases and residency here."""
@@ -789,6 +872,8 @@ if _ASCEND_AVAILABLE:
             # whose KV silently stays whatever was in the block — the decode then attends over stale
             # KV for those layers and the only symptom is the output text. Costs a set of small ints
             # per request.
+            self._audit_descriptor_coverage(req_meta, grouped, keep, addr_groups, len(src_list))
+
             wanted = {gi for gi, (_r, local_ids) in enumerate(grouped) if local_ids}
             if wanted - groups_covered:
                 raise KVGroupLayoutError(

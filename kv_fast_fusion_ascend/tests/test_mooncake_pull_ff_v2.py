@@ -1593,7 +1593,7 @@ def test_the_barrier_is_verification_only():
     src = inspect.getsource(v2)
 
     calls = src.count("_sync_device()") - src.count("def _sync_device()")
-    assert calls == 1, f"exactly one call site, inside verification (found {calls})"
+    assert calls == 2, f"one before each device read the diagnostic makes (found {calls})"
     transfer = src[src.index("        def _after_transfer(self, req_meta) -> None:"):]
     transfer = transfer[:transfer.index("        def _diagnose_mismatch(")]
     assert "_sync_device()" not in transfer, "not on the request's own path"
@@ -1752,3 +1752,65 @@ def test_the_cross_group_search_is_the_fallback_not_the_first_answer():
 
     assert fn.index("cross_match(row, rows_p, rows_d)") < fn.index("for other, (rows_o, _n) in")
     assert 'if kind != "foreign":' in fn, "widen only when the content is foreign to its own group"
+
+
+# =====================================================================================
+# the diagnostic must not report drift as corruption
+# =====================================================================================
+# It did. A block at `cos 0.9956, norm err 2.0%` was flagged and then labelled `foreign` — the
+# cosine bar passed comfortably, the 2% norm bar failed by a hair, and cross_match skips the row
+# itself so it correctly found no OTHER row matching. Meanwhile the check twenty seconds later
+# passed with a LOWER worst cosine (0.99141). Correct blocks under saturation drift to ~0.991 cosine
+# and ~2% norm; wrong ones sit at 0.74.
+def test_a_block_that_still_matches_its_own_row_is_degraded_not_foreign():
+    """The exact failure above: right content, drifted magnitude. Calling that 'it belongs to another
+    request' is a diagnostic being confidently wrong."""
+    rows_p = _rows(1, 2, 3, 4)
+    rows_d = list(rows_p)
+
+    kind, idx, cos = v2.cross_match(2, rows_p, rows_d)
+
+    assert kind == "degraded"
+    assert idx == 2 and cos > 0.99, "and it names the row it still matches — its own"
+
+
+def test_the_observed_false_positive_is_no_longer_a_mismatch_at_all():
+    """cos 0.9956 with a 2.0% norm error, measured on a correct block. The raised norm bar has to
+    let it through, or every saturated run reports corruption that is not there."""
+    a = _unit([1.0, 0.02, 0.0, 0.0])
+    b = _unit([1.0, 0.115, 0.0, 0.0])          # cos ~0.9956 against a
+
+    bad, cos, err = v2.compare_signature_rows([a], [10.0], [b], [10.2])
+
+    assert 0.99 < cos < 0.999, f"the fixture must reproduce the measured cosine, got {cos}"
+    assert abs(err - 0.0196) < 0.005, f"and the ~2% norm error, got {err}"
+    assert bad == [], "a correct block drifting under load is not a mismatch"
+
+
+def test_a_genuinely_mis_scaled_block_is_still_caught():
+    """The norm check has a job: content right, magnitude wrong. Raising the bar must not disable
+    it, only lift it off the noise floor."""
+    a = _unit([1.0, 0.0, 0.0, 0.0])
+
+    bad, _cos, err = v2.compare_signature_rows([a], [10.0], [a], [14.0])
+
+    assert len(bad) == 1 and err > 0.25
+
+
+def test_unrelated_content_is_still_foreign():
+    """The measured genuine failures: cos 0.74-0.76 to their own row, and no better match anywhere.
+    The degraded check must not swallow those."""
+    rows_p = _rows(1, 2, 3, 4)
+    rows_d = list(rows_p)
+    rows_d[1] = _unit([0.4, 0.4, 0.4, 0.4, 0.3, 0.3, 0.2, 0.1])
+
+    kind, _idx, _cos = v2.cross_match(1, rows_p, rows_d)
+
+    assert kind == "foreign"
+
+
+def test_the_degraded_bar_sits_between_the_two_populations():
+    """0.95: below the 0.99 mismatch bar, far above the ~0.75 that unrelated KV scores here. A bar
+    inside either population would merge them."""
+    assert 0.75 < v2.VERIFY_DEGRADED_COS < v2.VERIFY_MIN_COS
+    assert v2.VERIFY_MAX_NORM_ERR >= 0.05, "2% was the measured drift of CORRECT blocks"

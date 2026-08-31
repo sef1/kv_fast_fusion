@@ -523,3 +523,71 @@ def test_no_layout_anywhere_is_still_fatal():
 
     with pytest.raises(mc.KVGroupLayoutError, match="unreadable"):
         mc.resolve_kv_cache_groups(_Cfg([]), _Runner([]))
+
+
+# =====================================================================================
+# descriptor_coverage — every planned block must actually get written
+# =====================================================================================
+# v2's transfer verification found blocks on the decode holding content that matches no row of their
+# request in any group — ~0.19% of transferred blocks, one per affected request, clustered under
+# allocation churn. A block that receives no descriptor is never written and still holds its previous
+# tenant's KV, which looks exactly like that. The existing per-request check only asserts each GROUP
+# emitted something, so one missing block inside a group that emitted others passes it today.
+def _grouped(*per_group):
+    """`grouped` as _transfer_kv_cache sees it: per group, (remote runs, local runs)."""
+    return [([list(r) for r in remote], [list(l) for l in local]) for remote, local in per_group]
+
+
+def test_a_normal_emission_covers_every_planned_block():
+    grouped = _grouped(([[10, 11], [20]], [[70, 71], [80]]),
+                       ([[30]], [[90]]))
+    keep, addr_groups = [0, 1], {0: [0, 1], 1: [0, 1]}
+
+    covered, n = mc.descriptor_coverage(grouped, keep, addr_groups)
+
+    assert covered == mc.planned_blocks(grouped)
+    assert n == 2 * 3, "two addresses x three runs"
+
+
+def test_a_group_beyond_the_aligned_list_is_reported_as_a_gap():
+    """`if gi >= len(grouped): continue` skips a whole group silently. It cannot happen today, which
+    is exactly why nothing would notice if it started to."""
+    grouped = _grouped(([[10]], [[70]]))
+    covered, _n = mc.descriptor_coverage(grouped, [0], {0: [0, 5]})
+
+    assert covered == {(0, 70)}, "group 5 does not exist and must not invent coverage"
+
+
+def test_uneven_run_lists_lose_blocks_and_the_audit_sees_it():
+    """`zip(grouped_remote, grouped_local)` truncates to the shorter side. group_concurrent_contiguous
+    returns equal lengths, so this is a guard on a future change, not a live bug."""
+    grouped = [([[10]], [[70], [71]])]          # one remote run, two local runs
+
+    covered, _n = mc.descriptor_coverage(grouped, [0], {0: [0]})
+    missing = mc.planned_blocks(grouped) - covered
+
+    assert missing == {(0, 71)}, "the truncated run is never written"
+
+
+def test_a_block_missing_from_the_emission_is_named():
+    grouped = _grouped(([[10, 11]], [[70, 71]]))
+    covered, _n = mc.descriptor_coverage(grouped, [0], {0: []})   # no group emitted
+
+    assert mc.planned_blocks(grouped) - covered == {(0, 70), (0, 71)}
+
+
+def test_duplicate_addresses_do_not_inflate_coverage_or_hide_gaps():
+    """`keep` already drops repeated (local, remote) pairs; coverage is a SET, so re-emitting the
+    same block through several addresses must not read as covering a different one."""
+    grouped = _grouped(([[10], [11]], [[70], [71]]))
+
+    one, n1 = mc.descriptor_coverage(grouped, [0], {0: [0]})
+    both, n2 = mc.descriptor_coverage(grouped, [0, 1], {0: [0], 1: [0]})
+
+    assert one == both == {(0, 70), (0, 71)}
+    assert n2 == 2 * n1, "the segment COUNT still reflects the duplication"
+
+
+def test_coverage_is_empty_for_a_request_with_nothing_to_pull():
+    assert mc.descriptor_coverage([], [], {}) == (set(), 0)
+    assert mc.planned_blocks([]) == set()

@@ -794,14 +794,28 @@ if v2:
                 if VL:
                     # What the wrong block actually held. source/destination/group are descriptor
                     # arithmetic and localise to an index; foreign is block ownership instead, and
-                    # the fix for that is not in the descriptor loop.
+                    # the fix for that is not in the descriptor loop. `degraded` is neither — it is
+                    # a correct block whose magnitude drifted, and it must not be read as corruption.
                     print(f"       what it held: {VL}")
+                    if VL.get("degraded"):
+                        print(f"       -> {VL['degraded']} of these still matched their OWN row: "
+                              "content correct, magnitude drifted. Not wrong blocks.")
+                    if VL.get("foreign_static"):
+                        print(f"       -> {VL['foreign_static']} STATIC across a re-read: never "
+                              "written by the transfer, still holding a recycled tenant's KV. "
+                              "Run with BFF_AUDIT_DESCRIPTORS=1 — if coverage is complete, the "
+                              "write was dropped inside batch_transfer_sync_read (upstream, and "
+                              "shared with the stock connector).")
+                    if VL.get("foreign_changing"):
+                        print(f"       -> {VL['foreign_changing']} CHANGED across a re-read: "
+                              "another writer owns the block. That is a block-ownership bug, not "
+                              "the transfer.")
                     if VL.get("foreign") and not any(
                             VL.get(k) for k in ("source_permuted", "destination_permuted",
                                                 "group_permuted")):
-                        print("       -> FOREIGN only: the content belongs to no row of the "
-                              "request. That is block OWNERSHIP, not the descriptor arithmetic — "
-                              "check whether the stock connector has it too before changing ours.")
+                        print("       -> FOREIGN: the content belongs to no row of the request. "
+                              "That is block OWNERSHIP, not the descriptor arithmetic — check "
+                              "whether the stock connector has it too before changing ours.")
             elif VV.get("producer_moved"):
                 print("    -> PRODUCER_MOVED: the transfer is faithful, the signature was stale. "
                       "Dedup decides what to skip from those same signatures.")
