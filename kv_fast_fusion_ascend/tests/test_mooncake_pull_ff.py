@@ -12,6 +12,8 @@ vllm_ascend import.
 CPU only.
 """
 
+import re
+
 import pytest
 
 from kv_fast_fusion_ascend.connectors import mooncake_connector_ff as mc
@@ -733,7 +735,7 @@ def test_the_async_transfer_path_is_off_by_default():
     assert 'os.environ.get("BFF_XFER_ASYNC", "0") == "1"' in src
     fn = src[src.index("        def _one_batch(self, session_id, src, dst, lengths):"):]
     fn = fn[:fn.index("        def _issue_transfer(")]
-    assert fn.index("if not self._XFER_ASYNC:") < fn.index("batch_transfer_async_read"), \
+    assert fn.index("if not self._XFER_ASYNC") < fn.index("batch_transfer_async_read"), \
         "the sync call stays the default branch"
     assert "batch_transfer_sync_read" in fn, "and is still reachable unchanged"
 
@@ -747,10 +749,53 @@ def test_the_async_poll_is_bounded():
     fn = src[src.index("        def _one_batch(self, session_id, src, dst, lengths):"):]
     fn = fn[:fn.index("        def _issue_transfer(")]
 
-    assert "deadline = time.perf_counter() + self._XFER_ASYNC_TIMEOUT" in fn
+    assert "deadline = t0 + budget" in fn
     assert "if time.perf_counter() >= deadline:" in fn, \
         "the deadline must actually be compared, not merely computed"
     assert "while True:" in fn and "return 0" in fn, "it exits, it does not spin forever"
+
+
+def test_the_async_poll_sleeps_between_attempts():
+    """A tight Python poll loop holds the GIL, and the thread it starves is the engine core
+    generating tokens. The first run of this path took the whole EngineCore process down with it —
+    no scheduler stats after the submit line — so the sleep is not an optimisation."""
+    import inspect
+
+    src = inspect.getsource(mc)
+    fn = src[src.index("        def _one_batch(self, session_id, src, dst, lengths):"):]
+    fn = fn[:fn.index("        def _issue_transfer(")]
+
+    assert "time.sleep(self._XFER_ASYNC_POLL_S)" in fn, "the loop must yield between polls"
+    # Inside the loop, not before it: a sleep hoisted above `while True` would delay the first poll
+    # and then spin exactly as before.
+    assert fn.index("while True:") < fn.index("time.sleep(self._XFER_ASYNC_POLL_S)")
+
+
+def test_a_first_batch_that_never_settles_disables_the_async_path():
+    """Nothing in vllm-ascend calls the async pair, so its status convention is a guess: Mooncake's
+    own sync path polls to COMPLETED, which makes 0 more likely to mean "done" than "pending". If
+    the guess is wrong every batch burns its full timeout, which is how a 30s budget became a dead
+    run. A wrong guess must cost seconds once, not the run."""
+    import inspect
+
+    src = inspect.getsource(mc)
+    fn = src[src.index("        def _one_batch(self, session_id, src, dst, lengths):"):]
+    fn = fn[:fn.index("        def _issue_transfer(")]
+
+    assert "_XFER_ASYNC_FIRST_TIMEOUT" in fn, "the first batch gets its own, shorter leash"
+    assert "budget = self._XFER_ASYNC_FIRST_TIMEOUT if first else self._XFER_ASYNC_TIMEOUT" in fn
+    assert "KVCacheRecvingThreadFF._async_disabled = True" in fn, \
+        "and a first batch that times out turns the path off for the process"
+    # The disable must be consulted, or it is decoration: the sync fallback has to test it.
+    assert "KVCacheRecvingThreadFF._async_disabled" in fn[:fn.index("batch_transfer_async_read")]
+    # The class lives behind the _ASCEND_AVAILABLE gate, so read the defaults off the source. A
+    # first-batch leash that is not SHORTER than the steady-state one buys nothing.
+    def default(name):
+        m = re.search(rf'{name} = float\(os\.environ\.get\("[A-Z_]+", "([\d.]+)"\)\)', src)
+        assert m, f"{name} must keep an env-overridable float default"
+        return float(m.group(1))
+
+    assert default("_XFER_ASYNC_FIRST_TIMEOUT") < default("_XFER_ASYNC_TIMEOUT")
 
 
 def test_a_negative_handle_is_returned_rather_than_polled():
@@ -763,3 +808,123 @@ def test_a_negative_handle_is_returned_rather_than_polled():
     fn = fn[:fn.index("        def _issue_transfer(")]
 
     assert fn.index("if handle < 0:") < fn.index("deadline =")
+
+
+# =====================================================================================
+# recv-thread duty cycle
+#
+# The KV pulls run on ONE thread (the vendored run() pops and transfers synchronously; its
+# ThreadPoolExecutor(max_workers=32) is never used), so busy/wall is the whole question of whether
+# that thread is a bottleneck. The stock connector's own per-request log puts it at 0.9% over a 523s
+# con512 run — 4.6s across 512 requests, median 7.6ms. This override dropped that log, which is why
+# the ramp was argued from the shape of `Waiting` instead of measured.
+# =====================================================================================
+def test_the_duty_cycle_is_busy_over_wall_not_over_requests():
+    t = mc.RecvThreadTimer(clock=lambda: 100.0)
+    for _ in range(10):
+        t.note(50.0)                       # 10 x 50ms = 0.5s busy
+
+    assert t.requests == 10
+    assert t.busy_ms == pytest.approx(500.0)
+    assert t.duty_cycle(110.0) == pytest.approx(0.05)     # 0.5s of 10s wall
+    assert t.duty_cycle(1100.0) == pytest.approx(0.0005)  # same work, longer run, lower duty
+
+
+def test_a_zero_length_run_does_not_divide_by_zero():
+    t = mc.RecvThreadTimer(clock=lambda: 100.0)
+    t.note(5.0)
+
+    assert t.duty_cycle(100.0) == 0.0
+
+
+def test_batch_phases_add_busy_time_without_adding_requests():
+    """v2's signature exchange happens once per BATCH and blocks the thread exactly as a transfer
+    does, so it belongs in the duty cycle — but counting it as a request would divide the
+    ms/request figure by the wrong denominator, which is how 79.8s over 14 round trips was first
+    read as if it were spread over the run's requests."""
+    t = mc.RecvThreadTimer(clock=lambda: 0.0)
+    t.note(10.0)
+    t.note(10.0)
+    t.note_phase("exchange", 5700.0)
+
+    assert t.requests == 2, "the exchange is not a request"
+    assert t.busy_ms == pytest.approx(5720.0), "but it is busy time"
+    assert t.phase_ms["exchange"] == pytest.approx(5700.0)
+    assert "5.7s" in t.summary(10.0), "and it is named in the summary"
+
+
+def test_phases_are_reported_but_not_forced_to_partition_the_elapsed_time():
+    """They are the parts worth naming, not a partition. Silently redistributing the remainder
+    across them would hide exactly the gap worth finding."""
+    t = mc.RecvThreadTimer(clock=lambda: 0.0)
+    t.note(100.0, {"xfer": 20.0, "plan": 5.0})
+
+    assert t.busy_ms == pytest.approx(100.0), "elapsed wins; phases do not have to sum to it"
+    assert t.phase_ms == {"xfer": 20.0, "plan": 5.0}
+    summary = t.summary(1.0)
+    assert "0.1s" in summary and "xfer" in summary and "plan" in summary
+
+
+def test_zero_length_phases_are_dropped_rather_than_listed():
+    """A run with no signature exchange should not print `exchange 0.0s` — an absent phase and one
+    that cost nothing are different claims."""
+    t = mc.RecvThreadTimer(clock=lambda: 0.0)
+    t.note(10.0, {"xfer": 10.0, "meta": 0.0})
+    t.note_phase("exchange", 0.0)
+
+    assert "meta" not in t.phase_ms and "exchange" not in t.phase_ms
+
+
+def test_the_summary_carries_the_numbers_the_baseline_is_compared_on():
+    t = mc.RecvThreadTimer(clock=lambda: 0.0)
+    for _ in range(512):
+        t.note(9.0)
+    s = t.summary(523.0)
+
+    assert "512 request(s)" in s
+    assert "4.6s" in s, "total busy time"
+    assert "0.9% duty cycle" in s
+    assert "9.0 ms/request" in s
+
+
+def test_the_recv_timer_is_per_instance_not_shared_across_threads():
+    """A class-level accumulator would divide the SUM of every recv thread's busy time by ONE
+    thread's wall clock — a duty cycle over 100% with no way to tell which thread earned it."""
+    import inspect
+
+    src = inspect.getsource(mc)
+    fn = src[src.index("        def _recv_timer(self) -> RecvThreadTimer:"):]
+    fn = fn[:fn.index("        def _one_batch(")]
+
+    assert "self.__dict__" in fn, "stored per instance"
+    assert "_recv_timer_obj" in fn
+    assert "KVCacheRecvingThreadFF._recv_timer" not in fn, "never on the class"
+
+
+def test_the_per_request_transfer_timing_is_restored():
+    """The vendored _transfer_kv_cache logs one INFO per request; the stock connector's 512 of them
+    are what put its recv thread at a 0.9% duty cycle. This override dropped that log, leaving BFF's
+    serial thread unmeasured."""
+    import inspect
+
+    src = inspect.getsource(mc)
+    fn = src[src.index("        def _note_recv_timing(self, req_meta, elapsed_ms, phases)"):]
+    fn = fn[:fn.index("        def _transfer_kv_cache_timed(")]
+
+    assert "took %.2f ms" in fn, "same phrasing as the vendored line, so both parse alike"
+    assert "self._RECV_TIMING" in fn, "per-request line is opt-in; it is a hot serial thread"
+    assert "timer.summary(now)" in fn, "the aggregate is NOT opt-in — it is what decides anything"
+    assert "self._next_timing_report *= 10" in fn, "widening cadence, not one line per request"
+
+
+def test_the_timing_wrapper_records_even_when_the_transfer_raises():
+    """A request that dies mid-transfer still consumed the thread. Dropping its time would make the
+    duty cycle look best exactly when the thread is doing the most useless work."""
+    import inspect
+
+    src = inspect.getsource(mc)
+    fn = src[src.index("        def _transfer_kv_cache(self, req_meta):"):]
+    fn = fn[:fn.index("        def _note_recv_timing(")]
+
+    assert "finally:" in fn, "the accounting is in a finally, not after the call"
+    assert fn.index("finally:") < fn.index("self._note_recv_timing(")

@@ -701,6 +701,49 @@ else:
 PY
 }
 
+# The decode's KV pulls run on ONE serial thread (the vendored recv thread's 32-worker executor is
+# never used), so its DUTY CYCLE — busy ms over wall ms — decides whether it is a bottleneck at all.
+# The stock connector's own per-request log puts it at 0.9% (4.6s across 512 requests in a 523s run,
+# median 7.6ms); BFF's override dropped that log, which is why the ramp was argued from the shape of
+# `Waiting` instead of measured. Parses both connectors' lines so the two are read side by side.
+report_recv_thread() {
+  python3 - "$logs_root" <<'PY' || true
+import glob, os, re, statistics, sys
+
+d = sys.argv[1]
+files = sorted(glob.glob(os.path.join(d, "decode-*.txt")))
+# BFF's aggregate (always on) and the stock/BFF per-request lines (BFF's behind BFF_RECV_TIMING=1).
+SUMMARY = re.compile(r"recv thread: (.+?)\s*$", re.M)
+PERREQ = re.compile(r"took ([\d.]+) ms")
+summaries, per_req = [], []
+for fp in files:
+    try:
+        txt = open(fp, errors="replace").read()
+    except Exception:
+        continue
+    summaries += SUMMARY.findall(txt)
+    per_req += [float(x) for x in PERREQ.findall(txt)]
+
+if summaries:
+    # Last one wins: the cadence widens (1, 10, 100, ...), so the final line covers the whole run.
+    print(f"  recv thread: {summaries[-1]}")
+if per_req:
+    s = sorted(per_req)
+    n = len(s)
+    print(f"    per-request transfer: n={n} total {sum(s)/1000:.1f}s | mean "
+          f"{statistics.mean(s):.1f} ms median {statistics.median(s):.1f} "
+          f"p90 {s[int(.9*n)]:.1f} p99 {s[int(.99*n)]:.1f} max {max(s):.1f}")
+    if summaries:
+        # Only worth saying on a BFF run: on a stock run this line would be comparing the numbers
+        # it was measured from against themselves.
+        print(f"    -> stock at con512 for comparison: 4.6s total, mean 9.0 ms, median 7.6, "
+              f"p99 19.1 — a 0.9% duty cycle.")
+elif not summaries:
+    print("  recv thread: no timing in the decode logs (BFF_RECV_TIMING=1 adds the per-request "
+          "line; the aggregate needs a run with this build).")
+PY
+}
+
 collect_bff_stats() {
   [[ "$BFF_ON" != "1" ]] && return 0
   python3 - "$results_root" <<'PY' || true
@@ -1043,6 +1086,7 @@ main() {
 
   run_benchmark
   report_capacity_bound
+  report_recv_thread
   collect_bff_stats
 
   echo "Benchmark done. Logs: ${logs_root}  Results: ${results_root}"

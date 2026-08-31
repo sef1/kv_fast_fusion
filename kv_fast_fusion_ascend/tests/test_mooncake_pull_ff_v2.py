@@ -1581,8 +1581,25 @@ def test_the_decode_signature_is_taken_behind_a_barrier():
     fn = src[src.index("        def _verify_transfer(self, req_meta) -> None:"):]
     fn = fn[:fn.index("            except Exception as e:")]
 
-    assert fn.index("_sync_device()") < fn.index("mine = self.local_sigs("), \
+    assert fn.index("_sync_device()") < fn.index("self._recompute_local("), \
         "the barrier must precede the read it protects"
+
+
+def test_the_verify_barrier_and_recompute_are_once_per_request():
+    """Both are NPU queue drains on the decode's serial recv thread while the device is generating.
+    Per group they cost 7 barriers and 21 transfers — about 2.6s per verified request, a diagnostic
+    that changes the run it measures. The loop over groups must consume a result computed once."""
+    import inspect
+
+    src = inspect.getsource(v2)
+    fn = src[src.index("        def _verify_transfer(self, req_meta) -> None:"):]
+    fn = fn[:fn.index("            except Exception as e:")]
+
+    body = fn[fn.index("_sync_device()"):]
+    loop = body[body.index("for gi, payload in sorted(sigs.items()):"):]
+    assert "_sync_device()" not in loop, "the barrier must be hoisted out of the per-group loop"
+    assert "self._recompute_local(" not in loop, "and so must the recompute"
+    assert "mine_by_group.get(int(gi))" in loop, "the loop reads the single pass's result"
 
 
 def test_the_barrier_is_verification_only():
@@ -1928,3 +1945,123 @@ def test_corruption_is_counted_per_request_not_per_block():
     assert "stats.verify_requests_bad += 1" in fn
     assert "stats.verify_requests += checked" not in fn
     assert "stats.verify_requests_bad += mismatched" not in fn
+
+
+# =====================================================================================
+# one device pass for the whole exchange
+#
+# Each group's signatures end in three device-to-host transfers, and each transfer is a full NPU
+# queue drain on a producer busy prefilling. The producer measured `signature path warmed on group 0
+# in 400 ms` for ONE group; seven groups x three drains put an exchange at 5.7s, during which the
+# decode's serial recv thread does nothing and every queued KV pull waits behind it. That is the
+# ramp — Running=1 with Waiting=191 while the stock connector held Waiting=0 through its whole fill.
+# =====================================================================================
+def _code_only(text):
+    """Source with comments and docstrings dropped.
+
+    These tests count `.cpu()` calls and forbid `raise`, and this file's prose explains both at
+    length — matching the explanation instead of the code would make a passing test that proves
+    nothing and a failing one that is fixed by editing a comment."""
+    out, in_doc = [], False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if in_doc:
+            if '"""' in stripped:
+                in_doc = False
+            continue
+        if stripped.startswith('"""'):
+            # A one-line docstring opens and closes on the same line.
+            if not (stripped.endswith('"""') and len(stripped) > 3):
+                in_doc = True
+            continue
+        if stripped.startswith("#"):
+            continue
+        out.append(line.split("  # ")[0])
+    return "\n".join(out)
+
+
+def _groups_split_src():
+    import inspect
+
+    src = inspect.getsource(v2)
+    fn = src[src.index("        def signatures_for_groups_split(self, plan: dict):"):]
+    return _code_only(fn[:fn.index("        def signatures_for_group_split(")])
+
+
+def test_nothing_touches_the_host_until_every_group_is_computed():
+    """THE invariant. A single `.cpu()`, `.tolist()` or `.item()` left inside the per-group loop
+    restores the per-group drain and the 5.7s exchange with it, while every other test still
+    passes — the payloads would be identical, only the timing ruined."""
+    fn = _groups_split_src()
+    loop_start = fn.index("for gi, (block_ids, lengths) in sorted((plan or {}).items()):")
+    loop = fn[loop_start:fn.index("            if not sigs:")]
+
+    for host_call in (".cpu()", ".tolist()", ".item()", "SignatureCodec.encode("):
+        assert host_call not in loop, f"{host_call} inside the per-group loop drains the NPU queue"
+
+
+def test_the_three_transfers_happen_once_regardless_of_group_count():
+    """Not once per group. The count is what the whole change is: 21 drains become 3."""
+    fn = _groups_split_src()
+    after = fn[fn.index("            if not sigs:"):]
+
+    assert after.count(".cpu()") == 3, "hashes, vectors, norms — three, for the whole batch"
+    assert after.count("pd_lsh.get_proj(") == 1
+    assert after.count("pd_lsh.sub_hashes_device(") == 1
+    assert "torch.cat(sigs, dim=0)" in after, "the groups are concatenated, not iterated"
+
+
+def test_the_single_group_entry_point_delegates_rather_than_duplicating():
+    """Two encoders would have to be proved byte-identical by test forever. One makes it true by
+    construction — and the decode's _stability and _replay diagnostics still use the single form."""
+    import inspect
+
+    src = inspect.getsource(v2)
+    fn = src[src.index("        def signatures_for_group_split(self, gi: int, block_ids, lengths):"):]
+    fn = _code_only(fn[:fn.index("        def note_sig_failure(")])
+
+    assert "self.signatures_for_groups_split(" in fn
+    assert "signature_matrix(" not in fn, "no second copy of the computation"
+    assert "SignatureCodec.encode(" not in fn, "nor of the encoding"
+    assert "raise exc" in fn, "and it still raises what the caller has always caught"
+
+
+def test_one_group_s_failure_does_not_cost_the_others_their_signatures():
+    """A group whose KV cannot be indexed is a real condition the server already counts. Letting it
+    escape the batch would turn one bad group into a whole exchange read in full."""
+    fn = _groups_split_src()
+
+    assert "failures.append((gi, e))" in fn
+    assert "continue" in fn[fn.index("failures.append((gi, e))"):], "the other groups carry on"
+    assert "raise" not in fn, "per-group faults are returned, never raised out of the pass"
+
+
+def test_the_server_makes_one_cross_group_call_per_exchange():
+    """The loop that called the producer once per group is the 21 drains. It must be gone from the
+    server, not merely made cheaper inside the worker."""
+    import inspect
+
+    src = inspect.getsource(v2)
+    fn = src[src.index("        def _signatures_for(self, per_slot: dict) -> dict:"):]
+    fn = _code_only(fn[:fn.index("    class _SigClient:")])
+
+    assert "signatures_for_groups_split(" in fn
+    assert "signatures_for_group_split(" not in fn, "the per-group entry point is not the hot path"
+    assert fn.count("signatures_for_groups_split(") == 1, "one call, not one per group"
+    # The per-group faults must still be counted the way they always were.
+    assert 'self._note_failure("kv_layout")' in fn and 'self._note_failure("sig_error")' in fn
+
+
+def test_the_exchange_is_charged_to_the_recv_thread_s_duty_cycle():
+    """It blocks the serial recv thread exactly as a transfer does — 79.8s of a 738s run — so
+    leaving it out of the busy total would report a thread that looks idle while every queued pull
+    waits behind it."""
+    import inspect
+
+    src = inspect.getsource(v2)
+    fn = src[src.index("        def run(self):"):]
+    fn = fn[:fn.index("        def _peer_of(self, req_meta):")]
+
+    assert 'self._recv_timer.note_phase(\n                        "exchange"' in fn
+    assert "finally:" in fn, "charged even when the prefetch fails; it consumed the thread either way"
+    assert fn.index("_prefetch_signatures(live)") < fn.index("note_phase(")

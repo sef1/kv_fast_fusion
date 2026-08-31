@@ -235,6 +235,62 @@ def chunk_segments(src, dst, lengths, max_n):
             for i in range(0, n, max_n)]
 
 
+class RecvThreadTimer:
+    """Where the serial recv thread's wall clock goes, per request and in aggregate.
+
+    The recv thread handles one request at a time — the vendored ``run`` pops and transfers
+    synchronously, and its ``ThreadPoolExecutor(max_workers=32)`` is never used — so its **duty
+    cycle** (busy ms over wall ms) is the whole story of whether it is a bottleneck. The stock
+    connector's own per-request log puts that at 0.9% over a 523 s run at con512: 4.6 s of transfer
+    across 512 requests, median 7.6 ms. That is the number BFF has to be read against, and BFF's
+    override of ``_transfer_kv_cache`` dropped the log that produces it.
+
+    Phases are free-form so the two connectors can report different ones (v1 has no signature
+    exchange), and unknown phases simply appear in the summary. ``elapsed_ms`` is passed in rather
+    than measured here so this stays pure and testable off-device.
+
+    Note the phases need not sum to ``elapsed_ms``: they are the parts worth naming, not a partition.
+    The summary reports both, so unattributed time is visible rather than silently redistributed."""
+
+    __slots__ = ("busy_ms", "phase_ms", "requests", "started")
+
+    def __init__(self, clock=None):
+        self.requests = 0
+        self.busy_ms = 0.0
+        self.phase_ms: dict[str, float] = {}
+        self.started = (clock or time.perf_counter)()
+
+    def note(self, elapsed_ms: float, phases=None) -> None:
+        self.requests += 1
+        self.busy_ms += float(elapsed_ms)
+        for name, ms in (phases or {}).items():
+            if ms:
+                self.phase_ms[name] = self.phase_ms.get(name, 0.0) + float(ms)
+
+    def note_phase(self, name: str, elapsed_ms: float) -> None:
+        """Recv-thread time that belongs to no single request — v2's per-BATCH signature exchange.
+
+        Counts toward busy time (it blocks the thread exactly as a transfer does) but not toward
+        the request count, or the ms/request figure would be divided by the wrong denominator."""
+        if elapsed_ms:
+            self.busy_ms += float(elapsed_ms)
+            self.phase_ms[name] = self.phase_ms.get(name, 0.0) + float(elapsed_ms)
+
+    def duty_cycle(self, now: float) -> float:
+        """Busy fraction of wall clock since construction. 0.0 before any time has passed."""
+        wall_ms = (now - self.started) * 1e3
+        return self.busy_ms / wall_ms if wall_ms > 0 else 0.0
+
+    def summary(self, now: float) -> str:
+        """One line: how much of the recv thread's life was spent working, and on what."""
+        parts = " ".join(f"{n} {ms / 1e3:.1f}s" for n, ms in sorted(
+            self.phase_ms.items(), key=lambda kv: -kv[1]))
+        mean = self.busy_ms / self.requests if self.requests else 0.0
+        return (f"{self.requests} request(s), busy {self.busy_ms / 1e3:.1f}s of "
+                f"{(now - self.started):.1f}s wall = {self.duty_cycle(now) * 100:.1f}% duty cycle "
+                f"({mean:.1f} ms/request)" + (f" | {parts}" if parts else ""))
+
+
 def planned_blocks(grouped):
     """``{(group, local block)}`` the transfer intends to write — the set coverage must equal."""
     out: set = set()
@@ -796,41 +852,110 @@ if _ASCEND_AVAILABLE:
         # the producer's KV the second time. The async pair is the only API here that reports
         # completion at all, so it is both the candidate fix and, if it still loses writes, the
         # reproduction to send upstream with a status code attached.
+        #
+        # It hung the FIRST time it ran, taking the whole EngineCore process with it, so it is now
+        # written to fail in seconds instead: see _one_batch.
         _XFER_ASYNC = os.environ.get("BFF_XFER_ASYNC", "0") == "1"
         _XFER_ASYNC_TIMEOUT = float(os.environ.get("BFF_XFER_ASYNC_TIMEOUT", "30"))
+        # The FIRST batch gets a much shorter leash than the rest. Nothing in vllm-ascend calls the
+        # async pair, so its status convention is unverified; if this code has it backwards, every
+        # batch polls to its deadline and a 30 s one stalls the run. Two seconds proves the guess.
+        _XFER_ASYNC_FIRST_TIMEOUT = float(os.environ.get("BFF_XFER_ASYNC_FIRST_TIMEOUT", "2"))
+        # Between polls. Without it the loop is a tight Python loop that holds the GIL and starves
+        # the engine thread even when the convention IS right — which is half of why the run died.
+        _XFER_ASYNC_POLL_S = float(os.environ.get("BFF_XFER_ASYNC_POLL_S", "0.001"))
         _logged_async = False
         _logged_ret = False
+        # Flipped when the async path proves itself unusable; sends every later batch to the sync
+        # call rather than repeating a failure that costs seconds each time.
+        _async_disabled = False
+        # One INFO per request, matching what the vendored _transfer_kv_cache emits and this
+        # override dropped. Off by default because it is a log record on a hot serial thread; the
+        # duty-cycle summary below is always on and is the figure that decides anything.
+        _RECV_TIMING = os.environ.get("BFF_RECV_TIMING", "0") == "1"
+        _next_timing_report = 1
+
+        @property
+        def _recv_timer(self) -> RecvThreadTimer:
+            """Per-INSTANCE, created on first use.
+
+            Not a class attribute: the duty cycle is a fraction of one thread's wall clock, and
+            sharing one accumulator across recv threads would divide the sum of their busy time by a
+            single thread's lifetime — a duty cycle over 100% and no way to tell which thread."""
+            t = self.__dict__.get("_recv_timer_obj")
+            if t is None:
+                t = self.__dict__["_recv_timer_obj"] = RecvThreadTimer()
+            return t
 
         def _one_batch(self, session_id, src, dst, lengths):
             """One batch, through whichever API is selected. Returns the engine's status.
 
-            The async path submits and then polls ``get_batch_transfer_status`` to completion, which
-            is the whole point: the sync call reports 0 and drops writes, so a status that can
-            actually say "not done" is the only way to see the loss from inside the transport."""
-            if not self._XFER_ASYNC:
+            The async path submits and then polls ``get_batch_transfer_status``, which is the whole
+            point: the sync call reports 0 and drops writes, so a status that can actually say "not
+            done" is the only way to see the loss from inside the transport.
+
+            **It is written defensively because its first run killed a benchmark.** Three things are
+            unknown and none of them may cost more than seconds:
+
+            * The status convention. Mooncake's own sync path is submit-then-poll-to-COMPLETED, so 0
+              most likely means "all complete" — the opposite of what this loop assumes. If the guess
+              is wrong every batch polls to its deadline, which is exactly what a 30 s timeout turns
+              into a dead run. Hence the short first-batch leash and the permanent disable.
+            * Whether the poll releases the GIL. If it does not, a tight loop freezes the whole
+              process; the sleep bounds the damage either way.
+            * Batch-id lifetime. ``free_batch_id`` is not exposed in the binding, so ids may leak
+              toward the engine's "Exceed the limitation of capacity" ceiling. Nothing else in
+              vllm-ascend calls this pair, so there is no prior art to copy."""
+            if not self._XFER_ASYNC or KVCacheRecvingThreadFF._async_disabled:
                 return self.engine.batch_transfer_sync_read(session_id, src, dst, lengths)
             handle = self.engine.batch_transfer_async_read(session_id, src, dst, lengths)
             if handle < 0:
                 return handle
-            if not KVCacheRecvingThreadFF._logged_async:
+            first = not KVCacheRecvingThreadFF._logged_async
+            if first:
                 KVCacheRecvingThreadFF._logged_async = True
                 logger.info("MooncakeConnectorFF: BFF_XFER_ASYNC=1 — submitting through "
                             "batch_transfer_async_read, handle %r for %d segment(s).",
                             handle, len(src))
-            deadline = time.perf_counter() + self._XFER_ASYNC_TIMEOUT
+            budget = self._XFER_ASYNC_FIRST_TIMEOUT if first else self._XFER_ASYNC_TIMEOUT
+            t0 = time.perf_counter()
+            deadline = t0 + budget
+            polls = 0
             while True:
                 status = self.engine.get_batch_transfer_status([handle])
+                polls += 1
                 if status != 0:
                     # Non-zero is either completion or failure depending on the engine's
                     # convention, which is undocumented in the binding. Return it and let the
                     # caller's `< 0` check apply — the same contract the sync path has.
+                    if first:
+                        logger.info(
+                            "MooncakeConnectorFF: async status for the first batch was %r after "
+                            "%d poll(s) in %.1f ms — that is the convention this path assumes "
+                            "(non-zero = settled).", status, polls,
+                            (time.perf_counter() - t0) * 1e3)
                     return min(0, status)
                 if time.perf_counter() >= deadline:
-                    logger.error(
-                        "MooncakeConnectorFF: async transfer %r did not report completion within "
-                        "%.1fs for %d segment(s); treating as done and continuing.",
-                        handle, self._XFER_ASYNC_TIMEOUT, len(src))
+                    if first:
+                        # A first batch that never settles means the guess above is wrong, and every
+                        # later batch would burn the same budget. Stop asking.
+                        KVCacheRecvingThreadFF._async_disabled = True
+                        logger.error(
+                            "MooncakeConnectorFF: the first async transfer (%r, %d segment(s)) "
+                            "returned status 0 on all %d poll(s) for %.1fs. Either 0 means "
+                            "COMPLETED here — the opposite of what this path assumes — or the "
+                            "batch never settles. DISABLING BFF_XFER_ASYNC for this process and "
+                            "falling back to batch_transfer_sync_read.",
+                            handle, len(src), polls, budget)
+                    else:
+                        logger.error(
+                            "MooncakeConnectorFF: async transfer %r did not report completion "
+                            "within %.1fs for %d segment(s); treating as done and continuing.",
+                            handle, budget, len(src))
                     return 0
+                # Never a tight loop: this thread holds the GIL between polls, and the engine core
+                # it would starve is the one generating tokens.
+                time.sleep(self._XFER_ASYNC_POLL_S)
 
         def _issue_transfer(self, req_meta, session_id, src_list, dst_list, length_list):
             """Run the batched read, in bounded chunks, and hold the engine to its return value.
@@ -905,6 +1030,39 @@ if _ASCEND_AVAILABLE:
             request's aliases and residency here."""
 
         def _transfer_kv_cache(self, req_meta):
+            t_req = time.perf_counter()
+            phases: dict[str, float] = {}
+            # Cleared here, not left from the last request: this method has early returns (a full
+            # prefix-cache hit, a fully-deduped request) that never reach the emission loop, and a
+            # stale count would attribute the PREVIOUS request's segments to this one.
+            self.last_segment_count = 0
+            try:
+                self._transfer_kv_cache_timed(req_meta, phases)
+            finally:
+                self._note_recv_timing(req_meta, (time.perf_counter() - t_req) * 1e3, phases)
+
+        def _note_recv_timing(self, req_meta, elapsed_ms, phases) -> None:
+            """Per-request timing, then the duty cycle on a widening cadence.
+
+            The vendored ``_transfer_kv_cache`` logs one INFO per request and the stock connector's
+            512 of them are what put its recv thread at a 0.9% duty cycle; this override dropped
+            that log, leaving BFF's serial thread unmeasured. Restored here, plus the aggregate the
+            per-request lines only imply — and the aggregate is the one that decides anything, so it
+            is always on while the per-request line is behind BFF_RECV_TIMING=1."""
+            timer = self._recv_timer
+            timer.note(elapsed_ms, phases)
+            now = time.perf_counter()
+            if self._RECV_TIMING:
+                parts = " ".join(f"{n} {ms:.1f}" for n, ms in phases.items())
+                logger.info(
+                    "MooncakeConnectorFF: KV cache transfer for request %s took %.2f ms "
+                    "(%d segments) [ms: %s]", req_meta.get("remote_request_id"), elapsed_ms,
+                    self.last_segment_count, parts)
+            if timer.requests >= self._next_timing_report:
+                self._next_timing_report *= 10
+                logger.info("MooncakeConnectorFF recv thread: %s", timer.summary(now))
+
+        def _transfer_kv_cache_timed(self, req_meta, phases):
             local_groups = req_meta["local_block_ids"]
             remote_groups = req_meta["remote_block_ids"]
             if not flatten_group_lists(local_groups):
@@ -923,10 +1081,14 @@ if _ASCEND_AVAILABLE:
 
             if (remote_engine_id not in self.kv_caches_base_addr
                     or remote_handshake_port not in self.kv_caches_base_addr[remote_engine_id]):
+                _t = time.perf_counter()
                 self._get_remote_metadata(remote_host, remote_handshake_port)
+                phases["meta"] = (time.perf_counter() - _t) * 1e3
 
+            _t = time.perf_counter()
             grouped = self._align_and_group(
                 req_meta, local_groups, remote_groups, tp_num_need_pulls)
+            phases["plan"] = (time.perf_counter() - _t) * 1e3
 
             prefill_pp_rank = offset // tp_num_need_pulls
             inner_offset = offset % tp_num_need_pulls
@@ -971,6 +1133,7 @@ if _ASCEND_AVAILABLE:
                 logger.info("MooncakeConnectorFF: %d of %d base-address pairs carry distinct work "
                             "(%.1fx transfer amplification avoided).", len(keep), len(local_base),
                             len(local_base) / len(keep) if keep else 1.0)
+            _t = time.perf_counter()
             groups_covered: set = set()
             per_block: dict = {}
             for k in keep:
@@ -1009,7 +1172,8 @@ if _ASCEND_AVAILABLE:
             if self.capture_descriptors:
                 self.last_descriptors = per_block
                 self.last_session_id = session_id
-                self.last_segment_count = len(src_list)
+            self.last_segment_count = len(src_list)
+            phases["descriptors"] = (time.perf_counter() - _t) * 1e3
             self._audit_descriptor_coverage(req_meta, grouped, keep, addr_groups, len(src_list))
 
             wanted = {gi for gi, (_r, local_ids) in enumerate(grouped) if local_ids}
@@ -1025,12 +1189,22 @@ if _ASCEND_AVAILABLE:
                 # satisfied locally — and its aliases are ready NOW, so the landed-hook still has to
                 # fire. Returning without it would strand the request's aliases until they expired
                 # and send every one of its blocks to recompute.
+                _t = time.perf_counter()
                 self._after_transfer(req_meta)
+                phases["after"] = (time.perf_counter() - _t) * 1e3
                 return
-            self._issue_transfer(req_meta, session_id, src_list, dst_list, length_list)
 
+            _t = time.perf_counter()
+            self._issue_transfer(req_meta, session_id, src_list, dst_list, length_list)
+            phases["xfer"] = (time.perf_counter() - _t) * 1e3
+
+            _t = time.perf_counter()
             self._reformat_after_pull(grouped, offset, tp_num_need_pulls)
+            phases["reformat"] = (time.perf_counter() - _t) * 1e3
+
+            _t = time.perf_counter()
             self._after_transfer(req_meta)
+            phases["after"] = (time.perf_counter() - _t) * 1e3
 
         def _reformat_after_pull(self, grouped, offset, tp_num_need_pulls):
             """Stock's post-pull NZ/cat reformat, unchanged except for the block list it is given.

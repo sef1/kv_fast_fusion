@@ -952,33 +952,38 @@ if _ASCEND_AVAILABLE:
             """``{slot: {group: ids}}`` → ``{slot: {group: payload}}``, computing each GROUP once
             for the whole batch.
 
-            This is where batching pays, and the size of the prize is known: ~30% of the producer's
-            per-request cost, no more. ``signatures_for_group`` ends in a device-to-host sync, so
-            answering per request drained the NPU queue once per group PER REQUEST, and gathering
-            every slot's blocks for a group into one call makes that once per batch. Measured
-            222 ms → ~156 ms per request; the remainder is per-request gather/LSH/encode that no
-            amount of batching removes. End to end it is throughput-neutral — see :class:`_SigClient`
-            before spending anything more here.
+            Batching across SLOTS was the first hoist and it was worth ~30% (222 ms → ~156 ms per
+            request). Batching across GROUPS is the second and it is worth far more: each group's
+            signatures end in three device-to-host transfers, and each transfer is an NPU queue
+            drain on a node busy prefilling, so seven groups cost 21 drains and an exchange measured
+            **5.7 s**. One pass over every group in the batch costs 3, regardless of group count.
 
             Slots are kept apart by construction: the ids are concatenated in slot order and the
             resulting rows are sliced back by the same offsets, so row *i* of a slot's payload is
             still that slot's block *i*. A group one slot did not ask about simply contributes no
             rows and is absent from its answer."""
             out: dict[int, dict] = {slot: {} for slot in per_slot}
-            for gi, (slots, flat, lengths) in signature_batch_plan(per_slot).items():
-                try:
-                    payloads = self._worker.signatures_for_group_split(gi, flat, lengths)
-                except KVLayoutError as e:
+            plan = signature_batch_plan(per_slot)
+            try:
+                payloads_by_group, failures = self._worker.signatures_for_groups_split(
+                    {gi: (flat, lengths) for gi, (_slots, flat, lengths) in plan.items()})
+            except Exception as e:  # pragma: no cover - defensive
+                # Only reachable if the pass itself fails rather than one group in it; per-group
+                # faults come back in `failures` so the other groups still answer.
+                self._note_failure("sig_error")
+                logger.warning("BFF pull-v2: signature build failed for the whole batch: %s", e)
+                payloads_by_group, failures = {}, []
+            for gi, e in failures:
+                if isinstance(e, KVLayoutError):
                     # Counted, not swallowed: it means the cache cannot be indexed by connector
                     # block ids, which would make every signature in the run meaningless.
                     self._note_failure("kv_layout")
                     logger.warning("BFF pull-v2: cannot index KV for group %s (%s).", gi, e)
-                    continue
-                except Exception as e:  # pragma: no cover - defensive
+                else:
                     self._note_failure("sig_error")
                     logger.warning("BFF pull-v2: signature build failed for group %s: %s", gi, e)
-                    continue
-                for slot, payload in zip(slots, payloads):
+            for gi, (slots, _flat, _lengths) in plan.items():
+                for slot, payload in zip(slots, payloads_by_group.get(gi, ())):
                     if payload is not None:
                         out[slot][gi] = payload
 
@@ -1154,6 +1159,10 @@ if _ASCEND_AVAILABLE:
         # the producer's own method against its OWN cache, which is what makes the two sides
         # comparable: same code, same fixed-seed projection, same group layout.
         local_sigs = None
+        # The cross-group form of `local_sigs`, for the one caller that recomputes every group of a
+        # request at once. Bound beside it; `local_sigs` stays for the single-group diagnostics
+        # (_stability, _replay), which run only after a mismatch and so are not worth batching.
+        local_sigs_multi = None
         sig_port_offset: int = FF_PULL_V2_PORT_OFFSET
         _logged_first_decline = False
         _logged_first_cap = False
@@ -1238,12 +1247,19 @@ if _ASCEND_AVAILABLE:
                         live.append(req_data)
                 if not live:
                     continue
+                _t = time.perf_counter()
                 try:
                     self._prefetch_signatures(live)
                 except Exception as e:  # pragma: no cover - defensive
                     # Never fatal: with no cached signatures every request is read in full.
                     logger.warning("BFF pull-v2: signature prefetch failed (%s) — this batch is "
                                    "read in full.", e)
+                finally:
+                    # Per BATCH, and it blocks the thread exactly as a transfer does — so it belongs
+                    # in the duty cycle. It is also the only phase here that waits on ANOTHER node,
+                    # which is why it is named separately from the transfer it delays.
+                    self._recv_timer.note_phase(
+                        "exchange", (time.perf_counter() - _t) * 1e3)
                 for req_data in live:
                     try:
                         self._handle_request(req_data)
@@ -1629,6 +1645,21 @@ if _ASCEND_AVAILABLE:
             return (f" It CHANGED across a re-read (cos {cos:.4f}): something else is writing this "
                     f"block, so two requests own it.")
 
+        def _recompute_local(self, plan: dict) -> dict:
+            """``{group: (ids, [len(ids)])}`` → ``{group: payload}``, in one pass over the device.
+
+            Prefers the cross-group entry point. The per-group fallback exists so a worker that
+            binds only ``local_sigs`` still verifies — it is correct, just back to one drain per
+            group, which is what this whole change is removing."""
+            if not plan:
+                return {}
+            multi = self.local_sigs_multi
+            if multi is not None:
+                out, _failures = multi(plan)
+                return {gi: (rows[0] if rows else None) for gi, rows in out.items()}
+            return {gi: self.local_sigs(gi, ids, lengths)[0]
+                    for gi, (ids, lengths) in plan.items()}
+
         def _verify_transfer(self, req_meta) -> None:
             """Is the KV that just landed the KV the producer had? (BFF_V2_VERIFY_TRANSFER)
 
@@ -1671,12 +1702,22 @@ if _ASCEND_AVAILABLE:
                     if payload is not None:
                         sp, np_, _hh = SignatureCodec.decode(payload)
                         p_rows[int(gi)] = (sp.tolist(), np_)
+                # ONE barrier and ONE recompute for the whole request, not one of each per group.
+                # Both are NPU queue drains on this decode's serial recv thread while the device is
+                # generating, so per group they cost 7 barriers + 21 transfers — around 2.6 s per
+                # verified request, which is a diagnostic that changes the run it is measuring.
+                # Hoisted, they cost 1 + 3 regardless of group count.
+                _sync_device()
+                mine_by_group = self._recompute_local(
+                    {int(gi): (plan_groups.get(int(gi)) or [],
+                               [len(plan_groups.get(int(gi)) or [])])
+                     for gi, payload in sigs.items()
+                     if payload is not None and plan_groups.get(int(gi))})
                 for gi, payload in sorted(sigs.items()):
                     local_ids = plan_groups.get(int(gi)) or []
                     if not local_ids or payload is None:
                         continue
-                    _sync_device()
-                    mine = self.local_sigs(int(gi), local_ids, [len(local_ids)])[0]
+                    mine = mine_by_group.get(int(gi))
                     if mine is None:
                         continue
                     sig_d, norms_d, _h2 = SignatureCodec.decode(mine)
@@ -1788,6 +1829,7 @@ if _ASCEND_AVAILABLE:
                     # The producer's own method, pointed at THIS node's cache — that sameness is
                     # what makes the two sides' signatures comparable at all.
                     self.kv_recv_thread.local_sigs = self.signatures_for_group_split
+                    self.kv_recv_thread.local_sigs_multi = self.signatures_for_groups_split
                 logger.info("BFF pull-v2: decode dedup engine armed (V2_DEDUP=%s, sig timeout "
                             "%.1fs).", pd_dedup_v2.V2_ENABLED, SIG_EXCHANGE_TIMEOUT)
                 if VERIFY_TRANSFER > 0:
@@ -1845,47 +1887,93 @@ if _ASCEND_AVAILABLE:
                 self.kv_caches, layer_names, [int(b) for b in block_ids], is_mla,
                 self._jl, num_blocks=self.num_blocks, proj_holder=self._proj)
 
+        def signatures_for_groups_split(self, plan: dict):
+            """``{group: (flat ids, lengths)}`` → ``({group: [payload per length]}, failures)``.
+
+            **The device-to-host transfers are hoisted across GROUPS, not just slots.** That is the
+            whole point of this method, and the measurement behind it: the producer logged
+            ``signature path warmed on group 0 in 400 ms`` — one group — because each group's
+            signatures end in three transfers, and each transfer is a full NPU queue drain on a node
+            busy prefilling. Seven groups x three drains put an exchange at **5.7 s**, during which
+            the decode's serial recv thread does nothing and every queued KV pull waits behind it.
+            That is the ramp: BFF sat at ``Running=1, Waiting=191`` with KV at 89% while the stock
+            connector held ``Waiting=0`` through its entire fill.
+
+            Computing every group before syncing anything makes it three drains for the whole
+            exchange regardless of group count. The three could be packed into one buffer for a
+            further 3x, but that needs dtype punning across int64/fp16/fp32 and is not worth it.
+
+            Slots stay apart exactly as before — the concatenation is (group-major, then slot order)
+            and every row is sliced back by the same offsets it was written at.
+
+            ``failures`` is ``[(group, exception)]`` rather than a raise, because one group whose KV
+            cannot be indexed must not cost the other six their signatures; the caller counts and
+            logs them the way it always has."""
+            groups, sigs, norms_l = [], [], []
+            failures: list[tuple[int, Exception]] = []
+            is_mla = bool(getattr(self.vllm_config.model_config, "use_mla", False))
+            out: dict[int, list] = {}
+            for gi, (block_ids, lengths) in sorted((plan or {}).items()):
+                gi = int(gi)
+                out[gi] = [None] * len(lengths)
+                layer_names = sorted(self._group_layers.get(gi, ()))
+                layers = [self.kv_caches[ln] for ln in layer_names if ln in self.kv_caches]
+                if not layers or not block_ids:
+                    continue
+                try:
+                    sig, norms = signature_matrix(layers, [int(b) for b in block_ids], is_mla,
+                                                  self._jl, num_blocks=self.num_blocks)
+                except Exception as e:  # noqa: BLE001 - reported per group, never fatal to the batch
+                    failures.append((gi, e))
+                    continue
+                if sig is None:
+                    continue
+                groups.append((gi, sig.shape[0], list(lengths)))
+                sigs.append(sig)
+                norms_l.append(norms)
+            if not sigs:
+                return out, failures
+            # Nothing above this line touched the host. Everything below it drains the queue.
+            sig_all = sigs[0] if len(sigs) == 1 else torch.cat(sigs, dim=0)
+            norms_all = norms_l[0] if len(norms_l) == 1 else torch.cat(norms_l, dim=0)
+            proj = pd_lsh.get_proj(self._proj, sig_all.shape[1], sig_all.device)
+            # The three drains, together, once — for every group in the exchange.
+            hashes = pd_lsh.sub_hashes_device(sig_all, proj).cpu().tolist()
+            sig_host = sig_all.to(torch.float16).cpu()
+            norms_host = norms_all.detach().float().cpu()
+            # Sliced on the HOST from here on, so SignatureCodec.encode's own `.cpu()` calls are
+            # no-ops rather than two more drains per slot.
+            base = 0
+            for gi, rows, lengths in groups:
+                per_slot, off = [], base
+                for n in lengths:
+                    if n <= 0:
+                        per_slot.append(None)
+                        continue
+                    per_slot.append(SignatureCodec.encode(
+                        sig_host[off:off + n], norms_host[off:off + n], hashes[off:off + n]))
+                    off += n
+                out[gi] = per_slot
+                base += rows
+            return out, failures
+
         def signatures_for_group_split(self, gi: int, block_ids, lengths):
             """One group's signatures for SEVERAL requests at once, split back by ``lengths``.
 
             Same result as calling :meth:`signatures_for_group` once per request, at a fraction of
             the cost: every device-to-host transfer is hoisted out of the per-request loop.
 
-            There are three of them per call — the SimHash bucket ids, the fp16 vectors, and the
-            norms — and each is a full NPU queue drain on a producer that is busy prefilling. Paid
-            per request per group they came to ~3,600 drains in a 512-request run, which is what
-            made an exchange cost 211 ms and put ~108 s of the run in front of the decode's KV
-            reads. Paid once per group per batch they cost 3.
-
             ``lengths`` are consumed in order and must sum to ``len(block_ids)``; the caller built
             both from the same list, so slot *i*'s rows are ``block_ids[offset:offset+lengths[i]]``.
-            Returns one payload (or None) per length."""
-            n_out = len(lengths)
-            layer_names = sorted(self._group_layers.get(int(gi), ()))
-            layers = [self.kv_caches[ln] for ln in layer_names if ln in self.kv_caches]
-            if not layers or not block_ids:
-                return [None] * n_out
-            is_mla = bool(getattr(self.vllm_config.model_config, "use_mla", False))
-            sig, norms = signature_matrix(layers, [int(b) for b in block_ids], is_mla,
-                                          self._jl, num_blocks=self.num_blocks)
-            if sig is None:
-                return [None] * n_out
-            proj = pd_lsh.get_proj(self._proj, sig.shape[1], sig.device)
-            # The three syncs, together, once.
-            hashes = pd_lsh.sub_hashes_device(sig, proj).cpu().tolist()
-            sig_host = sig.to(torch.float16).cpu()
-            norms_host = norms.detach().float().cpu()
-            # Sliced on the HOST from here on, so SignatureCodec.encode's own `.cpu()` calls are
-            # no-ops rather than a fourth and fifth drain per slot.
-            out, off = [], 0
-            for n in lengths:
-                if n <= 0:
-                    out.append(None)
-                    continue
-                out.append(SignatureCodec.encode(
-                    sig_host[off:off + n], norms_host[off:off + n], hashes[off:off + n]))
-                off += n
-            return out
+            Returns one payload (or None) per length.
+
+            Delegates to :meth:`signatures_for_groups_split` so there is exactly ONE encoding path:
+            the two agreeing byte for byte is then true by construction rather than by test."""
+            out, failures = self.signatures_for_groups_split({int(gi): (block_ids, lengths)})
+            for bad_gi, exc in failures:
+                if bad_gi == int(gi):
+                    raise exc
+            return out.get(int(gi), [None] * len(lengths))
 
         def note_sig_failure(self, reason: str) -> None:
             # On the producer `_dedup_engine` is always None (only the decode decides), so this is a
