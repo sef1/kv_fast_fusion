@@ -917,6 +917,19 @@ if v2:
         if EX / RT < 1.5:
             print("    -> BATCHING DID NOT ENGAGE: the recv queue is never deep enough to drain. "
                   "Nothing downstream of this is worth tuning until it is.")
+    # The trade the async exchange makes, quoted rather than hidden. A request that waited longer
+    # than BFF_PULL_V2_SIG_DEADLINE_MS is read in full so it does not queue behind a 380 ms round
+    # trip. That is the design working; it costs exactly these requests their compression.
+    SKIP = sum(s.get("sig_deadline_skipped") or 0 for s in v2)
+    if SKIP:
+        total = EX + SKIP
+        print(f"    async exchange: {SKIP} of {total} request(s) ({100.0*SKIP/total:.0f}%) passed "
+              f"the deadline and were READ IN FULL — they trade their compression for not "
+              f"queueing (BFF_PULL_V2_SIG_DEADLINE_MS)")
+        if SKIP > EX:
+            print("    -> MORE requests skipped than exchanged: the producer cannot keep up with "
+                  "arrivals at all, so dedup is mostly off. Raise the deadline (more compression, "
+                  "more queueing) or accept that this load has no room for it.")
     if EX == 0:
         print("    -> v2 NEVER ASKED: the mechanism did not engage at all. Check BFF_V2_DEDUP and "
               "the producer's 'signature server (REP) bound on' line in the prefill log.")

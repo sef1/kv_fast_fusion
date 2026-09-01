@@ -1201,7 +1201,10 @@ def test_the_override_mirrors_that_contract():
     import inspect
 
     src = inspect.getsource(v2)
-    run = src[src.index("        def run(self):"):]
+    # Anchored on the docstring, not on "def run(self):" — _SigServer has one too, and it comes
+    # first in the file, so the plain index() was slicing from the ZMQ listener and only passed by
+    # luck. Adding a second _handle_request anywhere between them exposed it.
+    run = src[src.index('            """The vendored loop, taking the queue in DRAINED RUNS'):]
     run = run[:run.index("        def _peer_of(")]
 
     assert "self.ready_event.set()" in run
@@ -1368,9 +1371,22 @@ def test_the_fetch_is_gated_on_verification_but_the_plan_is_not():
     import inspect
 
     src = inspect.getsource(v2)
+    gate = "pd_dedup_v2.V2_ENABLED or self._verify_ready()"
 
-    assert src.count("or not (pd_dedup_v2.V2_ENABLED or self._verify_ready())") == 2, \
-        "both the prefetch and the plan entry gate open for verification"
+    def body(start, end):
+        return src[src.index(start):src.index(end)]
+
+    # Both fetch paths — the synchronous prefetch and the async exchange thread — must open for
+    # verification, or `dedup off` would leave the verifier with nothing from the producer.
+    for fetch, end in (("        def _prefetch_signatures(self, batch)", "        def _take_prefetched("),
+                       ("        def _exchange_for(self, batch)", "        def _run_async(")):
+        assert gate in body(fetch, end), f"{fetch.strip()} must open for verification"
+    # Planning must stay gated on V2_ENABLED alone downstream of that, or `dedup off` would stop
+    # meaning dedup off. Asserted per function rather than by counting occurrences across the
+    # module: a count passes for the wrong reason the moment a third call site appears.
+    plan = body("        def _plan_aligned(self, req_meta, aligned)", "        def _align_and_group(")
+    assert gate in plan, "the entry gate opens for verification"
+    assert "if not pd_dedup_v2.V2_ENABLED:" in plan, "and planning itself is gated on dedup alone"
 
 
 def test_verification_happens_before_release():
@@ -2202,3 +2218,244 @@ def test_a_request_with_several_bad_blocks_counts_once():
     # Outside the per-block loop, or it is a block counter with a different name.
     assert fn.index("for row, block_id in enumerate(ids):") < fn.index("if bad_here:")
     assert fn.index("stats.audit_requests_bad += 1") > fn.index("if bad_here:")
+
+
+# =====================================================================================
+# the ASYNC signature exchange
+#
+# The recv thread did exchange -> plan -> transfer strictly in order: ~132 ms of ZMQ round trip plus
+# ~63 ms of planning per request, capping the transport at ~7.6 req/s against the ~100/s the
+# transfers alone sustain, and producing a ~40 s ramp at Running=1 with Waiting=199. Splitting the
+# thread alone only MOVES that ceiling; the deadline is what removes it.
+# =====================================================================================
+def test_a_request_that_waited_too_long_goes_through_unplanned():
+    """THE property. Under a burst, dedup must cost compression and not liveness — the alternative
+    is queueing behind a round trip, which is the stall being removed."""
+    now = 100.0
+    items = [(now - 5.0, "old"), (now - 0.01, "fresh")]
+
+    fresh, stale, defer = v2.partition_by_age(items, deadline_s=0.2, now=now, max_batch=8)
+
+    assert [i for _t, i in stale] == ["old"]
+    assert [i for _t, i in fresh] == ["fresh"]
+    assert defer == []
+
+
+def test_the_overflow_is_deferred_with_its_ORIGINAL_stamp_not_restamped():
+    """A deferred request must keep ageing toward the deadline. Re-stamping it would reset the clock
+    every round trip, so a request behind a queue that keeps refilling would wait forever — the
+    exact failure the deadline exists to prevent."""
+    now = 100.0
+    # Stamped in the PAST, so "carried" and "re-stamped to now" are different values. Stamping them
+    # at `now` makes the assertion below true either way, which is how this first passed against a
+    # mutation that re-stamped every deferred item.
+    arrived = now - 0.15
+    items = [(arrived, f"r{i}") for i in range(5)]
+
+    fresh, stale, defer = v2.partition_by_age(items, deadline_s=0.2, now=now, max_batch=2)
+
+    assert [i for _t, i in fresh] == ["r0", "r1"], "oldest first, so nothing starves"
+    assert [i for _t, i in defer] == ["r2", "r3", "r4"]
+    assert all(t == arrived for t, _i in defer), "stamps carried, not refreshed"
+    assert stale == []
+    # 100 ms later they are 250 ms old, past the deadline, and must pass through. Re-stamped they
+    # would read as 100 ms old and be exchanged again — and again on every later round trip, so a
+    # request behind a queue that keeps refilling would never age out at all.
+    later = now + 0.1
+    fresh2, stale2, _d = v2.partition_by_age(defer, deadline_s=0.2, now=later, max_batch=2)
+    assert fresh2 == [], "nothing is fresh once it is past the deadline"
+    assert [i for _t, i in stale2] == ["r2", "r3", "r4"]
+
+
+def test_every_submitted_request_reaches_the_transfer_thread():
+    """A request left in the pipeline is a request whose blocks are never read and whose producer is
+    never signalled. Answered, unanswered or exploded, it must come out."""
+    import queue as _q
+
+    inbox = _q.Queue()
+    seen = []
+
+    def exchange(batch):
+        seen.extend(batch)
+        for r in batch:
+            r["answer"] = "yes"
+
+    p = v2.SignaturePipeline(inbox, exchange, deadline_s=5.0, max_batch=8)
+    p.start()
+    sent = [{"id": i} for i in range(20)]
+    for r in sent:
+        inbox.put(r)
+
+    got = [p.ready.get(timeout=5) for _ in range(20)]
+    assert {r["id"] for r in got} == set(range(20))
+    assert all(r.get("answer") == "yes" for r in got), "and each carries its own answer"
+
+
+def test_a_producer_that_raises_costs_compression_not_liveness():
+    """The recv thread it feeds must keep transferring. A pipeline that drops a batch on an
+    exception stops the decode."""
+    import queue as _q
+
+    inbox = _q.Queue()
+    errors = []
+
+    def exchange(batch):
+        raise RuntimeError("producer is down")
+
+    p = v2.SignaturePipeline(inbox, exchange, deadline_s=5.0, max_batch=8,
+                             on_error=errors.append)
+    p.start()
+    for i in range(5):
+        inbox.put({"id": i})
+
+    got = [p.ready.get(timeout=5) for _ in range(5)]
+    assert {r["id"] for r in got} == set(range(5)), "all five still transfer"
+    assert all(v2.SIG_SLOT not in r for r in got), "none of them claims an answer"
+    assert errors, "and the failure is reported rather than swallowed"
+
+
+def test_a_none_request_never_reaches_the_transfer_thread():
+    """The vendored loop logs and acknowledges these. Forwarding one would hand _handle_request a
+    None and lose the acknowledgement."""
+    import queue as _q
+
+    inbox = _q.Queue()
+    p = v2.SignaturePipeline(inbox, lambda b: None, deadline_s=5.0, max_batch=8)
+    p.start()
+    inbox.put(None)
+    inbox.put({"id": 1})
+
+    got = p.ready.get(timeout=5)
+    assert got == {"id": 1}
+    assert p.ready.empty()
+
+
+def test_the_pipeline_blocks_when_idle_and_spins_when_backlogged():
+    """It must not busy-wait with an empty inbox — that is a core burned against the decode loop —
+    and it must not wait for a new arrival to serve a backlog it is already carrying."""
+    import inspect
+
+    fn = inspect.getsource(v2.SignaturePipeline.run)
+
+    assert "blocking=not deferred" in fn, "blocks only when nothing is carried over"
+    nxt = inspect.getsource(v2.SignaturePipeline._next_raw)
+    assert "self.inbox.get()" in nxt and "get_nowait" in nxt
+
+
+def test_the_stale_requests_are_forwarded_before_the_round_trip_not_after():
+    """They are late already. Making them wait for an exchange they are not part of re-creates the
+    stall in a new place."""
+    import inspect
+
+    fn = inspect.getsource(v2.SignaturePipeline.run)
+
+    assert fn.index("for _stamp, item in stale:") < fn.index("self._exchange(")
+
+    # Indentation, not position: nesting the loop under `if not fresh:` still puts it before the
+    # exchange textually, while forwarding stale items ONLY when there is nothing to exchange —
+    # which silently drops them whenever a batch has both. Position alone passed that mutation.
+    def indent(needle):
+        line = next(ln for ln in fn.splitlines() if needle in ln)
+        return len(line) - len(line.lstrip())
+
+    assert indent("for _stamp, item in stale:") == indent("if not fresh:"), \
+        "stale items are forwarded unconditionally, not under a branch"
+
+
+def test_a_stale_request_still_reaches_the_transfer_thread():
+    """Exercises the deferral path end to end, which the bulk-delivery test above does not: with a
+    batch cap of one, everything after the first request is deferred and then ages out."""
+    import queue as _q
+
+    inbox = _q.Queue()
+    ticks = {"t": 0.0}
+
+    def exchange(batch):
+        # The clock moves while the round trip is in flight, which is what ages the deferred items.
+        ticks["t"] += 1.0
+
+    p = v2.SignaturePipeline(inbox, exchange, deadline_s=0.5, max_batch=1,
+                             clock=lambda: ticks["t"])
+    p.start()
+    for i in range(4):
+        inbox.put({"id": i})
+
+    got = [p.ready.get(timeout=5) for _ in range(4)]
+    assert {r["id"] for r in got} == set(range(4)), "deferred and stale requests still transfer"
+    assert p.passed_through >= 1, "and some of them genuinely took the stale path"
+
+
+def test_the_exchange_thread_never_touches_the_dedup_engine():
+    """plan, forget and release all run on the transfer thread and the engine has no locking.
+    Keeping the exchange side read-only is what lets the two threads coexist without one — including
+    its counters, which is why _take_prefetched does the counting."""
+    import inspect
+
+    src = inspect.getsource(v2)
+    fn = src[src.index("        def _exchange_for(self, batch) -> None:"):]
+    fn = _code_only(fn[:fn.index("        def _run_async(")])
+
+    assert "dedup_engine" not in fn, "not even stats"
+    assert "self.sig_client" in fn and "batch[i][SIG_SLOT]" in fn
+
+
+def test_the_answer_rides_on_the_request_not_in_a_shared_cache():
+    """With the exchange a batch ahead of the transfer, a cache keyed by request id is how one
+    request is handed another's signatures. On the request, that is structurally impossible."""
+    import inspect
+
+    src = inspect.getsource(v2)
+    fn = src[src.index("        def _take_prefetched(self, req_meta, ask) -> dict:"):]
+    fn = _code_only(fn[:fn.index("        def _plan_aligned(")])
+
+    assert "req_meta.pop(SIG_SLOT, None)" in fn, "popped from the request itself"
+    assert "claim_prefetched({rid: slot}, rid, ask)" in fn, \
+        "and still shape-checked — a one-entry cache reuses the guard verbatim"
+
+
+def test_a_deadline_skip_is_counted_apart_from_a_failed_exchange():
+    """One is the design working, the other is a producer that could not answer. Reading them
+    together would hide both — and would make `exchanges == 0` report 'v2 never asked' for a run
+    where the deadline simply fired on everything."""
+    import inspect
+
+    src = inspect.getsource(v2)
+    fn = src[src.index("        def _take_prefetched(self, req_meta, ask) -> dict:"):]
+    fn = _code_only(fn[:fn.index("        def _plan_aligned(")])
+
+    assert "stats.sig_deadline_skipped += 1" in fn
+    assert "stats.sig_phase_failed += 1" in fn
+    skip = fn[fn.index("if slot is None:"):]
+    assert "sig_phase_failed" not in skip[:skip.index("return {}")], \
+        "a deadline skip is not an exchange failure"
+    assert "stats.exchanges += 1" in fn
+    assert fn.index("stats.sig_deadline_skipped") < fn.index("stats.exchanges += 1"), \
+        "and a skip returns before it can be counted as an exchange"
+
+
+def test_async_is_off_by_default_and_raises_the_batch_cap_when_on():
+    """Off the critical path a bigger batch has no latency cost and a real throughput one: 199
+    queued requests at 8 per round trip is 25 trips, at 64 it is 4."""
+    import inspect
+
+    src = inspect.getsource(v2)
+
+    assert v2.ASYNC_SIG is False, "opt-in"
+    assert 'os.environ.get("BFF_PULL_V2_ASYNC_SIG", "0") == "1"' in src
+    assert '"64" if ASYNC_SIG else "8"' in src
+    assert v2.MAX_SIG_BATCH == 8, "and the synchronous default is unchanged"
+
+
+def test_the_synchronous_path_is_untouched_when_async_is_off():
+    """This is control-plane code we do not own. The vendored shape has to stay recognisable, and a
+    knob that rewrites it when off would make every earlier run incomparable."""
+    import inspect
+
+    src = inspect.getsource(v2)
+    run = src[src.index('            """The vendored loop, taking the queue in DRAINED RUNS'):]
+    run = run[:run.index("        def _peer_of(")]
+
+    assert "if ASYNC_SIG:" in run and "self._run_async()" in run
+    assert run.index("if ASYNC_SIG:") < run.index("self.request_queue.get()"), \
+        "the branch is taken before the vendored loop, not woven into it"
+    assert "self._prefetch_signatures(" in run, "the synchronous prefetch survives"

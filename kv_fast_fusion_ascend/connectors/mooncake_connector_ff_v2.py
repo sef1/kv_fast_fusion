@@ -155,7 +155,25 @@ MSG_SIG_REPLY_BATCH = b"bff_pull_v2_sig_rep_batch"
 # batch measured up to ~5 s of that. 8 keeps most of the saving at a quarter of the stall. The cap
 # also bounds one exchange's device work on the producer and keeps its batch-scaled timeout
 # meaningful.
-MAX_SIG_BATCH = int(os.environ.get("BFF_PULL_V2_SIG_BATCH", "8"))
+# Run the signature exchange on its own thread instead of in front of the transfer.
+#
+# Measured cost of NOT doing this, per request on the serial recv thread: 132 ms of ZMQ round trip
+# plus 63 ms of planning, which caps the transport at ~7.6 req/s against the ~100/s the transfers
+# alone sustain — and produces a ~40 s ramp at `Running=1, Waiting=199`. dedup=1 is the correct
+# configuration (F1 0.4707/0.4798 against the baseline's 0.4803) and this is what it costs.
+ASYNC_SIG = os.environ.get("BFF_PULL_V2_ASYNC_SIG", "0") == "1"
+# How long a request may wait for its signatures before it is read in full. This, not the threading,
+# is what removes the ceiling: under a burst dedup degrades to a plain read instead of queueing.
+SIG_DEADLINE_MS = float(os.environ.get("BFF_PULL_V2_SIG_DEADLINE_MS", "200"))
+# Off the critical path a bigger batch has no latency cost and a real throughput one: 199 queued
+# requests at 8 per round trip is 25 trips (~9.5 s), at 64 it is 4 (~1.5 s). It also amortises the
+# producer's single NPU drain per exchange, which is what its 380 ms actually is.
+MAX_SIG_BATCH = int(os.environ.get("BFF_PULL_V2_SIG_BATCH", "64" if ASYNC_SIG else "8"))
+# Where an async exchange leaves this request's own answer. On the request, not in a cache shared by
+# everything in flight: with the exchange a batch ahead of the transfer, a shared cache is how one
+# request is handed another's signatures — the same mis-attribution the producer/decode block-id
+# spaces already cost this connector once.
+SIG_SLOT = "_bff_pull_v2_sig"
 # Milliseconds to wait for a SECOND request when the queue drains empty. Zero, and measurement says
 # keep it there: batching is throughput-neutral (see _SigClient), so paying latency to manufacture a
 # batch buys nothing, and the request kept waiting is holding allocated KV blocks — the scarce
@@ -628,6 +646,119 @@ def claim_prefetched(cache, rid, ask):
     if shape != want:
         return {}, (shape, want)
     return sigs, None
+
+
+def partition_by_age(items, deadline_s, now, max_batch):
+    """Split ``[(stamp, item)]`` into ``(fresh, stale, defer)`` for one round trip.
+
+    * **stale** — waited longer than ``deadline_s``. These go straight through WITHOUT an exchange,
+      and that is the whole point of the design rather than a degradation of it: under a burst the
+      alternative is to queue, and queueing behind a 380 ms round trip is what produced 40 s of the
+      decode running ONE request while two hundred waited.
+    * **fresh** — up to ``max_batch``, exchanged together.
+    * **defer** — the rest, carried to the next round trip *with their original stamps*, so they age
+      toward the deadline instead of waiting forever behind a queue that keeps refilling.
+
+    Arrival order is preserved, so the oldest are served first and nothing starves. Stamps are
+    caller-supplied so this stays pure and testable with no clock."""
+    fresh, stale, defer = [], [], []
+    for stamp, item in items:
+        if now - stamp >= deadline_s:
+            stale.append((stamp, item))
+        elif len(fresh) < max(1, int(max_batch)):
+            fresh.append((stamp, item))
+        else:
+            defer.append((stamp, item))
+    return fresh, stale, defer
+
+
+class SignaturePipeline(threading.Thread):
+    """Runs the signature exchange on its OWN thread, so a transfer never waits for the producer.
+
+    The problem it solves. The recv thread did exchange, then plan, then transfer, strictly in
+    order: ~132 ms of ZMQ round trip plus ~63 ms of planning per request, which caps the whole
+    transport at about **7.6 requests a second** against the ~100/s the transfers alone sustain. It
+    is also the ramp — ``Running=1`` with ``Waiting`` climbing to 199 for four straight samples while
+    the stock connector held ``Waiting=0`` through its entire KV fill.
+
+    Splitting the thread alone would only move that ceiling. **The deadline is what removes it**: a
+    request that has waited too long is forwarded unplanned and read in full, so a burst costs
+    compression instead of liveness. See :func:`partition_by_age`.
+
+    Transport-free by construction — ``exchange`` is injected and the queues hold whatever the caller
+    puts in them — so the part that can stall a recv worker is testable with threads and no NPU.
+
+    ``exchange`` is allowed to raise: a failure is contained here and the batch is forwarded
+    unplanned, because the alternative is a recv thread that stops feeding the decode."""
+
+    def __init__(self, inbox, exchange, deadline_s, max_batch, clock=None, on_error=None):
+        super().__init__(daemon=True, name="BFFSignaturePipeline")
+        self.inbox = inbox
+        self.ready: queue.Queue = queue.Queue()
+        self._exchange = exchange
+        self._deadline_s = float(deadline_s)
+        self._max_batch = max(1, int(max_batch))
+        self._clock = clock or time.monotonic
+        self._on_error = on_error
+        self.exchanged = 0
+        self.passed_through = 0
+        self.batches = 0
+
+    def _next_raw(self, blocking: bool):
+        """Whatever is on the inbox now; block for the first item only when there is no backlog."""
+        if blocking:
+            first = self.inbox.get()
+            return drain_queue(self.inbox.get_nowait, first)
+        out = []
+        try:
+            while True:
+                out.append(self.inbox.get_nowait())
+        except queue.Empty:
+            pass
+        return out
+
+    def run(self):
+        deferred: list = []
+        while True:
+            try:
+                # Blocking only when nothing is carried over. With a backlog this spins through
+                # round trips as fast as the producer answers, which is the whole throughput story.
+                raw = self._next_raw(blocking=not deferred)
+                now = self._clock()
+                batch = deferred + [(now, item) for item in raw if item is not None]
+                for item in raw:
+                    if item is None:
+                        # The vendored loop logs and acknowledges these; keep that here so the
+                        # transfer thread never sees one.
+                        logger.warning("Received a None request!")
+                        self.inbox.task_done()
+                fresh, stale, deferred = partition_by_age(
+                    batch, self._deadline_s, now, self._max_batch)
+                # Stale FIRST, and before the round trip: they are late already, and making them
+                # wait for an exchange they are not part of is the exact stall being removed.
+                for _stamp, item in stale:
+                    self.passed_through += 1
+                    self.ready.put(item)
+                if not fresh:
+                    continue
+                self.batches += 1
+                try:
+                    self._exchange([item for _stamp, item in fresh])
+                    self.exchanged += len(fresh)
+                except Exception as e:  # noqa: BLE001 - see the class docstring
+                    if self._on_error is not None:
+                        self._on_error(e)
+                finally:
+                    # ALWAYS forwarded, answered or not. A request left here is a request whose
+                    # blocks are never read and whose producer is never signalled.
+                    for _stamp, item in fresh:
+                        self.ready.put(item)
+            # Deliberately blind: this thread dying strands every queued request — their KV is
+            # never read and their producer is never signalled, so the decode waits on them
+            # forever. No exception is narrow enough to be worth that.
+            except Exception as e:  # noqa: BLE001
+                if self._on_error is not None:
+                    self._on_error(e)
 
 
 class PendingAsk:
@@ -1225,6 +1356,60 @@ if _ASCEND_AVAILABLE:
             """Gates the FETCH, which runs a batch ahead of the claim in _plan_aligned."""
             return VERIFY_TRANSFER > 0 and KVCacheRecvingThreadFFv2._verify_sampler.ready()
 
+        @property
+        def _sig_pipeline(self):
+            """Thread A, started on first use. Per instance — it owns this thread's request queue."""
+            p = self.__dict__.get("_sig_pipeline_obj")
+            if p is None:
+                p = self.__dict__["_sig_pipeline_obj"] = SignaturePipeline(
+                    self.request_queue, self._exchange_for,
+                    SIG_DEADLINE_MS / 1000.0, MAX_SIG_BATCH,
+                    on_error=lambda e: logger.warning(
+                        "BFF pull-v2: signature pipeline error (%s) — those requests are read in "
+                        "full.", e))
+                p.start()
+                logger.info(
+                    "BFF pull-v2: ASYNC signature exchange on (deadline %.0f ms, batch cap %d). "
+                    "A request that waits longer than the deadline is read in full rather than "
+                    "queueing behind a round trip.", SIG_DEADLINE_MS, MAX_SIG_BATCH)
+            return p
+
+        def _exchange_for(self, batch) -> None:
+            """Thread A: ask each producer once for the batch and leave each answer ON its request.
+
+            Deliberately touches NO dedup-engine state, not even its counters. ``plan``, ``forget``
+            and ``release`` all run on the transfer thread and the engine has no locking, so keeping
+            this side read-only is what lets the two threads coexist without one. The counting moves
+            to :meth:`_take_prefetched`, which runs where the engine already does."""
+            if self.sig_client is None or not (pd_dedup_v2.V2_ENABLED or self._verify_ready()):
+                return
+            asks = [self._ask_for(req_meta) for req_meta in batch]
+            keys = [self._peer_of(req_meta) if ask else None
+                    for req_meta, ask in zip(batch, asks)]
+            for (host, port), positions in group_by_peer(keys).items():
+                answers = self.sig_client.ask_many(host, port, [asks[i] for i in positions])
+                for i, sigs in zip(positions, answers):
+                    batch[i][SIG_SLOT] = (ask_shape(asks[i]), sigs)
+
+        def _run_async(self):
+            """Thread B: transfer whatever the pipeline has made ready, and never wait on a peer.
+
+            The vendored body is preserved where it matters — one ``try`` per request, so a single
+            failure costs one request — but the queue it reads is the pipeline's, not the raw
+            request queue. ``task_done`` still pairs one-for-one with the ``get`` the pipeline made,
+            because ``_handle_request`` calls it in its own ``finally``."""
+            ready = self._sig_pipeline.ready
+            while True:
+                try:
+                    req_data = ready.get()
+                except Exception as e:  # noqa: BLE001 - the transfer thread must outlive any fault
+                    logger.error(f"Error in KVCacheTransferThread: {e}")
+                    continue
+                try:
+                    self._handle_request(req_data)
+                except Exception as e:  # noqa: BLE001 - vendored shape: one failure, one request
+                    logger.error(f"Error in KVCacheTransferThread: {e}")
+
         def run(self):
             """The vendored loop, taking the queue in DRAINED RUNS so the exchange can batch.
 
@@ -1250,6 +1435,12 @@ if _ASCEND_AVAILABLE:
             # that charges the first signature exchange, which is how it once read 858.6%.
             self._recv_timer                            # noqa: B018 - primes `started`
             self.ready_event.set()
+            if ASYNC_SIG:
+                # The exchange moves to its own thread and this one only transfers. Kept as a
+                # separate body rather than branching inside the loop: this is control-plane code we
+                # do not own, and the synchronous path has to stay recognisably the vendored shape.
+                self._run_async()
+                return
             while True:
                 try:
                     first = self.request_queue.get()
@@ -1349,8 +1540,31 @@ if _ASCEND_AVAILABLE:
 
         def _take_prefetched(self, req_meta, ask) -> dict:
             """Claim this request's prefetched signatures, or ``{}`` to read it in full."""
-            sigs, mismatch = claim_prefetched(
-                self._sig_cache, req_meta.get("remote_request_id"), ask)
+            rid = req_meta.get("remote_request_id")
+            if ASYNC_SIG:
+                # Async: the answer rode in on the request, so the "cache" can only ever hold this
+                # one. Counted HERE rather than on the exchange thread — see _exchange_for for why
+                # that side stays clear of the engine, stats included.
+                slot = req_meta.pop(SIG_SLOT, None)
+                stats = self.dedup_engine.stats
+                if slot is None:
+                    # No exchange happened: the request passed the deadline and is read in full.
+                    # Counted apart from a FAILED exchange — one is the design working, the other is
+                    # a producer that could not answer, and reading them together would hide both.
+                    stats.sig_deadline_skipped += 1
+                    return {}
+                stats.exchanges += 1
+                sigs, mismatch = claim_prefetched({rid: slot}, rid, ask)
+                if not sigs and mismatch is None:
+                    stats.sig_phase_failed += 1
+                if mismatch is not None:
+                    stats.sig_phase_failed += 1
+                    logger.warning(
+                        "BFF pull-v2: prefetched signatures do not match the planned request (%s "
+                        "vs %s) — reading it in full rather than pairing rows against the wrong "
+                        "blocks.", *mismatch)
+                return sigs
+            sigs, mismatch = claim_prefetched(self._sig_cache, rid, ask)
             if mismatch is not None:
                 self.dedup_engine.stats.sig_phase_failed += 1
                 logger.warning(

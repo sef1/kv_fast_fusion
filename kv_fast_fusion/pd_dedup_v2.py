@@ -382,6 +382,11 @@ class DedupStats:
         # failures here" and "no blocks here" are different claims.
         self.audit_buckets: dict = {}
         self.audit_ms_self = 0.0
+        # Requests that went through with NO exchange because they had waited longer than
+        # BFF_PULL_V2_SIG_DEADLINE_MS. That is the async design working as intended, not a failure —
+        # it trades this request's compression for not queueing every other request behind a 380 ms
+        # round trip. Counted apart from sig_phase_failed, which is a producer that could not answer.
+        self.sig_deadline_skipped = 0
         self.skip_reasons = dict.fromkeys(SKIP_REASONS, 0)
         # Producer-side only: blocks the decode told it to skip. An independent cross-check that
         # the two sides agree — it should track the decode's blocks_not_requested, and a divergence
@@ -550,6 +555,7 @@ class DedupStats:
             "audit_worst_cos": round(self.audit_worst_cos, 5) if self.audit_blocks else None,
             "audit_buckets": dict(self.audit_buckets) or None,
             "audit_ms_self_total": round(self.audit_ms_self, 1) if self.audit_requests else None,
+            "sig_deadline_skipped": self.sig_deadline_skipped or None,
             "exchange_skip_reasons": dict(self.skip_reasons),
             "blocks_withheld": self.blocks_withheld,
             "inert": self.is_inert(),
