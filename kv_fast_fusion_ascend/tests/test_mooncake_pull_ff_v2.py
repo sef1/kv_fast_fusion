@@ -1610,10 +1610,28 @@ def test_the_barrier_is_verification_only():
     src = inspect.getsource(v2)
 
     calls = src.count("_sync_device()") - src.count("def _sync_device()")
-    assert calls == 3, f"one before each device read the diagnostic makes (found {calls})"
+    assert calls == 5, f"one before each device read a diagnostic makes (found {calls})"
     transfer = src[src.index("        def _after_transfer(self, req_meta) -> None:"):]
-    transfer = transfer[:transfer.index("        def _diagnose_mismatch(")]
+    transfer = transfer[:transfer.index("        def _audit_self_consistency(")]
     assert "_sync_device()" not in transfer, "not on the request's own path"
+
+
+def test_every_barrier_sits_behind_a_diagnostic_that_is_off_by_default():
+    """A device-wide synchronize on the transfer path would serialise every request's KV read behind
+    the whole device. The two entry points reached from _after_transfer must each refuse before they
+    sync, not after."""
+    import inspect
+
+    src = inspect.getsource(v2)
+    for name, gate in (("_verify_transfer(self, req_meta) -> None:", "entry is None"),
+                       ("_audit_self_consistency(self, req_meta) -> None:", "XFER_AUDIT <= 0")):
+        fn = src[src.index(f"        def {name}"):]
+        fn = fn[fn.index('"""', fn.index('"""') + 3):]      # past the docstring
+        assert gate in fn, f"{name} must have its off-switch"
+        assert fn.index(gate) < fn.index("_sync_device()"), \
+            f"{name} syncs before it checks whether it should run at all"
+    assert v2.XFER_AUDIT == 0, "the audit is opt-in"
+    assert v2.VERIFY_TRANSFER == 0, "so is the verification"
 
 
 def test_the_producer_is_re_asked_only_when_a_check_fails():
@@ -2065,3 +2083,122 @@ def test_the_exchange_is_charged_to_the_recv_thread_s_duty_cycle():
     assert 'self._recv_timer.note_phase(\n                        "exchange"' in fn
     assert "finally:" in fn, "charged even when the prefetch fails; it consumed the thread either way"
     assert fn.index("_prefetch_signatures(live)") < fn.index("note_phase(")
+
+
+# =====================================================================================
+# the self-consistency audit
+#
+# Transfer, snapshot this decode's own signatures, re-issue the same descriptors, snapshot again. A
+# block that CHANGED was written wrong the first time. It contacts no producer, which is the only
+# reason it can run at volume: the signature-based verification blocks the serial recv thread for
+# 2-5s per request asking P, so it audited ~11 requests a run and found 2-6 events — enough to prove
+# the loss is real, nothing at all about its shape.
+# =====================================================================================
+def _audit_src():
+    import inspect
+
+    src = inspect.getsource(v2)
+    fn = src[src.index("        def _audit_self_consistency(self, req_meta) -> None:"):]
+    return _code_only(fn[:fn.index("        def _score_audit(")])
+
+
+def test_the_audit_never_contacts_the_producer():
+    """THE property that makes it affordable. One sig_client call and it is back to 2-5s a request,
+    which is how the previous detector ended up distorting the run it measured — verification on
+    gave Running=1 with Waiting=191, verification off gave the baseline's ramp exactly."""
+    fn = _audit_src()
+
+    for reaching_out in ("sig_client", "ask_many", "_peer_of", "_ask_for", "local_sigs("):
+        assert reaching_out not in fn, f"the audit must not use {reaching_out}"
+    assert "self._recompute_local(" in fn, "it recomputes locally, on this device only"
+
+
+def test_the_audit_reissues_the_identical_descriptors():
+    """Re-issuing anything else measures a different transfer and proves nothing. The descriptors
+    are the ones the real transfer emitted, captured per block."""
+    fn = _audit_src()
+
+    assert "self.last_descriptors" in fn
+    assert "self.last_session_id" in fn, "same peer, or it is not the same read"
+    assert "batch_transfer_sync_read(" in fn
+
+
+def test_the_audit_is_off_by_default_and_thinned_by_a_stride():
+    """It re-transfers a whole request and drains the device four times. On every request that is a
+    diagnostic heavy enough to become the thing being measured."""
+    fn = _audit_src()
+
+    assert v2.XFER_AUDIT == 0, "opt-in"
+    assert "if XFER_AUDIT <= 0" in fn
+    assert "_audit_seen % XFER_AUDIT" in fn, "every Nth request, not every request"
+    # The gate must come before the work, not after.
+    assert fn.index("XFER_AUDIT <= 0") < fn.index("_sync_device()")
+
+
+def test_the_audit_snapshots_before_the_reissue_and_after_it():
+    """Both snapshots, in that order, or it is comparing a block against itself."""
+    fn = _audit_src()
+
+    first = fn.index("first = self._recompute_local(plan)")
+    reissue = fn.index("batch_transfer_sync_read(")
+    second = fn.index("second = self._recompute_local(plan)")
+    assert first < reissue < second, "snapshot, re-issue, snapshot"
+    assert fn.count("_sync_device()") == 2, "one barrier before each snapshot"
+
+
+def test_the_audit_runs_before_release_like_the_verification_does():
+    """Once released, blocks may be aliased onto by later requests and a difference would be
+    ambiguous between a lost write and a legitimate alias."""
+    import inspect
+
+    src = inspect.getsource(v2)
+    fn = src[src.index("        def _after_transfer(self, req_meta) -> None:"):]
+    fn = fn[:fn.index("        def _audit_self_consistency(")]
+
+    assert fn.index("self._audit_self_consistency(") < fn.index(".release(")
+
+
+def test_the_audit_counts_every_block_it_checks_not_only_the_bad_ones():
+    """The denominator is the whole point. The previous detector recorded 4 failures and no
+    denominator, so "losses favour high offsets" could not be told from "most blocks are at high
+    offsets"."""
+    import inspect
+
+    src = inspect.getsource(v2)
+    fn = src[src.index("        def _score_audit(self, by_group, first, second, stats)"):]
+    fn = _code_only(fn[:fn.index("        def _audit_buckets(")])
+
+    assert "stats.audit_blocks += 1" in fn
+    loop = fn[fn.index("for row, block_id in enumerate(ids):"):]
+    assert "buckets.add(self._bucket_for(gi, block_id), changed)" in loop, \
+        "`changed` is passed as DATA, not used as a guard"
+
+    # Indentation is the actual invariant, and the only one a `if changed:` wrapper cannot satisfy.
+    # Comparing positions instead lets a second `if changed:` block slip through: the bucket call
+    # would still come after the first branch and still not be inside it.
+    def indent(needle):
+        line = next(ln for ln in loop.splitlines() if needle in ln)
+        return len(line) - len(line.lstrip())
+
+    assert indent("buckets.add(") == indent("stats.audit_blocks += 1"), (
+        "the bucket call must sit in the LOOP body beside the block counter, not nested under a "
+        "conditional — a bucket that only counts failures has no denominator, which is exactly "
+        "what made 4 events uninterpretable")
+    assert indent("bad_here += 1") > indent("stats.audit_blocks += 1"), \
+        "and the bad counter IS nested, so the two are genuinely at different depths here"
+
+
+def test_a_request_with_several_bad_blocks_counts_once():
+    """Same lesson the per-request verify counter had to learn: a request with three bad blocks is
+    one damaged answer, and counting blocks understated the impact by two orders of magnitude."""
+    import inspect
+
+    src = inspect.getsource(v2)
+    fn = src[src.index("        def _score_audit(self, by_group, first, second, stats)"):]
+    fn = _code_only(fn[:fn.index("        def _audit_buckets(")])
+
+    assert "if bad_here:" in fn
+    assert "stats.audit_requests_bad += 1" in fn
+    # Outside the per-block loop, or it is a block counter with a different name.
+    assert fn.index("for row, block_id in enumerate(ids):") < fn.index("if bad_here:")
+    assert fn.index("stats.audit_requests_bad += 1") > fn.index("if bad_here:")

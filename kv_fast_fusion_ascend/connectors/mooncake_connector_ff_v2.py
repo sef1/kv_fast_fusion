@@ -95,6 +95,16 @@ AUDIT_HOT_BLOCKS = os.environ.get("BFF_V2_AUDIT_HOT_BLOCKS", "0") == "1"
 # round-trip noise; crossed layers or groups do not come close. Diagnostic only: it never plans, it
 # never aliases, and a mismatch is reported rather than raised.
 VERIFY_TRANSFER = int(os.environ.get("BFF_V2_VERIFY_TRANSFER", "0"))
+# SELF-consistency audit: 0 off, N audits every Nth request. Transfer, snapshot this decode's own
+# signatures, re-issue the same descriptors, snapshot again — a block that CHANGED was written wrong
+# the first time.
+#
+# The point is that it never contacts the producer. VERIFY_TRANSFER's blocking exchange costs 2-5 s
+# per request on the serial recv thread, so it checked ~11 requests a run and found 2-6 events: it
+# proved the bug is real and can say nothing about its shape. This covers every block of an audited
+# request (~161 of them at 7 groups) for a re-transfer and four device drains, which is the volume a
+# rate and a distribution actually need.
+XFER_AUDIT = int(os.environ.get("BFF_XFER_AUDIT", "0"))
 # Seconds between checks, so the budget is spent ACROSS the run. See VerifySampler for why this
 # exists: the first version spent all 32 checks on the first 32 requests, which all ran before the
 # KV cache had ever filled, and reported a clean result about the wrong window.
@@ -1190,7 +1200,12 @@ if _ASCEND_AVAILABLE:
         _verify_ids: ClassVar[dict] = {}
         # Ask v1's emission loop to record per-block descriptors. Only worth its cost when a
         # mismatch might actually be replayed.
-        capture_descriptors: bool = VERIFY_TRANSFER > 0
+        # Either diagnostic needs the per-block descriptor list: verification to replay ONE failing
+        # block, the audit to re-issue the whole request.
+        capture_descriptors: bool = VERIFY_TRANSFER > 0 or XFER_AUDIT > 0
+        # Requests seen by the audit, for its every-Nth stride. On the class, not the instance: the
+        # stride should thin the audit across the node, not once per recv thread.
+        _audit_seen = 0
 
         @property
         def _verify_stash(self) -> dict:
@@ -1223,6 +1238,11 @@ if _ASCEND_AVAILABLE:
             still called for a ``None``, and ``_handle_request`` is still wrapped PER REQUEST so one
             failure costs one request — batching must not turn a single fault into a lost batch.
             A test parses the vendored source and fails if that shape changes underneath us."""
+            # Before ready_event, so the duty cycle's clock starts at the thread rather than at the
+            # first thing that charges it. This loop does NOT call super().run(), so v1's priming
+            # never reaches here — and the first thing to touch the timer would be the `finally`
+            # that charges the first signature exchange, which is how it once read 858.6%.
+            self._recv_timer                            # noqa: B018 - primes `started`
             self.ready_event.set()
             while True:
                 try:
@@ -1478,8 +1498,119 @@ if _ASCEND_AVAILABLE:
             path expires a map whose owner has not been batched, and an owner cannot be batched
             until its KV has actually arrived."""
             self._verify_transfer(req_meta)
+            self._audit_self_consistency(req_meta)
             if self.dedup_engine is not None:
                 self.dedup_engine.release(v1._ext_of(req_meta["remote_request_id"]))
+
+        def _audit_self_consistency(self, req_meta) -> None:
+            """Did this request's KV change when the identical descriptors were issued again?
+
+            A block that changed was written wrong the first time. That is the whole check, and it
+            needs **no producer round trip** — which is the only reason it can run at volume where
+            :meth:`_verify_transfer` cannot: that one blocks the serial recv thread for 2-5 s asking
+            P for signatures, so it audited ~11 requests a run and found 2-6 events. Enough to prove
+            the loss is real; nothing at all about its shape.
+
+            It cannot say WHICH of the two reads was wrong, only that they disagree, so it measures
+            ``P(disagree) ~ 2p`` — a known factor of two. ``_replay`` already established the
+            mechanism (five re-issues across two runs, every one delivering the producer's exact
+            KV), so the direction is not in question and only the rate and the distribution are.
+
+            Runs before ``release``, like the verification, so the blocks are still exactly what
+            arrived rather than something a later request has aliased onto.
+
+            Never raises. Note it DOES re-issue into live KV: that is safe precisely because a
+            re-issue delivers the correct bytes, and it leaves the block at least as correct as it
+            found it. Never gated on ``VERIFY_TRANSFER`` — the two are independent."""
+            if XFER_AUDIT <= 0 or self.dedup_engine is None:
+                return
+            KVCacheRecvingThreadFFv2._audit_seen += 1
+            if KVCacheRecvingThreadFFv2._audit_seen % XFER_AUDIT:
+                return
+            descs = self.last_descriptors or {}
+            if not descs or self.last_session_id is None:
+                return
+            stats = self.dedup_engine.stats
+            t0 = time.perf_counter()
+            try:
+                by_group: dict[int, list[int]] = {}
+                for gi, lb in descs:
+                    by_group.setdefault(int(gi), []).append(int(lb))
+                # Sorted so row i of a group's signature is block by_group[gi][i] on BOTH snapshots.
+                for ids in by_group.values():
+                    ids.sort()
+                plan = {gi: (ids, [len(ids)]) for gi, ids in by_group.items() if ids}
+                if not plan:
+                    return
+                _sync_device()
+                first = self._recompute_local(plan)
+                srcs, dsts, lens = [], [], []
+                for segs in descs.values():
+                    for d in segs:
+                        srcs.append(d[0])
+                        dsts.append(d[1])
+                        lens.append(d[2])
+                if self.engine.batch_transfer_sync_read(
+                        self.last_session_id, srcs, dsts, lens) < 0:
+                    return
+                _sync_device()
+                second = self._recompute_local(plan)
+            except Exception as e:  # noqa: BLE001 - an audit must never fail a request
+                logger.warning("BFF pull-v2: self-consistency audit failed (%s).", e)
+                return
+            finally:
+                stats.audit_ms_self += (time.perf_counter() - t0) * 1e3
+            self._score_audit(by_group, first, second, stats)
+
+        def _score_audit(self, by_group, first, second, stats) -> None:
+            """Compare the two snapshots block by block and bucket EVERY block, bad or not."""
+            buckets = self._audit_buckets
+            stats.audit_requests += 1
+            bad_here = 0
+            for gi, ids in sorted(by_group.items()):
+                a, b = first.get(gi), second.get(gi)
+                if a is None or b is None:
+                    continue
+                rows_a = SignatureCodec.decode(a)[0].tolist()
+                rows_b = SignatureCodec.decode(b)[0].tolist()
+                for row, block_id in enumerate(ids):
+                    if row >= len(rows_a) or row >= len(rows_b):
+                        break
+                    cos = sum(float(x) * float(y) for x, y in zip(rows_a[row], rows_b[row]))
+                    changed = cos < VERIFY_MIN_COS
+                    stats.audit_blocks += 1
+                    stats.audit_worst_cos = min(stats.audit_worst_cos, cos)
+                    if changed:
+                        stats.audit_blocks_bad += 1
+                        bad_here += 1
+                    buckets.add(self._bucket_for(gi, block_id), changed)
+            if bad_here:
+                stats.audit_requests_bad += 1
+            stats.audit_buckets = buckets.as_dict()
+
+        @property
+        def _audit_buckets(self):
+            """Per-instance, accumulated across the run and mirrored into stats after each request.
+
+            Kept here rather than rebuilt from ``stats.audit_buckets`` every time: the stats dict is
+            a report, and reading a report back in as state is how a denominator gets lost."""
+            b = self.__dict__.get("_audit_buckets_obj")
+            if b is None:
+                b = self.__dict__["_audit_buckets_obj"] = v1.AuditBuckets()
+            return b
+
+        def _bucket_for(self, gi, block_id) -> str:
+            """Where this block sits inside its registered region, or the group if that is unknown.
+
+            BFF registers 8 regions of 4.22 GiB against the stock connector's 56 of 618 MiB, so only
+            BFF's addressing crosses 2^32 — the most obvious structural difference between the two.
+            The naive version is already disconfirmed (failing ids span both sides of the boundary),
+            which is why this feeds a rate-per-bucket rather than a list."""
+            rm = self.region_map
+            descs = (self.last_descriptors or {}).get((int(gi), int(block_id)))
+            if rm is None or not descs:
+                return f"group{int(gi)}"
+            return rm.bucket(descs[0][0])
 
         def _diagnose_mismatch(self, req_meta, gi, ask, rows_p, norms_p, rows_d, norms_d) -> str:
             """Re-ask the producer for the failing group and name the cause. See classify_mismatch.

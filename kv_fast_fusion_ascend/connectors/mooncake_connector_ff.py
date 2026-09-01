@@ -291,6 +291,80 @@ class RecvThreadTimer:
                 f"({mean:.1f} ms/request)" + (f" | {parts}" if parts else ""))
 
 
+class RegionMap:
+    """Registered transfer-engine regions, so a raw address becomes ``(region, offset)``.
+
+    Why the offset matters. BFF's shared-tensor layout registers **8 regions of 4.22 GiB** (33.78
+    GiB over 8, from the producer's own registration line); the stock connector registers **56 of
+    618 MiB**. Only BFF's cross 2^32, at block id 32768 of 34,599. That is the most obvious
+    structural difference between the connector that loses writes and the one we have never caught
+    losing them, so every audited block is bucketed by where it sits inside its region.
+
+    The naive form of the hypothesis is already dead — observed failing block ids span 2208–34392,
+    both sides of the boundary — which is exactly why this reports a RATE per bucket against a
+    denominator rather than a list of failures. Four events with no denominator cannot distinguish
+    "losses favour high offsets" from "most blocks are at high offsets"."""
+
+    __slots__ = ("regions",)
+
+    def __init__(self, ptrs, sizes):
+        # Sorted so `locate` can stop at the first region that contains the address; regions from
+        # the engine are disjoint (it refuses overlapping registration), so at most one matches.
+        self.regions = sorted((int(p), int(s)) for p, s in zip(ptrs, sizes))
+
+    def locate(self, addr):
+        """``(region index, byte offset)`` for an address inside a region, else ``None``.
+
+        None is a real answer, not a failure: a descriptor pointing outside every registered region
+        would be a transfer the engine could not serve, and saying so beats bucketing it as 0."""
+        addr = int(addr)
+        for i, (base, size) in enumerate(self.regions):
+            if base <= addr < base + size:
+                return i, addr - base
+        return None
+
+    def bucket(self, addr):
+        """The offset band this address falls in, as a label.
+
+        Bands are chosen around 2^32 rather than uniformly: a 32-bit truncation somewhere in the
+        engine would show as a step at exactly 4 GiB, and uniform deciles would smear it."""
+        found = self.locate(addr)
+        if found is None:
+            return "unregistered"
+        _i, off = found
+        for limit, name in ((1 << 30, "0-1G"), (1 << 31, "1-2G"), (1 << 32, "2-4G")):
+            if off < limit:
+                return name
+        return ">=4G"
+
+
+class AuditBuckets:
+    """Checked and bad counts per bucket — the denominator is the point, not the numerator.
+
+    Every audited block is counted, not only the failing ones. A bucket with no failures and a
+    bucket with no blocks are different claims, and the previous detector could not tell them apart
+    because it only ever recorded failures."""
+
+    __slots__ = ("bad", "checked")
+
+    def __init__(self):
+        self.checked: dict[str, int] = {}
+        self.bad: dict[str, int] = {}
+
+    def add(self, key: str, mismatched: bool) -> None:
+        self.checked[key] = self.checked.get(key, 0) + 1
+        if mismatched:
+            self.bad[key] = self.bad.get(key, 0) + 1
+
+    def rows(self):
+        """``(bucket, checked, bad, rate)`` ordered by bucket, including buckets with zero bad."""
+        return [(k, n, self.bad.get(k, 0), self.bad.get(k, 0) / n if n else 0.0)
+                for k, n in sorted(self.checked.items())]
+
+    def as_dict(self) -> dict:
+        return {k: [n, self.bad.get(k, 0)] for k, n in sorted(self.checked.items())}
+
+
 def planned_blocks(grouped):
     """``{(group, local block)}`` the transfer intends to write — the set coverage must equal."""
     out: set = set()
@@ -807,6 +881,9 @@ if _ASCEND_AVAILABLE:
         because it can only be derived once the caches are registered."""
 
         base_addr_groups: list[list[int]] | None = None
+        # Set from register_kv_caches when the audit needs to bucket an address by where it sits
+        # inside its registered region. None until then, and the audit simply reports no buckets.
+        region_map: "RegionMap | None" = None
         _logged_amplification: bool = False
 
         def _align_and_group(self, req_meta, local_groups, remote_groups, tp_num_need_pulls):
@@ -872,20 +949,48 @@ if _ASCEND_AVAILABLE:
         # One INFO per request, matching what the vendored _transfer_kv_cache emits and this
         # override dropped. Off by default because it is a log record on a hot serial thread; the
         # duty-cycle summary below is always on and is the figure that decides anything.
+        # Issue every transfer TWICE, same descriptors both times.
+        #
+        # Not a diagnostic — a candidate fix, and the only DIRECT test of whether the dropped writes
+        # explain anything. `_replay` has now re-issued a failing block's own descriptor five times
+        # across two runs and got the producer's exact KV back every time, so the loss is transient
+        # and uncorrelated: a second pass should reduce the residual rate to ~p^2.
+        #
+        # It is nearly free. The recv thread's `xfer` phase was 1.4 s per 100 requests, so doubling
+        # it adds ~7 s to a 700 s run — which is why this is worth trying before characterising the
+        # bug's shape. If F1 rises to the baseline's 0.482 and the run-to-run spread collapses from
+        # 0.0235, the corruption is the cause. If nothing moves, it is not, and the cudagraph mode
+        # and the store connector are what is left.
+        _XFER_REDUNDANT = os.environ.get("BFF_XFER_REDUNDANT", "0") == "1"
         _RECV_TIMING = os.environ.get("BFF_RECV_TIMING", "0") == "1"
         _next_timing_report = 1
+        # After the first decade the cadence stops widening, or a 512-request run reports at 1, 10
+        # and 100 and never again — leaving the harness's "last line" describing the RAMP while
+        # calling it the run. The first run under this instrument reported 6.4% and the number was
+        # from request 100 of 512.
+        _TIMING_STRIDE = 100
 
         @property
         def _recv_timer(self) -> RecvThreadTimer:
-            """Per-INSTANCE, created on first use.
+            """Per-INSTANCE, and started when the THREAD starts, not on first use.
 
             Not a class attribute: the duty cycle is a fraction of one thread's wall clock, and
             sharing one accumulator across recv threads would divide the sum of their busy time by a
-            single thread's lifetime — a duty cycle over 100% and no way to tell which thread."""
+            single thread's lifetime — a duty cycle over 100% and no way to tell which thread.
+
+            Why ``run`` primes it. Created lazily, the first thing to touch it is the ``finally``
+            that charges the first signature exchange — so its clock started AFTER work it then
+            counted, and it reported 858.6% at request 1 and 129.9% at request 100. A duty cycle
+            over 100% is not a slow thread, it is a broken denominator."""
             t = self.__dict__.get("_recv_timer_obj")
             if t is None:
                 t = self.__dict__["_recv_timer_obj"] = RecvThreadTimer()
             return t
+
+        def run(self):
+            """Start the clock before any work can be charged to it, then hand off unchanged."""
+            self._recv_timer                            # noqa: B018 - primes `started`
+            super().run()
 
         def _one_batch(self, session_id, src, dst, lengths):
             """One batch, through whichever API is selected. Returns the engine's status.
@@ -969,11 +1074,12 @@ if _ASCEND_AVAILABLE:
             assumed, and only a NEGATIVE ret is still treated as fatal — the vendored contract."""
             for src, dst, lengths in chunk_segments(
                     src_list, dst_list, length_list, self._MAX_XFER_SEGMENTS):
-                ret = self._one_batch(session_id, src, dst, lengths)
-                if ret < 0:
-                    raise RuntimeError(
-                        f"KV transfer failed for request {req_meta['remote_request_id']} "
-                        f"(ret={ret}, {len(src)} segments)")
+                for _attempt in range(2 if self._XFER_REDUNDANT else 1):
+                    ret = self._one_batch(session_id, src, dst, lengths)
+                    if ret < 0:
+                        raise RuntimeError(
+                            f"KV transfer failed for request {req_meta['remote_request_id']} "
+                            f"(ret={ret}, {len(src)} segments)")
                 if not KVCacheRecvingThreadFF._logged_ret:
                     KVCacheRecvingThreadFF._logged_ret = True
                     logger.info(
@@ -1042,13 +1148,19 @@ if _ASCEND_AVAILABLE:
                 self._note_recv_timing(req_meta, (time.perf_counter() - t_req) * 1e3, phases)
 
         def _note_recv_timing(self, req_meta, elapsed_ms, phases) -> None:
-            """Per-request timing, then the duty cycle on a widening cadence.
+            """Per-request timing, then the duty cycle — widening at first, then on a fixed stride.
 
             The vendored ``_transfer_kv_cache`` logs one INFO per request and the stock connector's
             512 of them are what put its recv thread at a 0.9% duty cycle; this override dropped
             that log, leaving BFF's serial thread unmeasured. Restored here, plus the aggregate the
             per-request lines only imply — and the aggregate is the one that decides anything, so it
-            is always on while the per-request line is behind BFF_RECV_TIMING=1."""
+            is always on while the per-request line is behind BFF_RECV_TIMING=1.
+
+            The cadence widens 1, 10, 100 to catch a startup fault early and then STOPS widening. A
+            pure decade cadence reports at 100 and then not until 1000, so a 512-request run's last
+            line describes the ramp — and the harness reads the last line. There is no shutdown
+            report because the engines are killed outright at the end of a run; the stride is what
+            makes the final line cover the run instead."""
             timer = self._recv_timer
             timer.note(elapsed_ms, phases)
             now = time.perf_counter()
@@ -1059,7 +1171,9 @@ if _ASCEND_AVAILABLE:
                     "(%d segments) [ms: %s]", req_meta.get("remote_request_id"), elapsed_ms,
                     self.last_segment_count, parts)
             if timer.requests >= self._next_timing_report:
-                self._next_timing_report *= 10
+                self._next_timing_report = (
+                    self._next_timing_report * 10 if self._next_timing_report < self._TIMING_STRIDE
+                    else self._next_timing_report + self._TIMING_STRIDE)
                 logger.info("MooncakeConnectorFF recv thread: %s", timer.summary(now))
 
         def _transfer_kv_cache_timed(self, req_meta, phases):
@@ -1268,9 +1382,15 @@ if _ASCEND_AVAILABLE:
                 kept_ptrs, kept_sizes = dedup_registration_regions(ptrs, sizes)
                 logger.info(
                     "MooncakeConnectorFF: registering %d of %d KV regions (%d dropped as duplicates "
-                    "of BFF's shared-tensor layout), %.2f GiB total.",
+                    "of BFF's shared-tensor layout), %.2f GiB total — %.2f GiB each, %s 2^32.",
                     len(kept_ptrs), len(ptrs), len(ptrs) - len(kept_ptrs),
-                    sum(kept_sizes) / (1024 ** 3))
+                    sum(kept_sizes) / (1024 ** 3),
+                    (sum(kept_sizes) / len(kept_ptrs) / (1024 ** 3)) if kept_ptrs else 0.0,
+                    "CROSSING" if any(s > (1 << 32) for s in kept_sizes) else "under")
+                # Kept so the audit can turn a descriptor address into (region, offset). This is the
+                # only place the registered geometry is known, and it is the geometry that most
+                # obviously differs between this connector and the stock one.
+                self._registered_regions = (list(kept_ptrs), list(kept_sizes))
                 return _orig(kept_ptrs, kept_sizes)
 
             _mte.global_te.register_buffer = _dedup_register
@@ -1286,6 +1406,9 @@ if _ASCEND_AVAILABLE:
             self.base_addr_groups = self._build_base_addr_groups()
             if self.kv_role != "kv_producer" and self.kv_recv_thread is not None:
                 self.kv_recv_thread.base_addr_groups = self.base_addr_groups
+                regions = getattr(self, "_registered_regions", None)
+                if regions is not None:
+                    self.kv_recv_thread.region_map = RegionMap(*regions)
             logger.info("MooncakeConnectorFF: mapped %d base addresses over %d KV-cache groups "
                         "(%d layers x %d caches).", len(self.base_addr_groups),
                         len({g for gs in self.base_addr_groups for g in gs}),

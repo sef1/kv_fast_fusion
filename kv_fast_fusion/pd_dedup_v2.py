@@ -367,6 +367,21 @@ class DedupStats:
         # blocks understated the impact by two orders of magnitude.
         self.verify_requests = 0
         self.verify_requests_bad = 0
+        # SELF-consistency audit (BFF_XFER_AUDIT): transfer, snapshot this decode's own signatures,
+        # re-issue the same descriptors, snapshot again. A block that changes was written wrong the
+        # first time — and the check needs NO producer round trip, which is the only reason it can
+        # run at volume. The signature-based verification costs a 2-5 s blocking exchange per
+        # request and so checked ~11 requests a run and found 2-6 events: enough to prove the bug
+        # exists, far too few to say anything about its shape.
+        self.audit_requests = 0
+        self.audit_blocks = 0
+        self.audit_blocks_bad = 0
+        self.audit_requests_bad = 0
+        self.audit_worst_cos = 1.0
+        # {bucket: [checked, bad]} — the denominator travels with the numerator, because "no
+        # failures here" and "no blocks here" are different claims.
+        self.audit_buckets: dict = {}
+        self.audit_ms_self = 0.0
         self.skip_reasons = dict.fromkeys(SKIP_REASONS, 0)
         # Producer-side only: blocks the decode told it to skip. An independent cross-check that
         # the two sides agree — it should track the decode's blocks_not_requested, and a divergence
@@ -527,6 +542,14 @@ class DedupStats:
             "verify_localised": dict(self.verify_localised) or None,
             "verify_requests": self.verify_requests or None,
             "verify_requests_bad": self.verify_requests_bad if self.verify_requests else None,
+            # None when the audit was not asked for, so "not measured" never reads as "clean".
+            "audit_requests": self.audit_requests or None,
+            "audit_blocks": self.audit_blocks or None,
+            "audit_blocks_bad": self.audit_blocks_bad if self.audit_blocks else None,
+            "audit_requests_bad": self.audit_requests_bad if self.audit_requests else None,
+            "audit_worst_cos": round(self.audit_worst_cos, 5) if self.audit_blocks else None,
+            "audit_buckets": dict(self.audit_buckets) or None,
+            "audit_ms_self_total": round(self.audit_ms_self, 1) if self.audit_requests else None,
             "exchange_skip_reasons": dict(self.skip_reasons),
             "blocks_withheld": self.blocks_withheld,
             "inert": self.is_inert(),

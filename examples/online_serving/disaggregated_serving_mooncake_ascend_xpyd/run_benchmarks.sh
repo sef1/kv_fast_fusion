@@ -175,6 +175,8 @@ MIN_TOKENS=${MIN_TOKENS:-2048}
 # 6000 caps only ~9%, which leaves length free — and therefore exposes any effect BFF has on when
 # the model stops, which the GPU runs truncate away. Match it to 1024 to compare the two platforms.
 MAX_TOKENS=${MAX_TOKENS:-6000}
+# Run the same config N times against the same engines. 1 = today's behaviour exactly.
+REPEAT=${REPEAT:-1}
 REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-6000.0}
 # F1_DATASET=${F1_DATASET:-m-a-p/CodeFeedback-Filtered-Instruction}
 # F1_DATASET=${F1_DATASET:-codeparrot_f1_benchmark.jsonl}
@@ -701,6 +703,122 @@ else:
 PY
 }
 
+# Spread across repeats of ONE config, and how much of the output was literally identical.
+#
+# The benchmark decodes greedily (--temperature 0.0), so two runs of the same command should produce
+# the same tokens. The baseline's two runs differ by 0.0006 F1; two BFF runs of one command differ
+# by 0.0235 — more than half the 0.042 gap being investigated. A mean with no spread beside it
+# cannot support any claim smaller than that, and several were made.
+#
+# The byte-identical fraction is the sharper instrument: it is exactly zero-noise under greedy
+# decoding, where a mean over 512 samples is not.
+report_repeats() {
+  python3 - "$results_root" <<'PY' || true
+import glob, json, os, sys
+
+root = sys.argv[1]
+reps = sorted(glob.glob(os.path.join(root, "rep*")))
+runs = []
+for d in reps:
+    try:
+        with open(os.path.join(d, "benchmark_results.json")) as f:
+            summary = json.load(f)
+        with open(os.path.join(d, "raw_outputs.json")) as f:
+            raw = json.load(f)
+    except Exception:
+        continue
+    runs.append((os.path.basename(d), summary, [o.get("generated_text", "")
+                                                for o in raw.get("outputs", [])]))
+
+if len(runs) < 2:
+    print(f"  repeats: only {len(runs)} usable run(s) — nothing to compare.")
+    raise SystemExit
+
+
+def spread(key, get, fmt="{:.4f}"):
+    vals = [get(s) for _n, s, _t in runs]
+    vals = [v for v in vals if v is not None]
+    if not vals:
+        return None
+    lo, hi = min(vals), max(vals)
+    return (f"{fmt.format(lo)}-{fmt.format(hi)} (spread {fmt.format(hi - lo)})"
+            if lo != hi else fmt.format(lo))
+
+
+print(f"  repeats: {len(runs)} run(s) of the SAME config")
+for label, key, get, fmt in (
+        ("F1", "mean_f1", lambda s: (s.get("evaluation") or {}).get("mean_f1"), "{:.4f}"),
+        ("elapsed s", "elapsed_s", lambda s: s.get("elapsed_s"), "{:.1f}"),
+        ("output tokens", "total_output_tokens", lambda s: s.get("total_output_tokens"), "{:.0f}")):
+    got = spread(key, get, fmt)
+    if got:
+        print(f"    {label:>14}: {got}")
+
+# The zero-noise measure. Compare every run against the first, positionally — f1_main writes
+# outputs in prompt order, so index i is the same prompt in every run.
+base_name, _base_summary, base_txt = runs[0]
+for name, _summary, txt in runs[1:]:
+    n = min(len(base_txt), len(txt))
+    same = sum(1 for i in range(n) if base_txt[i] == txt[i])
+    if not n:
+        continue
+    print(f"    {base_name} vs {name}: {same} of {n} completions byte-identical "
+          f"({100.0*same/n:.1f}%)")
+    if same < n:
+        # Where they first part company, as a token-ish proxy. A divergence at position 0 is a
+        # different first token, which under greedy decoding means the logits differed immediately.
+        firsts = [next((j for j in range(min(len(base_txt[i]), len(txt[i])))
+                        if base_txt[i][j] != txt[i][j]), min(len(base_txt[i]), len(txt[i])))
+                  for i in range(n) if base_txt[i] != txt[i]]
+        firsts.sort()
+        mid = firsts[len(firsts) // 2]
+        print(f"      -> {len(firsts)} diverged; first differing CHARACTER at median {mid} "
+              f"(min {firsts[0]}, max {firsts[-1]}).")
+        print("      -> greedy decoding is deterministic given the same KV, so a diverged "
+              "completion means its KV differed.")
+PY
+}
+
+# What this run is NOT comparable to, printed with the result rather than discovered afterwards.
+#
+# Two defaults differ between BFF and the stock baselines and neither is visible in the summary
+# line, so nine runs of F1 were compared across them without anyone noticing:
+#
+#   USE_ASCEND_STORE  defaults to 0 for bff* and 1 for mooncakev1/layerwise/vanilla, so the
+#                     "baseline" runs AscendMultiConnector over an external KV pool while BFF runs
+#                     the mover standalone. Different KV path, different transport, different
+#                     throughput — the comment at the default itself says to set it to 0 for an
+#                     apples-to-apples comparison, and no run had.
+#   cudagraph_mode    the connector forces PIECEWISE for BFF while the stock baselines keep
+#                     FULL_DECODE_ONLY. Under greedy decoding that is a numerics difference, and
+#                     BFF generates ~20% more tokens than the baseline.
+#
+# Printing them costs nothing and makes an incomparable pair impossible to read as a result.
+report_comparability() {
+  local warn=0
+  echo "  comparability: BASELINE=$BASELINE USE_ASCEND_STORE=$USE_ASCEND_STORE"
+  if [[ "$BFF_ON" == "1" && "$USE_ASCEND_STORE" != "0" ]]; then
+    echo "    -> BFF with the store ON. The stock baselines default to ON and BFF to OFF, so"
+    echo "       check the run you are comparing against used the same value."
+    warn=1
+  elif [[ "$BFF_ON" != "1" && "$USE_ASCEND_STORE" != "0" ]]; then
+    echo "    -> NOT comparable to a bff* run: this one wraps the mover in AscendMultiConnector +"
+    echo "       AscendStoreConnector (external KV pool) and bff* defaults to standalone."
+    echo "       Rerun with USE_ASCEND_STORE=0 for an apples-to-apples baseline."
+    warn=1
+  fi
+  local piecewise
+  piecewise=$(grep -l "Overriding cudagraph_mode" "${logs_root}"/decode-*.txt 2>/dev/null | head -1)
+  if [[ -n "$piecewise" ]]; then
+    echo "    -> decode ran PIECEWISE (the connector overrode FULL_DECODE_ONLY). A stock baseline"
+    echo "       keeps FULL_DECODE_ONLY, so any output-length or F1 difference against one is"
+    echo "       confounded by the graph mode."
+    warn=1
+  fi
+  [[ "$warn" == "0" ]] && echo "    -> no known asymmetry against a stock baseline."
+  return 0
+}
+
 # The decode's KV pulls run on ONE serial thread (the vendored recv thread's 32-worker executor is
 # never used), so its DUTY CYCLE — busy ms over wall ms — decides whether it is a bottleneck at all.
 # The stock connector's own per-request log puts it at 0.9% (4.6s across 512 requests in a 523s run,
@@ -806,6 +924,56 @@ if v2:
         print(f"    -> {100.0*FAIL/EX:.0f}% of exchanges failed. Grep the PREFILL log: no 'bound on'"
               f" line = the producer never listened; 'bound on' but no 'served' = the decode never "
               f"reached it; both = it answered too slowly (raise BFF_PULL_V2_SIG_TIMEOUT).")
+    # SELF-consistency audit (BFF_XFER_AUDIT): re-issue a request's own descriptors and see whether
+    # its KV changes. Needs no producer, so unlike the verification below it can run at a volume
+    # that supports a RATE and a DISTRIBUTION rather than a handful of anecdotes.
+    AB = sum(s.get("audit_blocks") or 0 for s in v2)
+    if AB:
+        ABB = sum(s.get("audit_blocks_bad") or 0 for s in v2)
+        AR = sum(s.get("audit_requests") or 0 for s in v2)
+        ARB = sum(s.get("audit_requests_bad") or 0 for s in v2)
+        AWC = min([s.get("audit_worst_cos") for s in v2
+                   if s.get("audit_worst_cos") is not None] or [1.0])
+        AMS = sum(s.get("audit_ms_self_total") or 0 for s in v2)
+        print(f"    self-consistency audit: {ABB} of {AB} block(s) CHANGED on re-issue "
+              f"({100.0*ABB/AB:.3f}%, worst cos {AWC:.5f}) over {AR} audited request(s), "
+              f"costing {AMS/1000:.1f}s on the recv thread")
+        if AR:
+            print(f"    ... {ARB} of {AR} request(s) ({100.0*ARB/AR:.0f}%) had at least one block "
+                  f"change — a block that changed was written wrong the FIRST time.")
+        if not ABB:
+            print("    -> re-issuing every descriptor changed nothing. Either the writes are not "
+                  "being dropped in this configuration, or the audit is not reaching the "
+                  "conditions that drop them (check it ran at saturation, not during the ramp).")
+        # The distribution, with its denominator. A bucket with no failures and a bucket with no
+        # blocks are different claims; reading a failure list without the denominator is how
+        # "losses favour high offsets" and "most blocks are at high offsets" got confused.
+        buckets = {}
+        for s in v2:
+            for k, (n, bad) in (s.get("audit_buckets") or {}).items():
+                have = buckets.setdefault(k, [0, 0])
+                have[0] += n
+                have[1] += bad
+        if buckets:
+            print("    by offset within the registered region "
+                  "(BFF: 8 regions x 4.22 GiB, crossing 2^32; stock: 56 x 618 MiB, never):")
+            for k in sorted(buckets):
+                n, bad = buckets[k]
+                print(f"      {k:>13}: {bad:6d} bad of {n:7d} checked  "
+                      f"({100.0*bad/n if n else 0.0:.3f}%)")
+            hi = buckets.get(">=4G", [0, 0])
+            lo = sum(v[1] for k, v in buckets.items() if k != ">=4G")
+            lon = sum(v[0] for k, v in buckets.items() if k != ">=4G")
+            if hi[0] and lon:
+                r_hi, r_lo = hi[1] / hi[0], lo / lon
+                if r_hi > 3 * r_lo and hi[1] >= 5:
+                    print(f"    -> losses are {r_hi/max(r_lo,1e-9):.1f}x more likely past 2^32. "
+                          f"That is a 32-bit offset, and only BFF's regions are big enough to "
+                          f"reach it — which would make this OURS, not upstream.")
+                elif hi[1] or lo:
+                    print("    -> no step at 2^32: the loss does not follow region offset, so the "
+                          "4.22 GiB regions are not what distinguishes BFF from stock here.")
+
     # Did the KV that landed on the decode match what the producer had? The only CONTENT check in
     # the whole transfer path; everything else is structural (lengths, coverage, reachability).
     VC = sum(s.get("verify_checked") or 0 for s in v2)
@@ -1084,7 +1252,25 @@ main() {
   wait_for_all_nodes
   launch_proxy
 
-  run_benchmark
+  # REPEAT>1 runs the SAME config against the SAME engines N times. Under greedy decoding two such
+  # runs should agree; two BFF runs of one command differ by 0.0235 F1 where two baseline runs
+  # differ by 0.0006, and that spread is over half the BFF-vs-baseline gap being investigated. A
+  # single F1 cannot be read against it.
+  for _rep in $(seq 1 "${REPEAT}"); do
+    if [[ "${REPEAT}" -gt 1 ]]; then
+      echo "=== repeat ${_rep} of ${REPEAT} ==="
+      run_benchmark
+      # Archive before the next run overwrites results_latest; the differ needs both.
+      mkdir -p "${results_root}/rep${_rep}"
+      cp -f "${results_root}"/raw_outputs.json "${results_root}"/benchmark_results.json \
+            "${results_root}/rep${_rep}/" 2>/dev/null || true
+    else
+      run_benchmark
+    fi
+  done
+  [[ "${REPEAT}" -gt 1 ]] && report_repeats
+
+  report_comparability
   report_capacity_bound
   report_recv_thread
   collect_bff_stats

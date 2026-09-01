@@ -914,7 +914,47 @@ def test_the_per_request_transfer_timing_is_restored():
     assert "took %.2f ms" in fn, "same phrasing as the vendored line, so both parse alike"
     assert "self._RECV_TIMING" in fn, "per-request line is opt-in; it is a hot serial thread"
     assert "timer.summary(now)" in fn, "the aggregate is NOT opt-in — it is what decides anything"
-    assert "self._next_timing_report *= 10" in fn, "widening cadence, not one line per request"
+    assert "self._next_timing_report" in fn, "reported on a cadence, not once per request"
+
+
+def test_the_duty_cycle_keeps_reporting_past_the_first_hundred_requests():
+    """A pure decade cadence fires at 1, 10, 100 and then not until 1000, so a 512-request run's
+    LAST line describes the ramp — and the harness reads the last line. The first run under this
+    instrument reported 6.4% and that number was from request 100 of 512."""
+    import inspect
+
+    src = inspect.getsource(mc)
+    fn = src[src.index("        def _note_recv_timing(self, req_meta, elapsed_ms, phases)"):]
+    fn = fn[:fn.index("        def _transfer_kv_cache_timed(")]
+
+    assert "self._TIMING_STRIDE" in fn, "the cadence stops widening and steps instead"
+    # Simulate the schedule the code implements over a 512-request run. The class is behind the
+    # _ASCEND_AVAILABLE gate, so the stride is read off the source.
+    m = re.search(r"_TIMING_STRIDE = (\d+)", src)
+    assert m, "the stride must stay a readable constant"
+    stride, nxt, fired = int(m.group(1)), 1, []
+    for n in range(1, 513):
+        if n >= nxt:
+            nxt = nxt * 10 if nxt < stride else nxt + stride
+            fired.append(n)
+    assert fired[:3] == [1, 10, 100], "still widens early, to catch a startup fault"
+    assert fired[-1] >= 500, f"and the last report must cover the run, not the ramp (got {fired})"
+
+
+def test_the_timer_s_clock_starts_with_the_thread_not_with_the_first_charge():
+    """Created lazily, the first thing to touch it was the `finally` that charges the opening
+    signature exchange — so its wall clock began AFTER work it then counted, and it printed 858.6%
+    at request 1 and 129.9% at request 100. A duty cycle over 100% is a broken denominator, not a
+    busy thread."""
+    import inspect
+
+    src = inspect.getsource(mc)
+    fn = src[src.index("        def run(self):"):]
+    fn = fn[:fn.index("        def _note_recv_timing(")]
+
+    assert "self._recv_timer" in fn, "run() must touch the timer before any work is charged"
+    assert "super().run()" in fn, "and otherwise hand off to the vendored loop unchanged"
+    assert fn.index("self._recv_timer") < fn.index("super().run()")
 
 
 def test_the_timing_wrapper_records_even_when_the_transfer_raises():
@@ -928,3 +968,97 @@ def test_the_timing_wrapper_records_even_when_the_transfer_raises():
 
     assert "finally:" in fn, "the accounting is in a finally, not after the call"
     assert fn.index("finally:") < fn.index("self._note_recv_timing(")
+
+
+# =====================================================================================
+# where an address sits inside its registered region
+#
+# BFF's shared-tensor layout registers 8 regions of 4.22 GiB; the stock connector registers 56 of
+# 618 MiB. Only BFF's addressing crosses 2^32, and only BFF has been caught losing writes. The naive
+# form of that hypothesis is already dead — observed failing block ids span 2208-34392, both sides
+# of the boundary — which is why these buckets carry a denominator.
+# =====================================================================================
+def test_an_address_maps_to_its_region_and_offset():
+    rm = mc.RegionMap([0x1000, 0x9000], [0x1000, 0x2000])
+
+    assert rm.locate(0x1000) == (0, 0)
+    assert rm.locate(0x1fff) == (0, 0xfff)
+    assert rm.locate(0x9500) == (1, 0x500)
+
+
+def test_an_address_in_no_region_is_none_not_zero():
+    """A descriptor outside every registered region is a transfer the engine could not serve.
+    Bucketing it at offset 0 would put it in the busiest band and hide it."""
+    rm = mc.RegionMap([0x1000], [0x1000])
+
+    assert rm.locate(0x2000) is None, "one past the end is outside"
+    assert rm.locate(0xfff) is None
+    assert rm.bucket(0x2000) == "unregistered"
+
+
+def test_the_buckets_break_exactly_at_the_four_gigabyte_boundary():
+    """A 32-bit truncation inside the engine would show as a step at exactly 2^32. Uniform deciles
+    would smear it across two buckets and it would never be visible."""
+    base = 0x100000000000
+    rm = mc.RegionMap([base], [6 << 30])
+
+    assert rm.bucket(base + (1 << 32) - 1) == "2-4G"
+    assert rm.bucket(base + (1 << 32)) == ">=4G", "the boundary is a bucket edge, not an interior"
+    assert rm.bucket(base) == "0-1G"
+    assert rm.bucket(base + (1 << 30)) == "1-2G"
+
+
+def test_a_bff_sized_region_actually_reaches_the_boundary():
+    """Stated as the measurement, not the theory: 34,599 blocks x 131,072 B is 4.22 GiB, so block
+    32768 sits at exactly 2^32 and 5.3% of the pool is past it. Stock's 618 MiB regions never are."""
+    block_len, n_blocks = 131072, 34599
+
+    assert 32768 * block_len == 1 << 32
+    assert n_blocks * block_len > (1 << 32)
+    assert (33.78 * (1024 ** 3) / 56) < (1 << 32), "stock's 56 regions stay well under"
+
+
+def test_every_checked_block_is_counted_not_only_the_failing_ones():
+    """THE point of the rewrite. The previous detector recorded 4 failures and no denominator, so
+    "losses favour high offsets" was indistinguishable from "most blocks are at high offsets"."""
+    b = mc.AuditBuckets()
+    for _ in range(97):
+        b.add("0-1G", False)
+    b.add("0-1G", True)
+    b.add(">=4G", True)
+    b.add(">=4G", False)
+
+    rows = {k: (n, bad, rate) for k, n, bad, rate in b.rows()}
+    assert rows["0-1G"] == (98, 1, pytest.approx(1 / 98))
+    assert rows[">=4G"] == (2, 1, pytest.approx(0.5))
+
+
+def test_a_clean_bucket_and_an_empty_bucket_are_distinguishable():
+    """They are different claims and the report must not collapse them."""
+    b = mc.AuditBuckets()
+    b.add("0-1G", False)
+
+    assert b.as_dict() == {"0-1G": [1, 0]}, "checked but clean"
+    assert ">=4G" not in b.as_dict(), "never checked at all"
+
+
+def test_the_redundant_transfer_is_off_by_default_and_reissues_the_same_descriptors():
+    """It is a candidate FIX, not a diagnostic: `_replay` re-issued a failing block's own descriptor
+    five times across two runs and got the producer's exact KV every time, so the loss is transient
+    and a second pass should cut the residual to ~p^2. It must not change what is sent."""
+    import inspect
+
+    src = inspect.getsource(mc)
+
+    assert 'os.environ.get("BFF_XFER_REDUNDANT", "0") == "1"' in src, "off unless asked"
+    fn = src[src.index("        def _issue_transfer(self, req_meta, session_id"):]
+    fn = fn[:fn.index("        def _audit_descriptor_coverage(")]
+
+    assert "for _attempt in range(2 if self._XFER_REDUNDANT else 1):" in fn
+    # The retry must reuse the SAME chunk, or it is a different transfer and proves nothing.
+    body = fn[fn.index("for _attempt"):]
+    assert "self._one_batch(session_id, src, dst, lengths)" in body
+    assert body.count("self._one_batch(") == 1, "one call site, issued twice — not two code paths"
+    # And the chunking still drives the outer loop, so redundancy multiplies chunks rather than
+    # replacing them.
+    assert fn.index("chunk_segments(") < fn.index("for _attempt")
