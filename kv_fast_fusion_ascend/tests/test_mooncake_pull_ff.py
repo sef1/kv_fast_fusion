@@ -1042,23 +1042,105 @@ def test_a_clean_bucket_and_an_empty_bucket_are_distinguishable():
     assert ">=4G" not in b.as_dict(), "never checked at all"
 
 
-def test_the_redundant_transfer_is_off_by_default_and_reissues_the_same_descriptors():
-    """It is a candidate FIX, not a diagnostic: `_replay` re-issued a failing block's own descriptor
-    five times across two runs and got the producer's exact KV every time, so the loss is transient
-    and a second pass should cut the residual to ~p^2. It must not change what is sent."""
+def test_the_redundant_transfer_knob_is_gone():
+    """It issued every transfer twice, on the theory that the engine silently drops writes. The run
+    that tested it differed from its control by 0.0091 F1 against a measured spread of 0.0235, and
+    the self-consistency audit then put the per-block change rate at 1 in 20,026 with dedup ON — a
+    hundredth of what the signature verify reported with dedup OFF. A transport that drops writes is
+    indifferent to dedup, so the theory is retracted and the knob with it.
+
+    Pinned as a test because a knob that LOOKS like a fix for a real symptom is worth more than the
+    noise it was built on, and would otherwise come back."""
     import inspect
 
     src = inspect.getsource(mc)
 
-    assert 'os.environ.get("BFF_XFER_REDUNDANT", "0") == "1"' in src, "off unless asked"
+    # The NAME survives in a comment on purpose — a tombstone saying what was tried and why it was
+    # withdrawn is worth more than silence. What must be gone is the knob and its use.
+    assert 'os.environ.get("BFF_XFER_REDUNDANT"' not in src, "the knob is gone"
+    assert "self._XFER_REDUNDANT" not in src, "and nothing reads it"
+    assert "BFF_XFER_REDUNDANT" in src, "but the retraction stays, or it comes back"
     fn = src[src.index("        def _issue_transfer(self, req_meta, session_id"):]
     fn = fn[:fn.index("        def _audit_descriptor_coverage(")]
+    assert fn.count("self._one_batch(") == 1, "one chunk, one call — no second pass"
+    assert "for _attempt" not in fn
 
-    assert "for _attempt in range(2 if self._XFER_REDUNDANT else 1):" in fn
-    # The retry must reuse the SAME chunk, or it is a different transfer and proves nothing.
-    body = fn[fn.index("for _attempt"):]
-    assert "self._one_batch(session_id, src, dst, lengths)" in body
-    assert body.count("self._one_batch(") == 1, "one call site, issued twice — not two code paths"
-    # And the chunking still drives the outer loop, so redundancy multiplies chunks rather than
-    # replacing them.
-    assert fn.index("chunk_segments(") < fn.index("for _attempt")
+
+# =====================================================================================
+# the producer's save barrier
+#
+# vLLM calls wait_for_save() in the `finally` of _get_kv_connector_output, immediately before
+# get_finished reports the request done, and KVConnectorBase_V1 documents it as "blocks until all
+# saves are done". The vendored connector leaves it a no-op `pass`. Under ASYNCHRONOUS SCHEDULING
+# (both engines log it) the producer's host thread runs ahead of its device, so it announces a
+# request finished while that request's prefill KV writes are still queued — and the decode pulls
+# bytes the producer has not written yet.
+# =====================================================================================
+def test_the_save_barrier_is_off_until_a_run_demonstrates_it():
+    """Two theories — "the transport drops writes" and "the store connector explains the gap" —
+    survived longer than they should have. This one gets tested before it gets defaulted."""
+    import inspect
+
+    src = inspect.getsource(mc)
+
+    assert '_SAVE_BARRIER = os.environ.get("BFF_PD_SAVE_BARRIER", "0") == "1"' in src
+
+
+def test_the_barrier_is_the_producer_s_and_never_the_decode_s():
+    """A device barrier in the decode's wait_for_save would serialise the decode loop against the
+    whole device on every step — the opposite of the problem this exists to fix."""
+    import inspect
+
+    src = inspect.getsource(mc)
+    fn = src[src.index("        def wait_for_save(self):"):]
+    fn = fn[:fn.index("        def save_kv_layer(")]
+
+    assert "if _SAVE_BARRIER and self._is_producer:" in fn, "gated on BOTH the knob and the role"
+    assert "_sync_producer_writes()" in fn
+    assert "super().wait_for_save()" in fn, "the vendored contract still runs"
+    assert fn.index("super().wait_for_save()") < fn.index("_sync_producer_writes()")
+    # The role comes from the config, not from a guess about which process this is. Pinned as the
+    # whole assignment: __init__ reads is_kv_producer twice (the other is the fusion accumulator),
+    # so asserting the bare attribute passes even when _is_producer itself is hardcoded True.
+    init = src[src.index("        def __init__(self, vllm_config: \"VllmConfig\", role:"):]
+    init = init[:init.index("        def wait_for_save(")]
+    assert ("self._is_producer = bool(role != KVConnectorRole.SCHEDULER\n"
+            "                                     and vllm_config.kv_transfer_config"
+            ".is_kv_producer)") in init, \
+        "_is_producer must come from the config AND exclude the scheduler, which has no device"
+
+
+def test_the_barrier_cannot_break_a_step():
+    """It is on the serving path, not a diagnostic. A barrier that can raise turns a latent race
+    into a hard failure, which is strictly worse."""
+    import inspect
+
+    src = inspect.getsource(mc)
+    fn = src[src.index("    def _sync_producer_writes() -> None:"):]
+    fn = fn[:fn.index("    def _active_runner():")]
+
+    assert "try:" in fn and "except Exception" in fn
+    assert "raise" not in fn.split('"""')[2], "never re-raises"
+    assert "_SAVE_BARRIER_WARNED" in fn, "and says so once rather than every step"
+
+
+def test_the_two_barriers_stay_distinct():
+    """v2's _sync_device orders an RDMA write against the next NPU read, for verification, on the
+    DECODE. This one orders the producer's own writes against the decode's read, on the serving
+    path, on the PRODUCER. Same primitive, different race, different switch — merging them would put
+    a device-wide synchronize on the decode's transfer path."""
+    import inspect
+
+    from kv_fast_fusion_ascend.connectors import mooncake_connector_ff_v2 as v2
+
+    ff_src = inspect.getsource(mc)
+    v2_src = inspect.getsource(v2)
+
+    assert "def _sync_producer_writes()" in ff_src
+    assert "def _sync_device()" in v2_src
+    assert "_sync_producer_writes" not in v2_src.replace("v1._sync_producer_writes", ""), \
+        "v2 does not call the producer barrier itself"
+    # v2's docstring must no longer claim it is the only barrier in the connector.
+    doc = v2_src[v2_src.index("def _sync_device()"):]
+    doc = doc[:doc.index('"""', doc.index('"""') + 3)]
+    assert "BFF_PD_SAVE_BARRIER" in doc, "the other barrier is named where someone would look"

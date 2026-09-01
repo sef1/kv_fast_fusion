@@ -838,7 +838,13 @@ if _ASCEND_AVAILABLE:
     def _sync_device() -> None:
         """Wait for the device before reading KV that arrived by RDMA.
 
-        VERIFICATION ONLY — never on the transfer path. The one ``torch.npu.synchronize()`` in the
+        VERIFICATION ONLY — never on the DECODE's transfer path. There is now a second barrier in
+        this connector, ``v1._sync_producer_writes``, and it is neither a diagnostic nor on this
+        side: it drains the PRODUCER's queue in ``wait_for_save`` so the decode cannot read KV the
+        producer has not written yet. Different node, different race, different switch
+        (``BFF_PD_SAVE_BARRIER``). Do not merge them.
+
+        The one ``torch.npu.synchronize()`` in the
         vendored receive path sits inside ``reformat_kv_cache``
         (vllm_ascend/.../kv_p2p/mooncake_connector.py) under a FIXME saying that skipping it crashes
         GQA scenarios and that upstream has not found the root cause. At tp=1 with NZ off,

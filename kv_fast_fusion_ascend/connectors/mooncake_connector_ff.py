@@ -639,6 +639,52 @@ except Exception as _e:  # pragma: no cover - optional dependency
 
 if _ASCEND_AVAILABLE:
 
+    # Make the producer's KV writes EXECUTE before it announces the request finished.
+    #
+    # vLLM calls `wait_for_save()` in the `finally` of `_get_kv_connector_output`, immediately before
+    # `get_finished` reports the request done — and its base class documents it as "blocks until all
+    # saves are done". The vendored connector leaves it a no-op `pass`. With **asynchronous
+    # scheduling enabled** (both engines log it), the producer's host thread runs ahead of its
+    # device: it announces a request finished while that request's prefill KV writes are still
+    # queued on the NPU, and the decode then pulls bytes the producer has not written yet.
+    #
+    # The evidence this is what has been happening all along:
+    #   * dedup=1 scores F1 0.471-0.480 and dedup=0 scores 0.433-0.457, across five runs. Dedup's
+    #     signature exchange ends in `.cpu()` calls ON THE PRODUCER, which drain its NPU queue before
+    #     the decode transfers — an accidental barrier costing 67.6 s a run on the decode's serial
+    #     recv thread.
+    #   * The self-consistency audit finds 1 changed block in 20,026 with dedup ON; the signature
+    #     verify found 20-43% of requests bad with dedup OFF. A transport that drops writes does not
+    #     care whether dedup is on.
+    #   * `foreign_static` is a block still holding its previous tenant's KV. `retry_matches_producer`
+    #     is a replay arriving after the writes landed. Mismatches only at saturation is the
+    #     producer's queue being deepest then.
+    #
+    # Off by default until a run demonstrates it: two theories have already survived longer than
+    # they should have by being switched on before they were tested.
+    _SAVE_BARRIER = os.environ.get("BFF_PD_SAVE_BARRIER", "0") == "1"
+    _SAVE_BARRIER_WARNED = False
+
+    def _sync_producer_writes() -> None:
+        """Drain this node's device queue. Producer save path only — see `_SAVE_BARRIER`.
+
+        Distinct from v2's ``_sync_device``, which orders an RDMA write against the next NPU read
+        for verification. This one orders the producer's own KV writes against the decode's read,
+        and it is on the serving path rather than a diagnostic.
+
+        Never raises: a barrier that can fail a step is worse than the race it closes."""
+        global _SAVE_BARRIER_WARNED
+        try:
+            import torch
+            torch.npu.synchronize()
+        except Exception as e:  # noqa: BLE001 - the step must survive a missing/failed barrier
+            if not _SAVE_BARRIER_WARNED:
+                _SAVE_BARRIER_WARNED = True
+                logger.warning(
+                    "MooncakeConnectorFF: BFF_PD_SAVE_BARRIER=1 but the device barrier is "
+                    "unavailable (%s); the producer may still announce requests before its KV "
+                    "writes land.", e)
+
     def _active_runner():
         from kv_fast_fusion import fast_fusion_block_pool as _bp
         return getattr(_bp, "_ACTIVE_RUNNER", None)
@@ -949,19 +995,12 @@ if _ASCEND_AVAILABLE:
         # One INFO per request, matching what the vendored _transfer_kv_cache emits and this
         # override dropped. Off by default because it is a log record on a hot serial thread; the
         # duty-cycle summary below is always on and is the figure that decides anything.
-        # Issue every transfer TWICE, same descriptors both times.
-        #
-        # Not a diagnostic — a candidate fix, and the only DIRECT test of whether the dropped writes
-        # explain anything. `_replay` has now re-issued a failing block's own descriptor five times
-        # across two runs and got the producer's exact KV back every time, so the loss is transient
-        # and uncorrelated: a second pass should reduce the residual rate to ~p^2.
-        #
-        # It is nearly free. The recv thread's `xfer` phase was 1.4 s per 100 requests, so doubling
-        # it adds ~7 s to a 700 s run — which is why this is worth trying before characterising the
-        # bug's shape. If F1 rises to the baseline's 0.482 and the run-to-run spread collapses from
-        # 0.0235, the corruption is the cause. If nothing moves, it is not, and the cudagraph mode
-        # and the store connector are what is left.
-        _XFER_REDUNDANT = os.environ.get("BFF_XFER_REDUNDANT", "0") == "1"
+        # There was a BFF_XFER_REDUNDANT here that issued every transfer twice, on the theory that
+        # the engine silently drops writes. It is gone: the run that tested it differed from its
+        # control by 0.0091 F1 against a measured run-to-run spread of 0.0235, so it was never
+        # separable from noise, and the self-consistency audit then put the per-block change rate at
+        # 1 in 20,026 — a hundredth of what the signature verify reported with dedup off. A
+        # transport that drops writes does not care whether dedup is on. See wait_for_save.
         _RECV_TIMING = os.environ.get("BFF_RECV_TIMING", "0") == "1"
         _next_timing_report = 1
         # After the first decade the cadence stops widening, or a 512-request run reports at 1, 10
@@ -1065,21 +1104,27 @@ if _ASCEND_AVAILABLE:
         def _issue_transfer(self, req_meta, session_id, src_list, dst_list, length_list):
             """Run the batched read, in bounded chunks, and hold the engine to its return value.
 
-            The vendored call discards ``ret`` unless it is negative. That matters here: verification
-            found ~0.19% of transferred blocks never written while this connector's descriptor list
-            audited COMPLETE, so a write was lost inside the engine and nothing reported it. If
-            ``ret`` ever carries a completed-segment count, checking it against the segments we
-            handed over catches that on every request in production, with none of the signature
-            machinery. We do not know the convention, so the first value is logged rather than
-            assumed, and only a NEGATIVE ret is still treated as fatal — the vendored contract."""
+            The vendored call discards ``ret`` unless it is negative, and this checks it instead. If
+            ``ret`` ever carries a completed-segment count rather than a status code, comparing it
+            against the segments we handed over catches a short transfer on every request with none
+            of the signature machinery. We do not know the convention, so the first value is logged
+            rather than assumed, and only a NEGATIVE ret is still treated as fatal — the vendored
+            contract.
+
+            This used to say the engine was losing writes: verification found ~0.19% of transferred
+            blocks holding content the producer never had, with the descriptor list audited
+            COMPLETE. That reading is retracted. The self-consistency audit put the per-block change
+            rate at 1 in 20,026 with dedup ON, a hundredth of what the signature verify reported
+            with dedup OFF — and a transport that drops writes is indifferent to dedup. The blocks
+            were not un-written; they were read from the producer BEFORE the producer wrote them.
+            See ``wait_for_save``."""
             for src, dst, lengths in chunk_segments(
                     src_list, dst_list, length_list, self._MAX_XFER_SEGMENTS):
-                for _attempt in range(2 if self._XFER_REDUNDANT else 1):
-                    ret = self._one_batch(session_id, src, dst, lengths)
-                    if ret < 0:
-                        raise RuntimeError(
-                            f"KV transfer failed for request {req_meta['remote_request_id']} "
-                            f"(ret={ret}, {len(src)} segments)")
+                ret = self._one_batch(session_id, src, dst, lengths)
+                if ret < 0:
+                    raise RuntimeError(
+                        f"KV transfer failed for request {req_meta['remote_request_id']} "
+                        f"(ret={ret}, {len(src)} segments)")
                 if not KVCacheRecvingThreadFF._logged_ret:
                     KVCacheRecvingThreadFF._logged_ret = True
                     logger.info(
@@ -1474,10 +1519,19 @@ if _ASCEND_AVAILABLE:
             # Fusion accumulator: producer-side worker role only. MooncakeFFProducer is documented
             # transport-agnostic ("pure torch + pd_fuse — no NPU, no ZMQ"), so the layerwise
             # connector's engine is reused verbatim rather than reimplemented for this transport.
+            # Read from the config rather than inferred: wait_for_save must be a no-op on the
+            # DECODE, where a device barrier every step would serialise the decode loop against the
+            # whole device — the opposite of the problem it exists to fix.
+            self._is_producer = bool(role != KVConnectorRole.SCHEDULER
+                                     and vllm_config.kv_transfer_config.is_kv_producer)
             self._ff_producer = None
             self._ff_mla = False
             self._ff_warned_unmapped = False
             self._ff_groups_done = 0
+            if _SAVE_BARRIER and self._is_producer:
+                logger.info(
+                    "MooncakeConnectorFF: BFF_PD_SAVE_BARRIER=1 — the producer will drain its "
+                    "device queue in wait_for_save, before it announces a request finished.")
             if (_FF_FUSE and role != KVConnectorRole.SCHEDULER
                     and vllm_config.kv_transfer_config.is_kv_producer):
                 from kv_fast_fusion_ascend.connectors.mooncake_layerwise_connector_ff import (
@@ -1492,6 +1546,28 @@ if _ASCEND_AVAILABLE:
                     "MooncakeConnectorFF selected with BFF_PD_FUSE!=1. This connector requires the "
                     "BFF multi-group KV layout; with the split off it is strictly worse than the "
                     "stock MooncakeConnectorV1.")
+
+        def wait_for_save(self):
+            """Block until this step's KV writes have EXECUTED, not merely been enqueued.
+
+            The vendored connector leaves this a no-op ``pass``, and vLLM calls it in the ``finally``
+            of ``_get_kv_connector_output`` — right before ``get_finished`` reports the request done
+            and the response goes back through the proxy to the decode. ``KVConnectorBase_V1``
+            documents it as "blocks until all saves are done", which under asynchronous scheduling is
+            not true for free: the host runs ahead of the device, so the producer announces a request
+            finished while its prefill KV writes are still queued on the NPU.
+
+            See ``_sync_producer_writes`` for why that is the leading explanation for the decode
+            reading KV the producer never had, and for what it costs today — dedup's signature
+            exchange has been providing this barrier by accident, at 67.6 s a run on the decode's
+            serial recv thread.
+
+            One drain per STEP, not per request. It removes the host's run-ahead on the producer,
+            which will cost the producer some throughput; that is an acceptable trade here, since
+            relieving the producer's hold by 37% previously moved end-to-end throughput by 0%."""
+            super().wait_for_save()
+            if _SAVE_BARRIER and self._is_producer:
+                _sync_producer_writes()
 
         def save_kv_layer(self, layer_name, kv_layer, attn_metadata, **kwargs):
             """Producer fusion hook — the one place this connector sees KV as it is written.
