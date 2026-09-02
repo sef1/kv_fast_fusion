@@ -174,6 +174,15 @@ MAX_SIG_BATCH = int(os.environ.get("BFF_PULL_V2_SIG_BATCH", "64" if ASYNC_SIG el
 # request is handed another's signatures — the same mis-attribution the producer/decode block-id
 # spaces already cost this connector once.
 SIG_SLOT = "_bff_pull_v2_sig"
+# Move `plan` onto the exchange thread too, not just the exchange. Requires ASYNC_SIG. Even with the
+# exchange off Thread B, plan (~63 ms/request, and it HOLDS the GIL) is left serial on the transfer
+# thread — a ~14 req/s ceiling. On its own sub-flag because it is the change that makes the otherwise
+# lock-free dedup engine concurrent: it can be measured, and rolled back, independently of the
+# exchange move.
+ASYNC_PLAN = ASYNC_SIG and os.environ.get("BFF_PULL_V2_ASYNC_PLAN", "0") == "1"
+# Where the exchange thread leaves this request's plan, same reasoning as SIG_SLOT: on the request,
+# so plan slot i can never be paired against another request's blocks.
+PLAN_SLOT = "_bff_pull_v2_plan"
 # Milliseconds to wait for a SECOND request when the queue drains empty. Zero, and measurement says
 # keep it there: batching is throughput-neutral (see _SigClient), so paying latency to manufacture a
 # batch buys nothing, and the request kept waiting is holding allocated KV blocks — the scarce
@@ -702,7 +711,31 @@ class SignaturePipeline(threading.Thread):
         self._on_error = on_error
         self.exchanged = 0
         self.passed_through = 0
+        self.deferred_carried = 0
         self.batches = 0
+        # Busy time on THIS thread — the whole point of the accounting. It is charged only to the
+        # round trip, because a run that shows this exchange living here rather than on the transfer
+        # thread is the proof that "off the critical path" is real and not inferred from an absence.
+        self.busy_s = 0.0
+        self._start_time = None
+        self._next_report = 1
+
+    def summary(self, now) -> str:
+        wall = (now - self._start_time) if self._start_time is not None else 0.0
+        served = self.exchanged + self.passed_through
+        duty = (self.busy_s / wall * 100.0) if wall > 0 else 0.0
+        per = (self.busy_s / self.batches * 1e3) if self.batches else 0.0
+        return (f"{served} request(s) in {self.batches} round trip(s), exchanged {self.exchanged}, "
+                f"deadline-skipped {self.passed_through} | busy {self.busy_s:.1f}s of {wall:.1f}s "
+                f"= {duty:.1f}% of ITS OWN thread ({per:.0f} ms/round trip)")
+
+    def _report(self, now) -> None:
+        served = self.exchanged + self.passed_through
+        if served < self._next_report:
+            return
+        self._next_report = self._next_report * 10 if self._next_report < 100 else \
+            self._next_report + 100
+        logger.info("BFF pull-v2 signature pipeline: %s", self.summary(now))
 
     def _next_raw(self, blocking: bool):
         """Whatever is on the inbox now; block for the first item only when there is no backlog."""
@@ -718,6 +751,7 @@ class SignaturePipeline(threading.Thread):
         return out
 
     def run(self):
+        self._start_time = self._clock()
         deferred: list = []
         while True:
             try:
@@ -734,14 +768,18 @@ class SignaturePipeline(threading.Thread):
                         self.inbox.task_done()
                 fresh, stale, deferred = partition_by_age(
                     batch, self._deadline_s, now, self._max_batch)
+                self.deferred_carried = len(deferred)
                 # Stale FIRST, and before the round trip: they are late already, and making them
                 # wait for an exchange they are not part of is the exact stall being removed.
                 for _stamp, item in stale:
                     self.passed_through += 1
                     self.ready.put(item)
                 if not fresh:
+                    if stale:
+                        self._report(now)
                     continue
                 self.batches += 1
+                t0 = self._clock()
                 try:
                     self._exchange([item for _stamp, item in fresh])
                     self.exchanged += len(fresh)
@@ -749,10 +787,12 @@ class SignaturePipeline(threading.Thread):
                     if self._on_error is not None:
                         self._on_error(e)
                 finally:
+                    self.busy_s += self._clock() - t0
                     # ALWAYS forwarded, answered or not. A request left here is a request whose
                     # blocks are never read and whose producer is never signalled.
                     for _stamp, item in fresh:
                         self.ready.put(item)
+                    self._report(self._clock())
             # Deliberately blind: this thread dying strands every queued request — their KV is
             # never read and their producer is never signalled, so the decode waits on them
             # forever. No exception is narrow enough to be worth that.
@@ -1374,13 +1414,30 @@ if _ASCEND_AVAILABLE:
                     "queueing behind a round trip.", SIG_DEADLINE_MS, MAX_SIG_BATCH)
             return p
 
+        @property
+        def _engine_lock(self):
+            """Serialises every dedup-engine MUTATION — plan, forget, release.
+
+            The engine is otherwise lock-free because it was only ever touched from the one recv
+            thread. ``BFF_PULL_V2_ASYNC_PLAN`` breaks that: plan runs on the exchange thread while
+            release runs on the transfer thread, so their read-modify-writes on the resident set and
+            the alias tables can now interleave. This lock is the entire safety argument — held
+            across each whole plan-decide and each release, it keeps the maps consistent while still
+            letting the two threads run. With async-plan off it is uncontended (one thread) and
+            costs a few nanoseconds, so there is a single code path rather than a branch."""
+            lk = self.__dict__.get("_engine_lock_obj")
+            if lk is None:
+                lk = self.__dict__["_engine_lock_obj"] = threading.Lock()
+            return lk
+
         def _exchange_for(self, batch) -> None:
             """Thread A: ask each producer once for the batch and leave each answer ON its request.
 
-            Deliberately touches NO dedup-engine state, not even its counters. ``plan``, ``forget``
-            and ``release`` all run on the transfer thread and the engine has no locking, so keeping
-            this side read-only is what lets the two threads coexist without one. The counting moves
-            to :meth:`_take_prefetched`, which runs where the engine already does."""
+            With ``ASYNC_PLAN`` off this touches NO dedup-engine state, not even its counters — the
+            read-only side of the split. With it on, planning moves here too: the same
+            :meth:`_plan_aligned` runs under :attr:`_engine_lock` and its result rides on the request
+            in ``PLAN_SLOT``, so the transfer thread does no engine work at all. Either way the
+            exchange itself is producer I/O and is what this thread exists to overlap."""
             if self.sig_client is None or not (pd_dedup_v2.V2_ENABLED or self._verify_ready()):
                 return
             asks = [self._ask_for(req_meta) for req_meta in batch]
@@ -1390,6 +1447,28 @@ if _ASCEND_AVAILABLE:
                 answers = self.sig_client.ask_many(host, port, [asks[i] for i in positions])
                 for i, sigs in zip(positions, answers):
                     batch[i][SIG_SLOT] = (ask_shape(asks[i]), sigs)
+            if ASYNC_PLAN:
+                for req_meta in batch:
+                    req_meta[PLAN_SLOT] = self._plan_for(req_meta)
+
+        def _plan_for(self, req_meta) -> dict:
+            """Thread A: this request's plan, computed the moment its signatures land.
+
+            The transfer thread will re-derive the same ``aligned`` in ``_align_and_group`` — it is
+            pure list maths over ``req_meta`` and cheap — so only the plan travels, in ``PLAN_SLOT``.
+            Returns ``{}`` on any failure, which Thread B reads as 'nothing declined, transfer in
+            full', exactly the synchronous fallback."""
+            local = req_meta.get("local_block_ids")
+            remote = req_meta.get("remote_block_ids")
+            if not local or not v1.flatten_group_lists(local):
+                return {}
+            try:
+                aligned = v1.align_per_group(local, remote)
+                return self._plan_aligned(req_meta, aligned)
+            except Exception as e:  # noqa: BLE001 - a failed plan costs compression, never liveness
+                logger.warning("BFF pull-v2: async plan failed (%s) — this request is read in "
+                               "full.", e)
+                return {}
 
         def _run_async(self):
             """Thread B: transfer whatever the pipeline has made ready, and never wait on a peer.
@@ -1398,7 +1477,8 @@ if _ASCEND_AVAILABLE:
             failure costs one request — but the queue it reads is the pipeline's, not the raw
             request queue. ``task_done`` still pairs one-for-one with the ``get`` the pipeline made,
             because ``_handle_request`` calls it in its own ``finally``."""
-            ready = self._sig_pipeline.ready
+            pipeline = self._sig_pipeline
+            ready = pipeline.ready
             while True:
                 try:
                     req_data = ready.get()
@@ -1409,6 +1489,19 @@ if _ASCEND_AVAILABLE:
                     self._handle_request(req_data)
                 except Exception as e:  # noqa: BLE001 - vendored shape: one failure, one request
                     logger.error(f"Error in KVCacheTransferThread: {e}")
+                # Mirror the pipeline's own counters into the stats dump. Read-only of another
+                # thread's plain-int/float attributes: torn reads at worst report a slightly stale
+                # number in a diagnostic, never a wrong transfer. Cheap enough to do per request so
+                # the final dump reflects the whole run.
+                if self.dedup_engine is not None:
+                    st = self.dedup_engine.stats
+                    st.pipeline_busy_ms = pipeline.busy_s * 1e3
+                    st.pipeline_batches = pipeline.batches
+                    st.pipeline_exchanged = pipeline.exchanged
+                    # The pipeline is the single source of truth for deadline skips — a skipped
+                    # request is forwarded straight to transfer and may never enter _take_prefetched
+                    # (it never does under ASYNC_PLAN), so counting it there would miss it.
+                    st.sig_deadline_skipped = pipeline.passed_through
 
         def run(self):
             """The vendored loop, taking the queue in DRAINED RUNS so the exchange can batch.
@@ -1434,6 +1527,13 @@ if _ASCEND_AVAILABLE:
             # never reaches here — and the first thing to touch the timer would be the `finally`
             # that charges the first signature exchange, which is how it once read 858.6%.
             self._recv_timer                            # noqa: B018 - primes `started`
+            # Unconditional, so a run's mode is line 1 of the log rather than inferred from a MISSING
+            # line — the exact trap a stale build fell into, running synchronously while everyone
+            # read it as async.
+            logger.info(
+                "BFF pull-v2 recv thread: async exchange %s, async plan %s (deadline %.0f ms, "
+                "batch cap %d).", "ON" if ASYNC_SIG else "OFF", "ON" if ASYNC_PLAN else "OFF",
+                SIG_DEADLINE_MS, MAX_SIG_BATCH)
             self.ready_event.set()
             if ASYNC_SIG:
                 # The exchange moves to its own thread and this one only transfers. Kept as a
@@ -1548,10 +1648,10 @@ if _ASCEND_AVAILABLE:
                 slot = req_meta.pop(SIG_SLOT, None)
                 stats = self.dedup_engine.stats
                 if slot is None:
-                    # No exchange happened: the request passed the deadline and is read in full.
-                    # Counted apart from a FAILED exchange — one is the design working, the other is
-                    # a producer that could not answer, and reading them together would hide both.
-                    stats.sig_deadline_skipped += 1
+                    # No exchange happened: the request passed the deadline and is read in full. NOT
+                    # counted here — the pipeline's `passed_through` is the single source of truth
+                    # for deadline skips (mirrored into sig_deadline_skipped in _run_async), because
+                    # under ASYNC_PLAN a skipped request never reaches this method at all.
                     return {}
                 stats.exchanges += 1
                 sigs, mismatch = claim_prefetched({rid: slot}, rid, ask)
@@ -1606,50 +1706,56 @@ if _ASCEND_AVAILABLE:
             sigs = self._take_prefetched(req_meta, ask)
             if not sigs:
                 return {}
-            if KVCacheRecvingThreadFFv2._verify_sampler.take():
-                # Claimed HERE, not at verification time: the sampler decides which requests get
-                # checked, and that decision has to be made while the signatures are still in hand.
-                # Held for _after_transfer, because the comparison is only meaningful once the KV has
-                # actually landed. plan_groups is D's ids, positionally paired with P's rows; `ask`
-                # is P's ids for the same rows, kept so a failing group can be re-requested.
-                self._verify_stash[req_meta.get("remote_request_id")] = (ask, plan_groups, sigs)
-            if not pd_dedup_v2.V2_ENABLED:
-                # Verification only. It must never plan and never alias — the whole point is to
-                # observe an unmodified transfer.
-                return {}
-            # D's ids — row i of P's signature payload describes plan slot i, because
-            # align_per_group made the two lists equal-length and positionally paired.
-            n_groups = max(plan_groups) + 1
-            wrapped = [plan_groups.get(gi, []) for gi in range(n_groups)]
-            try:
-                planned = self.dedup_engine.plan({ext_id: wrapped}, {ext_id: sigs})
-            except Exception as e:  # pragma: no cover - defensive
-                logger.warning("BFF pull-v2: planning failed (%s) — reading in full.", e)
-                self.dedup_engine.forget([ext_id])
-                return {}
-            out = planned.get(ext_id)
-            if not out:
-                return {}
-            result = {gi: out[gi] for gi in plan_groups if gi < len(out)}
-            stats = self.dedup_engine.stats
-            declined, total = decline_fraction(result)
-            stats.note_request_decline(declined, total)
-            result, capped = cap_request_decline(result)
-            if capped:
-                # The aliases are already staged in the engine, so dropping the plan is not enough —
-                # forget() must retract them or they would be applied to blocks this request is now
-                # going to fetch normally.
-                self.dedup_engine.forget([ext_id])
-                stats.requests_capped += 1
-                if not KVCacheRecvingThreadFFv2._logged_first_cap:
-                    KVCacheRecvingThreadFFv2._logged_first_cap = True
-                    logger.warning(
-                        "BFF pull-v2: a request would have had %d of %d blocks (%.0f%%) replaced by "
-                        "other requests' KV — over the %.0f%% ceiling, so it is being read in full. "
-                        "That much substitution answers a neighbouring prompt, however similar each "
-                        "block is on its own. Tune with BFF_V2_MAX_REQ_DECLINE.",
-                        declined, total, 100.0 * declined / total, 100.0 * MAX_REQ_DECLINE)
-                return {}
+            # One lock, held across the whole plan-decide and (in _after_transfer) each release.
+            # Under ASYNC_PLAN this runs on the exchange thread while releases run on the transfer
+            # thread; the lock is what keeps the engine's resident set and alias tables consistent
+            # between them. Uncontended and near-free when async-plan is off. See _engine_lock.
+            with self._engine_lock:
+                if KVCacheRecvingThreadFFv2._verify_sampler.take():
+                    # Claimed HERE, not at verification time: the sampler decides which requests get
+                    # checked, and that decision has to be made while the signatures are still in
+                    # hand. Held for _after_transfer, because the comparison is only meaningful once
+                    # the KV has landed. plan_groups is D's ids, positionally paired with P's rows;
+                    # `ask` is P's ids for the same rows, kept so a failing group can be re-requested.
+                    self._verify_stash[req_meta.get("remote_request_id")] = (ask, plan_groups, sigs)
+                if not pd_dedup_v2.V2_ENABLED:
+                    # Verification only. It must never plan and never alias — the whole point is to
+                    # observe an unmodified transfer.
+                    return {}
+                # D's ids — row i of P's signature payload describes plan slot i, because
+                # align_per_group made the two lists equal-length and positionally paired.
+                n_groups = max(plan_groups) + 1
+                wrapped = [plan_groups.get(gi, []) for gi in range(n_groups)]
+                try:
+                    planned = self.dedup_engine.plan({ext_id: wrapped}, {ext_id: sigs})
+                except Exception as e:  # pragma: no cover - defensive
+                    logger.warning("BFF pull-v2: planning failed (%s) — reading in full.", e)
+                    self.dedup_engine.forget([ext_id])
+                    return {}
+                out = planned.get(ext_id)
+                if not out:
+                    return {}
+                result = {gi: out[gi] for gi in plan_groups if gi < len(out)}
+                stats = self.dedup_engine.stats
+                declined, total = decline_fraction(result)
+                stats.note_request_decline(declined, total)
+                result, capped = cap_request_decline(result)
+                if capped:
+                    # The aliases are already staged in the engine, so dropping the plan is not
+                    # enough — forget() must retract them or they would be applied to blocks this
+                    # request is now going to fetch normally.
+                    self.dedup_engine.forget([ext_id])
+                    stats.requests_capped += 1
+                    if not KVCacheRecvingThreadFFv2._logged_first_cap:
+                        KVCacheRecvingThreadFFv2._logged_first_cap = True
+                        logger.warning(
+                            "BFF pull-v2: a request would have had %d of %d blocks (%.0f%%) "
+                            "replaced by other requests' KV — over the %.0f%% ceiling, so it is "
+                            "being read in full. That much substitution answers a neighbouring "
+                            "prompt, however similar each block is on its own. Tune with "
+                            "BFF_V2_MAX_REQ_DECLINE.",
+                            declined, total, 100.0 * declined / total, 100.0 * MAX_REQ_DECLINE)
+                    return {}
             self._warn_on_runaway_groups(result)
             return result
 
@@ -1682,7 +1788,13 @@ if _ASCEND_AVAILABLE:
             (so a declined block breaks a contiguous run rather than being absorbed into one and
             dragged across the wire anyway)."""
             aligned = v1.align_per_group(local_groups, remote_groups)
-            planned = self._plan_aligned(req_meta, aligned)
+            # Under ASYNC_PLAN the exchange thread already planned this request and left the result
+            # in PLAN_SLOT; popping it here is all the transfer thread does with the engine. Off, it
+            # plans inline exactly as the vendored-derived path always has. One decision, one slot.
+            if ASYNC_PLAN:
+                planned = req_meta.pop(PLAN_SLOT, None) or {}
+            else:
+                planned = self._plan_aligned(req_meta, aligned)
             grouped = []
             n_declined = 0
             for gi, (remote_ids, local_ids) in enumerate(aligned):
@@ -1720,7 +1832,11 @@ if _ASCEND_AVAILABLE:
             self._verify_transfer(req_meta)
             self._audit_self_consistency(req_meta)
             if self.dedup_engine is not None:
-                self.dedup_engine.release(v1._ext_of(req_meta["remote_request_id"]))
+                # Same lock as plan/forget: under ASYNC_PLAN this release (transfer thread) races the
+                # exchange thread's plan for other requests, and the lock is what serialises their
+                # touches on the engine's shared maps.
+                with self._engine_lock:
+                    self.dedup_engine.release(v1._ext_of(req_meta["remote_request_id"]))
 
         def _audit_self_consistency(self, req_meta) -> None:
             """Did this request's KV change when the identical descriptors were issued again?

@@ -2413,24 +2413,28 @@ def test_the_answer_rides_on_the_request_not_in_a_shared_cache():
         "and still shape-checked — a one-entry cache reuses the guard verbatim"
 
 
-def test_a_deadline_skip_is_counted_apart_from_a_failed_exchange():
-    """One is the design working, the other is a producer that could not answer. Reading them
-    together would hide both — and would make `exchanges == 0` report 'v2 never asked' for a run
-    where the deadline simply fired on everything."""
+def test_a_deadline_skip_is_counted_from_the_pipeline_not_take_prefetched():
+    """A deadline skip is the design working; a failed exchange is a producer that could not answer.
+    They must be counted apart. And the skip count MUST come from the pipeline's `passed_through`,
+    not from _take_prefetched — under ASYNC_PLAN a skipped request never enters _take_prefetched at
+    all, so counting it there would silently undercount exactly the trade we are measuring."""
     import inspect
 
     src = inspect.getsource(v2)
-    fn = src[src.index("        def _take_prefetched(self, req_meta, ask) -> dict:"):]
-    fn = _code_only(fn[:fn.index("        def _plan_aligned(")])
+    take = src[src.index("        def _take_prefetched(self, req_meta, ask) -> dict:"):]
+    take = _code_only(take[:take.index("        def _plan_aligned(")])
+    skip = take[take.index("if slot is None:"):]
 
-    assert "stats.sig_deadline_skipped += 1" in fn
-    assert "stats.sig_phase_failed += 1" in fn
-    skip = fn[fn.index("if slot is None:"):]
+    assert "sig_deadline_skipped" not in skip[:skip.index("return {}")], \
+        "the skip is NOT counted in _take_prefetched — the pipeline is the source of truth"
     assert "sig_phase_failed" not in skip[:skip.index("return {}")], \
-        "a deadline skip is not an exchange failure"
-    assert "stats.exchanges += 1" in fn
-    assert fn.index("stats.sig_deadline_skipped") < fn.index("stats.exchanges += 1"), \
-        "and a skip returns before it can be counted as an exchange"
+        "a deadline skip is not an exchange failure either"
+    assert "stats.exchanges += 1" in take, "an actual exchange still counts as one"
+
+    run_async = src[src.index("            pipeline = self._sig_pipeline"):]
+    run_async = _code_only(run_async[:run_async.index("        def run(self):")])
+    assert "st.sig_deadline_skipped = pipeline.passed_through" in run_async, \
+        "the skip count is mirrored from the pipeline, which sees every skip"
 
 
 def test_async_is_off_by_default_and_raises_the_batch_cap_when_on():
@@ -2459,3 +2463,117 @@ def test_the_synchronous_path_is_untouched_when_async_is_off():
     assert run.index("if ASYNC_SIG:") < run.index("self.request_queue.get()"), \
         "the branch is taken before the vendored loop, not woven into it"
     assert "self._prefetch_signatures(" in run, "the synchronous prefetch survives"
+
+
+# =====================================================================================
+# async observability + plan-on-thread-A
+#
+# "Off the critical path" must be a READING, not an inference from a missing log line — a stale
+# synchronous build once passed for async precisely because the only evidence was an absence.
+# =====================================================================================
+def test_the_pipeline_charges_the_exchange_to_its_own_thread():
+    """pipeline.busy_s must accumulate the round-trip time, and the summary must render it as a
+    duty cycle of the pipeline's OWN wall clock. Nonzero here while the recv thread's `exchange`
+    phase is zero is the positive proof the exchange is off the transfer thread."""
+    import queue as _q
+
+    inbox = _q.Queue()
+    clock = {"t": 0.0}
+
+    def exchange(batch):
+        clock["t"] += 0.5                       # the round trip takes half a second
+
+    p = v2.SignaturePipeline(inbox, exchange, deadline_s=5.0, max_batch=8,
+                             clock=lambda: clock["t"])
+    p.start()
+    for i in range(3):
+        inbox.put({"id": i})
+    for _ in range(3):
+        p.ready.get(timeout=5)
+
+    assert p.busy_s > 0.0, "the round trip is charged to the pipeline thread"
+    s = p.summary(clock["t"])
+    assert "round trip" in s and "its own thread".upper() in s.upper()
+
+
+def test_the_startup_line_states_the_mode_unconditionally():
+    """A stale build ran synchronously while everyone read it as async, because async-on was only
+    ever logged, never async-off. The mode must be line 1 whether on or off."""
+    import inspect
+
+    src = inspect.getsource(v2)
+    run = src[src.index('            """The vendored loop, taking the queue in DRAINED RUNS'):]
+    run = run[:run.index("        def _peer_of(")]
+
+    assert "recv thread: async exchange %s, async plan %s" in run
+    assert run.index('logger.info(') < run.index("if ASYNC_SIG:"), \
+        "logged before the branch, so it fires in every mode"
+
+
+def test_plan_on_thread_a_is_off_by_default_and_requires_async_sig():
+    """It makes a lock-free engine concurrent, so it is its own opt-in — and meaningless without the
+    exchange thread it plans on."""
+    import inspect
+
+    src = inspect.getsource(v2)
+
+    assert v2.ASYNC_PLAN is False, "off by default"
+    assert 'os.environ.get("BFF_PULL_V2_ASYNC_PLAN", "0") == "1"' in src
+    assert "ASYNC_PLAN = ASYNC_SIG and" in src, "requires ASYNC_SIG — no plan thread otherwise"
+
+
+def test_thread_b_does_no_exchange_and_no_plan_when_planning_moved():
+    """The whole point: with plan on A, the transfer thread touches neither the producer nor the
+    engine's plan path. _run_async must be pure transfer."""
+    import inspect
+
+    src = inspect.getsource(v2)
+    # End-anchor on the recv-thread run() docstring, not "def run(self):" — _SigServer also has a
+    # run() and it comes first in the file, so the plain index would slice to an empty string.
+    fn = _code_only(src[src.index("        def _run_async(self):"):
+                        src.index('            """The vendored loop, taking the queue in DRAINED RUNS')])
+
+    for off_thread in ("ask_many", "_prefetch_signatures", "_exchange_for", "_plan_aligned",
+                       "_plan_for"):
+        assert off_thread not in fn, f"{off_thread} must not run on the transfer thread"
+    assert "_handle_request(" in fn, "it only transfers"
+
+
+def test_the_plan_travels_on_the_request_and_is_popped_once():
+    """Like SIG_SLOT: on the request, so plan slot i can never be paired against another request's
+    blocks. Popped (not peeked) so a stale plan cannot outlive its request."""
+    import inspect
+
+    src = inspect.getsource(v2)
+    exch = _code_only(src[src.index("        def _exchange_for(self, batch) -> None:"):
+                          src.index("        def _plan_for(")])
+    align = _code_only(src[src.index("        def _align_and_group(self, req_meta, local_groups"):
+                           src.index("        def _after_transfer(")])
+
+    assert "req_meta[PLAN_SLOT] = self._plan_for(req_meta)" in exch, "A attaches the plan"
+    assert "if ASYNC_PLAN:" in exch
+    assert "req_meta.pop(PLAN_SLOT, None)" in align, "B pops it"
+    assert "self._plan_aligned(req_meta, aligned)" in align, "and still plans inline when off"
+
+
+def test_every_engine_mutation_is_under_the_one_lock():
+    """plan, forget and release are the engine's only writers. With plan on A and release on B they
+    can interleave, and the lock is the entire safety argument — so each must be inside it."""
+    import inspect
+
+    src = inspect.getsource(v2)
+    plan = _code_only(src[src.index("        def _plan_aligned(self, req_meta, aligned):"):
+                          src.index("        def _warn_on_runaway_groups(")])
+    after = _code_only(src[src.index("        def _after_transfer(self, req_meta) -> None:"):
+                           src.index("        def _audit_self_consistency(")])
+
+    # In _plan_aligned, the lock must open before the first engine mutation and every plan/forget
+    # must sit after it.
+    assert "with self._engine_lock:" in plan
+    lock_at = plan.index("with self._engine_lock:")
+    assert lock_at < plan.index("self.dedup_engine.plan("), "plan is under the lock"
+    for w in ("self.dedup_engine.plan(", "self.dedup_engine.forget("):
+        assert plan.index(w) > lock_at, f"{w} is under the lock"
+    # release, on the other thread, takes the SAME lock.
+    assert "with self._engine_lock:" in after
+    assert after.index("with self._engine_lock:") < after.index("self.dedup_engine.release(")

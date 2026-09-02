@@ -930,6 +930,17 @@ if v2:
             print("    -> MORE requests skipped than exchanged: the producer cannot keep up with "
                   "arrivals at all, so dedup is mostly off. Raise the deadline (more compression, "
                   "more queueing) or accept that this load has no room for it.")
+    # Where the exchange actually ran. pipeline_busy_ms is time on the PIPELINE's own thread; if it
+    # is nonzero while the recv thread's own `exchange` phase (in the recv-thread summary) is zero,
+    # the exchange is genuinely off the transfer's critical path — the positive proof, not the
+    # inference from a missing log line that a stale synchronous build once passed for.
+    PBUSY = sum(s.get("pipeline_busy_ms") or 0 for s in v2)
+    PBAT = sum(s.get("pipeline_batches") or 0 for s in v2)
+    PEX = sum(s.get("pipeline_exchanged") or 0 for s in v2)
+    if PBAT:
+        print(f"    async pipeline: exchange ran on ITS OWN thread — {PBUSY/1000:.1f}s over {PBAT} "
+              f"round trip(s) ({PBUSY/PBAT:.0f} ms each), {PEX} request(s) exchanged. The recv "
+              f"thread's own `exchange` phase should read ~0s above; that gap IS off-critical-path.")
     if EX == 0:
         print("    -> v2 NEVER ASKED: the mechanism did not engage at all. Check BFF_V2_DEDUP and "
               "the producer's 'signature server (REP) bound on' line in the prefill log.")

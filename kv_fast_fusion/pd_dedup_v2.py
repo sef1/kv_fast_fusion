@@ -387,6 +387,13 @@ class DedupStats:
         # it trades this request's compression for not queueing every other request behind a 380 ms
         # round trip. Counted apart from sig_phase_failed, which is a producer that could not answer.
         self.sig_deadline_skipped = 0
+        # Async signature pipeline (BFF_PULL_V2_ASYNC_SIG): the exchange's OWN accounting, mirrored
+        # from the pipeline thread. These living here — with pipeline_busy_ms nonzero and the recv
+        # thread's own `exchange` phase at zero — is the positive proof the exchange ran off the
+        # transfer thread, rather than an inference from a missing log line.
+        self.pipeline_busy_ms = 0.0
+        self.pipeline_batches = 0
+        self.pipeline_exchanged = 0
         self.skip_reasons = dict.fromkeys(SKIP_REASONS, 0)
         # Producer-side only: blocks the decode told it to skip. An independent cross-check that
         # the two sides agree — it should track the decode's blocks_not_requested, and a divergence
@@ -556,6 +563,9 @@ class DedupStats:
             "audit_buckets": dict(self.audit_buckets) or None,
             "audit_ms_self_total": round(self.audit_ms_self, 1) if self.audit_requests else None,
             "sig_deadline_skipped": self.sig_deadline_skipped or None,
+            "pipeline_busy_ms": round(self.pipeline_busy_ms, 1) or None,
+            "pipeline_batches": self.pipeline_batches or None,
+            "pipeline_exchanged": self.pipeline_exchanged or None,
             "exchange_skip_reasons": dict(self.skip_reasons),
             "blocks_withheld": self.blocks_withheld,
             "inert": self.is_inert(),
