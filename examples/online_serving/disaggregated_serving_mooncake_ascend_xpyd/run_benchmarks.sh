@@ -860,6 +860,16 @@ elif not summaries:
     print("  recv thread: no timing in the decode logs (BFF_RECV_TIMING=1 adds the per-request "
           "line; the aggregate needs a run with this build).")
 PY
+  # Belt-and-suspenders to the preflight: if async was ASKED for, the decode must have logged that it
+  # engaged it. Catches a build that imports differently in-engine than in the preflight probe. Loud,
+  # after the run, so an inert-flag run is never quietly filed as an async result.
+  if [[ "${BASELINE}" == "bff_pull_v2" && ( "${BFF_PULL_V2_ASYNC_SIG:-0}" == "1" || "${BFF_PULL_V2_ASYNC_PLAN:-0}" == "1" ) ]]; then
+    if ! grep -qs "recv thread: async exchange ON" "${logs_root}"/decode-*.txt; then
+      echo "  !! ASYNC WAS REQUESTED BUT NEVER ENGAGED: no 'recv thread: async exchange ON' in the" >&2
+      echo "     decode log. This run is SYNCHRONOUS despite the flag — a stale connector slipped" >&2
+      echo "     past the preflight (different import path in-engine?). Do NOT read it as async." >&2
+    fi
+  fi
 }
 
 collect_bff_stats() {
@@ -1245,6 +1255,44 @@ PY
 # ============================================================
 # Main
 # ============================================================
+# Refuse to run stale connector code. Twice now a checkout behind HEAD has run the SYNCHRONOUS path
+# while BFF_PULL_V2_ASYNC_SIG=1 was set — the flag is read at import, so old code ignores it and there
+# is no error, just a 12-minute run that silently answered a different question. This imports the
+# connector THE WAY THE ENGINES WILL (same PYTHONPATH, exported above) and checks it carries the async
+# symbols. Provenance always; a hard stop when an async flag cannot possibly take effect.
+check_connector_freshness() {
+  [[ "$BASELINE" != "bff_pull_v2" ]] && return 0
+  local async_asked=0
+  [[ "${BFF_PULL_V2_ASYNC_SIG:-0}" == "1" || "${BFF_PULL_V2_ASYNC_PLAN:-0}" == "1" ]] && async_asked=1
+
+  local out rc
+  out=$(python3 -c 'import inspect, sys
+import kv_fast_fusion_ascend.connectors.mooncake_connector_ff_v2 as m
+print(inspect.getfile(m))
+sys.exit(0 if hasattr(m, "SignaturePipeline") and hasattr(m, "ASYNC_SIG") else 3)' 2>/dev/null)
+  rc=$?
+  local path; path=$(echo "$out" | tail -1)
+  echo "  connector: ${path:-<import failed>} (async symbols: $([[ $rc -eq 0 ]] && echo present || echo MISSING))"
+
+  if [[ $rc -eq 0 ]]; then
+    return 0
+  fi
+  # Missing async symbols (or the import failed outright).
+  if [[ "$async_asked" == "1" ]]; then
+    echo "  FATAL: BFF_PULL_V2_ASYNC_SIG/ASYNC_PLAN is set, but the connector vLLM will load does" >&2
+    echo "         not have the async pipeline. The flag would be silently ignored and the run" >&2
+    echo "         would answer the synchronous question instead — refusing to launch." >&2
+    echo "         Loaded from: ${path:-<import failed>}" >&2
+    echo "         REPO_ROOT=${REPO_ROOT}   (PYTHONPATH front = REPO_ROOT)" >&2
+    echo "         Sync that checkout to a build with the async pipeline (git pull), or unset the" >&2
+    echo "         async flags to run the synchronous path deliberately." >&2
+    exit 3
+  fi
+  echo "  WARNING: this connector predates the async pipeline. The synchronous path is fine, but a" >&2
+  echo "           run here can NOT be an async one — do not read it as such." >&2
+  return 0
+}
+
 main() {
   parse_args "$@"
   resolve_host_ip
@@ -1259,6 +1307,8 @@ main() {
   [[ "$BFF_ON" == "1" ]] && echo "  BFF: fuse=$BFF_PD_FUSE scale=$BFF_SCALE_MODE merge=$BFF_PD_MERGE repr=$BFF_PD_REPR thr=$BFF_THRESHOLD gs=$BFF_GROUP_SIZE eb=$BFF_PD_ENCODED_BATCH_SIZE max_rel_err=$BFF_MAX_REL_ERR"
   [[ "$BASELINE" == "bff_v2" ]] && echo "  BFF v2: dedup=$BFF_V2_DEDUP resident=$BFF_V2_RESIDENT sig_dim=$BFF_SIG_DIM sig_layers=$BFF_SIG_LAYERS sig_timeout=${BFF_V2_SIG_TIMEOUT}s"
   [[ "$BASELINE" == "bff_pull_v2" ]] && echo "  BFF pull-v2: dedup=$BFF_V2_DEDUP resident=$BFF_V2_RESIDENT sig_dim=$BFF_SIG_DIM sig_timeout=${BFF_PULL_V2_SIG_TIMEOUT}s (D asks P; sig port = kv_port+22000)"
+
+  check_connector_freshness
 
   rm -rf "${logs_root}" "${results_root}"; mkdir -p "${logs_root}" "${results_root}"
   rm -f "${results_root}"/bff_stats_*.json
