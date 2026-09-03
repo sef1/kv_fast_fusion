@@ -849,6 +849,105 @@ def test_a_partially_filled_last_block_is_hot_but_a_full_one_is_not():
     assert applier._hot_from(types.SimpleNamespace(num_computed_tokens=500)) == (3, 12)
 
 
+# =====================================================================================
+# Variant A: materialize-by-copy (BFF_V2_MATERIALIZE). An alias is realised by copying the
+# representative's KV into the request's OWN block instead of redirecting the block table at the
+# shared representative and freeing the orphan. Wire saving is unchanged; what changes is that
+# NOTHING is written to the table and NOTHING is freed — which is what keeps FULL_DECODE_ONLY
+# correct (no post-capture table mutation). Block size 128 throughout, matching BFF's requirement.
+# =====================================================================================
+def _materialize_applier(engine, copy_ok=True, block_size=128):
+    """Applier in materialize mode with recording write/copy callbacks.
+
+    ``written`` captures any block-table write (must stay empty in materialize mode); ``copied``
+    captures ``(gi, pairs)`` handed to the copy callback; ``failed`` is the recompute set."""
+    written, copied, failed = [], [], set()
+
+    def _write(r, rid, gi, blocks):
+        written.append((rid, gi, list(blocks)))
+        return True
+
+    def _copy(runner, gi, pairs):
+        copied.append((int(gi), [(int(s), int(d)) for s, d in pairs]))
+        return copy_ok
+
+    applier = pd_dedup_v2.AliasApplier(
+        engine, _write, failed.update, block_size=block_size, copy_blocks=_copy)
+    return applier, written, copied, failed
+
+
+def test_materialize_copies_rep_into_own_block_and_writes_no_table(monkeypatch):
+    """The common case under Variant A. A cold victim (51) is realised by copying rep 41's KV into
+    51 — the request keeps its own block 51, the table is never rewritten, nothing is freed."""
+    monkeypatch.setattr(pd_dedup_v2, "MATERIALIZE_ALIASES", True)
+    engine = _staged(victim=51, rep=41)
+    applier, written, copied, failed = _materialize_applier(engine)
+    runner = _fake_runner({"rA": [[], [41]], "rB": [[], [50, 51, 52, 53]]},
+                          computed={"rA": 128, "rB": 512})
+
+    applier.apply(runner)
+
+    assert copied == [(1, [(41, 51)])], "rep 41 copied into the request's own block 51"
+    assert written == [], "the block table must NOT be rewritten in materialize mode"
+    assert runner._updated_block_tables is None, "nothing staged for free/merge"
+    assert runner.requests["rB"].block_ids[1] == [50, 51, 52, 53], "own blocks kept as-is"
+    assert not failed
+    assert engine.stats.materialized == 1
+    assert engine.stats.applied == 1
+
+
+def test_materialize_falls_back_to_recompute_when_the_copy_cannot_run(monkeypatch):
+    """A copy that returns False (layout surprise, missing cache) must degrade to recompute, exactly
+    as a refused block-table write does — the victim holds nothing, so it cannot be 'kept'."""
+    monkeypatch.setattr(pd_dedup_v2, "MATERIALIZE_ALIASES", True)
+    engine = _staged(victim=51, rep=41)
+    applier, written, copied, failed = _materialize_applier(engine, copy_ok=False)
+    runner = _fake_runner({"rA": [[], [41]], "rB": [[], [50, 51, 52, 53]]},
+                          computed={"rA": 128, "rB": 512})
+
+    for _ in range(pd_dedup_v2.APPLY_MAX_AGE + 2):
+        applier.apply(runner)
+
+    assert copied, "the copy was attempted"
+    assert written == [], "still no table write"
+    assert failed == {51}, "the un-materialisable victim goes to the load-failure path"
+    assert engine.stats.materialized == 0
+
+
+def test_materialize_respects_the_hot_block_guard(monkeypatch):
+    """The frontier guard fires BEFORE the copy: a block the decode is still writing must not be
+    overwritten with the representative's KV any more than it may be aliased at it."""
+    monkeypatch.setattr(pd_dedup_v2, "MATERIALIZE_ALIASES", True)
+    engine = _staged(victim=52, rep=41)              # index 2 is hot at 300 computed tokens
+    applier, _written, copied, failed = _materialize_applier(engine)
+
+    applier.apply(_fake_runner({"rA": [[], [41]], "rB": [[], [50, 51, 52, 53]]},
+                               computed={"rA": 128, "rB": 300}))
+
+    assert copied == [], "the hot victim is refused before any copy is issued"
+    assert failed == {52}
+    assert engine.stats.hot_block_aliases == {1: 1}
+    assert engine.stats.materialized == 0
+
+
+def test_materialize_flag_off_uses_the_redirect_path(monkeypatch):
+    """With BFF_V2_MATERIALIZE unset the applier must be byte-identical to today: the table is
+    rewritten and the copy callback is never called, even when one is injected."""
+    monkeypatch.setattr(pd_dedup_v2, "MATERIALIZE_ALIASES", False)
+    engine = _staged(victim=51, rep=41)
+    applier, written, copied, _failed = _materialize_applier(engine)
+    runner = _fake_runner({"rA": [[], [41]], "rB": [[], [50, 51]]},
+                          computed={"rA": 128, "rB": 256})
+
+    applier.apply(runner)
+
+    assert copied == [], "no copy in redirect mode"
+    assert written == [("rB", 1, [50, 41])], "the table is rewritten as before"
+    assert runner._updated_block_tables == {"rB": {1: [50, 41]}}
+    assert engine.stats.applied == 1
+    assert engine.stats.materialized == 0
+
+
 def test_a_refused_hot_victim_is_counted_once_even_when_its_group_retries():
     """A group whose representative is not resident YET is retried for APPLY_MAX_AGE steps. If the
     refused victim stayed in the retry state it would be re-counted on every one of those steps, and

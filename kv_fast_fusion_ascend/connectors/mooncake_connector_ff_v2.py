@@ -2299,6 +2299,15 @@ if _ASCEND_AVAILABLE:
                     self.kv_recv_thread.local_sigs_multi = self.signatures_for_groups_split
                 logger.info("BFF pull-v2: decode dedup engine armed (V2_DEDUP=%s, sig timeout "
                             "%.1fs).", pd_dedup_v2.V2_ENABLED, SIG_EXCHANGE_TIMEOUT)
+                # Unconditional so line 1 of the log states the apply mode — Variant A materialize
+                # (copy into own blocks, no table write, full graph legal) vs the default redirect
+                # (pointer share + free, PIECEWISE-only). A stale build or an unset flag is then
+                # visible without inference, the trap the async work kept falling into.
+                logger.info("BFF pull-v2: alias apply mode = %s%s.",
+                            "MATERIALIZE (copy into own blocks; no post-capture table write)"
+                            if pd_dedup_v2.MATERIALIZE_ALIASES else "redirect (pointer share + free)",
+                            ", FULL_DECODE_ONLY permitted"
+                            if (ALLOW_FULL_GRAPH and pd_dedup_v2.MATERIALIZE_ALIASES) else "")
                 if VERIFY_TRANSFER > 0:
                     logger.warning(
                         "BFF pull-v2: TRANSFER VERIFICATION on for the first %d request(s). Each "
@@ -2512,12 +2521,25 @@ if _ASCEND_AVAILABLE:
 
             The knob is kept so the result stays reproducible, not as something to tune. Turning it
             on costs half the F1 and the failure is silent unless you read the text."""
+            # Variant A materialization removes the post-capture block-table write entirely (aliases
+            # are realised by KV copy into the request's OWN blocks, so the table never diverges from
+            # what the graph captured). That is the exact mechanism the 0.2704 result was attributed
+            # to, so materialize is the one mode in which permitting FULL_DECODE_ONLY is a real test
+            # rather than a known-broken reproduction. It still requires the operator to opt in via
+            # BFF_V2_ALLOW_FULL_GRAPH, so nothing changes silently.
+            if ALLOW_FULL_GRAPH and pd_dedup_v2.MATERIALIZE_ALIASES:
+                logger.warning(
+                    "BFF pull-v2: FULL_DECODE_ONLY permitted under BFF_V2_MATERIALIZE — aliases are "
+                    "materialised by KV copy, so no block-table write lands after graph capture. "
+                    "This is the decisive full-graph test; F1 must stay ~0.47, not fall to 0.27.")
+                return False
             if ALLOW_FULL_GRAPH:
                 logger.warning(
                     "BFF pull-v2: BFF_V2_ALLOW_FULL_GRAPH=1 permits FULL_DECODE_ONLY, which is "
-                    "KNOWN BROKEN with BFF's multi-group block tables — a measured run gave F1 "
-                    "0.2704 against 0.4947 under PIECEWISE, with token-level garbage from the "
-                    "first decoded token. Unset it unless you are deliberately reproducing that.")
+                    "KNOWN BROKEN with BFF's multi-group block tables under the REDIRECT path — a "
+                    "measured run gave F1 0.2704 against 0.4947 under PIECEWISE, with token-level "
+                    "garbage from the first decoded token. Set BFF_V2_MATERIALIZE=1 to make full "
+                    "graph a real test, or unset this unless deliberately reproducing the break.")
             return not ALLOW_FULL_GRAPH
 
         def _applier(self) -> "AliasApplier":
@@ -2530,7 +2552,11 @@ if _ASCEND_AVAILABLE:
                     group_layers=worker._group_layers,
                     # Lets the applier locate each request's write frontier and refuse to alias a
                     # block the decode has not finished writing. See pd_dedup_v2.PROTECT_HOT_BLOCKS.
-                    block_size=self._block_size())
+                    block_size=self._block_size(),
+                    # Variant A: injected so an alias can be realised by copying the representative's
+                    # KV into the request's own block instead of redirecting the table. Inert unless
+                    # BFF_V2_MATERIALIZE is set (pd_dedup_v2.MATERIALIZE_ALIASES).
+                    copy_blocks=_make_copy_alias_blocks(worker))
             return a
 
         def _block_size(self) -> int:
@@ -2577,8 +2603,10 @@ if _ASCEND_AVAILABLE:
                 n = applier._engine.stats.applied - before
                 if n:
                     hot = sum(applier._engine.stats.hot_block_aliases.values())
-                    logger.info("BFF pull-v2 apply | aliases_applied=%d | recompute(cum)=%d | "
-                                "hot-block refused(cum)=%d", n,
+                    logger.info("BFF pull-v2 apply | aliases_applied=%d | via=%s | "
+                                "materialized(cum)=%d | recompute(cum)=%d | hot-block refused(cum)=%d",
+                                n, "copy" if pd_dedup_v2.MATERIALIZE_ALIASES else "redirect",
+                                applier._engine.stats.materialized,
                                 applier._engine.stats.recomputed, hot)
                 _audit_t0 = time.perf_counter()
                 self._audit_hot_blocks(runner)
@@ -2712,6 +2740,42 @@ if _ASCEND_AVAILABLE:
             _ff_write_runner_block_table,
         )
         return _ff_write_runner_block_table(runner, rid, gi, new_blocks)
+
+    def _make_copy_alias_blocks(worker):
+        """Build the Variant A copy callback bound to this worker's registered KV caches.
+
+        ``copy(runner, gi, pairs) -> bool`` copies, for group ``gi``, each ``(src_rep, dst_victim)``
+        block pair inside every layer of the group, so the request's own physical block ends up
+        holding the representative's KV. Returns True iff the device copy was issued. Unlike the
+        redirect path this writes NOTHING to the block table — the table keeps pointing at the
+        request's own (now-filled) blocks — which is what lets FULL_DECODE_ONLY stay correct: there
+        is no post-capture table mutation for the replayed graph to miss.
+
+        Reuses ``AscendAttentionBackend.copy_blocks``, the same primitive vLLM uses for block
+        swap/copy: it does ``key/value_caches[dst] = [src]`` on dim 0 of each ``[2, num_blocks, ...]``
+        layer cache. Defensive by construction — any layout surprise returns False so the alias
+        degrades to a recompute (``note_failed_blocks``) rather than crashing the forward."""
+        def _copy(runner, gi: int, pairs) -> bool:
+            if not pairs:
+                return False
+            try:
+                import torch
+                from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
+                layer_names = sorted(worker._group_layers.get(int(gi), ()))
+                kv_caches = [worker.kv_caches[ln] for ln in layer_names if ln in worker.kv_caches]
+                if not kv_caches:
+                    return False
+                dev = kv_caches[0].device
+                # Columns are [src, dst] == [representative, own victim], the order copy_blocks reads.
+                src_to_dists = torch.tensor(
+                    [[int(s), int(d)] for s, d in pairs], dtype=torch.int64, device=dev)
+                AscendAttentionBackend.copy_blocks(kv_caches, src_to_dists)
+                return True
+            except Exception as e:  # noqa: BLE001 - a copy that cannot run must recompute, not crash
+                logger.warning("BFF pull-v2 materialize copy failed (group %s, %d pairs): %s",
+                               gi, len(pairs), e)
+                return False
+        return _copy
 
     def register_mooncake_connector_ff_v2() -> None:
         """Register ``MooncakeConnectorFFv2`` (idempotent)."""

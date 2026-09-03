@@ -89,6 +89,17 @@ FAIL_REASONS = ("owner_never_batched", "rep_not_resident", "victim_not_in_table"
 # correctness bug. Set to 0 to reproduce the old behaviour — the counter still fires either way.
 PROTECT_HOT_BLOCKS = os.environ.get("BFF_V2_PROTECT_HOT_BLOCKS", "1") == "1"
 
+# Variant A (see plan Update 4). When set, an alias is realised by COPYING the representative's KV
+# into the request's OWN physical block, instead of redirecting the block-table slot at the shared
+# representative and freeing the orphan. Wire saving is identical (the victim block was still not
+# fetched over the wire); what changes is local — no block is freed (so concurrency returns to the
+# baseline the group split had before dedup inflated it) and, crucially, NO block-table write lands
+# after graph capture, which is the one thing that broke FULL_DECODE_ONLY. The correctness
+# precondition is exactly the redirect path's: the alias is chosen only when the whole block is
+# equivalent, so copying the whole block is as valid as pointing at it — and it is strictly safer on
+# hot blocks, because each request now writes its own block instead of a shared representative.
+MATERIALIZE_ALIASES = os.environ.get("BFF_V2_MATERIALIZE", "0") == "1"
+
 # Why an exchange did not happen at all. A connector that never ASKS produces exactly the same
 # all-zero stats as one that asked and found nothing, and the first Ascend run was the former for
 # an entire benchmark before a log dive found it. Silence is not an acceptable report.
@@ -319,7 +330,8 @@ class DedupStats:
         self.planned: dict[int, int] = {}            # blocks considered
         self.dropped_resident: dict[int, int] = {}   # served by a block already on D
         self.dropped_batch: dict[int, int] = {}      # served by another block in the same transfer
-        self.applied = 0            # aliases that reached the block table
+        self.applied = 0            # aliases that reached the block table (or were materialised)
+        self.materialized = 0       # aliases realised by KV copy into the own block (Variant A)
         self.recomputed = 0         # aliases that could not be applied -> local recompute
         # Wall time spent inside AliasApplier.apply, which runs on the decode's critical path once
         # per forward step. Measured because the 2026-08-19 A/B showed the current connector paying
@@ -512,6 +524,7 @@ class DedupStats:
             "apply_calls": self.apply_calls,
             "apply_us_mean": round(self.apply_ms * 1000 / self.apply_calls, 1) if self.apply_calls else 0,
             "aliases_applied": self.applied,
+            "aliases_materialized": self.materialized,
             "aliases_recomputed": self.recomputed,
             "alias_failure_reasons": dict(self.fail_reasons),
             # Non-zero means the run was aliasing blocks the decode was still writing into — two
@@ -871,10 +884,18 @@ class AliasApplier:
     joined."""
 
     def __init__(self, engine: DedupEngine, write_block_table, note_failed_blocks,
-                 normalize_req_id=None, group_layers=None, block_size=None) -> None:
+                 normalize_req_id=None, group_layers=None, block_size=None,
+                 copy_blocks=None) -> None:
         self._engine = engine
         self._write = write_block_table
         self._note_failed = note_failed_blocks
+        # Variant A (MATERIALIZE_ALIASES): ``copy_blocks(runner, gi, pairs) -> bool`` copies the
+        # representative's KV into the request's own block, where ``pairs`` is a list of
+        # ``(src_representative_block_id, dst_own_block_id)``. Injected the same way ``write_block_table``
+        # is, because the KV-cache tensors live on the connector's worker. None leaves materialize mode
+        # inert (the applier falls back to the redirect path), so a caller that does not pass it — or a
+        # run with BFF_V2_MATERIALIZE unset — behaves exactly as before.
+        self._copy = copy_blocks
         self._norm = normalize_req_id or (lambda rid: rid)
         # KV block size, used only to locate each request's write frontier (see _hot_from). None
         # leaves the whole hot-block check inert, so a caller that does not pass it behaves exactly
@@ -982,9 +1003,33 @@ class AliasApplier:
                     del by_group[gi]
                     continue
                 new_blocks, scales, why = self._substitute(rid2blocks, rid, gi, mapping)
+                if MATERIALIZE_ALIASES and self._copy is not None:
+                    # Variant A: realise the alias by COPYING the representative's KV into the
+                    # request's own block. ``_substitute`` has already validated residency+owner
+                    # (``why``) — the same gate the redirect path trusts — so on ``why is None`` the
+                    # ``rep`` ids are safe copy SOURCES. Destinations are the request's ORIGINAL
+                    # victim blocks (from ``mapping``), which the block table keeps pointing at, so
+                    # nothing is written to the table and nothing is freed.
+                    pairs = [(int(rep), int(victim))
+                             for victim, (rep, _owner, _scale) in mapping.items()]
+                    if why is None and self._copy(runner, int(gi), pairs):
+                        # Scales still apply: the materialised KV is the representative's, so a ratio
+                        # recorded for it is as valid as under redirect. Length is this group's own
+                        # (unchanged) block count.
+                        self._store_ratios(runner, local_rid, int(gi), scales,
+                                           len(rid2blocks[rid][gi]))
+                        n_applied += len(mapping)
+                        stats.materialized += len(mapping)
+                        # NOT added to ``updated``: that channel drives the scheduler's block FREE and
+                        # the block-table merge, neither of which must happen when we keep our own
+                        # blocks. The victim holds a valid copy now, so it is genuinely applied.
+                        del by_group[gi]
+                        continue
+                    # why != None (rep not yet resident / recycled) or the copy could not run: fall
+                    # through to the SAME retry/fail handling the redirect path uses below.
                 # Free ONLY when the device table was really rewritten — and recompute whenever it
                 # was not, because unlike v1 the victim block holds nothing.
-                if why is None and self._write(runner, local_rid, int(gi), new_blocks):
+                elif why is None and self._write(runner, local_rid, int(gi), new_blocks):
                     updated.setdefault(local_rid, {})[int(gi)] = new_blocks
                     # Strictly after the write: the scales describe a substitution that has actually
                     # happened, and a scale recorded for a table that was refused would rescale KV
