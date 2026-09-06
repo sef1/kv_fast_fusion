@@ -93,6 +93,10 @@ PRODUCER_SIGCACHE = os.environ.get("BFF_V2_PRODUCER_SIGCACHE", "0") == "1"
 # process and the queue simply stays empty there, so the decode falls back to on-demand (no win, no
 # harm). Bounded so a stall can never grow it without limit — a dropped job is just an on-demand miss.
 _PRODUCER_SIG_JOBS: "queue.Queue" = queue.Queue(maxsize=4096)
+# How many finished requests to sign per forward step in wait_for_save. Bounds the compute one step
+# adds so it stays inside the transport's window; the queue absorbs any backlog and it drains over the
+# next steps. Small enough not to stall a transfer, large enough to keep the cache ahead of the pulls.
+SIG_PRECOMPUTE_PER_STEP = int(os.environ.get("BFF_V2_SIG_PRECOMPUTE_PER_STEP", "8"))
 # Check, after each apply, that no physical block sits in two live requests' write frontiers.
 #
 # OFF by default now: its question is closed. It found 0 collisions across 1,008,893 slot
@@ -2384,12 +2388,8 @@ if _ASCEND_AVAILABLE:
                 self._await_sig_server()
                 self._warm_signatures()
                 logger.info("BFF pull-v2 producer: signature precompute %s.",
-                            "ON (computed at save time, exchange served from cache)"
+                            "ON (computed in wait_for_save on the forward thread, served from cache)"
                             if PRODUCER_SIGCACHE else "OFF (computed on demand per exchange)")
-                if PRODUCER_SIGCACHE:
-                    t = threading.Thread(target=self._precompute_loop, daemon=True,
-                                         name="BFF-pullv2-SigPrecompute")
-                    t.start()
             else:
                 self._dedup_engine = DedupEngine()
                 self._sig_client = _SigClient()
@@ -2612,23 +2612,27 @@ if _ASCEND_AVAILABLE:
                             n += 1
             return n
 
-        def _precompute_loop(self) -> None:
-            """Producer drain thread: turn each finished request's block ids (enqueued by
-            ``request_finished_all_groups``) into cached signatures, off both critical paths.
+        def drain_precompute(self, max_jobs: int = SIG_PRECOMPUTE_PER_STEP) -> int:
+            """Compute + cache signatures for up to ``max_jobs`` finished requests, ON THE CALLER'S
+            THREAD (the producer forward thread, from ``wait_for_save``).
 
-            Reads ``kv_caches`` only (never writes), so unlike the decode's materialize copy it does
-            not race the adxl transport that is concurrently reading the same tensors for the pull.
-            The head start over the decode's exchange is the proxy round-trip that carries
-            ``kv_transfer_params`` from here to D; when it is not enough, the exchange just misses and
-            recomputes on demand."""
-            while True:
-                job = _PRODUCER_SIG_JOBS.get()
-                if job is None:                       # shutdown sentinel
-                    return
+            This is the whole reason it is NOT a background thread: an UNPACED background drain floods
+            the producer NPU and stalls the adxl transport serving the pulls (measured: 485 transfer
+            timeouts). Run from ``wait_for_save`` it is sequenced with the forward the transport
+            already coexists with, and bounded per step so no single step's compute exceeds the
+            transport's window. Returns the number of jobs drained."""
+            n = 0
+            for _ in range(max(0, int(max_jobs))):
+                try:
+                    job = _PRODUCER_SIG_JOBS.get_nowait()
+                except queue.Empty:
+                    break
                 try:
                     self.precompute_signatures(job)
-                except Exception as e:  # noqa: BLE001 - never kill the precompute thread
+                except Exception as e:  # noqa: BLE001 - a bad job is skipped, never fatal
                     logger.warning("BFF pull-v2 producer: precompute job failed (%s).", e)
+                n += 1
+            return n
 
         def serve_signatures_cached(self, per_slot) -> dict:
             """Cache-first core for the _SigServer: ``{slot: {gi: [ids]}}`` -> ``{slot: {gi: payload}}``.
@@ -2715,6 +2719,23 @@ if _ASCEND_AVAILABLE:
 
         def save_kv_layer(self, layer_name, kv_layer, attn_metadata, **kwargs) -> None:
             """No-op: signatures are computed on demand from the registered KV cache."""
+
+        def wait_for_save(self):
+            """As v1 (the optional producer write barrier), plus: under PRODUCER_SIGCACHE, drain a
+            bounded batch of finished requests into the signature cache HERE — on the forward thread.
+
+            vLLM calls this once per step in the worker's ``_get_kv_connector_output`` finally, on the
+            same thread that just ran the forward. Computing the signatures here is what makes them
+            coordinated with the forward the adxl transport already coexists with, instead of an
+            uncoordinated background thread that floods the NPU and stalls the pulls (measured: 485
+            transfer timeouts). Bounded per step so no single step overruns the transport's window."""
+            super().wait_for_save()
+            if PRODUCER_SIGCACHE and self.connector_worker is not None:
+                try:
+                    self.connector_worker.drain_precompute()
+                except Exception as e:  # noqa: BLE001 - precompute must never fail the step
+                    logger.warning("BFF pull-v2 producer: wait_for_save precompute drain failed "
+                                   "(%s).", e)
 
         def request_finished_all_groups(self, request, block_ids):
             """As v1 (hand over the KV, delay the free), plus: under PRODUCER_SIGCACHE, enqueue this
