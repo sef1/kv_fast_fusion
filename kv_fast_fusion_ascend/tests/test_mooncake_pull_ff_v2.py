@@ -29,6 +29,36 @@ SENT = -1
 
 
 # =====================================================================================
+# cache_list_device — the Variant A materialize copy read a layer's device. A layer's KV cache is a
+# (key, value) tuple, not a stacked tensor, so `kv_caches[0].device` crashed with "'tuple' object
+# has no attribute 'device'" on the box and sent every alias to recompute (aliases_materialized=0).
+# =====================================================================================
+class _FakeTensor:
+    """Minimal stand-in with a .device, so the layout logic is testable without torch/NPU."""
+    def __init__(self, device):
+        self.device = device
+
+
+def test_cache_list_device_reads_the_key_of_a_key_value_tuple():
+    """The real Ascend layout: each layer is a (key, value) tuple. The device must come from the key
+    tensor, not from the tuple (which has no .device)."""
+    key, value = _FakeTensor("npu:0"), _FakeTensor("npu:0")
+    assert v2.cache_list_device([(key, value), (key, value)]) == "npu:0"
+
+
+def test_cache_list_device_handles_a_stacked_tensor_layout():
+    """A layer given as a single [2, num_blocks, ...] tensor (the other supported shape) must also
+    resolve, straight off the tensor's own .device."""
+    assert v2.cache_list_device([_FakeTensor("npu:1")]) == "npu:1"
+
+
+def test_cache_list_device_of_no_caches_is_none():
+    """An empty group has no device; the copy callback treats None/empty as "cannot copy" → recompute
+    rather than crash."""
+    assert v2.cache_list_device([]) is None
+
+
+# =====================================================================================
 # filter_sentinels — the one function that must never be got wrong
 # =====================================================================================
 def test_a_declined_position_vanishes_from_both_lists():

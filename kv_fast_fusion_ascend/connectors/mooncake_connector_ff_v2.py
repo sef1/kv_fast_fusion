@@ -967,6 +967,21 @@ def parse_sig_reply_batch(msg) -> dict:
     return out
 
 
+def cache_list_device(kv_caches):
+    """Device of a list of per-layer KV caches, tolerating both layouts BFF sees.
+
+    A layer's cache is a ``(key, value)`` tuple here (``signature_matrix`` treats ``first[0]`` as the
+    key), not a stacked ``[2, num_blocks, ...]`` tensor — so reading ``kv_caches[0].device`` blindly
+    dereferences ``.device`` on a tuple, which is the exact crash the first materialize run hit
+    ('tuple' object has no attribute 'device'). Pure and vllm_ascend-free so it is unit-testable
+    off-NPU; the copy callback in the NPU section calls it."""
+    if not kv_caches:
+        return None
+    probe = kv_caches[0]
+    probe = probe[0] if isinstance(probe, (list, tuple)) else probe
+    return probe.device
+
+
 # =================================================================================================
 # Ascend/NPU-only section
 # =================================================================================================
@@ -2304,7 +2319,9 @@ if _ASCEND_AVAILABLE:
                 # (pointer share + free, PIECEWISE-only). A stale build or an unset flag is then
                 # visible without inference, the trap the async work kept falling into.
                 logger.info("BFF pull-v2: alias apply mode = %s%s.",
-                            "MATERIALIZE (copy into own blocks; no post-capture table write)"
+                            "MATERIALIZE (copy into own blocks; no post-capture table write; "
+                            "retains own blocks, no orphan free — memory NOT shared, concurrency at "
+                            "baseline, by design)"
                             if pd_dedup_v2.MATERIALIZE_ALIASES else "redirect (pointer share + free)",
                             ", FULL_DECODE_ONLY permitted"
                             if (ALLOW_FULL_GRAPH and pd_dedup_v2.MATERIALIZE_ALIASES) else "")
@@ -2765,7 +2782,10 @@ if _ASCEND_AVAILABLE:
                 kv_caches = [worker.kv_caches[ln] for ln in layer_names if ln in worker.kv_caches]
                 if not kv_caches:
                     return False
-                dev = kv_caches[0].device
+                # Layout-aware (a layer's cache is a (key, value) tuple, not a stacked tensor).
+                # copy_blocks below consumes either shape via kv_cache[0]/[1]; only the device read
+                # needs the guard. See cache_list_device.
+                dev = cache_list_device(kv_caches)
                 # Columns are [src, dst] == [representative, own victim], the order copy_blocks reads.
                 src_to_dists = torch.tensor(
                     [[int(s), int(d)] for s, d in pairs], dtype=torch.int64, device=dev)
