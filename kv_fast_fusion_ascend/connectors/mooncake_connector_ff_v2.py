@@ -79,6 +79,20 @@ SIG_SERVER_BIND_TIMEOUT = float(os.environ.get("BFF_PULL_V2_SIG_BIND_TIMEOUT", "
 # MooncakeConnectorFFv2.requires_piecewise_for_cudagraph. Kept only so the experiment stays
 # reproducible; it is not a tuning knob.
 ALLOW_FULL_GRAPH = os.environ.get("BFF_V2_ALLOW_FULL_GRAPH", "0") == "1"
+# Producer-side signature precompute (Update 9). When set, the producer computes each request's block
+# signatures at SAVE time (off the decode's critical path — P has slack, D is the bottleneck) and the
+# _SigServer answers exchanges from that cache, so the decode's exchange stops paying for the
+# producer's on-demand NPU drains (~79 s / 16x the actual transfer at con512). A cache MISS falls back
+# to the existing on-demand compute, so the result is never wrong, only slower. Default off.
+PRODUCER_SIGCACHE = os.environ.get("BFF_V2_PRODUCER_SIGCACHE", "0") == "1"
+
+# Bridge for PRODUCER_SIGCACHE: the scheduler-side `request_finished_all_groups` (which has the
+# per-group block ids) enqueues a precompute job here, and the producer worker's drain thread (which
+# has `kv_caches`) consumes it. At TP=1 scheduler and worker share the process, so this in-process
+# queue joins the two halves without any wire/protocol change; at TP>1 the worker is a separate
+# process and the queue simply stays empty there, so the decode falls back to on-demand (no win, no
+# harm). Bounded so a stall can never grow it without limit — a dropped job is just an on-demand miss.
+_PRODUCER_SIG_JOBS: "queue.Queue" = queue.Queue(maxsize=4096)
 # Check, after each apply, that no physical block sits in two live requests' write frontiers.
 #
 # OFF by default now: its question is closed. It found 0 collisions across 1,008,893 slot
@@ -967,6 +981,45 @@ def parse_sig_reply_batch(msg) -> dict:
     return out
 
 
+def assemble_sig_payload(rows: list) -> dict | None:
+    """Merge per-block signature payloads (each a 1-row ``SignatureCodec.encode`` dict) into one
+    n-block slot payload, byte-identical to ``SignatureCodec.encode`` over the stacked rows.
+
+    This is what lets the producer cache signatures per ``(group, block_id)`` yet still answer a
+    decode exchange in the exact per-slot format the decode already parses — so the wire protocol and
+    the decode are untouched (Update 9). ``rows`` are in slot order, one per block. Returns None if
+    any row is missing, so the caller reads that slot in full rather than pairing short.
+
+    Pure and vllm-free (bytes + lists only) so it is unit-testable off-NPU."""
+    if not rows or any(r is None for r in rows):
+        return None
+    out = {
+        "sig": b"".join(r["sig"] for r in rows),
+        "dim": rows[0]["dim"],
+        "norms": [r["norms"][0] for r in rows],
+        "hashes": [r["hashes"][0] for r in rows],
+    }
+    if rows[0].get("kvn") is not None:
+        out["kvn"] = b"".join(r["kvn"] for r in rows)
+        out["kvn_v"] = b"".join(r["kvn_v"] for r in rows)
+        out["kvn_layers"] = rows[0]["kvn_layers"]
+    return out
+
+
+def split_cached_blocks(block_ids: list, cache: dict, gi: int) -> tuple:
+    """Partition ``block_ids`` into (cached rows in slot order with None for misses, missing ids).
+
+    ``cache`` is keyed ``(gi, block_id) -> per-block payload``. Returned ``rows`` is index-aligned
+    with ``block_ids`` (None where absent); ``missing`` is the de-duplicated list of ids to compute.
+    Pure, so the cache-hit/miss bookkeeping is testable without a device."""
+    rows = [cache.get((int(gi), int(b))) for b in block_ids]
+    missing = [int(b) for b, r in zip(block_ids, rows) if r is None]
+    # de-dup preserving order — a slot can ask the same id twice (a prefix shared within itself)
+    seen: set = set()
+    missing = [b for b in missing if not (b in seen or seen.add(b))]
+    return rows, missing
+
+
 def cache_list_device(kv_caches):
     """Device of a list of per-layer KV caches, tolerating both layouts BFF sees.
 
@@ -1130,10 +1183,19 @@ if _ASCEND_AVAILABLE:
             if self.served + self.failed < self._next_report:
                 return
             self._next_report *= 10
+            cache = ""
+            if PRODUCER_SIGCACHE:
+                h = getattr(self._worker, "_sig_cache_hits", 0)
+                m = getattr(self._worker, "_sig_cache_misses", 0)
+                tot = h + m
+                # The number that says the precompute is doing its job: a high hit rate means the
+                # exchange was served from cache and paid no on-demand NPU drain.
+                rate = 100.0 * h / tot if tot else 0.0
+                cache = f" | precompute cache {h}/{tot} blocks ({rate:.1f}% hit)"
             logger.info("BFF pull-v2 signature server: served %d request(s) in %d exchange(s) "
-                        "(%.1f per exchange), %d failed%s.", self.served, self.batches,
+                        "(%.1f per exchange), %d failed%s%s.", self.served, self.batches,
                         self.served / self.batches if self.batches else 0.0, self.failed,
-                        (" " + str(self.fail_reasons)) if self.fail_reasons else "")
+                        (" " + str(self.fail_reasons)) if self.fail_reasons else "", cache)
 
         def _handle(self, msg):
             """Answer either shape. Both tags are served so a decode one version behind still
@@ -1164,6 +1226,17 @@ if _ASCEND_AVAILABLE:
             resulting rows are sliced back by the same offsets, so row *i* of a slot's payload is
             still that slot's block *i*. A group one slot did not ask about simply contributes no
             rows and is absent from its answer."""
+            # PRODUCER_SIGCACHE: answer from the save-time precompute cache (miss → on-demand
+            # fallback inside serve_signatures_cached). This is what moves the NPU drains off the
+            # decode's blocking exchange onto prefill — see Update 9.
+            if PRODUCER_SIGCACHE:
+                out = self._worker.serve_signatures_cached(per_slot)
+                served = sum(1 for v in out.values() if v)
+                if served:
+                    self.served += served
+                self.batches += 1
+                self._report()
+                return out
             out: dict[int, dict] = {slot: {} for slot in per_slot}
             plan = signature_batch_plan(per_slot)
             try:
@@ -2283,6 +2356,14 @@ if _ASCEND_AVAILABLE:
             self._proj = [None]      # SimHash projection cache — same reason
             self._ff_failed_blocks: set = set()
             self._group_layers: dict[int, set] = {}
+            # Producer-side signature precompute cache (PRODUCER_SIGCACHE): (gi, block_id) -> per-block
+            # payload, filled at save time and read by the _SigServer thread, so guarded by a lock.
+            # Naturally bounded by the block pool (each id is overwritten by the next request that
+            # finishes on it, before any decode asks), so no eviction hook is needed. See Update 9.
+            self._sig_row_cache: dict = {}
+            self._sig_cache_lock = threading.Lock()
+            self._sig_cache_hits = 0
+            self._sig_cache_misses = 0
             super().__init__(vllm_config, engine_id, kv_cache_config)
 
         def register_kv_caches(self, kv_caches):
@@ -2302,6 +2383,13 @@ if _ASCEND_AVAILABLE:
                 self._sig_server.start()
                 self._await_sig_server()
                 self._warm_signatures()
+                logger.info("BFF pull-v2 producer: signature precompute %s.",
+                            "ON (computed at save time, exchange served from cache)"
+                            if PRODUCER_SIGCACHE else "OFF (computed on demand per exchange)")
+                if PRODUCER_SIGCACHE:
+                    t = threading.Thread(target=self._precompute_loop, daemon=True,
+                                         name="BFF-pullv2-SigPrecompute")
+                    t.start()
             else:
                 self._dedup_engine = DedupEngine()
                 self._sig_client = _SigClient()
@@ -2468,6 +2556,118 @@ if _ASCEND_AVAILABLE:
                     raise exc
             return out.get(int(gi), [None] * len(lengths))
 
+        # -- producer signature precompute (PRODUCER_SIGCACHE, Update 9) -------------------
+        def signature_rows_for(self, gi: int, block_ids):
+            """Per-block signature payloads for ONE group — a 1-row ``SignatureCodec.encode`` dict per
+            block, in ``block_ids`` order (None for a block that cannot be signed).
+
+            This is the unit the producer caches by ``(gi, block_id)``; slot payloads are reassembled
+            from these with :func:`assemble_sig_payload`, so a cached answer is byte-identical to the
+            on-demand ``signatures_for_groups_split`` path (same ``signature_matrix`` + projections +
+            3-arg encode). One device pass for the whole ``block_ids`` list, like the on-demand path.
+            Never raises the per-group compute — a failure returns Nones, which the caller treats as a
+            miss and reads in full."""
+            ids = [int(b) for b in block_ids]
+            if not ids:
+                return []
+            layer_names = sorted(self._group_layers.get(int(gi), ()))
+            layers = [self.kv_caches[ln] for ln in layer_names if ln in self.kv_caches]
+            if not layers:
+                return [None] * len(ids)
+            is_mla = bool(getattr(self.vllm_config.model_config, "use_mla", False))
+            sig, norms = signature_matrix(layers, ids, is_mla, self._jl, num_blocks=self.num_blocks)
+            if sig is None:
+                return [None] * len(ids)
+            proj = pd_lsh.get_proj(self._proj, sig.shape[1], sig.device)
+            hashes = pd_lsh.sub_hashes_device(sig, proj).cpu().tolist()
+            sig_host = sig.to(torch.float16).cpu()
+            norms_host = norms.detach().float().cpu()
+            return [SignatureCodec.encode(sig_host[j:j + 1], norms_host[j:j + 1], hashes[j:j + 1])
+                    for j in range(len(ids))]
+
+        def precompute_signatures(self, blocks_by_group) -> int:
+            """Compute + cache per-block signatures for ``{gi: [block_ids]}`` at SAVE time.
+
+            Overwrites existing ``(gi, block_id)`` entries — that is what keeps a recycled block id
+            fresh, so the cache never serves stale KV and needs no eviction hook (see Update 9).
+            Returns the count cached. Never fatal: a failed group is skipped and falls back to the
+            decode's on-demand exchange."""
+            if not PRODUCER_SIGCACHE or not blocks_by_group:
+                return 0
+            n = 0
+            for gi, ids in blocks_by_group.items():
+                ids = [int(b) for b in ids]
+                if not ids:
+                    continue
+                try:
+                    rows = self.signature_rows_for(int(gi), ids)
+                except Exception as e:  # noqa: BLE001 - never fatal; on-demand covers the miss
+                    logger.warning("BFF pull-v2 producer: precompute failed for group %s (%s).",
+                                   gi, e)
+                    continue
+                with self._sig_cache_lock:
+                    for b, row in zip(ids, rows):
+                        if row is not None:
+                            self._sig_row_cache[(int(gi), int(b))] = row
+                            n += 1
+            return n
+
+        def _precompute_loop(self) -> None:
+            """Producer drain thread: turn each finished request's block ids (enqueued by
+            ``request_finished_all_groups``) into cached signatures, off both critical paths.
+
+            Reads ``kv_caches`` only (never writes), so unlike the decode's materialize copy it does
+            not race the adxl transport that is concurrently reading the same tensors for the pull.
+            The head start over the decode's exchange is the proxy round-trip that carries
+            ``kv_transfer_params`` from here to D; when it is not enough, the exchange just misses and
+            recomputes on demand."""
+            while True:
+                job = _PRODUCER_SIG_JOBS.get()
+                if job is None:                       # shutdown sentinel
+                    return
+                try:
+                    self.precompute_signatures(job)
+                except Exception as e:  # noqa: BLE001 - never kill the precompute thread
+                    logger.warning("BFF pull-v2 producer: precompute job failed (%s).", e)
+
+        def serve_signatures_cached(self, per_slot) -> dict:
+            """Cache-first core for the _SigServer: ``{slot: {gi: [ids]}}`` -> ``{slot: {gi: payload}}``.
+
+            Assembles each slot payload from the ``(gi, block_id)`` cache, computing only the MISSING
+            ids on demand (one pass per group, preserving the drain-batching) and back-filling. A miss
+            is slower, never wrong. Hit/miss are counted BEFORE back-fill so the telemetry reflects
+            what the precompute actually covered."""
+            out: dict = {slot: {} for slot in per_slot}
+            missing_by_group: dict = {}
+            with self._sig_cache_lock:
+                for groups in per_slot.values():
+                    for gi, ids in (groups or {}).items():
+                        rows, miss = split_cached_blocks(list(ids), self._sig_row_cache, int(gi))
+                        self._sig_cache_hits += sum(1 for r in rows if r is not None)
+                        self._sig_cache_misses += len(miss)
+                        if miss:
+                            missing_by_group.setdefault(int(gi), set()).update(miss)
+            for gi, miss in missing_by_group.items():
+                ids = sorted(miss)
+                try:
+                    rows = self.signature_rows_for(int(gi), ids)
+                except Exception as e:  # noqa: BLE001 - fallback failure -> read in full
+                    logger.warning("BFF pull-v2: on-demand signature fallback failed for group %s "
+                                   "(%s).", gi, e)
+                    rows = [None] * len(ids)
+                with self._sig_cache_lock:
+                    for b, row in zip(ids, rows):
+                        if row is not None:
+                            self._sig_row_cache[(int(gi), int(b))] = row
+            with self._sig_cache_lock:
+                for slot, groups in per_slot.items():
+                    for gi, ids in (groups or {}).items():
+                        payload = assemble_sig_payload(
+                            [self._sig_row_cache.get((int(gi), int(b))) for b in ids])
+                        if payload is not None:
+                            out[slot][int(gi)] = payload
+            return out
+
         def note_sig_failure(self, reason: str) -> None:
             # On the producer `_dedup_engine` is always None (only the decode decides), so this is a
             # no-op there by design — _SigServer keeps and logs its own tally instead. Kept for the
@@ -2515,6 +2715,27 @@ if _ASCEND_AVAILABLE:
 
         def save_kv_layer(self, layer_name, kv_layer, attn_metadata, **kwargs) -> None:
             """No-op: signatures are computed on demand from the registered KV cache."""
+
+        def request_finished_all_groups(self, request, block_ids):
+            """As v1 (hand over the KV, delay the free), plus: under PRODUCER_SIGCACHE, enqueue this
+            finished request's per-group block ids for the worker's precompute thread.
+
+            ``block_ids`` is already per group (list of lists) — the same ids that go into
+            ``kv_transfer_params`` — so the worker signs exactly what D will pull. Enqueue is
+            best-effort: a full queue or any error just leaves those blocks to the on-demand exchange.
+            This is scheduler-side; the worker drains the module queue in the same process (TP=1)."""
+            res = super().request_finished_all_groups(request, block_ids)
+            if PRODUCER_SIGCACHE and block_ids:
+                try:
+                    groups = {int(gi): [int(b) for b in g]
+                              for gi, g in enumerate(block_ids) if g}
+                    if groups:
+                        _PRODUCER_SIG_JOBS.put_nowait(groups)
+                except queue.Full:
+                    pass
+                except Exception as e:  # noqa: BLE001 - enqueue must never fail the request
+                    logger.warning("BFF pull-v2 producer: could not enqueue precompute (%s).", e)
+            return res
 
         @classmethod
         def requires_piecewise_for_cudagraph(cls, extra_config: dict) -> bool:

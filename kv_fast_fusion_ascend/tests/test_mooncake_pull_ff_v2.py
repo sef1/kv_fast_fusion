@@ -59,6 +59,65 @@ def test_cache_list_device_of_no_caches_is_none():
 
 
 # =====================================================================================
+# Producer signature precompute (PRODUCER_SIGCACHE, Update 9): the producer caches per-block
+# signatures at save time and reassembles slot payloads from them. The reassembly MUST be byte-
+# identical to the on-demand monolithic encode, or the decode pairs signatures against the wrong
+# blocks — silently. That invariant is what these tests pin.
+# =====================================================================================
+def _rand_sig(n, dim=8, tables=4, seed=0):
+    import torch
+    g = torch.Generator().manual_seed(seed)
+    sig = torch.randn(n, dim, generator=g)
+    norms = torch.rand(n, generator=g)
+    hashes = [[int(x) for x in row] for row in torch.randint(0, 1 << 20, (n, tables), generator=g)]
+    return sig, norms, hashes
+
+
+def test_assemble_sig_payload_is_byte_identical_to_monolithic_encode():
+    """The whole point: a slot payload assembled from per-block rows must equal the payload the
+    on-demand path produces by encoding the block rows together — same sig bytes, dim, norms, hashes.
+    A mismatch would mispair P's rows against D's blocks and read the wrong KV with no error."""
+    from kv_fast_fusion.pd_dedup_v2 import SignatureCodec
+    sig, norms, hashes = _rand_sig(5)
+    monolithic = SignatureCodec.encode(sig, norms, hashes)
+    per_block = [SignatureCodec.encode(sig[j:j + 1], norms[j:j + 1], hashes[j:j + 1])
+                 for j in range(5)]
+    assembled = v2.assemble_sig_payload(per_block)
+    assert assembled["sig"] == monolithic["sig"], "sig bytes must match exactly"
+    assert assembled["dim"] == monolithic["dim"]
+    assert assembled["norms"] == monolithic["norms"]
+    assert assembled["hashes"] == monolithic["hashes"]
+    # And it must round-trip through decode to the same rows.
+    import torch
+    d_asm = SignatureCodec.decode(assembled)
+    d_mono = SignatureCodec.decode(monolithic)
+    assert torch.equal(d_asm[0], d_mono[0])
+    assert d_asm[1] == d_mono[1] and d_asm[2] == d_mono[2]
+
+
+def test_assemble_returns_none_if_any_block_is_missing():
+    """A slot with a cache miss anywhere must read in full, not pair short against the wrong blocks."""
+    from kv_fast_fusion.pd_dedup_v2 import SignatureCodec
+    sig, norms, hashes = _rand_sig(3)
+    rows = [SignatureCodec.encode(sig[j:j + 1], norms[j:j + 1], hashes[j:j + 1]) for j in range(3)]
+    rows[1] = None
+    assert v2.assemble_sig_payload(rows) is None
+    assert v2.assemble_sig_payload([]) is None
+
+
+def test_split_cached_blocks_partitions_hits_and_dedups_misses():
+    """Rows come back index-aligned with the ask (None for misses); missing ids are de-duplicated
+    while preserving order so the on-demand pass computes each once."""
+    cache = {(1, 10): "A", (1, 12): "C"}
+    rows, missing = v2.split_cached_blocks([10, 11, 12, 11, 13], cache, gi=1)
+    assert rows == ["A", None, "C", None, None]
+    assert missing == [11, 13], "misses de-duplicated, order preserved"
+    # A different group id never hits another group's entries.
+    rows2, missing2 = v2.split_cached_blocks([10, 12], cache, gi=2)
+    assert rows2 == [None, None] and missing2 == [10, 12]
+
+
+# =====================================================================================
 # filter_sentinels — the one function that must never be got wrong
 # =====================================================================================
 def test_a_declined_position_vanishes_from_both_lists():
@@ -2082,7 +2141,10 @@ def test_the_single_group_entry_point_delegates_rather_than_duplicating():
 
     src = inspect.getsource(v2)
     fn = src[src.index("        def signatures_for_group_split(self, gi: int, block_ids, lengths):"):]
-    fn = _code_only(fn[:fn.index("        def note_sig_failure(")])
+    # Slice to the END of this method (the next def), not to a far-off one — the producer precompute
+    # methods that follow have their OWN legitimate signature_matrix call for the per-block cache.
+    fn = fn[len("        def signatures_for_group_split(self, gi: int, block_ids, lengths):"):]
+    fn = _code_only(fn[:fn.index("\n        def ")])
 
     assert "self.signatures_for_groups_split(" in fn
     assert "signature_matrix(" not in fn, "no second copy of the computation"
