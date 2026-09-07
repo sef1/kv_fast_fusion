@@ -97,6 +97,12 @@ _PRODUCER_SIG_JOBS: "queue.Queue" = queue.Queue(maxsize=4096)
 # adds so it stays inside the transport's window; the queue absorbs any backlog and it drains over the
 # next steps. Small enough not to stall a transfer, large enough to keep the cache ahead of the pulls.
 SIG_PRECOMPUTE_PER_STEP = int(os.environ.get("BFF_V2_SIG_PRECOMPUTE_PER_STEP", "8"))
+# Usage-gated dedup (Update 11): run the signature exchange + aliasing ONLY when the decode's KV
+# cache usage is at least this fraction — i.e. only when dedup's memory relief is worth its cost. The
+# pull-heavy ramp (low usage) then runs dedup-free at baseline speed, and dedup self-throttles (its
+# frees drop usage back below the gate). 0.0 disables the gate (dedup always on, the prior behaviour);
+# 0.97 is a sensible "only under real pressure". Usage unknown (None) is treated as below the gate.
+DEDUP_KV_THRESHOLD = float(os.environ.get("BFF_V2_DEDUP_KV_THRESHOLD", "0.0"))
 # Check, after each apply, that no physical block sits in two live requests' write frontiers.
 #
 # OFF by default now: its question is closed. It found 0 collisions across 1,008,893 slot
@@ -985,6 +991,18 @@ def parse_sig_reply_batch(msg) -> dict:
     return out
 
 
+def dedup_gate_open(usage, threshold) -> bool:
+    """Should dedup (the exchange + aliasing) run at this KV-cache usage? (Update 11.)
+
+    Open (True) when ``threshold <= 0`` — the gate is disabled, dedup always on, the prior behaviour.
+    Otherwise open only when ``usage`` is known AND at/above ``threshold``. Unknown usage (None) keeps
+    it CLOSED so an unmeasurable state behaves like baseline rather than silently deduping. Pure, so
+    the policy is unit-testable without a block pool."""
+    if threshold <= 0.0:
+        return True
+    return usage is not None and usage >= threshold
+
+
 def assemble_sig_payload(rows: list) -> dict | None:
     """Merge per-block signature payloads (each a 1-row ``SignatureCodec.encode`` dict) into one
     n-block slot payload, byte-identical to ``SignatureCodec.encode`` over the stacked rows.
@@ -1532,6 +1550,10 @@ if _ASCEND_AVAILABLE:
             exchange itself is producer I/O and is what this thread exists to overlap."""
             if self.sig_client is None or not (pd_dedup_v2.V2_ENABLED or self._verify_ready()):
                 return
+            # Usage gate (Update 11) — same policy as the sync path: below threshold, skip the
+            # exchange so this batch is read in full. Verify-only runs are never gated.
+            if pd_dedup_v2.V2_ENABLED and self._dedup_gate_closed():
+                return
             asks = [self._ask_for(req_meta) for req_meta in batch]
             keys = [self._peer_of(req_meta) if ask else None
                     for req_meta, ask in zip(batch, asks)]
@@ -1702,6 +1724,19 @@ if _ASCEND_AVAILABLE:
                 return {}
             return ask
 
+        def _dedup_gate_closed(self) -> bool:
+            """Usage gate (Update 11): True ⇒ SKIP dedup this batch because KV usage is below
+            DEDUP_KV_THRESHOLD (dedup's memory relief is not yet worth its exchange cost). Reads the
+            live decode usage via the block-pool bridge; counts closed batches for the log. Never
+            gates the verify-only path — that must observe an unmodified transfer regardless."""
+            if DEDUP_KV_THRESHOLD <= 0.0 or self.dedup_engine is None:
+                return False
+            from kv_fast_fusion import fast_fusion_block_pool as _bp
+            if dedup_gate_open(_bp.kv_cache_usage(), DEDUP_KV_THRESHOLD):
+                return False
+            self.dedup_engine.stats.dedup_gated_batches += 1
+            return True
+
         def _prefetch_signatures(self, batch) -> None:
             """Ask each producer once for the whole drained run, before any of it is transferred.
 
@@ -1712,6 +1747,11 @@ if _ASCEND_AVAILABLE:
             cache.clear()
             if (self.dedup_engine is None or self.sig_client is None
                     or not (pd_dedup_v2.V2_ENABLED or self._verify_ready())):
+                return
+            # Usage gate: below threshold, skip the exchange entirely — the batch is read in full,
+            # like baseline. Not applied when only verification is active (V2 disabled), so a verify
+            # run still exchanges. See _dedup_gate_closed.
+            if pd_dedup_v2.V2_ENABLED and self._dedup_gate_closed():
                 return
             asks = [self._ask_for(req_meta) for req_meta in batch]
             keys = [self._peer_of(req_meta) if ask else None
@@ -2401,7 +2441,9 @@ if _ASCEND_AVAILABLE:
                     self.kv_recv_thread.local_sigs = self.signatures_for_group_split
                     self.kv_recv_thread.local_sigs_multi = self.signatures_for_groups_split
                 logger.info("BFF pull-v2: decode dedup engine armed (V2_DEDUP=%s, sig timeout "
-                            "%.1fs).", pd_dedup_v2.V2_ENABLED, SIG_EXCHANGE_TIMEOUT)
+                            "%.1fs, KV-usage gate %s).", pd_dedup_v2.V2_ENABLED, SIG_EXCHANGE_TIMEOUT,
+                            f">= {DEDUP_KV_THRESHOLD:.2f}" if DEDUP_KV_THRESHOLD > 0
+                            else "off (dedup always on)")
                 # Unconditional so line 1 of the log states the apply mode — Variant A materialize
                 # (copy into own blocks, no table write, full graph legal) vs the default redirect
                 # (pointer share + free, PIECEWISE-only). A stale build or an unset flag is then

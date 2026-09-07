@@ -41,7 +41,7 @@
 # =============================================================================
 
 # ---- Model / topology --------------------------------------------------------
-MODEL=${MODEL:-deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct}
+MODEL=${MODEL:-Qwen/Qwen-7B-Instruct} #deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct
 TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-1200}
 PROXY_HTTP_PORT=${PROXY_HTTP_PORT:-10001}   # proxy HTTP serving port (benchmark target)
 KV_IP=${KV_IP:-10.10.10.174}

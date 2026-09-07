@@ -20,6 +20,7 @@ import os
 import queue
 import re
 import time
+import types
 
 import pytest
 
@@ -103,6 +104,45 @@ def test_assemble_returns_none_if_any_block_is_missing():
     rows[1] = None
     assert v2.assemble_sig_payload(rows) is None
     assert v2.assemble_sig_payload([]) is None
+
+
+# =====================================================================================
+# Usage-gated dedup (BFF_V2_DEDUP_KV_THRESHOLD, Update 11): dedup runs only when KV usage is high.
+# The gate must be OFF-safe — an unknown usage or a disabled threshold must never silently change
+# behaviour from the operator's expectation.
+# =====================================================================================
+def test_dedup_gate_disabled_is_always_open():
+    """threshold <= 0 disables the gate: dedup always runs, regardless of usage (even unknown)."""
+    assert v2.dedup_gate_open(0.10, 0.0) is True
+    assert v2.dedup_gate_open(None, 0.0) is True
+    assert v2.dedup_gate_open(0.99, -1.0) is True
+
+
+def test_dedup_gate_opens_only_at_or_above_threshold():
+    """With a real threshold, dedup runs only under pressure."""
+    assert v2.dedup_gate_open(0.98, 0.97) is True, "above -> open"
+    assert v2.dedup_gate_open(0.97, 0.97) is True, "exactly at -> open"
+    assert v2.dedup_gate_open(0.96, 0.97) is False, "below -> closed (read in full)"
+
+
+def test_dedup_gate_treats_unknown_usage_as_closed():
+    """None usage (no block pool captured yet, or TP>1 cross-process) must behave like baseline:
+    dedup OFF, never a silent guess that could alias against a state we cannot measure."""
+    assert v2.dedup_gate_open(None, 0.97) is False
+
+
+def test_kv_cache_usage_reads_the_captured_pool(monkeypatch):
+    """The usage the gate reads is 1 - free/total from the captured block pool; None when there is no
+    pool or no total."""
+    from kv_fast_fusion import fast_fusion_block_pool as bp
+    monkeypatch.setattr(bp, "_BLOCK_POOL", None, raising=False)
+    assert bp.kv_cache_usage() is None, "no pool captured yet -> unknown"
+    pool = types.SimpleNamespace(num_gpu_blocks=100, get_num_free_blocks=lambda: 3)
+    monkeypatch.setattr(bp, "_BLOCK_POOL", pool, raising=False)
+    assert abs(bp.kv_cache_usage() - 0.97) < 1e-9, "97 of 100 in use"
+    monkeypatch.setattr(bp, "_BLOCK_POOL",
+                        types.SimpleNamespace(num_gpu_blocks=0, blocks=[]), raising=False)
+    assert bp.kv_cache_usage() is None, "no total -> unknown, not a divide-by-zero"
 
 
 def test_split_cached_blocks_partitions_hits_and_dedups_misses():

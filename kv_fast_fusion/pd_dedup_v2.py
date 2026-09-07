@@ -344,6 +344,10 @@ class DedupStats:
         self.fail_reasons = dict.fromkeys(FAIL_REASONS, 0)
         self.sig_phase_failed = 0   # exchanges that fell back to a full transfer
         self.exchanges = 0          # exchanges actually attempted
+        # Batches skipped by the KV-usage gate (BFF_V2_DEDUP_KV_THRESHOLD): dedup did not run because
+        # memory was not under pressure, so the batch was read in full like baseline. A high count
+        # over a run means most of it ran dedup-free — which is the point during the ramp.
+        self.dedup_gated_batches = 0
         # Round trips, and requests carried by them, on transports that batch the signature phase.
         # Left at zero elsewhere and reported as None rather than 0, because "this transport does
         # not batch" and "batching never engaged" are the two readings that matter and 0 says both.
@@ -526,6 +530,7 @@ class DedupStats:
             "aliases_applied": self.applied,
             "aliases_materialized": self.materialized,
             "aliases_recomputed": self.recomputed,
+            "dedup_gated_batches": self.dedup_gated_batches,
             "alias_failure_reasons": dict(self.fail_reasons),
             # Non-zero means the run was aliasing blocks the decode was still writing into — two
             # requests sharing the same physical slots for their newly generated tokens. Zero means

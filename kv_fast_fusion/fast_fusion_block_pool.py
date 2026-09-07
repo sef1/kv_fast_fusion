@@ -16,6 +16,31 @@ _ACTIVE_RUNNER = None
 # image of _ACTIVE_RUNNER. None ⇒ promotion-time apply unavailable (e.g. TP>1: other process).
 _FF_PENDING_SOURCE = None
 
+# The decode's KV BlockPool, captured on every free (patched_free_blocks, where `self` IS the pool)
+# so the worker-side recv thread can read current KV-cache usage WITHOUT a handle to the scheduler.
+# Used to GATE dedup on memory pressure (Update 11): the exchange only runs when usage is high, so
+# the pull-heavy ramp runs dedup-free at baseline speed. None until the first free, and across
+# processes at TP>1 — callers treat None as "below gate" (dedup off), the baseline-safe default.
+_BLOCK_POOL = None
+
+
+def kv_cache_usage():
+    """Fraction of the decode's KV blocks in use (1 - free/total), or None if not yet known.
+
+    Read cross-thread from the recv thread; a length read is racy but a threshold gate does not need
+    exactness. None (no pool captured, or a zero/absent total) means "cannot tell" — the caller must
+    default to dedup OFF so an unknown state never silently behaves differently from baseline."""
+    bp = _BLOCK_POOL
+    if bp is None:
+        return None
+    try:
+        total = getattr(bp, "num_gpu_blocks", None) or len(getattr(bp, "blocks", []))
+        if not total:
+            return None
+        return 1.0 - bp.get_num_free_blocks() / total
+    except Exception:  # noqa: BLE001 - a gate read must never raise into the recv thread
+        return None
+
 # When set, do NOT eagerly evict a freed block from the prefix cache on ref-0 free — keep it
 # cached (stock vLLM does this lazy eviction) so a preempted request can recover it on resume
 # instead of recomputing the prefill. Safe in raw/ratio (KV is not mutated, so the cached block
@@ -126,6 +151,11 @@ def patched_maybe_evict_cached_block(self, block) -> bool:
 
 def patched_free_blocks(self, ordered_blocks):
     """Free a list of blocks with deduplication by block_id."""
+    # `self` IS the BlockPool here — capture it so the recv thread can read KV usage for the dedup
+    # gate (Update 11). Idempotent; the reference never changes for the life of the process.
+    global _BLOCK_POOL
+    if _BLOCK_POOL is None:
+        _BLOCK_POOL = self
     # Materialize the iterable to allow multiple passes.
     seen = {}
     blocks_list = list(ordered_blocks)
