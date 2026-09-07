@@ -2441,9 +2441,11 @@ if _ASCEND_AVAILABLE:
                     self.kv_recv_thread.local_sigs = self.signatures_for_group_split
                     self.kv_recv_thread.local_sigs_multi = self.signatures_for_groups_split
                 logger.info("BFF pull-v2: decode dedup engine armed (V2_DEDUP=%s, sig timeout "
-                            "%.1fs, KV-usage gate %s).", pd_dedup_v2.V2_ENABLED, SIG_EXCHANGE_TIMEOUT,
+                            "%.1fs, KV-usage gate %s, sig compute dtype %s).",
+                            pd_dedup_v2.V2_ENABLED, SIG_EXCHANGE_TIMEOUT,
                             f">= {DEDUP_KV_THRESHOLD:.2f}" if DEDUP_KV_THRESHOLD > 0
-                            else "off (dedup always on)")
+                            else "off (dedup always on)",
+                            str(pd_dedup_v2.SIG_COMPUTE_DTYPE).replace("torch.", ""))
                 # Unconditional so line 1 of the log states the apply mode — Variant A materialize
                 # (copy into own blocks, no table write, full graph legal) vs the default redirect
                 # (pointer share + free, PIECEWISE-only). A stale build or an unset flag is then

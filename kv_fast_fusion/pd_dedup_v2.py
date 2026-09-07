@@ -46,6 +46,19 @@ from kv_fast_fusion.pd_dedup_plan import DedupPlanner, IncomingBlock
 # fidelity is traded for wire size: 128 fp16 dims is ~256 B against a block of KV that is ~1.6 MB,
 # i.e. 0.02%. Shared JL projection, fixed seed, so P and D agree without negotiating.
 SIG_DIM = int(os.environ.get("BFF_SIG_DIM", "128"))
+# Dtype the JL projection (the dominant signature cost) runs in. The gather + the [N, ~262k] @
+# [~262k, SIG_DIM] matmul are the producer's per-exchange NPU work; in fp32 that matmul runs off the
+# Ascend cube (slow vector path) and the gather moves twice the bytes. bf16 runs on the cube with
+# fp32 internal accumulate — several× faster — and the fidelity cost is ~nil because the sig is
+# truncated to fp16 on the wire anyway (SignatureCodec.encode) and the small [N, SIG_DIM] result is
+# re-upcast to fp32 before the norm/normalize below. MUST match on P and D (they derive the same
+# projection from the same seed), so it is env-wide, never per-process; "fp32" restores the old path
+# for a clean A/B. The [N, SIG_DIM] LSH matmul is 0.1% of this and stays fp32.
+_SIG_DTYPES = {"bf16": torch.bfloat16, "bfloat16": torch.bfloat16,
+               "fp16": torch.float16, "float16": torch.float16,
+               "fp32": torch.float32, "float32": torch.float32}
+SIG_COMPUTE_DTYPE = _SIG_DTYPES.get(
+    os.environ.get("BFF_SIG_COMPUTE_DTYPE", "bf16").lower(), torch.bfloat16)
 # Master switch. Off disables the ENTIRE mechanism, signature exchange included — the transfer
 # reverts to what the stock connector would do, which is the "BFF group split, no fusion" control
 # arm, NOT a measurement of what the exchange costs. (Two runs with this off differ only by noise,
@@ -224,7 +237,7 @@ def block_layer_norms(kv_layers: list, block_ids: list[int], is_mla: bool):
 
 
 def signature_matrix(kv_layers: list, block_ids: list[int], is_mla: bool, jl_holder: list,
-                     num_blocks: int | None = None):
+                     num_blocks: int | None = None, compute_dtype=None):
     """Concatenate the given layers' per-block K and project to :data:`SIG_DIM`.
 
     Mirrors ``FFProducerFusion.block_repr`` + the concat the v1 clustering used, so a v2 signature
@@ -236,9 +249,15 @@ def signature_matrix(kv_layers: list, block_ids: list[int], is_mla: bool, jl_hol
     tensor whose block count is an integer multiple of it (``block_size_scale``), in which case a
     connector block id does not index the tensor and the only safe answer is to refuse.
 
+    ``compute_dtype`` is the dtype the gather + JL matmul run in (default :data:`SIG_COMPUTE_DTYPE`,
+    normally bf16); the small ``[N, d]`` result is re-upcast to fp32 before the norm so the returned
+    vectors, their norms, and every downstream cosine/LSH consumer are numerically unchanged. Pass
+    ``torch.float32`` to reproduce the pre-bf16 path exactly (used by the fp32-golden tests).
+
     Returns ``(normalised [N, d], norms [N])`` on the caller's device."""
     if not block_ids or not kv_layers:
         return None, None
+    dt = SIG_COMPUTE_DTYPE if compute_dtype is None else compute_dtype
     first = kv_layers[0]
     probe = first[0] if isinstance(first, (list, tuple)) else first
     if num_blocks is not None and getattr(probe, "shape", None) is not None:
@@ -252,15 +271,21 @@ def signature_matrix(kv_layers: list, block_ids: list[int], is_mla: bool, jl_hol
     idx = torch.as_tensor(block_ids, dtype=torch.long, device=probe.device)
     parts = []
     for kv in kv_layers:
-        blk = key_blocks(kv, idx, is_mla).float()
+        blk = key_blocks(kv, idx, is_mla).to(dt)
         parts.append(blk.reshape(idx.shape[0], -1))
     full = torch.cat(parts, dim=1)
-    if jl_holder[0] is None or jl_holder[0].shape[0] != full.shape[1]:
+    # The projection is seeded in fp32 on the host (so P and D derive the same one), then cast to the
+    # compute dtype and cached at that dtype; the shape guard rebuilds only on a feature-width change,
+    # and the compute dtype is fixed for the process, so a cached projection is always the right one.
+    if (jl_holder[0] is None or jl_holder[0].shape[0] != full.shape[1]
+            or jl_holder[0].dtype != dt):
         g = torch.Generator(device="cpu")
         g.manual_seed(20240517)
         jl_holder[0] = torch.randn(full.shape[1], SIG_DIM, generator=g,
-                                   dtype=torch.float32).to(full.device)
-    sig = full @ jl_holder[0]
+                                   dtype=torch.float32).to(full.device).to(dt)
+    # Heavy matmul in `dt` (cube path in bf16); upcast the small [N, SIG_DIM] result to fp32 so the
+    # norm/normalize — and thus every consumer — stay bit-for-bit what the fp32 path produced.
+    sig = (full @ jl_holder[0]).float()
     norms = sig.norm(dim=1).clamp(min=1e-6)
     return sig / norms.unsqueeze(1), norms
 
