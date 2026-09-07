@@ -84,28 +84,38 @@ def test_signature_roundtrip_preserves_the_cosine_decision():
     assert torch.allclose(before, after, atol=2e-3), "fp16 must not move any pairwise cosine"
 
 
-def test_bf16_projection_preserves_the_cosine_decision_and_is_deterministic():
-    """The signature matmul defaults to bf16 (BFF_SIG_COMPUTE_DTYPE) to run on the Ascend cube
-    instead of the fp32 vector path. What must NOT move is the cosine — it IS the merge decision —
-    and P and D must derive bit-identical signatures or they disagree on every alias."""
+@pytest.mark.parametrize("dt", [torch.float16, torch.bfloat16])
+def test_low_precision_projection_preserves_the_cosine_decision_and_is_deterministic(dt):
+    """The signature matmul defaults to fp16 (BFF_SIG_COMPUTE_DTYPE) to hit the Ascend cube instead
+    of the fp32 vector path — fp16, not bf16, because Ascend's cube does not fast-path bf16. What
+    must NOT move in either low-precision dtype is the cosine — it IS the merge decision — and P and
+    D must derive bit-identical signatures or they disagree on every alias."""
     torch.manual_seed(0)
     layers = [torch.randn(2, 6, 4, 2, 8)]                 # [K|V, blocks, block, heads, dim]
     ids = [1, 2, 3, 4, 5]
 
     sig_fp32, _ = pd_dedup_v2.signature_matrix(
         layers, ids, False, [None], compute_dtype=torch.float32)
-    sig_bf16, _ = pd_dedup_v2.signature_matrix(
-        layers, ids, False, [None], compute_dtype=torch.bfloat16)
+    sig_lp, _ = pd_dedup_v2.signature_matrix(
+        layers, ids, False, [None], compute_dtype=dt)
 
     # Rows stay unit vectors (the normalize stays fp32), so the cosine is a plain dot product.
-    assert torch.allclose(sig_bf16.norm(dim=1), torch.ones(5), atol=1e-3)
+    assert torch.allclose(sig_lp.norm(dim=1), torch.ones(5), atol=1e-3)
     # The pairwise cosine — the actual decision surface — does not move enough to reclassify a merge.
-    assert torch.allclose(sig_fp32 @ sig_fp32.T, sig_bf16 @ sig_bf16.T, atol=2e-2)
+    assert torch.allclose(sig_fp32 @ sig_fp32.T, sig_lp @ sig_lp.T, atol=2e-2)
     # P and D run the same code on the same seed → byte-identical projection → identical signatures.
-    sig_bf16_again, _ = pd_dedup_v2.signature_matrix(
-        layers, ids, False, [None], compute_dtype=torch.bfloat16)
-    assert torch.equal(sig_bf16, sig_bf16_again)
-    # And the module default routes through the configured compute dtype, not a stale fp32 path.
+    sig_lp_again, _ = pd_dedup_v2.signature_matrix(
+        layers, ids, False, [None], compute_dtype=dt)
+    assert torch.equal(sig_lp, sig_lp_again)
+
+
+def test_the_module_default_compute_dtype_is_fp16_on_the_ascend_cube():
+    """The shipped default routes through SIG_COMPUTE_DTYPE (fp16), not a stale fp32 path — the flip
+    away from bf16 (a measured cube no-op on Ascend) has to be the code's default, not just prose."""
+    assert pd_dedup_v2.SIG_COMPUTE_DTYPE is torch.float16
+    torch.manual_seed(0)
+    layers = [torch.randn(2, 6, 4, 2, 8)]
+    ids = [1, 2, 3, 4, 5]
     sig_default, _ = pd_dedup_v2.signature_matrix(layers, ids, False, [None])
     assert torch.equal(
         sig_default,

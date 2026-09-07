@@ -48,17 +48,20 @@ from kv_fast_fusion.pd_dedup_plan import DedupPlanner, IncomingBlock
 SIG_DIM = int(os.environ.get("BFF_SIG_DIM", "128"))
 # Dtype the JL projection (the dominant signature cost) runs in. The gather + the [N, ~262k] @
 # [~262k, SIG_DIM] matmul are the producer's per-exchange NPU work; in fp32 that matmul runs off the
-# Ascend cube (slow vector path) and the gather moves twice the bytes. bf16 runs on the cube with
-# fp32 internal accumulate — several× faster — and the fidelity cost is ~nil because the sig is
-# truncated to fp16 on the wire anyway (SignatureCodec.encode) and the small [N, SIG_DIM] result is
-# re-upcast to fp32 before the norm/normalize below. MUST match on P and D (they derive the same
-# projection from the same seed), so it is env-wide, never per-process; "fp32" restores the old path
+# Ascend cube (slow vector path) and the gather moves twice the bytes. The dtype the Ascend cube
+# actually accelerates is **fp16** (fp32 internal accumulate) — a box A/B showed bf16 left
+# exchange_ms unmoved because Ascend's cube does NOT fast-path bf16, so it fell back to the slow
+# route and bought nothing. fp16 is lossless here because the model runs fp16 (the KV cache is
+# already fp16, so the .to(fp16) gather is a no-op cast) and the sig is truncated to fp16 on the wire
+# anyway (SignatureCodec.encode); the small [N, SIG_DIM] result is re-upcast to fp32 before the
+# norm/normalize below. MUST match on P and D (they derive the same projection from the same seed),
+# so it is env-wide, never per-process; "fp32" restores the old path and "bf16" the Update-12 path
 # for a clean A/B. The [N, SIG_DIM] LSH matmul is 0.1% of this and stays fp32.
 _SIG_DTYPES = {"bf16": torch.bfloat16, "bfloat16": torch.bfloat16,
                "fp16": torch.float16, "float16": torch.float16,
                "fp32": torch.float32, "float32": torch.float32}
 SIG_COMPUTE_DTYPE = _SIG_DTYPES.get(
-    os.environ.get("BFF_SIG_COMPUTE_DTYPE", "bf16").lower(), torch.bfloat16)
+    os.environ.get("BFF_SIG_COMPUTE_DTYPE", "fp16").lower(), torch.float16)
 # Master switch. Off disables the ENTIRE mechanism, signature exchange included — the transfer
 # reverts to what the stock connector would do, which is the "BFF group split, no fusion" control
 # arm, NOT a measurement of what the exchange costs. (Two runs with this off differ only by noise,
