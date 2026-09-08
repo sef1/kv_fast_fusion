@@ -2994,6 +2994,20 @@ if _ASCEND_AVAILABLE:
                     stats.sig_batches = client.batches
                     stats.sig_batched_requests = client.batched_requests
                     stats.exchange_ms = client.exchange_ms
+                # Profiler (Update 14): the decode KV occupancy per running request, once per dump, so
+                # the 120-vs-198 concurrency gap is a greppable time series in the decode log next to
+                # loggers.py's Running/KV samples. Comparable across the baseline / dedup=0 / dedup=1
+                # arms; a rising blocks_per_running with a stalled running count localises the gap.
+                try:
+                    from kv_fast_fusion import fast_fusion_block_pool as _bp
+                    runner = getattr(_bp, "_ACTIVE_RUNNER", None)
+                    idx = getattr(getattr(runner, "input_batch", None), "req_id_to_index", None)
+                    snap = _bp.block_occupancy(len(idx) if idx is not None else 0)
+                    if snap is not None:
+                        logger.info("BFF pull-v2 occupancy | blocks total=%d free=%d used=%d | "
+                                    "running=%d | blocks_per_running=%.1f", *snap)
+                except Exception as e:  # noqa: BLE001 - profiling must never break the dump
+                    logger.warning("BFF pull-v2: occupancy snapshot failed (%s).", e)
                 stats.dump()
 
         def _v2_apply(self) -> None:

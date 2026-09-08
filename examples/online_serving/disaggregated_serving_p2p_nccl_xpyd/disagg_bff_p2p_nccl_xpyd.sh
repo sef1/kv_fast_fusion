@@ -146,7 +146,7 @@ BFF_THRESHOLD=${BFF_THRESHOLD:-0.75}       # BFF fusion threshold (0.0-1.0, 0.75
 # >0 = also match each prefill batch against a rolling registry of the last N requests' rep blocks
 # (frees more on D → compression can exceed ~2×). Set N near the decode-resident request count;
 # proj repr recommended to bound registry memory.
-BFF_PD_ENCODED_BATCH_SIZE=${BFF_PD_ENCODED_BATCH_SIZE:-16}
+BFF_PD_ENCODED_BATCH_SIZE=${BFF_PD_ENCODED_BATCH_SIZE:-32}
 # ---- GPU memory / recv-buffer tuning -----------------------------------------
 # P only SENDS, so its recv-buffer threshold (kv_buffer_size) can be tiny (1e1).
 # P only SENDS, so its recv-buffer threshold (kv_buffer_size) can be tiny (1e1).
@@ -155,7 +155,7 @@ BFF_PD_ENCODED_BATCH_SIZE=${BFF_PD_ENCODED_BATCH_SIZE:-16}
 # the recv torch.empty (the "Peer Out Of Memory/Threshold, response:1" on P).
 PREFILL_GPU_UTIL=${PREFILL_GPU_UTIL:-0.85}  # P frees blocks fast (low KV residency) but needs headroom
                                             # for the prefill activation spike — 0.95 OOMs the forward
-DECODE_GPU_UTIL=${DECODE_GPU_UTIL:-0.75}     # headroom for transient recv buffers / NCCL / CPU-pool staging
+DECODE_GPU_UTIL=${DECODE_GPU_UTIL:-0.7}     # headroom for transient recv buffers / NCCL / CPU-pool staging
 PREFILL_KV_BUFFER=${PREFILL_KV_BUFFER:-1e1} # producer never receives → tiny
 DECODE_KV_BUFFER=${DECODE_KV_BUFFER:-8e9}   # spill to CPU pool early; keep GPU-resident recv small
 
@@ -168,8 +168,8 @@ F1_SPLIT=${F1_SPLIT:-train}
 F1_INPUT_KEY=${F1_INPUT_KEY:-instruction}
 F1_OUTPUT_KEY=${F1_OUTPUT_KEY:-response}
 NUM_PROMPTS=${NUM_PROMPTS:-512}
-MAX_CONCURRENCY=${MAX_CONCURRENCY:-256}  # max inflight requests (stress test)
-REQUEST_RATE=${REQUEST_RATE:-300}      # arrivals/s (stress test). 'inf' = fire all at once (cap by MAX_CONCURRENCY)
+MAX_CONCURRENCY=${MAX_CONCURRENCY:-64}  # max inflight requests (stress test)
+REQUEST_RATE=${REQUEST_RATE:-100}      # arrivals/s (stress test). 'inf' = fire all at once (cap by MAX_CONCURRENCY)
 BURSTINESS=${BURSTINESS:-0.3}          # gamma shape: <1 burstier (spiky), 1=Poisson, >1 more uniform
 MIN_TOKENS=${MIN_TOKENS:-1536}            # skip prompts shorter than this many input tokens (0=off)
 MAX_TOKENS=${MAX_TOKENS:-4096}         # per-request generation budget (must be < max_model_len - prompt)

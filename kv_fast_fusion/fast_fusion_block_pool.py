@@ -41,6 +41,30 @@ def kv_cache_usage():
     except Exception:  # noqa: BLE001 - a gate read must never raise into the recv thread
         return None
 
+
+def block_occupancy(num_running=None):
+    """Decode KV-block snapshot for the profiler (Update 14): ``(total, free, used, running,
+    blocks_per_running)`` or None when the pool is not yet captured.
+
+    ``blocks_per_running`` is the number the 120-vs-198 gap turns on — a dedup request holding ~1.6x a
+    baseline one shows up here as a rising per-request occupancy while ``running`` stalls. ``running``
+    is passed in by the caller (which holds the runner), not read here. Pure and defensive: any read
+    error returns None rather than raising into the dump path."""
+    bp = _BLOCK_POOL
+    if bp is None:
+        return None
+    try:
+        total = getattr(bp, "num_gpu_blocks", None) or len(getattr(bp, "blocks", []))
+        if not total:
+            return None
+        free = bp.get_num_free_blocks()
+        used = total - free
+        r = int(num_running) if num_running else 0
+        per = round(used / r, 1) if r > 0 else 0.0
+        return int(total), int(free), int(used), r, per
+    except Exception:  # noqa: BLE001 - a profiling read must never break the dump
+        return None
+
 # When set, do NOT eagerly evict a freed block from the prefix cache on ref-0 free — keep it
 # cached (stock vLLM does this lazy eviction) so a preempted request can recover it on resume
 # instead of recomputing the prefill. Safe in raw/ratio (KV is not mutated, so the cached block

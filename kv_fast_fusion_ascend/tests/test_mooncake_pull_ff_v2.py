@@ -199,6 +199,19 @@ def test_kv_cache_usage_reads_the_captured_pool(monkeypatch):
     assert bp.kv_cache_usage() is None, "no total -> unknown, not a divide-by-zero"
 
 
+def test_block_occupancy_reports_blocks_per_running(monkeypatch):
+    """Update 14 profiler: (total, free, used, running, blocks_per_running). blocks_per_running is the
+    number the 120-vs-198 gap turns on; running=0 must not divide by zero, and no pool -> None."""
+    from kv_fast_fusion import fast_fusion_block_pool as bp
+    monkeypatch.setattr(bp, "_BLOCK_POOL", None, raising=False)
+    assert bp.block_occupancy(50) is None, "no pool captured yet -> None"
+    pool = types.SimpleNamespace(num_gpu_blocks=1000, get_num_free_blocks=lambda: 400)
+    monkeypatch.setattr(bp, "_BLOCK_POOL", pool, raising=False)
+    assert bp.block_occupancy(120) == (1000, 400, 600, 120, 5.0), "600 used over 120 running"
+    assert bp.block_occupancy(0) == (1000, 400, 600, 0, 0.0), "running=0 -> no divide-by-zero"
+    assert bp.block_occupancy(None) == (1000, 400, 600, 0, 0.0), "missing running -> 0"
+
+
 def test_split_cached_blocks_partitions_hits_and_dedups_misses():
     """Rows come back index-aligned with the ask (None for misses); missing ids are de-duplicated
     while preserving order so the on-demand pass computes each once."""
