@@ -67,7 +67,7 @@ HF_HUB_CACHE=${HF_HUB_CACHE:-"/data/models/huggingface/hub"}
 # directly (comma-separated lists) — those win over the NUM_*-derived defaults.
 NUM_PREFILL=${NUM_PREFILL:-1}        # n
 NUM_DECODE=${NUM_DECODE:-1}          # m
-TP=${TP:-2}                          # tensor-parallel size PER instance (each P/D gets TP GPUs)
+TP=${TP:-1}                          # tensor-parallel size PER instance (each P/D gets TP GPUs)
 HTTP_PORT_BASE=${HTTP_PORT_BASE:-20003}
 
 # Build "start,start+1,...,start+count-1".
@@ -112,7 +112,7 @@ else
     HYBRID_FLAG="--no-disable-hybrid-kv-cache-manager"
     ENABLE_CHUNKED=${ENABLE_CHUNKED:-1}
 fi
-MAX_MODEL_LEN=${MAX_MODEL_LEN:-8192}
+MAX_MODEL_LEN=${MAX_MODEL_LEN:-32678}
 MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-8192}
 # Attention backend. Normally auto-selected (leave empty). VLLM_BATCH_INVARIANT=1 hard-requires an
 # explicitly pinned backend (init crashes with "got 'None'" otherwise), so auto-default it to FLASH_ATTN
@@ -163,15 +163,15 @@ DECODE_KV_BUFFER=${DECODE_KV_BUFFER:-8e9}   # spill to CPU pool early; keep GPU-
 # The run targets the PROXY (f1_main streams, so it captures TTFT/ITL/TPOT + throughput,
 # and computes F1 against the HF dataset). Results are saved to a config-tagged JSON so a
 # sweep over BFF_PD_MERGE × BFF_THRESHOLD × BFF_GROUP_SIZE is easy to tabulate.
-F1_DATASET=${F1_DATASET:-m-a-p/CodeFeedback-Filtered-Instruction} #nvidia/OpenMathInstruct-2}
+F1_DATASET=${F1_DATASET:-ise-uiuc/Magicoder-Evol-Instruct-110K} #nvidia/OpenMathInstruct-2}
 F1_SPLIT=${F1_SPLIT:-train}
-F1_INPUT_KEY=${F1_INPUT_KEY:-query}
-F1_OUTPUT_KEY=${F1_OUTPUT_KEY:-answer}
-NUM_PROMPTS=${NUM_PROMPTS:-500}
-MAX_CONCURRENCY=${MAX_CONCURRENCY:-100}  # max inflight requests (stress test)
+F1_INPUT_KEY=${F1_INPUT_KEY:-instruction}
+F1_OUTPUT_KEY=${F1_OUTPUT_KEY:-response}
+NUM_PROMPTS=${NUM_PROMPTS:-512}
+MAX_CONCURRENCY=${MAX_CONCURRENCY:-256}  # max inflight requests (stress test)
 REQUEST_RATE=${REQUEST_RATE:-300}      # arrivals/s (stress test). 'inf' = fire all at once (cap by MAX_CONCURRENCY)
 BURSTINESS=${BURSTINESS:-0.3}          # gamma shape: <1 burstier (spiky), 1=Poisson, >1 more uniform
-MIN_TOKENS=${MIN_TOKENS:-512}            # skip prompts shorter than this many input tokens (0=off)
+MIN_TOKENS=${MIN_TOKENS:-1536}            # skip prompts shorter than this many input tokens (0=off)
 MAX_TOKENS=${MAX_TOKENS:-4096}         # per-request generation budget (must be < max_model_len - prompt)
 # Guard: max_tokens >= max_model_len leaves no room for the prompt → the server rejects EVERY request
 # ('max_tokens too large'). Clamp an over-large value (with headroom for the prompt) and warn loudly.

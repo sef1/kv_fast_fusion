@@ -36,6 +36,7 @@ Everything above the ``_ASCEND_AVAILABLE`` gate is pure and imports on any box, 
 alignment logic is unit-testable without an NPU.
 """
 
+import base64
 import os
 import threading
 import time
@@ -56,6 +57,11 @@ CONNECTOR_NAME = "MooncakeConnectorFF"
 # The first two MUST leave decode output bit-identical to phase A; that invariance is the gate.
 _FF_SHIP = os.environ.get("BFF_FF_SHIP", "1") == "1"
 _FF_APPLY = os.environ.get("BFF_FF_APPLY", "1") == "1"
+
+# Piggyback the per-block signatures onto the P->D kv_transfer_params (the only P->D message), so the
+# decode never pays the synchronous ask->reply round trip. Default off; when off, everything below is
+# inert and the decode falls back to the on-demand exchange. See Update 13.
+SIG_PIGGYBACK = os.environ.get("BFF_V2_SIG_PIGGYBACK", "0") == "1"
 _FF_FUSE = os.environ.get("BFF_PD_FUSE", "0") == "1"
 
 
@@ -542,6 +548,92 @@ def normalize_ff_redirects(raw) -> "dict[int, list] | None":
     return out or None
 
 
+def ff_sig_encode(sigs_by_group) -> "dict | None":
+    """JSON-safe form of ``{gi: SignatureCodec.encode payload}`` for the ``ff_sigs`` params key.
+
+    ``SignatureCodec.encode`` emits raw ``bytes`` (``sig`` and, under ratio mode, ``kvn``/``kvn_v``)
+    that ``json.dumps`` cannot carry across the proxy. Base64 those blobs and leave the JSON-native
+    fields (``norms`` list, ``hashes`` list, the int dims) untouched; :func:`ff_sig_decode` reverses
+    it to the exact dict ``SignatureCodec.decode`` expects. Returns None for an empty/None input so
+    the caller can simply omit the key (a request with no piggybacked signatures)."""
+    if not sigs_by_group:
+        return None
+    out: dict = {}
+    for gi, payload in sigs_by_group.items():
+        if not payload:
+            continue
+        enc = dict(payload)
+        for k in ("sig", "kvn", "kvn_v"):
+            blob = enc.get(k)
+            if isinstance(blob, (bytes, bytearray)):
+                enc[k] = base64.b64encode(blob).decode("ascii")
+        out[str(int(gi))] = enc
+    return out or None
+
+
+def ff_sig_decode(raw) -> "dict | None":
+    """Inverse of :func:`ff_sig_encode`: coerce the ``ff_sigs`` field back from its JSON round trip.
+
+    Group keys arrive stringified (same as ``normalize_ff_redirects``) and the base64 blobs come back
+    as ``str``; restore int group ids and raw ``bytes`` so the payload is byte-identical to what
+    ``SignatureCodec.encode`` produced on the producer. Non-fatal throughout — a request whose sigs do
+    not decode simply falls back to the on-demand exchange, never a wrong alias."""
+    if not isinstance(raw, dict) or not raw:
+        return None
+    out: dict[int, dict] = {}
+    for gi, payload in raw.items():
+        try:
+            key = int(gi)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        dec = dict(payload)
+        for k in ("sig", "kvn", "kvn_v"):
+            blob = dec.get(k)
+            if isinstance(blob, str):
+                try:
+                    dec[k] = base64.b64decode(blob)
+                except (ValueError, TypeError):
+                    dec = None
+                    break
+        if dec is not None:
+            out[key] = dec
+    return out or None
+
+
+class FFSigStash:
+    """Producer-side handoff of per-request signature payloads from the WORKER to the SCHEDULER.
+
+    Mirrors :class:`FFRowStash` exactly (same TP=1 in-process channel, same consume-once + bounded
+    contract), but carries ``{gi: SignatureCodec.encode payload}`` per external request id instead of
+    redirect rows. The worker fills it in ``wait_for_save`` (KV settled, on the forward thread); the
+    scheduler drains it in ``request_finished_all_groups`` to staple onto ``kv_transfer_params``."""
+
+    def __init__(self, cap: int = 4096):
+        self.lock = threading.Lock()
+        self.sigs: OrderedDict = OrderedDict()
+        self.cap = cap
+        self.dropped = 0
+
+    def offer(self, ext_id: str, sigs_by_group: dict) -> None:
+        """Store (replace) this request's per-group payloads. Replace, not merge: the worker computes
+        a request's whole set in one ``wait_for_save`` pass, so there is never a partial to preserve."""
+        if not sigs_by_group:
+            return
+        with self.lock:
+            self.sigs[ext_id] = sigs_by_group
+            self.sigs.move_to_end(ext_id)
+            while len(self.sigs) > self.cap:
+                self.sigs.popitem(last=False)
+                self.dropped += 1
+
+    def take(self, ext_id: str) -> "dict | None":
+        """Pop this request's payloads. Consume-once: a second call returns None."""
+        with self.lock:
+            return self.sigs.pop(ext_id, None)
+
+
 def resolve_kv_cache_groups(kv_cache_config, runner):
     """The BFF group layout, from whichever source actually has it.
 
@@ -700,6 +792,9 @@ if _ASCEND_AVAILABLE:
     # Producer worker → producer scheduler (rows), and the consumer's sink for the promotion hook.
     # Module-level singletons because the two halves are different objects in the same process.
     _FF_ROWS = FFRowStash()
+    # Producer worker -> producer scheduler (signature payloads), same TP=1 in-process channel as
+    # _FF_ROWS; drained in request_finished_all_groups to staple onto kv_transfer_params. See Update 13.
+    _FF_SIGS = FFSigStash()
     _FF_SOURCE = None
 
     def _ff_pending_source():
@@ -730,10 +825,18 @@ if _ASCEND_AVAILABLE:
         def __init__(self):
             super().__init__()
             self.fuse_reqs: list[tuple] = []
+            # Piggybacked signatures decoded off kv_transfer_params, keyed by remote_request_id (the
+            # id the recv thread pairs on). Serialized to the worker with the rest of the metadata, so
+            # unlike the producer's _FF_SIGS this crosses the scheduler->worker boundary at TP>1 too.
+            self.ff_sigs: dict = {}
 
         def add_new_req(self, request_id, local_block_ids, num_external_tokens,
                         kv_transfer_params):
             remote = kv_transfer_params["remote_block_ids"]
+            if SIG_PIGGYBACK:
+                decoded = ff_sig_decode(kv_transfer_params.get("ff_sigs"))
+                if decoded:
+                    self.ff_sigs[kv_transfer_params["remote_request_id"]] = decoded
             # A producer running the stock connector (or a pre-BFF one) still sends a flat list.
             # Promote it rather than mis-indexing it, and say so once — mixing the two sides is a
             # deployment mistake, not something to paper over silently.
@@ -903,10 +1006,17 @@ if _ASCEND_AVAILABLE:
             ff_redirects = None
             if _FF_SHIP:
                 ff_redirects = _FF_ROWS.take(_ext_of(request.request_id))
+            # Signatures ride the SAME dict (Update 13), so D never asks. Only present when the worker
+            # had this request's sigs cached in time (see wait_for_save); otherwise the key is omitted
+            # and D falls back to the on-demand exchange — best-effort, never a wrong alias.
+            ff_sigs = None
+            if SIG_PIGGYBACK:
+                ff_sigs = ff_sig_encode(_FF_SIGS.take(_ext_of(request.request_id)))
             return delay_free_blocks, dict(
                 do_remote_prefill=True,
                 do_remote_decode=False,
                 ff_redirects=ff_redirects or {},
+                ff_sigs=ff_sigs or {},
                 remote_block_ids=groups,
                 remote_engine_id=self.engine_id,
                 remote_request_id=request.request_id,

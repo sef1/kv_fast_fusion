@@ -97,6 +97,10 @@ _PRODUCER_SIG_JOBS: "queue.Queue" = queue.Queue(maxsize=4096)
 # adds so it stays inside the transport's window; the queue absorbs any backlog and it drains over the
 # next steps. Small enough not to stall a transfer, large enough to keep the cache ahead of the pulls.
 SIG_PRECOMPUTE_PER_STEP = int(os.environ.get("BFF_V2_SIG_PRECOMPUTE_PER_STEP", "8"))
+# Upper bound on the D-side piggyback stash (remote_request_id -> {gi: payload}). Entries are popped
+# when the recv thread plans the request; the cap only backstops the rare un-consumed ones (a request
+# whose batch was gate-closed before the pop). Generous vs the ~512 concurrency. See Update 13.
+_PIGGYBACK_STASH_CAP = int(os.environ.get("BFF_V2_PIGGYBACK_STASH_CAP", "8192"))
 # Usage-gated dedup (Update 11): run the signature exchange + aliasing ONLY when the decode's KV
 # cache usage is at least this fraction — i.e. only when dedup's memory relief is worth its cost. The
 # pull-heavy ramp (low usage) then runs dedup-free at baseline speed, and dedup self-throttles (its
@@ -1482,6 +1486,16 @@ if _ASCEND_AVAILABLE:
                 cache = self.__dict__["_sig_cache_d"] = {}
             return cache
 
+        @property
+        def piggyback_sigs(self) -> dict:
+            """Signatures stapled onto kv_transfer_params (Update 13), ``{remote_request_id: {gi:
+            payload}}``, staged by the worker's ``start_load_kv``. Consumed (popped) in
+            ``_prefetch_signatures`` before any ask. Lazy for the same reason as ``_sig_cache``."""
+            d = self.__dict__.get("_piggyback_d")
+            if d is None:
+                d = self.__dict__["_piggyback_d"] = {}
+            return d
+
         # The block ids of the request being verified right now, so the stability re-read touches
         # exactly the block that failed. Set immediately before _localise, read only by it.
         _verify_ids: ClassVar[dict] = {}
@@ -1754,9 +1768,26 @@ if _ASCEND_AVAILABLE:
             if pd_dedup_v2.V2_ENABLED and self._dedup_gate_closed():
                 return
             asks = [self._ask_for(req_meta) for req_meta in batch]
-            keys = [self._peer_of(req_meta) if ask else None
-                    for req_meta, ask in zip(batch, asks)]
             stats = self.dedup_engine.stats
+            # Piggyback (Update 13): a request whose signatures rode in on kv_transfer_params is
+            # answered from the local stash with NO round trip; only the misses reach the producer.
+            # This is the whole point — the ask, not the compute, was the ~172 ms cost.
+            piggy = self.piggyback_sigs if v1.SIG_PIGGYBACK else None
+            keys = []
+            for req_meta, ask in zip(batch, asks):
+                if not ask:
+                    keys.append(None)
+                    continue
+                rid = req_meta.get("remote_request_id")
+                if piggy is not None:
+                    psig = piggy.pop(rid, None)
+                    if psig:
+                        cache[rid] = (ask_shape(ask), psig)
+                        stats.piggyback_hits += 1
+                        keys.append(None)          # answered locally — no exchange
+                        continue
+                    stats.piggyback_misses += 1
+                keys.append(self._peer_of(req_meta))
             for (host, port), positions in group_by_peer(keys).items():
                 answers = self.sig_client.ask_many(host, port, [asks[i] for i in positions])
                 for i, sigs in zip(positions, answers):
@@ -2410,6 +2441,24 @@ if _ASCEND_AVAILABLE:
             self._sig_cache_misses = 0
             super().__init__(vllm_config, engine_id, kv_cache_config)
 
+        def start_load_kv(self, metadata):
+            """Worker-side per-step entry. Stage this step's piggybacked signatures (Update 13) onto
+            the recv thread BEFORE ``super()`` enqueues the requests, so a request's sigs are present
+            in ``piggyback_sigs`` by the time the (serial) recv thread dequeues it. ``metadata.ff_sigs``
+            crossed from the scheduler with the rest of the metadata; empty at TP>1 fallback or when
+            piggyback is off, in which case this is a no-op and D asks as before."""
+            if v1.SIG_PIGGYBACK and self.kv_recv_thread is not None:
+                sigs = getattr(metadata, "ff_sigs", None)
+                if sigs:
+                    staged = self.kv_recv_thread.piggyback_sigs
+                    staged.update(sigs)
+                    # Bound the stash: entries are normally popped when the recv thread plans the
+                    # request, but a gate-closed batch returns before the pop, so drop the oldest
+                    # rather than let un-consumed sigs from gated batches accumulate over a long run.
+                    while len(staged) > _PIGGYBACK_STASH_CAP:
+                        staged.pop(next(iter(staged)))
+            return super().start_load_kv(metadata)
+
         def register_kv_caches(self, kv_caches):
             super().register_kv_caches(kv_caches)
             # Inverse of v1's layer->group map; AliasApplier and the signature builder both want
@@ -2441,11 +2490,12 @@ if _ASCEND_AVAILABLE:
                     self.kv_recv_thread.local_sigs = self.signatures_for_group_split
                     self.kv_recv_thread.local_sigs_multi = self.signatures_for_groups_split
                 logger.info("BFF pull-v2: decode dedup engine armed (V2_DEDUP=%s, sig timeout "
-                            "%.1fs, KV-usage gate %s, sig compute dtype %s).",
+                            "%.1fs, KV-usage gate %s, sig compute dtype %s, piggyback %s).",
                             pd_dedup_v2.V2_ENABLED, SIG_EXCHANGE_TIMEOUT,
                             f">= {DEDUP_KV_THRESHOLD:.2f}" if DEDUP_KV_THRESHOLD > 0
                             else "off (dedup always on)",
-                            str(pd_dedup_v2.SIG_COMPUTE_DTYPE).replace("torch.", ""))
+                            str(pd_dedup_v2.SIG_COMPUTE_DTYPE).replace("torch.", ""),
+                            "ON" if v1.SIG_PIGGYBACK else "off")
                 # Unconditional so line 1 of the log states the apply mode — Variant A materialize
                 # (copy into own blocks, no table write, full graph legal) vs the default redirect
                 # (pointer share + free, PIECEWISE-only). A stale build or an unset flag is then
@@ -2678,6 +2728,40 @@ if _ASCEND_AVAILABLE:
                 n += 1
             return n
 
+        def precompute_and_offer(self, fuse_reqs, max_reqs: int = SIG_PRECOMPUTE_PER_STEP) -> int:
+            """Piggyback (Update 13): sign the requests that finished prefill THIS step and hand the
+            assembled per-request payloads to the scheduler via ``_FF_SIGS`` for stapling onto
+            ``kv_transfer_params``. Called from ``wait_for_save``, AFTER ``super().wait_for_save()``,
+            so the KV these ids point at has settled (the save barrier, when enabled, is what makes the
+            same-step read safe — reading un-settled KV is the F1-0.198 corruption from Update 10).
+
+            ``fuse_reqs`` is ``[(rid, ext_id, per_group_block_ids)]`` from the connector metadata — the
+            requests completing this step, exactly what ``request_finished`` will ship moments later.
+            Bounded per step (``max_reqs``) so the compute never exceeds the transport's window, the
+            same discipline as :meth:`drain_precompute`. Group 0 (warmup) is never signed. Best-effort:
+            any failure just leaves that request to D's on-demand exchange."""
+            if not v1.SIG_PIGGYBACK or not fuse_reqs:
+                return 0
+            n = 0
+            for (_rid, ext_id, groups) in list(fuse_reqs)[:max(0, int(max_reqs))]:
+                payload_by_group: dict = {}
+                for gi, ids in enumerate(groups):
+                    if gi <= 0 or not ids:      # skip the warmup group and empty groups
+                        continue
+                    try:
+                        rows = self.signature_rows_for(int(gi), [int(b) for b in ids])
+                    except Exception as e:  # noqa: BLE001 - never fatal; D falls back to the exchange
+                        logger.warning("BFF pull-v2 producer: piggyback sign failed for group %s "
+                                       "(%s).", gi, e)
+                        continue
+                    payload = assemble_sig_payload(rows)
+                    if payload is not None:
+                        payload_by_group[int(gi)] = payload
+                if payload_by_group:
+                    v1._FF_SIGS.offer(ext_id, payload_by_group)
+                    n += 1
+            return n
+
         def serve_signatures_cached(self, per_slot) -> dict:
             """Cache-first core for the _SigServer: ``{slot: {gi: [ids]}}`` -> ``{slot: {gi: payload}}``.
 
@@ -2748,6 +2832,7 @@ if _ASCEND_AVAILABLE:
         # requests finish, and the first occurrence is the one worth reading.
         _logged_hot_collision = False
         _logged_mirror_drift = False
+        _warned_piggyback_barrier = False
 
         def __init__(self, vllm_config, role, kv_cache_config=None):
             super().__init__(vllm_config, role, kv_cache_config)
@@ -2779,6 +2864,22 @@ if _ASCEND_AVAILABLE:
                     self.connector_worker.drain_precompute()
                 except Exception as e:  # noqa: BLE001 - precompute must never fail the step
                     logger.warning("BFF pull-v2 producer: wait_for_save precompute drain failed "
+                                   "(%s).", e)
+            # Piggyback (Update 13): sign this step's just-finished requests and stage them for the
+            # scheduler to staple onto kv_transfer_params. AFTER super().wait_for_save() so the save
+            # barrier (when on) has settled the KV — see precompute_and_offer.
+            if v1.SIG_PIGGYBACK and self.connector_worker is not None:
+                if not v1._SAVE_BARRIER and not MooncakeConnectorFFv2._warned_piggyback_barrier:
+                    MooncakeConnectorFFv2._warned_piggyback_barrier = True
+                    logger.warning(
+                        "BFF pull-v2: BFF_V2_SIG_PIGGYBACK=1 without BFF_PD_SAVE_BARRIER=1 — the "
+                        "same-step signature read may race the async KV write. Enable the save "
+                        "barrier if F1 drops.")
+                try:
+                    fuse_reqs = getattr(self._connector_metadata, "fuse_reqs", None)
+                    self.connector_worker.precompute_and_offer(fuse_reqs or [])
+                except Exception as e:  # noqa: BLE001 - piggyback must never fail the step
+                    logger.warning("BFF pull-v2 producer: wait_for_save piggyback sign failed "
                                    "(%s).", e)
 
         def request_finished_all_groups(self, request, block_ids):

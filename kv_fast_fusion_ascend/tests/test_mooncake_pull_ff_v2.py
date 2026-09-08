@@ -107,6 +107,60 @@ def test_assemble_returns_none_if_any_block_is_missing():
 
 
 # =====================================================================================
+# Signature piggyback (Update 13): P staples per-block sigs onto kv_transfer_params (JSON, via the
+# proxy) so D never asks. The codec must survive that JSON round trip byte-for-byte, or D pairs the
+# wrong rows against the wrong blocks — silently.
+# =====================================================================================
+def _pyld(n=4):
+    from kv_fast_fusion.pd_dedup_v2 import SignatureCodec
+    sig, norms, hashes = _rand_sig(n)
+    return SignatureCodec.encode(sig, norms, hashes)
+
+
+def test_ff_sig_codec_survives_the_json_proxy_round_trip_byte_identical():
+    """kv_transfer_params crosses the proxy as JSON, which cannot carry the raw `sig` bytes. Base64
+    must reproduce the exact payload SignatureCodec.encode made, or the cosine pairs against garbage."""
+    import json
+
+    from kv_fast_fusion_ascend.connectors import mooncake_connector_ff as v1
+    sigs_by_group = {1: _pyld(4), 3: _pyld(2)}
+    wire = json.loads(json.dumps(v1.ff_sig_encode(sigs_by_group)))   # the actual proxy hop
+    back = v1.ff_sig_decode(wire)
+    assert set(back) == {1, 3} and all(isinstance(g, int) for g in back)
+    for gi in (1, 3):
+        assert back[gi]["sig"] == sigs_by_group[gi]["sig"], "sig bytes must survive base64+JSON"
+        assert back[gi]["dim"] == sigs_by_group[gi]["dim"]
+        assert back[gi]["norms"] == sigs_by_group[gi]["norms"]
+        assert back[gi]["hashes"] == sigs_by_group[gi]["hashes"]
+
+
+def test_ff_sig_codec_is_non_fatal_on_empty_or_corrupt_input():
+    """A missing/undecodable field must yield None (→ D asks on demand), never raise into the hook."""
+    from kv_fast_fusion_ascend.connectors import mooncake_connector_ff as v1
+    assert v1.ff_sig_encode(None) is None
+    assert v1.ff_sig_encode({}) is None
+    assert v1.ff_sig_decode(None) is None
+    assert v1.ff_sig_decode({}) is None
+    assert v1.ff_sig_decode({"1": {"sig": "!!not base64!!", "dim": 8}}) is None
+
+
+def test_ff_sig_stash_is_consume_once_and_bounded():
+    """The producer worker offers a request's payloads once; the scheduler takes them once. A second
+    take returns None so a retried request_finished cannot ship stale sigs; the cap bounds a leak."""
+    from kv_fast_fusion_ascend.connectors import mooncake_connector_ff as v1
+    stash = v1.FFSigStash(cap=2)
+    stash.offer("ext-a", {1: _pyld(2)})
+    got = stash.take("ext-a")
+    assert got is not None and 1 in got
+    assert stash.take("ext-a") is None, "consume-once"
+    stash.offer("x", {1: _pyld(1)})
+    stash.offer("y", {1: _pyld(1)})
+    stash.offer("z", {1: _pyld(1)})           # evicts the oldest ("x")
+    assert stash.take("x") is None and stash.dropped == 1
+    assert stash.take("z") is not None
+
+
+# =====================================================================================
 # Usage-gated dedup (BFF_V2_DEDUP_KV_THRESHOLD, Update 11): dedup runs only when KV usage is high.
 # The gate must be OFF-safe — an unknown usage or a disabled threshold must never silently change
 # behaviour from the operator's expectation.

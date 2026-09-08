@@ -376,6 +376,11 @@ class DedupStats:
         # memory was not under pressure, so the batch was read in full like baseline. A high count
         # over a run means most of it ran dedup-free — which is the point during the ramp.
         self.dedup_gated_batches = 0
+        # Piggyback (Update 13): requests whose signatures rode in on kv_transfer_params (hits, no
+        # round trip) vs those that had to fall back to the on-demand exchange (misses). A high hit
+        # fraction over a run is the mechanism working — exchange_ms should collapse in step with it.
+        self.piggyback_hits = 0
+        self.piggyback_misses = 0
         # Round trips, and requests carried by them, on transports that batch the signature phase.
         # Left at zero elsewhere and reported as None rather than 0, because "this transport does
         # not batch" and "batching never engaged" are the two readings that matter and 0 says both.
@@ -506,8 +511,11 @@ class DedupStats:
         self.skip_reasons[reason] = self.skip_reasons.get(reason, 0) + n
 
     def is_inert(self) -> bool:
-        """True when v2 is installed but has never once asked the decode anything."""
-        return self.exchanges == 0 and any(self.skip_reasons.values())
+        """True when v2 is installed but has never once acquired a signature — by ASK or by
+        piggyback. Piggyback hits count here: a fully-piggybacked run makes no exchange, so
+        ``exchanges == 0`` alone would misread a working run as inert."""
+        return (self.exchanges == 0 and self.piggyback_hits == 0
+                and any(self.skip_reasons.values()))
 
     def should_dump(self, step: int) -> bool:
         now = time.monotonic()
@@ -559,6 +567,8 @@ class DedupStats:
             "aliases_materialized": self.materialized,
             "aliases_recomputed": self.recomputed,
             "dedup_gated_batches": self.dedup_gated_batches,
+            "piggyback_hits": self.piggyback_hits,
+            "piggyback_misses": self.piggyback_misses,
             "alias_failure_reasons": dict(self.fail_reasons),
             # Non-zero means the run was aliasing blocks the decode was still writing into — two
             # requests sharing the same physical slots for their newly generated tokens. Zero means
