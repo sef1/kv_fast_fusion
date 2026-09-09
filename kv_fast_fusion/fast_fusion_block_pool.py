@@ -30,9 +30,12 @@ _BLOCK_POOL = None
 # wrong KV (F1 ~0.44 with dedup OFF; dedup only ever hid this because its signature-exchange .cpu()
 # calls were an accidental full-device barrier). Root-cause fix: before a ref-0 block re-enters the
 # free queue (becomes reallocatable), drain the NPU so the in-flight write lands while the block is
-# still owned. Off by default. `torch` is imported lazily so this module stays vllm/torch-free for
-# off-device unit tests (see the module note above).
-_FREE_FLUSH = os.environ.get("BFF_FREE_FLUSH", "0") == "1"
+# still owned. ON by default — it fixes a real correctness bug (dedup=0 F1 0.44→0.49, finish_length
+# 18%→9%, rps 0.66→0.92 at con512) at ~0 cost (tpot 68.9 vs 69 ms without it), and is globally safe:
+# `_flush_npu` is a no-op without `torch.npu`, so GPU/CPU paths are untouched. Set BFF_FREE_FLUSH=0 to
+# disable (e.g. to reproduce the race). `torch` is imported lazily so this module stays vllm/torch-free
+# for off-device unit tests (see the module note above).
+_FREE_FLUSH = os.environ.get("BFF_FREE_FLUSH", "1") == "1"
 _FLUSH_WARNED = False
 
 
