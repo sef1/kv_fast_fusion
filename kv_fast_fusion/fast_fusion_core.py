@@ -13,6 +13,43 @@ from vllm.v1.core.kv_cache_utils import (
     init_none_hash,
 )
 
+def bff_group_layout(original_layers, balanced_groups, group_size):
+    """Pure partition of the model's layer names into BFF storage groups.
+
+    Returns ``list[(layer_names, spec_id)]``. ``spec_id`` selects one of the two page-identical
+    specs the caller builds: ``0`` = ``per_layer_spec``, ``1`` = the ``sliding_window``-flipped
+    ``warmup_spec``. Only two distinct spec VALUES are ever needed — get_kv_cache_config_from_groups
+    preserves same-spec groups as separate groups (today's 6 fusion groups already share one spec);
+    verify_and_split only requires that >1 distinct spec value be present overall.
+
+    * ``balanced_groups >= 2`` (Update 17, dedup=0): ALL layers split into that many BALANCED
+      contiguous groups (sizes differ by <=1), spec_id alternating so adjacent groups differ. This
+      holds ``max_layers_per_group × num_groups`` at its floor (== total layers == baseline
+      concurrency) while minimizing the per-step per-group block-table tax. N=2 is the optimum.
+    * otherwise: today's layout — warmup group (first 2 + last 2 layers, alt spec) + the middle
+      layers chunked by ``group_size`` (per_layer_spec). Byte-for-byte the prior behaviour.
+    """
+    n = len(original_layers)
+    if balanced_groups and balanced_groups >= 2:
+        g = max(2, min(balanced_groups, n))
+        base, extra = divmod(n, g)
+        layout = []
+        start = 0
+        for i in range(g):
+            size = base + (1 if i < extra else 0)
+            layout.append((original_layers[start:start + size], i % 2))
+            start += size
+        return layout
+    warmup = original_layers[0:2] + original_layers[-2:]
+    fused = original_layers[2:-2]
+    layout = [(warmup, 1)]
+    layout += [
+        (fused[i:i + group_size], 0)
+        for i in range(0, len(fused), group_size)
+    ]
+    return layout
+
+
 def _initialize_kv_caches(
         self, vllm_config: VllmConfig
     ) -> KVCacheConfig:
@@ -68,7 +105,9 @@ def _initialize_kv_caches(
             from vllm.v1.core.kv_cache_utils import (
                 get_kv_cache_config_from_groups, _report_kv_cache_config,
             )
-            from kv_fast_fusion.constants import BFF_GROUP_SIZE
+            from kv_fast_fusion.constants import (
+                BFF_GROUP_SIZE, BFF_BALANCED_GROUPS,
+            )
 
             # Reference (global) layer ordering + a concrete per-layer spec.
             ref_group = kv_cache_configs[0].kv_cache_groups[0]
@@ -93,20 +132,23 @@ def _initialize_kv_caches(
             # caches (2x) while MLAAttentionSpec's single-latent-cache formula has no
             # such factor, tripping `assert len(page_sizes) == 1` in
             # get_uniform_page_size.)
-            warmup_layers_names = original_layers[0:2] + original_layers[-2:]
-            fused_layers_names = original_layers[2:-2]
-            fused_chunks = [
-                fused_layers_names[i:i + BFF_GROUP_SIZE]
-                for i in range(0, len(fused_layers_names), BFF_GROUP_SIZE)
-            ]
-
             warmup_spec = replace(per_layer_spec, sliding_window=8192)
 
-            # Global group spec list (warmup first, then fusion chunks).
-            global_groups = [KVCacheGroupSpec(warmup_layers_names, warmup_spec)]
-            global_groups += [
-                KVCacheGroupSpec(chunk, per_layer_spec) for chunk in fused_chunks
+            # Global group spec list. Default: warmup group first, then fusion chunks.
+            # BFF_BALANCED_GROUPS>=2 (dedup=0): N balanced groups instead (see bff_group_layout).
+            _specs = (per_layer_spec, warmup_spec)  # index by spec_id (0, 1)
+            global_groups = [
+                KVCacheGroupSpec(layer_names, _specs[spec_id])
+                for layer_names, spec_id in bff_group_layout(
+                    original_layers, BFF_BALANCED_GROUPS, BFF_GROUP_SIZE
+                )
             ]
+            if BFF_BALANCED_GROUPS >= 2 and os.environ.get("BFF_V2_DEDUP") == "1":
+                logger.warning(
+                    "BFF_BALANCED_GROUPS=%d with BFF_V2_DEDUP=1: balanced groups fuse boundary "
+                    "layers and coarsen dedup granularity — supported combo is dedup=0.",
+                    BFF_BALANCED_GROUPS,
+                )
 
             # Rebuild each worker's config with the correctly-sized pool + tensors.
             rebuilt_configs = []
