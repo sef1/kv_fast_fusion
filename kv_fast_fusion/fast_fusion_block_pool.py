@@ -23,6 +23,32 @@ _FF_PENDING_SOURCE = None
 # processes at TP>1 — callers treat None as "below gate" (dedup off), the baseline-safe default.
 _BLOCK_POOL = None
 
+# Decode-side KV write-race fix (Update 16). A block is freed on the HOST the instant its request
+# finishes, but its last attention KV write can still be in flight on the NPU graph stream (Ascend's
+# async cudagraph replay). If that block is then reallocated and the next request's KV is RDMA'd into
+# it, the stale write lands AFTER the RDMA and clobbers the fresh KV — the decode then generates from
+# wrong KV (F1 ~0.44 with dedup OFF; dedup only ever hid this because its signature-exchange .cpu()
+# calls were an accidental full-device barrier). Root-cause fix: before a ref-0 block re-enters the
+# free queue (becomes reallocatable), drain the NPU so the in-flight write lands while the block is
+# still owned. Off by default. `torch` is imported lazily so this module stays vllm/torch-free for
+# off-device unit tests (see the module note above).
+_FREE_FLUSH = os.environ.get("BFF_FREE_FLUSH", "0") == "1"
+_FLUSH_WARNED = False
+
+
+def _flush_npu() -> None:
+    """Full-device NPU drain — the only barrier that waits for the graph stream the KV write lives on.
+    Defensive: a build without ``torch.npu`` degrades to a no-op rather than failing the free path."""
+    global _FLUSH_WARNED
+    try:
+        import torch
+        npu = getattr(torch, "npu", None)
+        if npu is not None:
+            npu.synchronize()
+    except Exception:  # noqa: BLE001 - a barrier that cannot run must never break block freeing
+        if not _FLUSH_WARNED:
+            _FLUSH_WARNED = True
+
 
 def kv_cache_usage():
     """Fraction of the decode's KV blocks in use (1 - free/total), or None if not yet known.
@@ -192,6 +218,13 @@ def patched_free_blocks(self, ordered_blocks):
     #     block for block in unique_blocks
     #     if block.ref_cnt == 0 and not block.is_null
     # ])
+    # FREE_FLUSH (Update 16): before ANY ref-0 block below re-enters the free queue (the instant it
+    # becomes reallocatable), drain the NPU once so a previous tenant's still-in-flight KV write lands
+    # now, while the block is still owned — otherwise it lands after the next request's RDMA and
+    # clobbers the fresh KV. Once per free EVENT, and only when something is actually being freed;
+    # frees run between forward steps, so the sync mostly waits on the just-finished forward anyway.
+    if _FREE_FLUSH and any(b.ref_cnt == 0 and not b.is_null for b in unique_blocks):
+        _flush_npu()
     freed_ids = []
     for block in unique_blocks:
         if block.ref_cnt == 0 and not block.is_null:

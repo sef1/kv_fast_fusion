@@ -102,7 +102,7 @@ if [[ "$BASELINE" == "bff" || "$BASELINE" == "bff_v2" || "$BASELINE" == "bff_pul
       || "$BASELINE" == "bff_pull_v2" ]]; then
   USE_ASCEND_STORE=${USE_ASCEND_STORE:-0}
 else
-  USE_ASCEND_STORE=${USE_ASCEND_STORE:-1}
+  USE_ASCEND_STORE=${USE_ASCEND_STORE:-0}
 fi
 
 # ---- BFF knobs (only take effect when BASELINE=bff) ----
