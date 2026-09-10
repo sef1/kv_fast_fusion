@@ -891,6 +891,27 @@ class DedupEngine:
         across time must compare this against the owner recorded when the alias was decided."""
         return self._resident_owner.get((group, int(block_id)))
 
+    def held_block_counts(self) -> dict:
+        """Blocks the dedup machinery pins OUTSIDE the live decode set — the suspected concurrency
+        cap (Update 21). Diagnostic only; lock-guarded and cheap (sizes of the bookkeeping maps).
+
+        - ``resident``: (group, block) entries in the cross-transfer resident registry — reps kept
+          alive so a later request can drop a re-pull.
+        - ``pending_alias`` / ``alias_ready``: victim blocks whose alias is decided but not yet
+          applied (the latter has landed and is waiting on the apply path / ``APPLY_MAX_AGE``).
+        - ``pending_resident``: blocks staged to enter the resident registry once their transfer lands.
+        """
+        with self.lock:
+            resident = len(self._resident_owner)
+            pending_alias = sum(len(vics) for by_gi in self._pending_alias.values()
+                                for vics in by_gi.values())
+            alias_ready = sum(len(vics) for by_gi in self._alias_ready.values()
+                              for vics in by_gi.values())
+            pending_resident = sum(len(t[3]) for by_gi in self._pending_resident.values()
+                                   for t in by_gi.values())
+        return {"resident": resident, "pending_alias": pending_alias,
+                "alias_ready": alias_ready, "pending_resident": pending_resident}
+
     # -- test/introspection helpers ------------------------------------------------------
     def note_resident(self, group: int, sigs, hashes, norms, block_ids, owner="") -> None:
         if not self._resident_enabled:

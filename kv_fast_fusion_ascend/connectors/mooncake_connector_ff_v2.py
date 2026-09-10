@@ -3006,6 +3006,28 @@ if _ASCEND_AVAILABLE:
                     if snap is not None:
                         logger.info("BFF pull-v2 occupancy | blocks total=%d free=%d used=%d | "
                                     "running=%d | blocks_per_running=%.1f", *snap)
+                        # Update 21: split `used` into LIVE (blocks owned by RUNNING requests) vs HELD
+                        # (pinned by the dedup machinery). used >> live localises the concurrency cap to
+                        # the hold; the per-map counts then name which structure to release.
+                        try:
+                            reqs = getattr(runner, "requests", None) or {}
+                            live = 0
+                            for rid in (idx or {}):
+                                bids = getattr(reqs.get(rid), "block_ids", None)
+                                if bids:  # BFF: list of per-group id lists; stay layout-agnostic
+                                    for g in bids:
+                                        live += len(g) if isinstance(g, (list, tuple)) else 1
+                            eng = getattr(self.connector_worker, "_dedup_engine", None)
+                            held = eng.held_block_counts() if eng is not None else {}
+                            used = snap[2]
+                            logger.info(
+                                "BFF pull-v2 occupancy split | used=%d live=%d held=%d | resident=%d "
+                                "pending_alias=%d alias_ready=%d pending_resident=%d",
+                                used, live, used - live, held.get("resident", 0),
+                                held.get("pending_alias", 0), held.get("alias_ready", 0),
+                                held.get("pending_resident", 0))
+                        except Exception as e:  # noqa: BLE001 - profiling must never break the dump
+                            logger.warning("BFF pull-v2: occupancy split failed (%s).", e)
                 except Exception as e:  # noqa: BLE001 - profiling must never break the dump
                     logger.warning("BFF pull-v2: occupancy snapshot failed (%s).", e)
                 stats.dump()
