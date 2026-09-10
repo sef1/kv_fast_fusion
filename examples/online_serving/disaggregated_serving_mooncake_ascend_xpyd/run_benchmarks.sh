@@ -117,6 +117,8 @@ BFF_PD_MERGE=${BFF_PD_MERGE:-cc}         # within-batch clustering: cc | nr_tree
 BFF_PD_REPR=${BFF_PD_REPR:-proj}         # block repr for similarity: full | proj | mean
 BFF_THRESHOLD=${BFF_THRESHOLD:-0.85}     # cosine merge threshold (0..1)
 BFF_GROUP_SIZE=${BFF_GROUP_SIZE:-4}      # fusion layers packed per KV-cache group
+BFF_BALANCED_GROUPS=${BFF_BALANCED_GROUPS:-0}   # 0=warmup+chunk split; >=2 = N balanced storage groups (dedup=0)
+BFF_FF_GROUPS=${BFF_FF_GROUPS:-}         # set (e.g. "1") -> fold un-chosen fusion groups into warmup; empty=off
 BFF_PD_ENCODED_BATCH_SIZE=${BFF_PD_ENCODED_BATCH_SIZE:-8}   # cross-batch registry window (0=within-batch only)
 
 # ---- v2 knobs (BASELINE=bff_v2 only) ----
@@ -419,7 +421,15 @@ export_bff_env() {
   fi
   export BFF_PD_FUSE=$BFF_PD_FUSE BFF_SCALE_MODE=$BFF_SCALE_MODE BFF_PD_MERGE=$BFF_PD_MERGE \
          BFF_PD_REPR=$BFF_PD_REPR BFF_THRESHOLD=$BFF_THRESHOLD BFF_GROUP_SIZE=$BFF_GROUP_SIZE \
+         BFF_BALANCED_GROUPS=$BFF_BALANCED_GROUPS \
          BFF_PD_ENCODED_BATCH_SIZE=$BFF_PD_ENCODED_BATCH_SIZE
+  # Storage-layout knob: export only when set, so unset == today's warmup+chunk layout (the connector
+  # and fast_fusion_core both key the fold on BFF_FF_GROUPS being present).
+  if [[ -n "$BFF_FF_GROUPS" ]]; then
+    export BFF_FF_GROUPS=$BFF_FF_GROUPS
+  else
+    unset BFF_FF_GROUPS
+  fi
   # v2 knobs. Exported for every BFF arm, not just bff_v2: BFF_MAX_REL_ERR also gates v1's merges
   # (both go through pd_lsh.probe), so an A/B at the same error budget is one variable apart.
   export BFF_MAX_REL_ERR=$BFF_MAX_REL_ERR BFF_V2_DEDUP=$BFF_V2_DEDUP \
