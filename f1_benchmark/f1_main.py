@@ -191,6 +191,7 @@ async def run_api_inference(
     request_timeout: float = 600.0,
     disable_tqdm: bool = False,
     stream: bool = True,
+    ignore_eos: bool = False,
 ) -> List[Dict[str, Any]]:
     """Async inference against an OpenAI-compatible server."""
     if gen_config is None:
@@ -206,6 +207,11 @@ async def run_api_inference(
         "temperature": gen_config.get("temperature", 0.0),
         "top_p": gen_config.get("top_p", 1.0),
     }
+    if ignore_eos:
+        # Throughput-only mode: never stop on EOS, so every request decodes exactly max_tokens.
+        # This removes generation-length (rambling) as a confound, isolating the pure concurrency/
+        # per-step effect of KV freeing from output quality. vLLM's OpenAI server honors this field.
+        api_params["ignore_eos"] = True
 
     n = len(prompts)
     results: List[Any] = [None] * n
@@ -333,6 +339,9 @@ async def main():
     parser.add_argument("--disable-tqdm", action="store_true")
     parser.add_argument("--no-stream", dest="stream", action="store_false")
     parser.add_argument("--max-tokens", type=int, default=6000)
+    parser.add_argument("--ignore-eos", action="store_true",
+                        help="Never stop on EOS: every request decodes exactly --max-tokens. "
+                             "Throughput-only mode — removes generation-length as a confound.")
     parser.add_argument("--result-file", type=str, default=None)
     parser.add_argument("--label", type=str, default="")
     parser.set_defaults(stream=True)
@@ -359,7 +368,7 @@ async def main():
         prompts, args.model, api_url, gen_config=gen_config,
         request_rate=args.request_rate, burstiness=args.burstiness,
         max_concurrency=args.max_concurrency, request_timeout=args.request_timeout,
-        disable_tqdm=args.disable_tqdm, stream=args.stream,
+        disable_tqdm=args.disable_tqdm, stream=args.stream, ignore_eos=args.ignore_eos,
     )
     end_time = time.perf_counter()
 

@@ -119,6 +119,11 @@ BFF_THRESHOLD=${BFF_THRESHOLD:-0.85}     # cosine merge threshold (0..1)
 BFF_GROUP_SIZE=${BFF_GROUP_SIZE:-4}      # fusion layers packed per KV-cache group
 BFF_BALANCED_GROUPS=${BFF_BALANCED_GROUPS:-0}   # 0=warmup+chunk split; >=2 = N balanced storage groups (dedup=0)
 BFF_FF_GROUPS=${BFF_FF_GROUPS:-}         # set (e.g. "1") -> fold un-chosen fusion groups into warmup; empty=off
+# Throughput-only mode: skip F1/accuracy AND fix output length (ignore_eos + max-tokens=FIXED_OUTPUT_LEN) so
+# every request decodes exactly the same number of tokens. Isolates the pure concurrency/per-step effect of
+# KV freeing from output quality (rambling). 0 = normal F1 benchmark.
+THROUGHPUT_ONLY=${THROUGHPUT_ONLY:-0}
+FIXED_OUTPUT_LEN=${FIXED_OUTPUT_LEN:-1024}
 BFF_PD_ENCODED_BATCH_SIZE=${BFF_PD_ENCODED_BATCH_SIZE:-8}   # cross-batch registry window (0=within-batch only)
 
 # ---- v2 knobs (BASELINE=bff_v2 only) ----
@@ -607,13 +612,26 @@ run_benchmark() {
   local npu; npu=$(assign_npu_for_node $target_index); [ -z "$npu" ] && npu=$(assign_npu_for_node 0)
   export ASCEND_RT_VISIBLE_DEVICES=$npu
   export VLLM_WORKER_MULTIPROC_METHOD="spawn" VLLM_USE_V1="1"
-  echo "Running F1 benchmark (prefill_concurrency=${PREFILL_MAX_CONCURRENCY}, decode_concurrency=${DECODE_MAX_CONCURRENCY}, prompts=${NUM_PROMPTS}) against proxy ${PROXY_PORT}..."
+  # Accuracy vs throughput-only: normal runs compute F1 with the dataset's own max length; throughput-only
+  # drops F1/code metrics and forces a fixed output length (ignore_eos), so freeing's concurrency effect is
+  # measured without the generation-length (rambling) confound.
+  local eval_flags max_tok_flag mode
+  if [[ "${THROUGHPUT_ONLY}" == "1" ]]; then
+    eval_flags="--ignore-eos"
+    max_tok_flag="${FIXED_OUTPUT_LEN}"
+    mode="THROUGHPUT-only (no F1, ignore_eos, fixed output=${FIXED_OUTPUT_LEN})"
+  else
+    eval_flags="--compute-f1 --compute-code-metrics"
+    max_tok_flag="${MAX_TOKENS}"
+    mode="F1 benchmark"
+  fi
+  echo "Running ${mode} (prefill_concurrency=${PREFILL_MAX_CONCURRENCY}, decode_concurrency=${DECODE_MAX_CONCURRENCY}, prompts=${NUM_PROMPTS}) against proxy ${PROXY_PORT}..."
   python -m f1_benchmark.f1_main \
     --dataset-path "${F1_DATASET}" --hf-split "${F1_SPLIT}" \
     --input-key "${F1_INPUT_KEY}" --output-key "${F1_OUTPUT_KEY}" \
     --num-prompts ${NUM_PROMPTS} --request-rate ${REQUEST_RATE} --burstiness ${BURSTINESS} \
     --max-concurrency ${DECODE_MAX_CONCURRENCY} --request-timeout ${REQUEST_TIMEOUT} \
-    --min-tokens ${MIN_TOKENS} --max-tokens ${MAX_TOKENS} --compute-f1 --compute-code-metrics \
+    --min-tokens ${MIN_TOKENS} --max-tokens ${max_tok_flag} ${eval_flags} \
     --model "${MODEL}" --host ${VLLM_HOST_IP} --port ${PROXY_PORT} \
     --result-dir "${results_root}" \
     > "${logs_root}/${BASELINE}-${NUM_PREFILL}Px${NUM_DECODE}D-con${DECODE_MAX_CONCURRENCY}-serving.txt" 2>&1
