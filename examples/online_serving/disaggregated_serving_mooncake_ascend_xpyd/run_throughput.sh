@@ -19,4 +19,8 @@
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export THROUGHPUT_ONLY=1
 export FIXED_OUTPUT_LEN="${FIXED_OUTPUT_LEN:-1024}"
+# FREE_FLUSH (full-device npu.synchronize per block-free) only fixes the F1 write race, which this
+# accuracy-disregarding harness does not measure — default it OFF so throughput reflects freeing's true
+# potential, not the per-step sync. Override with BFF_FREE_FLUSH=1 to measure the sync's cost.
+export BFF_FREE_FLUSH="${BFF_FREE_FLUSH:-0}"
 exec bash "${here}/run_benchmarks.sh" "$@"

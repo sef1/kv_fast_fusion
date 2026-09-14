@@ -124,6 +124,10 @@ BFF_FF_GROUPS=${BFF_FF_GROUPS:-}         # set (e.g. "1") -> fold un-chosen fusi
 # KV freeing from output quality (rambling). 0 = normal F1 benchmark.
 THROUGHPUT_ONLY=${THROUGHPUT_ONLY:-0}
 FIXED_OUTPUT_LEN=${FIXED_OUTPUT_LEN:-1024}
+# FREE_FLUSH: a full-device npu.synchronize() per block-free (fast_fusion_block_pool.py) that fixes the
+# decode-side KV write race — needed for F1, but BFF-only per-step overhead. Default on; set 0 to measure
+# throughput without it (the write race only hurts accuracy, so throughput-only runs don't need it).
+BFF_FREE_FLUSH=${BFF_FREE_FLUSH:-1}
 BFF_PD_ENCODED_BATCH_SIZE=${BFF_PD_ENCODED_BATCH_SIZE:-8}   # cross-batch registry window (0=within-batch only)
 
 # ---- v2 knobs (BASELINE=bff_v2 only) ----
@@ -437,6 +441,7 @@ export_bff_env() {
   fi
   # v2 knobs. Exported for every BFF arm, not just bff_v2: BFF_MAX_REL_ERR also gates v1's merges
   # (both go through pd_lsh.probe), so an A/B at the same error budget is one variable apart.
+  export BFF_FREE_FLUSH=$BFF_FREE_FLUSH
   export BFF_MAX_REL_ERR=$BFF_MAX_REL_ERR BFF_V2_DEDUP=$BFF_V2_DEDUP \
          BFF_V2_RESIDENT=$BFF_V2_RESIDENT BFF_SIG_DIM=$BFF_SIG_DIM \
          BFF_V2_MAX_RESIDENT=$BFF_V2_MAX_RESIDENT BFF_V2_SIG_TIMEOUT=$BFF_V2_SIG_TIMEOUT \
