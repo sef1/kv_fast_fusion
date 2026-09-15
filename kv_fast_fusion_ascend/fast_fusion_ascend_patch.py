@@ -475,6 +475,16 @@ def apply_fast_fusion_ascend_patch() -> None:
         logger.warning("BFF Ascend: could not patch NPUModelRunner (%s); consumer block-sharing "
                        "will be inert and _ACTIVE_RUNNER stays unpublished.", e, exc_info=True)
 
+    # Per-step attribution for the cost the GROUP SPLIT imposes on the runner (Update 28). Default
+    # OFF: with BFF_STEP_PROFILE unset this wraps nothing and touches no vLLM attribute. Installed
+    # here, above the BFF_PD_FUSE gate, because the number it exists to produce — one group's cost
+    # vs seven — is only meaningful when read on BOTH a split and an unsplit run.
+    try:
+        from kv_fast_fusion_ascend.step_profile import install as _install_step_profile
+        _install_step_profile()
+    except Exception as e:  # noqa: BLE001 - a diagnostic must never break serving
+        logger.warning("BFF Ascend: step profile unavailable (%s).", e)
+
     # Register the connector name unconditionally so it always resolves if selected.
     try:
         from kv_fast_fusion_ascend.connectors.mooncake_layerwise_connector_ff import (

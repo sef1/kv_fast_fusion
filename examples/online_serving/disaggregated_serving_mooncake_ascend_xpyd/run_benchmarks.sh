@@ -137,6 +137,11 @@ BFF_MAX_INFLIGHT_LOADS=${BFF_MAX_INFLIGHT_LOADS:-0}
 # SAME step, so anything over the cap ships without signatures and costs the decode a ~374 ms on-demand
 # round trip in front of its transfer. Must cover a real producer step (24-27 prefills at con512).
 BFF_V2_SIG_PRECOMPUTE_PER_STEP=${BFF_V2_SIG_PRECOMPUTE_PER_STEP:-32}
+# Per-step attribution for the group split's cost on the runner (Update 28). Wraps nothing when 0.
+# BFF arms only — the baseline runs stock vLLM and never imports the patch — which is exactly why the
+# profiler reports ms/CALL: one group's cost is what the single-group baseline pays, so the comparison
+# needs no instrumented baseline run.
+BFF_STEP_PROFILE=${BFF_STEP_PROFILE:-0}
 BFF_PD_ENCODED_BATCH_SIZE=${BFF_PD_ENCODED_BATCH_SIZE:-8}   # cross-batch registry window (0=within-batch only)
 
 # ---- v2 knobs (BASELINE=bff_v2 only) ----
@@ -452,7 +457,8 @@ export_bff_env() {
   # (both go through pd_lsh.probe), so an A/B at the same error budget is one variable apart.
   export BFF_FREE_FLUSH=$BFF_FREE_FLUSH
   export BFF_MAX_INFLIGHT_LOADS=$BFF_MAX_INFLIGHT_LOADS \
-         BFF_V2_SIG_PRECOMPUTE_PER_STEP=$BFF_V2_SIG_PRECOMPUTE_PER_STEP
+         BFF_V2_SIG_PRECOMPUTE_PER_STEP=$BFF_V2_SIG_PRECOMPUTE_PER_STEP \
+         BFF_STEP_PROFILE=$BFF_STEP_PROFILE
   export BFF_MAX_REL_ERR=$BFF_MAX_REL_ERR BFF_V2_DEDUP=$BFF_V2_DEDUP \
          BFF_V2_RESIDENT=$BFF_V2_RESIDENT BFF_SIG_DIM=$BFF_SIG_DIM \
          BFF_V2_MAX_RESIDENT=$BFF_V2_MAX_RESIDENT BFF_V2_SIG_TIMEOUT=$BFF_V2_SIG_TIMEOUT \
