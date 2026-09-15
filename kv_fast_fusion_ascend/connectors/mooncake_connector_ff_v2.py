@@ -94,9 +94,13 @@ PRODUCER_SIGCACHE = os.environ.get("BFF_V2_PRODUCER_SIGCACHE", "0") == "1"
 # harm). Bounded so a stall can never grow it without limit — a dropped job is just an on-demand miss.
 _PRODUCER_SIG_JOBS: "queue.Queue" = queue.Queue(maxsize=4096)
 # How many finished requests to sign per forward step in wait_for_save. Bounds the compute one step
-# adds so it stays inside the transport's window; the queue absorbs any backlog and it drains over the
-# next steps. Small enough not to stall a transfer, large enough to keep the cache ahead of the pulls.
-SIG_PRECOMPUTE_PER_STEP = int(os.environ.get("BFF_V2_SIG_PRECOMPUTE_PER_STEP", "8"))
+# adds so it stays inside the transport's window. For the SIGCACHE queue (drain_precompute) a backlog
+# drains over later steps; for the PIGGYBACK (precompute_and_offer) there is no later step — the
+# staple happens in this one — so the cap is a hard coverage limit. Raised 8 -> 32 in Update 27: with
+# max_num_batched_tokens=65536 the producer completes 24-27 prefills in a single step, so 8 dropped
+# 37 % of them (piggyback_misses 190/512), and each drop cost the decode a ~374 ms on-demand round trip
+# ahead of its transfer — far more than the signing it avoided, since that signing then happens anyway.
+SIG_PRECOMPUTE_PER_STEP = int(os.environ.get("BFF_V2_SIG_PRECOMPUTE_PER_STEP", "32"))
 # Upper bound on the D-side piggyback stash (remote_request_id -> {gi: payload}). Entries are popped
 # when the recv thread plans the request; the cap only backstops the rare un-consumed ones (a request
 # whose batch was gate-closed before the pop). Generous vs the ~512 concurrency. See Update 13.
@@ -1032,6 +1036,79 @@ def assemble_sig_payload(rows: list) -> dict | None:
     return out
 
 
+def sig_payload_shape(sigs) -> dict:
+    """``{group: rows}`` read off the PAYLOADS themselves, not off the ask that requested them.
+
+    ``ask_shape`` fingerprints the question; this fingerprints the answer. Storing the answer's own
+    shape is what lets ``claim_prefetched`` catch a producer that sent a different number of rows
+    than D asked for — the piggyback path used to store the ask's shape beside an untrimmed payload,
+    so the guard passed and the disagreement only surfaced deep inside ``DedupEngine._plan`` as
+    ``signature/block mismatch``, discarding the whole request."""
+    return {int(gi): len((p or {}).get("norms") or ()) for gi, p in (sigs or {}).items()}
+
+
+def trim_sig_payload_to(payload, n: int):
+    """Keep this payload's **last** ``n`` block rows, or ``None`` if it cannot be made to fit.
+
+    The tail, never the head, because that is the transport's alignment convention throughout:
+    ``align_per_group`` keeps P's *last* ``len(local)`` ids, since a decode-side prefix-cache hit
+    covers the *front* of the sequence. The producer's piggybacked payload is signed over P's WHOLE
+    block list, so it is longer by exactly that cached head; pairing row 0 with D's block 0 would
+    shift every alias by the hit length and substitute KV from the wrong positions — fluently, with
+    no error anywhere, which is the failure mode that cost the group-0 run.
+
+    ``None`` when the payload is SHORTER than the ask or internally inconsistent: short is not a
+    prefix hit, it is a producer/decode disagreement, and the honest answer to that is a full read.
+    Pure bytes/list arithmetic — no torch, no device — so it is unit-testable off-NPU."""
+    n = int(n)
+    if not payload or n <= 0:
+        return None
+    try:
+        dim = int(payload["dim"])
+        norms = list(payload["norms"])
+        hashes = list(payload["hashes"])
+        sig = payload["sig"]
+        rows = len(norms)
+        # Every parallel array must agree about the row count before any of them is sliced.
+        if rows < n or len(hashes) != rows or dim <= 0 or len(sig) != rows * dim * 2:
+            return None
+        if rows == n:
+            return payload
+        drop = rows - n
+        out = dict(payload)
+        out["sig"] = sig[drop * dim * 2:]
+        out["norms"] = norms[-n:]
+        out["hashes"] = hashes[-n:]
+        if payload.get("kvn") is not None:
+            stride = int(payload["kvn_layers"]) * 4     # fp32 per layer, k and v alike
+            kvn, kvn_v = payload["kvn"], payload["kvn_v"]
+            if stride <= 0 or len(kvn) != rows * stride or len(kvn_v) != rows * stride:
+                return None
+            out["kvn"] = kvn[drop * stride:]
+            out["kvn_v"] = kvn_v[drop * stride:]
+        return out
+    except Exception:  # noqa: BLE001 - a malformed payload costs compression, never liveness
+        return None
+
+
+def fit_piggyback_to_ask(sigs, ask):
+    """Tail-trim a whole piggybacked ``{group: payload}`` onto ``ask``, or ``None`` to go ask P.
+
+    All-or-nothing per request: a group the producer did not sign, or one that cannot be trimmed to
+    the asked length, means this request's answer is incomplete, and a partial dict would fail
+    ``claim_prefetched``'s shape check anyway. Falling back to the on-demand exchange costs a round
+    trip; guessing costs correctness."""
+    if not sigs or not ask:
+        return None
+    out = {}
+    for gi, ids in ask.items():
+        fitted = trim_sig_payload_to(sigs.get(int(gi)), len(ids))
+        if fitted is None:
+            return None
+        out[int(gi)] = fitted
+    return out
+
+
 def split_cached_blocks(block_ids: list, cache: dict, gi: int) -> tuple:
     """Partition ``block_ids`` into (cached rows in slot order with None for misses, missing ids).
 
@@ -1218,6 +1295,11 @@ if _ASCEND_AVAILABLE:
                 # exchange was served from cache and paid no on-demand NPU drain.
                 rate = 100.0 * h / tot if tot else 0.0
                 cache = f" | precompute cache {h}/{tot} blocks ({rate:.1f}% hit)"
+            # Every served request is a round trip the piggyback failed to cover, so the overflow the
+            # per-step cap dropped belongs on the same line as the served count — it is usually why.
+            over = getattr(self._worker, "_sig_precompute_overflow", 0)
+            if over:
+                cache += f" | piggyback overflow {over} (cap {SIG_PRECOMPUTE_PER_STEP}/step)"
             logger.info("BFF pull-v2 signature server: served %d request(s) in %d exchange(s) "
                         "(%.1f per exchange), %d failed%s%s.", self.served, self.batches,
                         self.served / self.batches if self.batches else 0.0, self.failed,
@@ -1781,8 +1863,18 @@ if _ASCEND_AVAILABLE:
                 rid = req_meta.get("remote_request_id")
                 if piggy is not None:
                     psig = piggy.pop(rid, None)
-                    if psig:
-                        cache[rid] = (ask_shape(ask), psig)
+                    # TAIL-trim to the ask before caching (Update 27). P signs its whole block list
+                    # while this ask is tail-aligned, so a decode-side prefix-cache hit leaves the
+                    # payload longer by the cached head. Untrimmed, the row/id disagreement used to
+                    # reach DedupEngine._plan as `signature/block mismatch` and the request was read
+                    # in full — the freeing was thrown away for an alignment the transport already
+                    # knows how to do. The shape stored is the PAYLOAD's, so claim_prefetched still
+                    # guards the pairing rather than trusting the question.
+                    fitted = fit_piggyback_to_ask(psig, ask) if psig else None
+                    if fitted is not None:
+                        if sig_payload_shape(fitted) != sig_payload_shape(psig):
+                            stats.piggyback_trimmed += 1
+                        cache[rid] = (sig_payload_shape(fitted), fitted)
                         stats.piggyback_hits += 1
                         keys.append(None)          # answered locally — no exchange
                         continue
@@ -2439,6 +2531,9 @@ if _ASCEND_AVAILABLE:
             self._sig_cache_lock = threading.Lock()
             self._sig_cache_hits = 0
             self._sig_cache_misses = 0
+            # Requests that completed prefill in a step but lost the piggyback to the per-step cap —
+            # each one is an on-demand round trip the decode pays in front of its transfer.
+            self._sig_precompute_overflow = 0
             super().__init__(vllm_config, engine_id, kv_cache_config)
 
         def start_load_kv(self, metadata):
@@ -2739,11 +2834,30 @@ if _ASCEND_AVAILABLE:
             requests completing this step, exactly what ``request_finished`` will ship moments later.
             Bounded per step (``max_reqs``) so the compute never exceeds the transport's window, the
             same discipline as :meth:`drain_precompute`. Group 0 (warmup) is never signed. Best-effort:
-            any failure just leaves that request to D's on-demand exchange."""
+            any failure just leaves that request to D's on-demand exchange.
+
+            **The overflow cannot be carried to the next step** (Update 27): ``request_finished``
+            staples this same engine step, so a request not signed HERE ships without ``ff_sigs`` and
+            is lost to the piggyback for good. That is not hypothetical — with
+            ``max_num_batched_tokens=65536`` the producer completes 24-27 prefills in a step, a cap of
+            8 dropped 37 % of them (``piggyback_misses=190`` of 512), and every one cost the decode a
+            ~374 ms on-demand round trip IN FRONT OF ITS TRANSFER. Hence the raised default and the
+            overflow counter: the bound stays (it is what keeps producer compute inside the transport's
+            window), but a bound that silently drops a third of the coverage is worse than the compute
+            it saves, because that compute is merely deferred to a worse moment."""
             if not v1.SIG_PIGGYBACK or not fuse_reqs:
                 return 0
             n = 0
-            for (_rid, ext_id, groups) in list(fuse_reqs)[:max(0, int(max_reqs))]:
+            cap = max(0, int(max_reqs))
+            overflow = len(fuse_reqs) - cap
+            if overflow > 0:
+                self._sig_precompute_overflow += overflow
+                logger.warning_once(
+                    "BFF pull-v2 producer: %d request(s) completed prefill this step but the "
+                    "piggyback cap is %d — the rest ship without signatures and cost the decode an "
+                    "on-demand exchange each. Raise BFF_V2_SIG_PRECOMPUTE_PER_STEP.",
+                    len(fuse_reqs), cap)
+            for (_rid, ext_id, groups) in list(fuse_reqs)[:cap]:
                 payload_by_group: dict = {}
                 for gi, ids in enumerate(groups):
                     if gi <= 0 or not ids:      # skip the warmup group and empty groups

@@ -117,6 +117,78 @@ def _pyld(n=4):
     return SignatureCodec.encode(sig, norms, hashes)
 
 
+# --- Update 27: tail-trim a piggybacked payload onto the ask instead of discarding the request -----
+# P signs its WHOLE block list; D's ask is tail-aligned by align_per_group, because a decode-side
+# prefix-cache hit covers the FRONT of the sequence. Untrimmed, the row/id disagreement surfaced as
+# `signature/block mismatch` inside DedupEngine._plan and the request was transferred in full (26 of
+# 512 in one measured run). Trimming from the wrong end is worse than discarding: it shifts every
+# alias by the hit length and substitutes KV from the wrong positions, silently.
+def test_trim_keeps_the_LAST_rows_matching_align_per_group():
+    import torch
+
+    from kv_fast_fusion.pd_dedup_v2 import SignatureCodec
+    sig, norms, hashes = _rand_sig(5)
+    full = SignatureCodec.encode(sig, norms, hashes)
+    tail = SignatureCodec.encode(sig[2:], norms[2:], hashes[2:])
+    trimmed = v2.trim_sig_payload_to(full, 3)
+    assert trimmed["sig"] == tail["sig"], "must be the LAST 3 rows, not the first 3"
+    assert trimmed["norms"] == tail["norms"] and trimmed["hashes"] == tail["hashes"]
+    assert torch.equal(SignatureCodec.decode(trimmed)[0], SignatureCodec.decode(tail)[0])
+    # The head rows, which a "first N" trim would have kept, must be gone.
+    assert SignatureCodec.decode(trimmed)[0].shape[0] == 3
+
+
+def test_trim_carries_the_ratio_mode_kv_norms_along_the_same_cut():
+    """kvn/kvn_v are parallel arrays; slicing sig but not them would scale aliases by another
+    block's norms — the raw-mode error ratio mode exists to remove."""
+    import torch
+
+    from kv_fast_fusion.pd_dedup_v2 import SignatureCodec
+    sig, norms, hashes = _rand_sig(4)
+    k, v = torch.rand(4, 2), torch.rand(4, 2)
+    full = SignatureCodec.encode(sig, norms, hashes, (k, v))
+    tail = SignatureCodec.encode(sig[1:], norms[1:], hashes[1:], (k[1:], v[1:]))
+    trimmed = v2.trim_sig_payload_to(full, 3)
+    assert trimmed["kvn"] == tail["kvn"] and trimmed["kvn_v"] == tail["kvn_v"]
+    assert trimmed["kvn_layers"] == 2
+    assert torch.equal(SignatureCodec.kv_norms(trimmed)[0], k[1:])
+
+
+def test_trim_refuses_to_pad_a_payload_shorter_than_the_ask():
+    """Short is not a prefix hit — it is a producer/decode disagreement, and the honest answer is a
+    full read. Same for an exact fit (returned unchanged) and for nonsense."""
+    payload = _pyld(3)
+    assert v2.trim_sig_payload_to(payload, 4) is None
+    assert v2.trim_sig_payload_to(payload, 0) is None
+    assert v2.trim_sig_payload_to(None, 2) is None
+    assert v2.trim_sig_payload_to(payload, 3) is payload
+    assert v2.trim_sig_payload_to({"dim": 4, "norms": [1.0], "hashes": [[1]], "sig": b"xx"}, 1) is None
+
+
+def test_fit_piggyback_is_all_or_nothing_per_request():
+    """A group the producer did not sign leaves the answer incomplete; a partial dict would fail
+    claim_prefetched's shape check anyway, so fall back to the exchange rather than half-plan."""
+    sigs = {1: _pyld(5), 2: _pyld(5)}
+    fitted = v2.fit_piggyback_to_ask(sigs, {1: [10, 11, 12], 2: [20, 21, 22]})
+    assert v2.sig_payload_shape(fitted) == {1: 3, 2: 3}
+    assert v2.fit_piggyback_to_ask(sigs, {1: [10], 3: [30]}) is None, "unsigned group -> ask P"
+    assert v2.fit_piggyback_to_ask(sigs, {1: list(range(9))}) is None, "ask longer than signed"
+    assert v2.fit_piggyback_to_ask(None, {1: [1]}) is None
+
+
+def test_a_fitted_payload_plans_without_the_mismatch_that_discarded_the_request():
+    """End to end on the thing the log complained about: P signed 20 blocks, D allocated 18. The
+    fitted payload must pair row-for-row with D's ids, so DedupEngine.plan considers them instead of
+    logging `signature/block mismatch` and transferring the request in full."""
+    from kv_fast_fusion import pd_dedup_v2
+    sigs = {1: _pyld(20)}
+    ask = {1: list(range(1000, 1018))}          # 18 tail-aligned ids, P sent 20 rows
+    fitted = v2.fit_piggyback_to_ask(sigs, ask)
+    sig, _norms, _hashes = pd_dedup_v2.SignatureCodec.decode(fitted[1])
+    assert sig.shape[0] == len(ask[1]), "rows must equal ids — this is the mismatch condition"
+    assert v2.sig_payload_shape(fitted) == v2.ask_shape(ask), "and claim_prefetched must accept it"
+
+
 def test_ff_sig_codec_survives_the_json_proxy_round_trip_byte_identical():
     """kv_transfer_params crosses the proxy as JSON, which cannot carry the raw `sig` bytes. Base64
     must reproduce the exact payload SignatureCodec.encode made, or the cosine pairs against garbage."""
@@ -2776,3 +2848,33 @@ def test_every_engine_mutation_is_under_the_one_lock():
     # release, on the other thread, takes the SAME lock.
     assert "with self._engine_lock:" in after
     assert after.index("with self._engine_lock:") < after.index("self.dedup_engine.release(")
+
+
+def test_the_piggyback_overflow_is_counted_and_cannot_be_carried_to_a_later_step():
+    """The per-step cap is a HARD coverage limit for the piggyback, unlike the SIGCACHE queue:
+    request_finished staples in the same engine step, so a request not signed here ships without
+    ff_sigs for good and costs the decode a ~374 ms on-demand round trip in front of its transfer.
+    With max_num_batched_tokens=65536 the producer completes 24-27 prefills per step, so a cap of 8
+    dropped 37 % of them (piggyback_misses 190/512). The drop must at least be visible."""
+    import inspect
+
+    assert v2.SIG_PRECOMPUTE_PER_STEP >= 32, "the default must cover a real producer step"
+    src = inspect.getsource(v2)
+    body = src[src.index("def precompute_and_offer"):]
+    body = body[:body.index("def serve_signatures_cached")]
+    assert "_sig_precompute_overflow" in body, "an overflow is counted, not silently dropped"
+    assert "warning_once" in body, "and named once in the log with the knob that fixes it"
+
+
+def test_the_piggyback_cache_stores_the_PAYLOAD_shape_not_the_ask_shape():
+    """claim_prefetched's guard is only worth something if it fingerprints the answer. Storing
+    ask_shape beside an untrimmed payload is what let a 20-row payload through against 18 ids, so
+    the disagreement surfaced deep inside DedupEngine._plan instead of at the guard."""
+    import inspect
+
+    src = inspect.getsource(v2)
+    body = src[src.index("def _prefetch_signatures"):]
+    body = body[:body.index("def _exchange_for")] if "def _exchange_for" in body else body[:6000]
+    assert "fit_piggyback_to_ask(psig, ask)" in body
+    assert "cache[rid] = (sig_payload_shape(fitted), fitted)" in body
+    assert "cache[rid] = (ask_shape(ask), psig)" not in body, "the untrimmed store is gone"

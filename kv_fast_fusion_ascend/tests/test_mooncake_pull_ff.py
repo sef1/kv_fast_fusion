@@ -1144,3 +1144,62 @@ def test_the_two_barriers_stay_distinct():
     doc = v2_src[v2_src.index("def _sync_device()"):]
     doc = doc[:doc.index('"""', doc.index('"""') + 3)]
     assert "BFF_PD_SAVE_BARRIER" in doc, "the other barrier is named where someone would look"
+
+
+# =====================================================================================
+# Admission back-pressure (Update 27). vLLM allocates a request's KV blocks and THEN parks it in
+# WAITING_FOR_REMOTE_KVS, with no cap on how many may be parked. Under BFF the signature exchange
+# runs in front of every transfer on one serial recv thread, so that queue grows and its blocks are
+# dead weight: one con512 run had ~20,000 of 34,591 blocks held by requests that could not decode,
+# and KV saturated at Running=97 where the baseline reached 194 with Waiting=0.
+#
+# The cure has to defer WITHOUT allocating, which is exactly what returning None from
+# get_num_new_matched_tokens does (scheduler.py re-queues the request untouched). These pin the
+# policy; the wiring that feeds it is asserted below on the source.
+# =====================================================================================
+_REMOTE = {"do_remote_prefill": True}
+
+
+def test_the_cap_is_off_by_default_and_only_gates_remote_prefills():
+    assert mc.admission_deferred(10_000, 0, _REMOTE) is False, "cap 0 = vLLM's own behaviour"
+    # A locally-computed request is never deferred: its blocks are productive immediately, so
+    # holding it back would cost concurrency to protect concurrency.
+    assert mc.admission_deferred(10_000, 4, {"do_remote_prefill": False}) is False
+    assert mc.admission_deferred(10_000, 4, None) is False
+
+
+def test_the_cap_defers_exactly_at_quota_and_admits_below_it():
+    assert mc.admission_deferred(3, 4, _REMOTE) is False
+    assert mc.admission_deferred(4, 4, _REMOTE) is True, "at quota -> defer, do not allocate"
+    assert mc.admission_deferred(5, 4, _REMOTE) is True
+
+
+def test_admission_is_released_by_finished_recving_not_only_by_completion():
+    """The release half. If the quota were only returned when a request FINISHES, the cap would
+    throttle the whole run instead of just the load queue — so it must fall the moment the worker
+    reports the KV landed, which is when the blocks stop being dead weight."""
+    import inspect
+
+    src = inspect.getsource(mc)
+    assert "self._inflight_loads.add(request.request_id)" in src, "registered where a load is queued"
+    assert "def note_loads_finished" in src and "_inflight_loads.discard(rid)" in src
+    # And it is wired to vLLM's own signal, on the scheduler-side connector.
+    assert "def update_connector_output" in src
+    assert 'getattr(connector_output, "finished_recving", None)' in src
+    # Safety net: a request that is aborted, or finishes without a recv ever being reported, must
+    # not hold a slot for the rest of the run.
+    finished = src[src.index("def request_finished_all_groups"):]
+    assert "self._inflight_loads.discard(request.request_id)" in finished[:2000]
+
+
+def test_a_deferred_request_answers_None_so_the_scheduler_does_not_allocate():
+    """The contract with vLLM: `ext_tokens is None` is the ONLY answer that re-queues a request
+    without calling allocate_slots. Returning (0, False) instead would admit it with no external
+    tokens and recompute the prompt locally — correct output, but the opposite of the intent."""
+    import inspect
+
+    src = inspect.getsource(mc)
+    body = src[src.index("def get_num_new_matched_tokens"):]
+    body = body[:body.index("def note_loads_finished")]
+    assert "return None, False" in body
+    assert "super().get_num_new_matched_tokens" in body, "below quota it is a pass-through"

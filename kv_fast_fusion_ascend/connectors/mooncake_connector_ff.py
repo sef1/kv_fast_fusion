@@ -64,6 +64,22 @@ _FF_APPLY = os.environ.get("BFF_FF_APPLY", "1") == "1"
 SIG_PIGGYBACK = os.environ.get("BFF_V2_SIG_PIGGYBACK", "0") == "1"
 _FF_FUSE = os.environ.get("BFF_PD_FUSE", "0") == "1"
 
+# How many requests may sit in WAITING_FOR_REMOTE_KVS at once. 0 = unlimited (vLLM's own behaviour).
+#
+# vLLM allocates a request's KV blocks and THEN parks it waiting for the pull, with no cap on how many
+# may be parked (v1/core/sched/scheduler.py, allocate_slots -> WAITING_FOR_REMOTE_KVS). That is fine
+# when loads complete as fast as they are queued. Under BFF they do not: the signature exchange runs
+# in front of every transfer on one serial recv thread, so the queue grows and its blocks are dead
+# weight. Measured at con512 (Update 27): `occupancy split | used=34546 live=14301` — ~20 000 of the
+# pool's 34 591 blocks held by requests that could not decode, KV saturated at Running=97 where the
+# baseline reached 194 with Waiting=0.
+#
+# With a cap, an over-quota request is deferred by returning None from get_num_new_matched_tokens
+# (the scheduler's own back-pressure channel: it re-queues without allocating), so it waits holding
+# ZERO blocks and the running set gets the pool. It cannot deadlock — the count only falls, and it
+# falls on every completed load.
+_MAX_INFLIGHT_LOADS = int(os.environ.get("BFF_MAX_INFLIGHT_LOADS", "0"))
+
 
 def _parse_ff_groups(raw):
     """``BFF_FF_GROUPS="1,2,3"`` → the set of fusion groups to run, or None for "every eligible".
@@ -406,6 +422,22 @@ def align_per_group(local_groups, remote_groups) -> list[tuple[list[int], list[i
             remote = remote[-len(local):]
         out.append((remote, local))
     return out
+
+
+def admission_deferred(inflight: int, cap: int, params) -> bool:
+    """Should this request be handed back to the waiting queue instead of allocated for?
+
+    ``True`` only for a remote-prefill request while ``cap`` loads are already in flight. Pure, so
+    the policy is testable without a scheduler: the caller turns ``True`` into ``(None, False)``,
+    which is vLLM's documented "cannot determine matched tokens yet" answer and makes the scheduler
+    re-queue the request **without calling allocate_slots** — the whole point, since an allocated
+    request that cannot decode is holding blocks the running set needs.
+
+    A non-remote request is never deferred: it computes locally and its blocks are productive
+    immediately. ``cap <= 0`` disables the mechanism entirely (vLLM's own behaviour)."""
+    if cap <= 0 or not params or not params.get("do_remote_prefill"):
+        return False
+    return inflight >= cap
 
 
 def flatten_group_lists(groups) -> list[int]:
@@ -871,6 +903,30 @@ if _ASCEND_AVAILABLE:
             # several scheduler steps. Fusion must read K from a FULLY written prompt, so chunks
             # accumulate here and only emit once the last one lands.
             self._ff_chunked: dict[str, tuple] = {}
+            # Requests whose remote-KV load has been registered but not yet reported finished — i.e.
+            # exactly the requests holding allocated blocks they cannot yet decode from. A set, not a
+            # counter, so a duplicate registration (update_state_after_alloc runs on EVERY allocation
+            # for a request, not just the first) cannot inflate it and wedge admission shut.
+            self._inflight_loads: set[str] = set()
+            if _MAX_INFLIGHT_LOADS > 0:
+                logger.info("MooncakeConnectorFF: admitting at most %d concurrent remote-KV load(s); "
+                            "over-quota requests wait WITHOUT holding blocks.", _MAX_INFLIGHT_LOADS)
+
+        def get_num_new_matched_tokens(self, request, num_computed_tokens):
+            """Back-pressure on admission: defer rather than allocate when the load queue is full.
+
+            Returning ``None`` here is the scheduler's own channel for "not schedulable yet" — it
+            re-queues the request untouched, so unlike every other throttle this one costs no blocks.
+            Off by default (``BFF_MAX_INFLIGHT_LOADS=0``), in which case this is a pass-through."""
+            if admission_deferred(len(self._inflight_loads), _MAX_INFLIGHT_LOADS,
+                                  request.kv_transfer_params):
+                return None, False
+            return super().get_num_new_matched_tokens(request, num_computed_tokens)
+
+        def note_loads_finished(self, finished_recving) -> None:
+            """Release the in-flight quota for loads the worker has completed."""
+            for rid in finished_recving or ():
+                self._inflight_loads.discard(rid)
 
         def update_state_after_alloc(self, request, blocks, num_external_tokens):
             params = request.kv_transfer_params
@@ -908,6 +964,10 @@ if _ASCEND_AVAILABLE:
                                    if num_external_tokens > 0 else [])
                 self._reqs_need_recv[request.request_id] = (
                     request, local_block_ids, num_external_tokens)
+                # This request now holds allocated blocks it cannot decode from until its pull lands.
+                # Counted HERE, the one place that knows a load was actually registered — and
+                # released in note_loads_finished / request_finished_all_groups.
+                self._inflight_loads.add(request.request_id)
             else:
                 logger.warning("Got invalid KVTransferParams: %s. This request will not utilize "
                                "KVTransfer", params)
@@ -985,6 +1045,10 @@ if _ASCEND_AVAILABLE:
             the proxy as JSON, where a list of lists survives unchanged."""
             groups = [list(g) for g in block_ids]
             params = request.kv_transfer_params
+            # Safety net for the admission quota: a request that is aborted, or finishes without the
+            # worker ever reporting its recv, would otherwise hold a slot for the rest of the run and
+            # ratchet admission shut. Every request passes through here exactly once.
+            self._inflight_loads.discard(request.request_id)
             from vllm.v1.request import RequestStatus
             if (params is None or not params.get("do_remote_decode")
                     or request.status != RequestStatus.FINISHED_LENGTH_CAPPED):
@@ -1656,6 +1720,23 @@ if _ASCEND_AVAILABLE:
                     "MooncakeConnectorFF selected with BFF_PD_FUSE!=1. This connector requires the "
                     "BFF multi-group KV layout; with the split off it is strictly worse than the "
                     "stock MooncakeConnectorV1.")
+
+        def update_connector_output(self, connector_output):
+            """The scheduler-side "these loads landed" signal — the release half of the admission cap.
+
+            vLLM calls this on the SCHEDULER connector with the worker's ``finished_recving`` before
+            it promotes those requests out of WAITING_FOR_REMOTE_KVS, which is exactly the moment
+            their blocks stop being dead weight. The base is a no-op, so this adds accounting to a
+            path that had none; it must never raise, because a throw here would strand the promotion
+            of requests whose KV has already arrived."""
+            super().update_connector_output(connector_output)
+            if self.connector_scheduler is None:
+                return
+            try:
+                self.connector_scheduler.note_loads_finished(
+                    getattr(connector_output, "finished_recving", None))
+            except Exception as e:  # noqa: BLE001 - accounting must never break the scheduler
+                logger.warning("MooncakeConnectorFF: could not release in-flight loads (%s).", e)
 
         def wait_for_save(self):
             """Block until this step's KV writes have EXECUTED, not merely been enqueued.

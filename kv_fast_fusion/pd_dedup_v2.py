@@ -381,6 +381,11 @@ class DedupStats:
         # fraction over a run is the mechanism working — exchange_ms should collapse in step with it.
         self.piggyback_hits = 0
         self.piggyback_misses = 0
+        # Piggybacked payloads whose rows had to be TAIL-trimmed to the ask (Update 27): P signs its
+        # whole block list, D's ask is tail-aligned by align_per_group, so a local prefix-cache hit
+        # leaves P's payload longer by exactly the cached head. Before the trim these requests hit
+        # the `signature/block mismatch` path and were transferred in full — 26 of 512 in one run.
+        self.piggyback_trimmed = 0
         # Round trips, and requests carried by them, on transports that batch the signature phase.
         # Left at zero elsewhere and reported as None rather than 0, because "this transport does
         # not batch" and "batching never engaged" are the two readings that matter and 0 says both.
@@ -569,6 +574,7 @@ class DedupStats:
             "dedup_gated_batches": self.dedup_gated_batches,
             "piggyback_hits": self.piggyback_hits,
             "piggyback_misses": self.piggyback_misses,
+            "piggyback_trimmed": self.piggyback_trimmed,
             "alias_failure_reasons": dict(self.fail_reasons),
             # Non-zero means the run was aliasing blocks the decode was still writing into — two
             # requests sharing the same physical slots for their newly generated tokens. Zero means

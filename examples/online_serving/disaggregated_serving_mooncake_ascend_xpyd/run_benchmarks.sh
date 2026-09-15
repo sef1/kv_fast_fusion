@@ -128,6 +128,15 @@ FIXED_OUTPUT_LEN=${FIXED_OUTPUT_LEN:-1024}
 # decode-side KV write race — needed for F1, but BFF-only per-step overhead. Default on; set 0 to measure
 # throughput without it (the write race only hurts accuracy, so throughput-only runs don't need it).
 BFF_FREE_FLUSH=${BFF_FREE_FLUSH:-1}
+# Admission back-pressure (Update 27). vLLM allocates a request's KV blocks and THEN parks it waiting
+# for its remote-KV pull, uncapped — so BFF's slow, exchange-gated admission leaves the pool jammed by
+# requests that cannot decode (measured: ~20k of 34.5k blocks; KV saturated at Running=97 vs the
+# baseline's 194). With a cap, an over-quota request waits holding ZERO blocks. 0 = vLLM's behaviour.
+BFF_MAX_INFLIGHT_LOADS=${BFF_MAX_INFLIGHT_LOADS:-0}
+# How many requests the producer signs per forward step for the piggyback. The staple happens in the
+# SAME step, so anything over the cap ships without signatures and costs the decode a ~374 ms on-demand
+# round trip in front of its transfer. Must cover a real producer step (24-27 prefills at con512).
+BFF_V2_SIG_PRECOMPUTE_PER_STEP=${BFF_V2_SIG_PRECOMPUTE_PER_STEP:-32}
 BFF_PD_ENCODED_BATCH_SIZE=${BFF_PD_ENCODED_BATCH_SIZE:-8}   # cross-batch registry window (0=within-batch only)
 
 # ---- v2 knobs (BASELINE=bff_v2 only) ----
@@ -442,6 +451,8 @@ export_bff_env() {
   # v2 knobs. Exported for every BFF arm, not just bff_v2: BFF_MAX_REL_ERR also gates v1's merges
   # (both go through pd_lsh.probe), so an A/B at the same error budget is one variable apart.
   export BFF_FREE_FLUSH=$BFF_FREE_FLUSH
+  export BFF_MAX_INFLIGHT_LOADS=$BFF_MAX_INFLIGHT_LOADS \
+         BFF_V2_SIG_PRECOMPUTE_PER_STEP=$BFF_V2_SIG_PRECOMPUTE_PER_STEP
   export BFF_MAX_REL_ERR=$BFF_MAX_REL_ERR BFF_V2_DEDUP=$BFF_V2_DEDUP \
          BFF_V2_RESIDENT=$BFF_V2_RESIDENT BFF_SIG_DIM=$BFF_SIG_DIM \
          BFF_V2_MAX_RESIDENT=$BFF_V2_MAX_RESIDENT BFF_V2_SIG_TIMEOUT=$BFF_V2_SIG_TIMEOUT \
