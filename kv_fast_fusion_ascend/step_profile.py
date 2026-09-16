@@ -38,6 +38,16 @@ logger = init_logger(__name__)
 
 STEP_PROFILE = os.environ.get("BFF_STEP_PROFILE", "0") == "1"
 
+# Attribute the FIXED device memory BFF costs before the KV pool is sized (Update 33). vLLM's own
+# line reports `Available KV cache memory` 34.66 GiB for the baseline against 33.78 GiB for BFF — a
+# flat **0.88 GiB**, IDENTICAL at 2, 4 and 7 groups, so it is not the group split, the block tables or
+# the per-group attention metadata (all of which scale with group count). It comes off the KV pool
+# because it is allocated before `determine_available_memory` runs, and being fixed it hurts in
+# proportion to how small the pool is: −2.5 % of KV at GPU_MEM_UTIL=1.0 and **−9.8 % at 0.5**, which
+# is why halving memory flipped the memory-bound experiment against BFF.
+MEM_PROBE = os.environ.get("BFF_MEM_PROBE", "0") == "1"
+_MEM_LAST: dict = {}
+
 # Marks a wrapped function so a second install() cannot nest timers and double-count. Same idiom (and
 # the same reason) as fast_fusion_ascend_patch's _WRAP_SENTINEL: these installers run from module
 # import, and an import can happen twice.
@@ -129,6 +139,39 @@ class StepProfile:
 
 
 PROFILE = StepProfile()
+
+
+def mem_probe(label: str) -> dict | None:
+    """Log device memory at ``label`` and the delta since the previous probe, or do nothing.
+
+    Reports BOTH allocated and reserved: the caching allocator hands memory back to the pool but not
+    to the driver, and `determine_available_memory` is charged for what is RESERVED — so a probe that
+    watched only `allocated` would miss exactly the kind of overhead we are hunting.
+
+    Returns the reading (for tests) or None when the flag is off or there is no NPU. Every failure is
+    swallowed: a memory probe that can raise during engine init is worse than no probe."""
+    if not MEM_PROBE:
+        return None
+    try:
+        import torch
+        npu = getattr(torch, "npu", None)
+        if npu is None or not npu.is_available():
+            return None
+        gib = 1024 ** 3
+        cur = {"allocated": npu.memory_allocated() / gib, "reserved": npu.memory_reserved() / gib}
+        prev = _MEM_LAST.get("last")
+        if prev is None:
+            logger.info("BFF mem probe | %-28s allocated=%.3f GiB reserved=%.3f GiB",
+                        label, cur["allocated"], cur["reserved"])
+        else:
+            logger.info("BFF mem probe | %-28s allocated=%.3f GiB (%+.3f) reserved=%.3f GiB (%+.3f)",
+                        label, cur["allocated"], cur["allocated"] - prev["allocated"],
+                        cur["reserved"], cur["reserved"] - prev["reserved"])
+        _MEM_LAST["last"] = cur
+        return cur
+    except Exception as e:  # noqa: BLE001 - a diagnostic must never break engine init
+        logger.warning("BFF mem probe (%s) unavailable: %s", label, e)
+        return None
 
 
 def _wrap(cls, name: str, phase: str, on_call=None) -> bool:

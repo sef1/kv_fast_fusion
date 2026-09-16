@@ -142,6 +142,10 @@ BFF_V2_SIG_PRECOMPUTE_PER_STEP=${BFF_V2_SIG_PRECOMPUTE_PER_STEP:-32}
 # profiler reports ms/CALL: one group's cost is what the single-group baseline pays, so the comparison
 # needs no instrumented baseline run.
 BFF_STEP_PROFILE=${BFF_STEP_PROFILE:-0}
+# Attribute the fixed 0.88 GiB BFF costs before the KV pool is sized (Update 33) — 2.5 % of KV at
+# GPU_MEM_UTIL=1.0, 9.8 % at 0.5. Exported for EVERY arm, ahead of the BFF_ON gate, because the
+# comparison that matters is BFF's `Available KV cache memory` against the baseline's.
+BFF_MEM_PROBE=${BFF_MEM_PROBE:-0}
 BFF_PD_ENCODED_BATCH_SIZE=${BFF_PD_ENCODED_BATCH_SIZE:-8}   # cross-batch registry window (0=within-batch only)
 
 # ---- v2 knobs (BASELINE=bff_v2 only) ----
@@ -437,6 +441,9 @@ JSON
 # Ascend patch (the group split): apply_fast_fusion_ascend_patch is gated on BFF_PD_FUSE==1.
 export_bff_env() {
   local role=$1   # kv_producer | kv_consumer
+  # Ahead of the gate on purpose: the memory probe's whole job is to compare BFF against the
+  # BASELINE's available KV, so it must reach the arm where BFF is off too.
+  export BFF_MEM_PROBE=$BFF_MEM_PROBE
   if [[ "$BFF_ON" != "1" ]]; then
     export BFF_PD_FUSE=0
     unset BFF_PD_STATS_DIR

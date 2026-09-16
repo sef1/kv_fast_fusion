@@ -1,5 +1,8 @@
 {
   "devDependencies": {
     "@anthropic-ai/claude-code": "^2.1.217"
+  },
+  "dependencies": {
+    "@nanonets/graft": "^0.18.0"
   }
 }

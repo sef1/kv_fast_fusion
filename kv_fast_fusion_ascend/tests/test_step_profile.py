@@ -128,3 +128,44 @@ def test_a_raising_target_is_still_timed_and_still_raises():
     with pytest.raises(RuntimeError, match="step failed"):
         _Fake().boom()
     assert sp.PROFILE.phases["bt_commit"][0] == 1
+
+
+# =====================================================================================
+# mem_probe (Update 33). vLLM reports `Available KV cache memory` 34.66 GiB for the baseline against
+# 33.78 GiB for BFF — a flat 0.88 GiB, IDENTICAL at 2, 4 and 7 groups, so it is not the group split.
+# Being fixed, it costs 2.5 % of KV at GPU_MEM_UTIL=1.0 and 9.8 % at 0.5, which is what flipped the
+# memory-bound experiment. These pin that the probe is inert by default and cannot throw during init.
+# =====================================================================================
+def test_mem_probe_is_inert_when_the_flag_is_off(monkeypatch):
+    monkeypatch.setattr(sp, "MEM_PROBE", False)
+    assert sp.mem_probe("patch:before") is None
+
+
+def test_mem_probe_never_raises_without_an_npu(monkeypatch):
+    """It brackets engine init on a box that may not have torch.npu at all; a probe that raises
+    there would take down serving for a diagnostic."""
+    monkeypatch.setattr(sp, "MEM_PROBE", True)
+    assert sp.mem_probe("patch:before") is None      # no torch.npu on this box -> None, no raise
+
+
+def test_mem_probe_reports_reserved_as_well_as_allocated(monkeypatch):
+    """determine_available_memory is charged for RESERVED memory — the caching allocator returns
+    blocks to its pool, not to the driver — so a probe watching only `allocated` would miss exactly
+    the overhead being hunted."""
+    import types
+
+    fake = types.SimpleNamespace(
+        is_available=lambda: True,
+        memory_allocated=lambda: 2 * 1024 ** 3,
+        memory_reserved=lambda: 3 * 1024 ** 3,
+    )
+    import torch
+    monkeypatch.setattr(sp, "MEM_PROBE", True)
+    monkeypatch.setattr(torch, "npu", fake, raising=False)
+    sp._MEM_LAST.clear()
+    first = sp.mem_probe("patch:before")
+    assert first == {"allocated": 2.0, "reserved": 3.0}
+    # A second probe must report a delta against the first, not restate absolutes.
+    fake.memory_allocated = lambda: 3 * 1024 ** 3
+    second = sp.mem_probe("patch:after")
+    assert second["allocated"] == 3.0 and sp._MEM_LAST["last"] == second

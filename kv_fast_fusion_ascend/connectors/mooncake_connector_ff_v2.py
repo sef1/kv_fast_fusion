@@ -2534,7 +2534,14 @@ if _ASCEND_AVAILABLE:
             # Requests that completed prefill in a step but lost the piggyback to the per-step cap —
             # each one is an on-demand round trip the decode pays in front of its transfer.
             self._sig_precompute_overflow = 0
+            # Update 33: bracket the worker's init. If the connector is constructed BEFORE
+            # determine_available_memory, whatever it allocates (transfer-engine registrations, the
+            # signature server, the dedup engine) comes straight off the KV pool — and BFF's pool is a
+            # flat 0.88 GiB smaller than the baseline's at every group count.
+            from kv_fast_fusion_ascend.step_profile import mem_probe
+            mem_probe("connector-worker:before-init")
             super().__init__(vllm_config, engine_id, kv_cache_config)
+            mem_probe("connector-worker:after-init")
 
         def start_load_kv(self, metadata):
             """Worker-side per-step entry. Stage this step's piggybacked signatures (Update 13) onto
@@ -3126,20 +3133,45 @@ if _ASCEND_AVAILABLE:
                         try:
                             reqs = getattr(runner, "requests", None) or {}
                             live = 0
+                            per_req: dict = {}
                             for rid in (idx or {}):
                                 bids = getattr(reqs.get(rid), "block_ids", None)
                                 if bids:  # BFF: list of per-group id lists; stay layout-agnostic
                                     for g in bids:
                                         live += len(g) if isinstance(g, (list, tuple)) else 1
+                                    per_req[rid] = bids
                             eng = getattr(self.connector_worker, "_dedup_engine", None)
                             held = eng.held_block_counts() if eng is not None else {}
                             used = snap[2]
+                            # `shared` and `held` are opposite signs of the same subtraction and must
+                            # be reported separately: live > used means aliasing RELEASED victims and
+                            # several requests now reference one block — the mechanism working. Printed
+                            # as a single signed "held" it read as `held=-2692`, which is what made a
+                            # working freeing path look like a leak. Never render it signed again.
+                            total = snap[0] or 1
+                            shared = max(0, live - used)
                             logger.info(
-                                "BFF pull-v2 occupancy split | used=%d live=%d held=%d | resident=%d "
-                                "pending_alias=%d alias_ready=%d pending_resident=%d",
-                                used, live, used - live, held.get("resident", 0),
-                                held.get("pending_alias", 0), held.get("alias_ready", 0),
-                                held.get("pending_resident", 0))
+                                "BFF pull-v2 occupancy split | used=%d live=%d | shared=%d (%.1f%% of "
+                                "pool) held=%d | resident=%d pending_alias=%d alias_ready=%d "
+                                "pending_resident=%d",
+                                used, live, shared, 100.0 * shared / total, max(0, used - live),
+                                held.get("resident", 0), held.get("pending_alias", 0),
+                                held.get("alias_ready", 0), held.get("pending_resident", 0))
+                            # Update 32: is the sharing dedup creates BATCHABLE? `redundancy` bounds
+                            # the KV bandwidth a shared/unique attention split could recover;
+                            # `batchable` is the part whose sharers sit at the same slot, which is
+                            # the only part one shared GEMM could serve. Same walk, no extra pass.
+                            sh = pd_dedup_v2.sharing_stats(per_req)
+                            stats.sharing = sh
+                            logger.info(
+                                "BFF pull-v2 sharing | refs=%d distinct=%d redundancy=%.1f%% "
+                                "batchable=%.1f%% | fanout %s | mean_shared=%.2f max=%d "
+                                "aligned=%.1f%%",
+                                sh["refs"], sh["distinct"], 100.0 * sh["redundancy"],
+                                100.0 * sh["batchable"],
+                                " ".join(f"{k}:{v}" for k, v in sh["fanout"].items()),
+                                sh["mean_fanout_shared"], sh["max_fanout"],
+                                100.0 * sh["aligned_frac"])
                         except Exception as e:  # noqa: BLE001 - profiling must never break the dump
                             logger.warning("BFF pull-v2: occupancy split failed (%s).", e)
                 except Exception as e:  # noqa: BLE001 - profiling must never break the dump
