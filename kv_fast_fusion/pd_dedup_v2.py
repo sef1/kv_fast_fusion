@@ -153,6 +153,78 @@ def threshold_for(gi: int) -> float:
     return _THRESHOLD_G.get(gi, float(THRESHOLD))
 
 
+_FANOUT_BUCKETS = ((1, 1), (2, 2), (3, 4), (5, 8), (9, 16), (17, None))
+
+
+def sharing_stats(per_req_groups) -> dict:
+    """Is the sharing dedup creates actually *batchable* — Hydragen's question, answered on our data.
+
+    ``per_req_groups`` is ``{req_id: [[block ids] per group]}`` for the requests running RIGHT NOW.
+    That instant matters and a run total does not: a shared/unique attention split (vLLM's
+    ``cascade_attention``, arXiv 2402.05099) can only batch sharers that are in the same forward step.
+
+    Today aliasing saves memory but no bandwidth — paged attention re-reads a shared block once per
+    sharer — which is exactly why our +7.2 % concurrency came back as −6.8 % per-request efficiency.
+    The numbers here bound what a split could recover:
+
+    * ``redundancy`` — ``1 - distinct/refs``: the fraction of KV block reads that are re-reads of a
+      block some other running request is also reading. **The ceiling on the bandwidth a shared/unique
+      split could save.** No kernel beats it.
+    * ``batchable`` — the same quantity counting only sharers that hold the block at the SAME slot.
+      Keys are stored post-RoPE and the causal mask is positional, so sharers at different positions
+      cannot go into one shared GEMM. High ``redundancy`` with low ``batchable`` means the sharing is
+      real and the idea is still dead — the distinction `wire_saving_pct` cannot make.
+    * ``fanout`` — distribution of references per block (the speedup factor on the shared slice),
+      with ``mean_fanout_shared`` and ``max_fanout``.
+
+    Fan-out is counted in REFERENCES, not distinct requests, so a block a single request holds twice
+    counts as the re-read it is. Pure dict arithmetic over ids — no device, no torch, no engine state.
+    """
+    refs_by_block: dict = {}
+    for groups in (per_req_groups or {}).values():
+        for gi, blocks in enumerate(groups or ()):
+            if not isinstance(blocks, (list, tuple)):
+                continue
+            for slot, bid in enumerate(blocks):
+                refs_by_block.setdefault((int(gi), int(bid)), []).append(slot)
+
+    refs = sum(len(s) for s in refs_by_block.values())
+    distinct = len(refs_by_block)
+    hist = {f"{lo}+" if hi is None else (str(lo) if lo == hi else f"{lo}-{hi}"): 0
+            for lo, hi in _FANOUT_BUCKETS}
+    keys = list(hist)
+    shared_blocks = shared_refs = aligned_refs = 0
+    max_fanout = 0
+    for slots in refs_by_block.values():
+        n = len(slots)
+        max_fanout = max(max_fanout, n)
+        for (lo, hi), key in zip(_FANOUT_BUCKETS, keys):
+            if n >= lo and (hi is None or n <= hi):
+                hist[key] += 1
+                break
+        if n > 1:
+            shared_blocks += 1
+            shared_refs += n
+            # The largest cohort holding this block at ONE slot — the only sharers a single shared
+            # GEMM could serve. Not the whole fan-out.
+            counts: dict = {}
+            for s in slots:
+                counts[s] = counts.get(s, 0) + 1
+            aligned_refs += max(counts.values())
+    # Serving a cohort of m with one read saves m-1 reads, so the batchable saving over all shared
+    # blocks is (aligned_refs - shared_blocks) — references minus the one read each block still costs.
+    return {
+        "refs": refs,
+        "distinct": distinct,
+        "redundancy": round(1.0 - distinct / refs, 4) if refs else 0.0,
+        "batchable": round((aligned_refs - shared_blocks) / refs, 4) if refs else 0.0,
+        "fanout": hist,
+        "mean_fanout_shared": round(shared_refs / shared_blocks, 2) if shared_blocks else 0.0,
+        "max_fanout": max_fanout,
+        "aligned_frac": round(aligned_refs / shared_refs, 4) if shared_refs else 0.0,
+    }
+
+
 class KVLayoutError(ValueError):
     """The per-layer cache is not a shape this can index blocks out of.
 
@@ -386,6 +458,10 @@ class DedupStats:
         # leaves P's payload longer by exactly the cached head. Before the trim these requests hit
         # the `signature/block mismatch` path and were transferred in full — 26 of 512 in one run.
         self.piggyback_trimmed = 0
+        # Latest sharing_stats() snapshot (Update 32) — whether the sharing aliasing creates is
+        # BATCHABLE by a shared/unique attention split, which is the only way it becomes bandwidth
+        # rather than just memory. None until the first occupancy dump; see sharing_stats.
+        self.sharing: dict | None = None
         # Round trips, and requests carried by them, on transports that batch the signature phase.
         # Left at zero elsewhere and reported as None rather than 0, because "this transport does
         # not batch" and "batching never engaged" are the two readings that matter and 0 says both.
@@ -575,6 +651,7 @@ class DedupStats:
             "piggyback_hits": self.piggyback_hits,
             "piggyback_misses": self.piggyback_misses,
             "piggyback_trimmed": self.piggyback_trimmed,
+            "sharing": self.sharing,
             "alias_failure_reasons": dict(self.fail_reasons),
             # Non-zero means the run was aliasing blocks the decode was still writing into — two
             # requests sharing the same physical slots for their newly generated tokens. Zero means
