@@ -2534,14 +2534,14 @@ if _ASCEND_AVAILABLE:
             # Requests that completed prefill in a step but lost the piggyback to the per-step cap —
             # each one is an on-demand round trip the decode pays in front of its transfer.
             self._sig_precompute_overflow = 0
-            # Update 33: bracket the worker's init. If the connector is constructed BEFORE
-            # determine_available_memory, whatever it allocates (transfer-engine registrations, the
-            # signature server, the dedup engine) comes straight off the KV pool — and BFF's pool is a
-            # flat 0.88 GiB smaller than the baseline's at every group count.
-            from kv_fast_fusion_ascend.step_profile import mem_probe
-            mem_probe("connector-worker:before-init")
+            # NOTE (Update 34): this init used to be bracketed by mem probes, hunting the flat
+            # 0.88 GiB by which BFF's `Available KV cache memory` trails the baseline's. It cannot be
+            # here. `ensure_kv_transfer_initialized` — which constructs this object — runs in
+            # NPUWorker.initialize_from_config (vllm_ascend/worker/worker.py:516), *after*
+            # determine_available_memory (:327) has already sized the pool. Whatever this allocates is
+            # charged to the run, never to the KV budget. The probes now bracket the profiling itself
+            # (step_profile.install_mem_probe); do not re-add them here.
             super().__init__(vllm_config, engine_id, kv_cache_config)
-            mem_probe("connector-worker:after-init")
 
         def start_load_kv(self, metadata):
             """Worker-side per-step entry. Stage this step's piggybacked signatures (Update 13) onto
@@ -3162,7 +3162,15 @@ if _ASCEND_AVAILABLE:
                             # `batchable` is the part whose sharers sit at the same slot, which is
                             # the only part one shared GEMM could serve. Same walk, no extra pass.
                             sh = pd_dedup_v2.sharing_stats(per_req)
-                            stats.sharing = sh
+                            # Stash the PEAK-refs sample, not the most recent one. These dumps run to
+                            # the end of the drain, where the handful of surviving requests give
+                            # refs=300 / redundancy=0 % / max_fanout=1 — and read alone out of
+                            # bff_stats that says "this run had no sharing at all" about a run whose
+                            # steady state was 10-12 %. The question is what the sharing looks like at
+                            # concurrency, so keep the busiest sample.
+                            prev_sh = stats.sharing
+                            if prev_sh is None or sh["refs"] >= prev_sh.get("refs", 0):
+                                stats.sharing = sh
                             logger.info(
                                 "BFF pull-v2 sharing | refs=%d distinct=%d redundancy=%.1f%% "
                                 "batchable=%.1f%% | fanout %s | mean_shared=%.2f max=%d "

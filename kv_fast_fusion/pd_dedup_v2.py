@@ -458,9 +458,12 @@ class DedupStats:
         # leaves P's payload longer by exactly the cached head. Before the trim these requests hit
         # the `signature/block mismatch` path and were transferred in full — 26 of 512 in one run.
         self.piggyback_trimmed = 0
-        # Latest sharing_stats() snapshot (Update 32) — whether the sharing aliasing creates is
-        # BATCHABLE by a shared/unique attention split, which is the only way it becomes bandwidth
-        # rather than just memory. None until the first occupancy dump; see sharing_stats.
+        # The BUSIEST sharing_stats() snapshot of the run (Update 32) — whether the sharing aliasing
+        # creates is BATCHABLE by a shared/unique attention split, which is the only way it becomes
+        # bandwidth rather than just memory. The writer keeps the sample with the most block
+        # references, not the last one: the dumps continue through the drain, where two surviving
+        # requests report redundancy 0 % and would misrepresent a run whose steady state was 10-12 %
+        # (Update 34). None until the first occupancy dump; see sharing_stats.
         self.sharing: dict | None = None
         # Round trips, and requests carried by them, on transports that batch the signature phase.
         # Left at zero elsewhere and reported as None rather than 0, because "this transport does

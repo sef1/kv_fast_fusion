@@ -2878,3 +2878,32 @@ def test_the_piggyback_cache_stores_the_PAYLOAD_shape_not_the_ask_shape():
     assert "fit_piggyback_to_ask(psig, ask)" in body
     assert "cache[rid] = (sig_payload_shape(fitted), fitted)" in body
     assert "cache[rid] = (ask_shape(ask), psig)" not in body, "the untrimmed store is gone"
+
+
+def test_the_sharing_snapshot_kept_in_bff_stats_is_the_BUSIEST_one_not_the_last():
+    """The occupancy dumps run to the end of the drain. Run 51's final sample was refs=300,
+    redundancy=0.0 %, max_fanout=1 — two surviving requests — while its steady state was 10-12 %
+    redundancy at refs~5200. Overwriting `stats.sharing` every dump therefore ships the one sample
+    that says the opposite of the run, and the Hydragen decision rule is read off that field."""
+    import inspect
+
+    src = inspect.getsource(v2)
+    body = src[src.index("sh = pd_dedup_v2.sharing_stats(per_req)"):]
+    body = body[:body.index("except Exception")]
+    assert 'sh["refs"] >= prev_sh.get("refs", 0)' in body, "keep the sample with the most refs"
+    assert "\n                            stats.sharing = sh" not in body.split("prev_sh")[0], (
+        "the unconditional overwrite must be gone, not merely shadowed")
+
+
+def test_the_connector_worker_init_is_not_where_the_kv_pool_overhead_can_be(monkeypatch):
+    """Update 34. `ensure_kv_transfer_initialized` — which constructs this worker — runs in
+    NPUWorker.initialize_from_config (vllm_ascend/worker/worker.py:516), AFTER
+    determine_available_memory (:327) has already sized the pool. Probing here to explain a smaller
+    KV pool measures something strictly downstream of the number, so the probes were moved to bracket
+    the profiling itself. Pin that they do not creep back."""
+    import inspect
+
+    src = inspect.getsource(v2)
+    assert "connector-worker:before-init" not in src, "this probe cannot observe the KV budget"
+    assert "connector-worker:after-init" not in src
+    assert "initialize_from_config" in src, "and the reason stays recorded next to the call"

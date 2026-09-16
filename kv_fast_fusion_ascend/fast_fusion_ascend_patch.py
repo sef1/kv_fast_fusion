@@ -448,13 +448,18 @@ def apply_fast_fusion_ascend_patch() -> None:
     ``_connector_finished`` (``assert len(kv_cache_groups)==1``) whenever the top connector isn't taken
     as ``SupportsHMA`` — and reshaping the layout for a stock run is wrong regardless. The FF connector
     name is still registered (harmless; it self-disables fusion when ``BFF_PD_FUSE!=1``)."""
-    # Memory attribution (Update 33). BFF's `Available KV cache memory` is a flat 0.88 GiB below the
-    # baseline's at EVERY group count, so a fixed allocation made before the pool is sized is eating
-    # it — 2.5 % of KV at full utilisation, 9.8 % at half. These probes bracket the patch so the
-    # overhead is attributed instead of guessed. Off unless BFF_MEM_PROBE=1.
+    # Memory attribution (Update 33, relocated by Update 34). BFF's `Available KV cache memory` is a
+    # flat 0.88 GiB below the baseline's at EVERY group count — and also with BFF_PD_FUSE=0, i.e. with
+    # this whole patch gated off below — so it is 2.5 % of KV at full utilisation and 9.8 % at half,
+    # for a reason that is NOT the group split. `install_mem_probe` brackets the one window that can
+    # still contain it, `determine_available_memory` itself; these two bracket the patch. Both are
+    # above the BFF_PD_FUSE gate so they reach the baseline arm, because the comparison is the point.
+    # Off unless BFF_MEM_PROBE=1.
     try:
-        from kv_fast_fusion_ascend.step_profile import mem_probe as _mem_probe
+        from kv_fast_fusion_ascend import step_profile as _sp
+        _mem_probe = _sp.mem_probe
         _mem_probe("patch:before")
+        _sp.install_mem_probe()
     except Exception:  # noqa: BLE001 - diagnostics must never break the patch
         _mem_probe = None
 

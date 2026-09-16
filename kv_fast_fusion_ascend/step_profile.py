@@ -48,6 +48,14 @@ STEP_PROFILE = os.environ.get("BFF_STEP_PROFILE", "0") == "1"
 MEM_PROBE = os.environ.get("BFF_MEM_PROBE", "0") == "1"
 _MEM_LAST: dict = {}
 
+# Which "this diagnostic is/is not running" lines have already been said. Four box runs in this
+# project have been lost to a diagnostic that engaged silently and failed silently: an env var that
+# never reached the engine, a module that was never committed, and a probe that ran before the device
+# existed all produce the SAME empty log as success does. So every diagnostic here states its state
+# once, unconditionally, and the states are keyed separately — a probe that is unavailable early and
+# working later must be able to say both.
+_ANNOUNCED: dict = {}
+
 # Marks a wrapped function so a second install() cannot nest timers and double-count. Same idiom (and
 # the same reason) as fast_fusion_ascend_patch's _WRAP_SENTINEL: these installers run from module
 # import, and an import can happen twice.
@@ -141,37 +149,105 @@ class StepProfile:
 PROFILE = StepProfile()
 
 
+def announce_once(key: str, level: str, msg: str, *args) -> bool:
+    """Say a diagnostic's state exactly once. Returns True when it printed.
+
+    The point is that an unset flag and a working probe must never look the same in a log. See
+    ``_ANNOUNCED``."""
+    if _ANNOUNCED.get(key):
+        return False
+    _ANNOUNCED[key] = True
+    getattr(logger, level)(msg, *args)
+    return True
+
+
 def mem_probe(label: str) -> dict | None:
     """Log device memory at ``label`` and the delta since the previous probe, or do nothing.
 
-    Reports BOTH allocated and reserved: the caching allocator hands memory back to the pool but not
-    to the driver, and `determine_available_memory` is charged for what is RESERVED — so a probe that
-    watched only `allocated` would miss exactly the kind of overhead we are hunting.
+    Reports allocated, reserved AND the device-wide free/total. Allocated alone is not enough: the
+    caching allocator hands memory back to its pool but not to the driver, and
+    ``determine_available_memory`` is charged for what is RESERVED. Free/total is not optional either
+    — vLLM's ``non_torch_increase`` is computed from ``mem_get_info``, so it counts memory held
+    OUTSIDE torch, including by another process on the same device, and that is the only term a
+    torch-only reading cannot see.
 
     Returns the reading (for tests) or None when the flag is off or there is no NPU. Every failure is
     swallowed: a memory probe that can raise during engine init is worse than no probe."""
     if not MEM_PROBE:
+        announce_once("mem_probe:off", "info",
+                      "BFF mem probe: OFF (BFF_MEM_PROBE unset) — device-memory attribution disabled.")
         return None
     try:
         import torch
         npu = getattr(torch, "npu", None)
         if npu is None or not npu.is_available():
+            announce_once("mem_probe:unavailable", "warning",
+                          "BFF mem probe: UNAVAILABLE at %s — torch.npu is absent or the device is "
+                          "not initialised yet, so this probe point reports nothing.", label)
             return None
+        announce_once("mem_probe:on", "info", "BFF mem probe: ON (BFF_MEM_PROBE=1).")
         gib = 1024 ** 3
         cur = {"allocated": npu.memory_allocated() / gib, "reserved": npu.memory_reserved() / gib}
+        # Device-wide, so it catches non-torch and other-process memory. Not every torch_npu build
+        # exposes it; its absence must cost the two fields, never the probe.
+        try:
+            free, total = npu.mem_get_info()
+            cur["free"] = free / gib
+            cur["total"] = total / gib
+        except Exception:  # noqa: BLE001, S110 - optional; its absence costs two fields, not the probe
+            pass
         prev = _MEM_LAST.get("last")
+        tail = ""
+        if "free" in cur:
+            tail = f" | device free={cur['free']:.3f}/{cur['total']:.3f} GiB"
+            if prev is not None and "free" in prev:
+                tail += f" ({cur['free'] - prev['free']:+.3f})"
         if prev is None:
-            logger.info("BFF mem probe | %-28s allocated=%.3f GiB reserved=%.3f GiB",
-                        label, cur["allocated"], cur["reserved"])
+            logger.info("BFF mem probe | %-26s allocated=%.3f GiB reserved=%.3f GiB%s",
+                        label, cur["allocated"], cur["reserved"], tail)
         else:
-            logger.info("BFF mem probe | %-28s allocated=%.3f GiB (%+.3f) reserved=%.3f GiB (%+.3f)",
+            logger.info("BFF mem probe | %-26s allocated=%.3f GiB (%+.3f) reserved=%.3f GiB (%+.3f)%s",
                         label, cur["allocated"], cur["allocated"] - prev["allocated"],
-                        cur["reserved"], cur["reserved"] - prev["reserved"])
+                        cur["reserved"], cur["reserved"] - prev["reserved"], tail)
         _MEM_LAST["last"] = cur
         return cur
     except Exception as e:  # noqa: BLE001 - a diagnostic must never break engine init
         logger.warning("BFF mem probe (%s) unavailable: %s", label, e)
         return None
+
+
+def install_mem_probe() -> None:
+    """Bracket ``determine_available_memory`` — the only window that can hold the fixed overhead.
+
+    Update 34 settled the ordering from source (``vllm_ascend/worker/worker.py``): ``init_device``
+    (:309), ``load_model`` (:429), **``determine_available_memory``** (:327), and only THEN
+    ``initialize_from_config`` (:514) → ``ensure_kv_transfer_initialized`` (:516). The KV connector is
+    built after the pool is sized, so it cannot be the 0.88 GiB and bracketing its ``__init__`` (as
+    Update 33 did) measures something downstream of the number. The profile run is where the arms
+    diverge, so that is what gets bracketed — and it is installed above the ``BFF_PD_FUSE`` gate so it
+    reaches the baseline arm too, because the comparison is the whole point."""
+    if not MEM_PROBE:
+        return
+    try:
+        from vllm_ascend.worker.worker import NPUWorker
+    except Exception as e:  # noqa: BLE001 - a diagnostic must never break serving
+        logger.warning("BFF mem probe: could not reach NPUWorker (%s); memory profiling stays "
+                       "unbracketed.", e)
+        return
+    orig = getattr(NPUWorker, "determine_available_memory", None)
+    if orig is None or getattr(orig, _WRAP_SENTINEL, False):
+        return
+
+    def _probed(*args, _orig=orig, **kwargs):
+        mem_probe("worker:before-profile")
+        try:
+            return _orig(*args, **kwargs)
+        finally:
+            mem_probe("worker:after-profile")
+
+    setattr(_probed, _WRAP_SENTINEL, True)
+    NPUWorker.determine_available_memory = _probed
+    logger.info("BFF mem probe: bracketing NPUWorker.determine_available_memory.")
 
 
 def _wrap(cls, name: str, phase: str, on_call=None) -> bool:
@@ -229,6 +305,8 @@ def install() -> None:
     Every target is wrapped independently inside its own try/except: this is a diagnostic, and a
     vLLM-ascend version that renamed one method must cost that one phase, never the run."""
     if not STEP_PROFILE:
+        announce_once("step_profile:off", "info",
+                      "BFF step profile: OFF (BFF_STEP_PROFILE unset) — nothing wrapped.")
         return
     wrapped = []
     try:
