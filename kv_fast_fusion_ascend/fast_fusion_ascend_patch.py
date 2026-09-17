@@ -415,6 +415,90 @@ def _patch_npu_model_runner() -> None:
     logger.info("BFF Ascend: patched NPUModelRunner.__init__.")
 
 
+def forward_ordered(meta: dict, order) -> int:
+    """Reorder ``meta`` IN PLACE so its keys follow ``order``; return how many positions changed.
+
+    Keys absent from ``order`` keep their relative order at the end. In place, not a copy, so any
+    holder of the dict sees the same object the runner returned. Pure; no device, no vllm."""
+    rank = {name: i for i, name in enumerate(order)}
+    before = list(meta)
+    after = sorted((k for k in before if k in rank), key=rank.__getitem__)
+    after += [k for k in before if k not in rank]
+    moved = sum(1 for a, b in zip(before, after) if a != b)
+    if moved:
+        items = [(k, meta[k]) for k in after]
+        meta.clear()
+        meta.update(items)
+    return moved
+
+
+_FORWARD_ORDER_ANNOUNCED = [False]
+
+
+def _patch_attn_metadata_forward_order() -> None:
+    """Hand full-graph replay its attention metadata in FORWARD order (Update 36).
+
+    ``AscendAttentionBackendImpl.update_graph_params``' FIA branch — the one that runs, since the paged
+    branch needs ``num_tokens`` in ``pa_shape_list``, which defaults to empty — pairs metadata with
+    captured graph tasks by position::
+
+        attn_keys = list(attn_metadata.keys())
+        for key, param, ... in zip(attn_keys, graph_params.attn_params[num_tokens], ...):
+            block_tables = attn_metadata[key].block_tables
+
+    The captured params are appended in forward execution order (layer 0..27). ``attn_metadata`` is
+    filled GROUP by group (``_build_attention_metadata``). With one group those coincide; with BFF's
+    legacy layout the warmup group is ``{0, 1, 26, 27}``, so the key order is ``0,1,26,27,2,3,...``
+    and roughly half the layers replay against ANOTHER group's block table. Block ids differ per group,
+    so those layers attend over the wrong physical KV: garbage from the first decoded token while
+    every live block table is correct — the 2026-08-26 FULL_DECODE_ONLY run, F1 0.2704 vs 0.4947.
+    (It was then attributed to a block table frozen at capture; the FIA branch re-reads it live.)
+
+    The forward order is taken from ``static_forward_context``, which the attention modules register
+    into in model construction order — the order the capture appended in — so no layer-name parsing
+    and no assumption about the layout. Only engages under a full cudagraph mode with more than one KV
+    cache group; every PIECEWISE or single-group run is untouched."""
+    from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+
+    orig = getattr(NPUModelRunner, "_build_attention_metadata", None)
+    if orig is None or getattr(orig, _WRAP_SENTINEL, False):
+        return
+
+    def _build(self, *args, _orig=orig, **kwargs):
+        out = _orig(self, *args, **kwargs)
+        try:
+            cfg = self.vllm_config.compilation_config
+            groups = self.kv_cache_config.kv_cache_groups
+            if not cfg.cudagraph_mode.has_full_cudagraphs() or len(groups) <= 1:
+                return out
+            order = getattr(self, "_bff_forward_order", None)
+            if order is None:
+                order = list(cfg.static_forward_context)
+                self._bff_forward_order = order
+            meta = out[0] if isinstance(out, tuple) else out
+            metas = meta if isinstance(meta, list) else [meta]
+            moved = max((forward_ordered(m, order) for m in metas if isinstance(m, dict)), default=0)
+            if not _FORWARD_ORDER_ANNOUNCED[0]:
+                _FORWARD_ORDER_ANNOUNCED[0] = True
+                n = len(metas[0]) if metas and isinstance(metas[0], dict) else 0
+                if moved:
+                    logger.info("BFF full-graph metadata order: %d/%d layers were out of forward "
+                                "order across %d KV-cache groups → reordered, so each replayed "
+                                "attention task reads its OWN group's block table.",
+                                moved, n, len(groups))
+                else:
+                    logger.info("BFF full-graph metadata order: already aligned (%d layers, %d "
+                                "groups) — nothing to reorder.", n, len(groups))
+        except Exception as e:  # noqa: BLE001 - never break a step over an ordering fix
+            logger.warning("BFF full-graph metadata reorder skipped (%s); full-graph replay may "
+                           "pair layers with the wrong group's block table.", e)
+        return out
+
+    setattr(_build, _WRAP_SENTINEL, True)
+    NPUModelRunner._build_attention_metadata = _build
+    logger.info("BFF Ascend: attention metadata is put in forward order for full-graph replay.")
+
+
 def _registration_failed(name: str, exc: Exception) -> None:
     """A connector failed to register. Fatal iff this run actually selected it.
 
@@ -625,6 +709,15 @@ def apply_fast_fusion_ascend_patch() -> None:
         except Exception as e:  # pragma: no cover - defensive
             logger.warning("BFF Ascend: failed to wrap %s.update_from_output: %s",
                            getattr(cls, "__name__", cls), e)
+
+    # --- Full-graph metadata order (Update 36) ---
+    # Below the gate: only the group split can put attn_metadata out of forward order, and the
+    # wrapper is itself a no-op under PIECEWISE or a single group.
+    try:
+        _patch_attn_metadata_forward_order()
+    except Exception as e:  # noqa: BLE001 # pragma: no cover - only reachable off the Ascend stack
+        logger.warning("BFF Ascend: could not install the full-graph metadata reorder (%s); "
+                       "FULL_DECODE_ONLY with multiple KV-cache groups is unsafe.", e)
 
     logger.info("Fast fusion Ascend patch applied (mode=raw, BFF_PD_FUSE=1).")
     if _mem_probe is not None:

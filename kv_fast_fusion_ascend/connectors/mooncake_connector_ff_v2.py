@@ -3036,13 +3036,19 @@ if _ASCEND_AVAILABLE:
             produced token-level garbage from the first decoded token — F1 0.2704 against 0.4947 for
             the identical configuration under PIECEWISE, AST validity 8.61% against 15.43%.
 
-            So the cause is the seven block tables in
-            ``AscendAttentionBackendImpl.update_graph_params``, which re-reads only ``seq_lens`` per
-            replay and takes ``block_table`` from the tuple frozen at capture. Note what that
-            implies, and why it is invisible to every check in this file: the connector writes
-            correct block ids into the LIVE table — the slot trace saw 1,008,893 clean observations
-            and the device-vs-host check saw no divergence — while the replayed graph reads the
-            table captured earlier. We validate a table the graph does not use.
+            **Mechanism, corrected by Update 36.** It was attributed to ``update_graph_params``
+            "taking ``block_table`` from the tuple frozen at capture". That is the paged branch, which
+            only runs for shapes in ``pa_shape_list`` (empty by default). The branch that runs is FIA,
+            and it re-reads ``attn_metadata[key].block_tables`` LIVE — but pairs ``key`` with the
+            captured task by position, zipping dict order against capture order. Captures append in
+            forward order (layer 0..27); ``attn_metadata`` is filled group by group, and the legacy
+            warmup group ``{0,1,26,27}`` makes that ``0,1,26,27,2,3,...``. So about half the layers
+            replayed against ANOTHER group's block table. That is also why every check here was clean:
+            the slot trace saw 1,008,893 clean observations and the device-vs-host check no divergence,
+            because the live tables were right — the wrong layer was reading them.
+            ``fast_fusion_ascend_patch._patch_attn_metadata_forward_order`` now puts the metadata in
+            forward order under any full-graph, multi-group run. Until an F1 run confirms it, full
+            graph stays opt-in below.
 
             The knob is kept so the result stays reproducible, not as something to tune. Turning it
             on costs half the F1 and the failure is silent unless you read the text.
@@ -3073,11 +3079,12 @@ if _ASCEND_AVAILABLE:
                 return False
             if ALLOW_FULL_GRAPH:
                 logger.warning(
-                    "BFF pull-v2: BFF_V2_ALLOW_FULL_GRAPH=1 permits FULL_DECODE_ONLY, which is "
-                    "KNOWN BROKEN with BFF's multi-group block tables under the REDIRECT path — a "
-                    "measured run gave F1 0.2704 against 0.4947 under PIECEWISE, with token-level "
-                    "garbage from the first decoded token. Set BFF_V2_MATERIALIZE=1 to make full "
-                    "graph a real test, or unset this unless deliberately reproducing the break.")
+                    "BFF pull-v2: BFF_V2_ALLOW_FULL_GRAPH=1 permits FULL_DECODE_ONLY. A 2026-08-26 "
+                    "run gave F1 0.2704 vs 0.4947 under PIECEWISE (garbage from the first token); "
+                    "Update 36 traced that to full-graph replay pairing layers with another KV-cache "
+                    "group's block table, which the metadata reorder now fixes. UNVERIFIED until an "
+                    "F1 run holds ~0.49 — confirm the 'BFF full-graph metadata order' line, and do not "
+                    "trust a throughput-only run to show corruption.")
             return not ALLOW_FULL_GRAPH
 
         def _applier(self) -> "AliasApplier":
