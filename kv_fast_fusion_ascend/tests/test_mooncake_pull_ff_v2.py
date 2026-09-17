@@ -2907,3 +2907,47 @@ def test_the_connector_worker_init_is_not_where_the_kv_pool_overhead_can_be(monk
     assert "connector-worker:before-init" not in src, "this probe cannot observe the KV budget"
     assert "connector-worker:after-init" not in src
     assert "initialize_from_config" in src, "and the reason stays recorded next to the call"
+
+
+def _requires_piecewise_fn(allow_full_graph: bool, materialize: bool):
+    """The REAL `MooncakeConnectorFFv2.requires_piecewise_for_cudagraph` body, lifted out of the source.
+
+    The class is only defined when vllm_ascend imports, so it cannot be instantiated here; compiling the
+    method from the module source with its three globals stubbed tests the shipped logic rather than a
+    copy of it."""
+    import inspect
+    import os
+    import textwrap
+    import types
+
+    src = inspect.getsource(v2)
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "requires_piecewise_for_cudagraph":
+            node.decorator_list = []
+            code = textwrap.dedent(ast.get_source_segment(src, node))
+            break
+    else:
+        raise AssertionError("requires_piecewise_for_cudagraph not found in the v2 connector")
+    quiet = types.SimpleNamespace(warning=lambda *a, **k: None)
+    g = {"os": os, "ALLOW_FULL_GRAPH": allow_full_graph, "logger": quiet,
+         "pd_dedup_v2": types.SimpleNamespace(MATERIALIZE_ALIASES=materialize)}
+    exec(compile(code, "<requires_piecewise>", "exec"), g)  # noqa: S102 - our own module's source
+    return lambda: g["requires_piecewise_for_cudagraph"](None, {})
+
+
+def test_v2_forces_piecewise_only_when_the_group_split_is_on(monkeypatch):
+    """Update 35. The PIECEWISE downgrade costs 0.88 GiB of KV (profile torch peak 8.27 vs 7.39 GiB
+    for the FULL_DECODE_ONLY baseline decode) — the whole of BFF's smaller pool. Its justification is
+    the multi-group block tables a full-graph replay mis-reads, so without BFF_PD_FUSE=1 there is no
+    split and no reason to pay. Ungated, it also made a BFF_PD_FUSE=0 probe read 8.05 GiB and look like
+    it had exonerated the connector."""
+    monkeypatch.delenv("BFF_PD_FUSE", raising=False)
+    assert _requires_piecewise_fn(False, False)() is False, "no split -> keep the fused decode graph"
+    monkeypatch.setenv("BFF_PD_FUSE", "0")
+    assert _requires_piecewise_fn(False, False)() is False
+
+    monkeypatch.setenv("BFF_PD_FUSE", "1")
+    assert _requires_piecewise_fn(False, False)() is True, "split on -> PIECEWISE, as measured necessary"
+    assert _requires_piecewise_fn(True, False)() is False, "the explicit opt-in still reproduces the break"
+    assert _requires_piecewise_fn(True, True)() is False, "and materialize + opt-in is the real test"

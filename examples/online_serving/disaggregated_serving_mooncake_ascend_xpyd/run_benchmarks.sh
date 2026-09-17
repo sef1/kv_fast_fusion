@@ -71,6 +71,16 @@ DECODE_KV_PORT_BASE=${DECODE_KV_PORT_BASE:-30000}
 # ---- Engine sizing ----
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-65536}
 MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-65536}   # was 64 in the original (a typo) — 64 starves prefill
+# The decode's own budget. vLLM sizes its memory-profile forward at this many tokens and reserves the
+# resulting peak for good, but a P/D decode never runs a forward that large: its steps are at most
+# max_num_seqs tokens, and a load-failure recompute is chunked (chunked prefill is on). So on the decode
+# 65536 mostly buys a phantom reservation taken out of the KV pool. Default = the shared value.
+DECODE_MAX_NUM_BATCHED_TOKENS=${DECODE_MAX_NUM_BATCHED_TOKENS:-$MAX_NUM_BATCHED_TOKENS}
+# The decode's graph mode. Update 35: the baseline decode ran FULL_DECODE_ONLY (one fused graph) while
+# MooncakeConnectorFFv2 forces PIECEWISE, and the split graph's profile peak is 0.88 GiB higher
+# (torch peak 8.27 vs 7.39 GiB) — so every BFF-vs-baseline run was also a graph-mode comparison.
+# DECODE_CUDAGRAPH_MODE=PIECEWISE puts the baseline on BFF's footing.
+DECODE_CUDAGRAPH_MODE=${DECODE_CUDAGRAPH_MODE:-FULL_DECODE_ONLY}
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-48}
 GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.92}
 BLOCK_SIZE=${BLOCK_SIZE:-128}         # BFF requires 128
@@ -366,8 +376,9 @@ export_ascend_env() {
   export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
   export PYTHONHASHSEED=0
   export MOONCAKE_CONFIG_PATH ASCEND_BUFFER_POOL=4:8 MC_STORE_ENABLE_HTTP_SERVER=1
-  # COMPILATION_CONFIG (cudagraph) is DECODE-ONLY (FULL_DECODE_ONLY); prefill launches without it.
-  export COMPILATION_CONFIG='{"cudagraph_capture_sizes":[1,4,8,12,16,20,24,28,32,36,40,48,56,64,80,96],"cudagraph_mode":"FULL_DECODE_ONLY"}'
+  # COMPILATION_CONFIG (cudagraph) is DECODE-ONLY (DECODE_CUDAGRAPH_MODE, default FULL_DECODE_ONLY);
+  # prefill launches without it. A BFF connector may still downgrade it to PIECEWISE at config time.
+  export COMPILATION_CONFIG='{"cudagraph_capture_sizes":[1,4,8,12,16,20,24,28,32,36,40,48,56,64,80,96],"cudagraph_mode":"'"${DECODE_CUDAGRAPH_MODE}"'"}'
   export_ssd_offload_env   # no-op unless ENABLE_SSD_OFFLOAD=1
   unset HCCL_INTRA_ROCE_ENABLE
 }
@@ -531,11 +542,12 @@ JSON
 # $1 = tag (prefill|decode). --compilation-config (cudagraph) is DECODE-ONLY.
 common_args() {
   local tag=$1 extra=""
-  local max_concurrency
+  local max_concurrency max_batched=${MAX_NUM_BATCHED_TOKENS}
   if [[ "$tag" == "prefill" ]]; then
     max_concurrency=${PREFILL_MAX_CONCURRENCY}
   else
     max_concurrency=${DECODE_MAX_CONCURRENCY}
+    max_batched=${DECODE_MAX_NUM_BATCHED_TOKENS}
   fi
   if [[ "$BFF_ON" == "1" ]]; then
     extra="--enable-prefix-caching --no-disable-hybrid-kv-cache-manager"
@@ -549,7 +561,7 @@ common_args() {
     --trust-remote-code \
     --block-size ${BLOCK_SIZE} \
     --max-model-len ${MAX_MODEL_LEN} \
-    --max-num-batched-tokens ${MAX_NUM_BATCHED_TOKENS} \
+    --max-num-batched-tokens ${max_batched} \
     --max-num-seqs ${max_concurrency} \
     ${extra}"
     # --num_gpu_blocks_override 6000 \
@@ -1361,6 +1373,7 @@ main() {
   if [ "$KILL_ONLY" = true ]; then kill_all_nodes; echo "Cleanup done."; exit 0; fi
 
   echo "BFF Ascend config: BASELINE=$BASELINE launcher=$LAUNCHER connector=$CONNECTOR ${NUM_PREFILL}Px${NUM_DECODE}D tp=$TP_SIZE use_ascend_store=$USE_ASCEND_STORE"
+  echo "  decode: cudagraph_mode=$DECODE_CUDAGRAPH_MODE (requested; a BFF connector may force PIECEWISE) max_num_batched_tokens=$DECODE_MAX_NUM_BATCHED_TOKENS | prefill max_num_batched_tokens=$MAX_NUM_BATCHED_TOKENS"
   [[ "$BFF_ON" == "1" ]] && echo "  BFF: fuse=$BFF_PD_FUSE scale=$BFF_SCALE_MODE merge=$BFF_PD_MERGE repr=$BFF_PD_REPR thr=$BFF_THRESHOLD gs=$BFF_GROUP_SIZE eb=$BFF_PD_ENCODED_BATCH_SIZE max_rel_err=$BFF_MAX_REL_ERR"
   [[ "$BASELINE" == "bff_v2" ]] && echo "  BFF v2: dedup=$BFF_V2_DEDUP resident=$BFF_V2_RESIDENT sig_dim=$BFF_SIG_DIM sig_layers=$BFF_SIG_LAYERS sig_timeout=${BFF_V2_SIG_TIMEOUT}s"
   [[ "$BASELINE" == "bff_pull_v2" ]] && echo "  BFF pull-v2: dedup=$BFF_V2_DEDUP resident=$BFF_V2_RESIDENT sig_dim=$BFF_SIG_DIM sig_timeout=${BFF_PULL_V2_SIG_TIMEOUT}s (D asks P; sig port = kv_port+22000)"

@@ -3045,7 +3045,20 @@ if _ASCEND_AVAILABLE:
             table captured earlier. We validate a table the graph does not use.
 
             The knob is kept so the result stays reproducible, not as something to tune. Turning it
-            on costs half the F1 and the failure is silent unless you read the text."""
+            on costs half the F1 and the failure is silent unless you read the text.
+
+            **The downgrade has a memory price, measured (Update 35).** vLLM sizes the KV pool from a
+            profile forward at ``max_num_batched_tokens``, and the attention-split graph peaks higher
+            than a fused one: torch peak 8.27 GiB here against 7.39 GiB for the FULL_DECODE_ONLY
+            baseline decode (the baseline's own PIECEWISE prefill also reads 8.27), weights and
+            non-torch memory identical. That 0.88 GiB is the whole of BFF's smaller
+            ``Available KV cache memory`` — 2.5 % of KV at util 1.0, 9.8 % at 0.5. So the answer is
+            gated on ``BFF_PD_FUSE``, like v1's: with no group split there are no multiple block
+            tables for a replay to mis-read, and forcing PIECEWISE would charge a stock-layout run
+            that price for nothing — which is also what made a ``BFF_PD_FUSE=0`` probe look like it
+            exonerated the connector when the connector was the cause."""
+            if os.environ.get("BFF_PD_FUSE", "0") != "1":
+                return False
             # Variant A materialization removes the post-capture block-table write entirely (aliases
             # are realised by KV copy into the request's OWN blocks, so the table never diverges from
             # what the graph captured). That is the exact mechanism the 0.2704 result was attributed
