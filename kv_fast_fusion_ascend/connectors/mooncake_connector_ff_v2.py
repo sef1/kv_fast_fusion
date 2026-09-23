@@ -1162,9 +1162,14 @@ try:
         signature_matrix,
     )
     from kv_fast_fusion_ascend.connectors import mooncake_connector_ff as v1
+    from kv_fast_fusion_ascend.connectors.merge_stats import (
+        BFFMergeStats,
+        tp_group_if_sharded,
+    )
     from kv_fast_fusion_ascend.connectors.mooncake_layerwise_connector_ff_v2 import (
         signatures_for_group,
     )
+    from kv_fast_fusion_ascend.hybrid_layout import build_hybrid_layout
 
     _ASCEND_AVAILABLE = True
 except Exception as _e:  # pragma: no cover - optional dependency
@@ -1359,9 +1364,13 @@ if _ASCEND_AVAILABLE:
             for gi, e in failures:
                 if isinstance(e, KVLayoutError):
                     # Counted, not swallowed: it means the cache cannot be indexed by connector
-                    # block ids, which would make every signature in the run meaningless.
+                    # block ids, which would make every signature in the run meaningless. Logged
+                    # ONCE per group — the producer marks such a group unsignable and stops
+                    # retrying it, so a repeat here would mean the sticky set is not working.
                     self._note_failure("kv_layout")
-                    logger.warning("BFF pull-v2: cannot index KV for group %s (%s).", gi, e)
+                    logger.warning_once(
+                        "BFF pull-v2: cannot index KV for group %s (%s) — this group is now "
+                        "excluded from dedup for the rest of the run." % (gi, e))
                 else:
                     self._note_failure("sig_error")
                     logger.warning("BFF pull-v2: signature build failed for group %s: %s", gi, e)
@@ -1822,13 +1831,22 @@ if _ASCEND_AVAILABLE:
 
         def _dedup_gate_closed(self) -> bool:
             """Usage gate (Update 11): True ⇒ SKIP dedup this batch because KV usage is below
-            DEDUP_KV_THRESHOLD (dedup's memory relief is not yet worth its exchange cost). Reads the
-            live decode usage via the block-pool bridge; counts closed batches for the log. Never
-            gates the verify-only path — that must observe an unmodified transfer regardless."""
+            DEDUP_KV_THRESHOLD (dedup's memory relief is not yet worth its exchange cost). Counts
+            closed batches for the log. Never gates the verify-only path — that must observe an
+            unmodified transfer regardless.
+
+            The usage is whatever the SCHEDULER last shipped on the connector metadata, not a local
+            read. The block pool lives only in the scheduler process, so at TP>1 a local read is
+            always None and the gate — which is deliberately closed-when-unknown — was permanently
+            shut for the whole run, silently, whenever the threshold was above zero. The local read
+            remains as the fallback for the TP=1 case, where it is the same object anyway."""
             if DEDUP_KV_THRESHOLD <= 0.0 or self.dedup_engine is None:
                 return False
-            from kv_fast_fusion import fast_fusion_block_pool as _bp
-            if dedup_gate_open(_bp.kv_cache_usage(), DEDUP_KV_THRESHOLD):
+            usage = self._kv_usage
+            if usage is None:
+                from kv_fast_fusion import fast_fusion_block_pool as _bp
+                usage = _bp.kv_cache_usage()
+            if dedup_gate_open(usage, DEDUP_KV_THRESHOLD):
                 return False
             self.dedup_engine.stats.dedup_gated_batches += 1
             return True
@@ -2519,6 +2537,15 @@ if _ASCEND_AVAILABLE:
             self._dedup_engine = None
             self._sig_client = None
             self._sig_server = None
+            # Pool occupancy as last shipped by the scheduler; see start_load_kv and
+            # _dedup_gate_closed. None until the first step, which reads as "closed".
+            self._kv_usage: float | None = None
+            # Hybrid geometry, derived in register_kv_caches once the tensors exist.
+            self._layout = None
+            # Groups whose KV cannot be indexed by block id. Sticky: the layout is a property of
+            # the allocation, so a group that refuses once refuses forever, and retrying it is a
+            # gather plus a log line per exchange for the rest of the run.
+            self._unsignable: set[int] = set()
             self._jl = [None]        # JL projection cache, must outlive the calls
             self._proj = [None]      # SimHash projection cache — same reason
             self._ff_failed_blocks: set = set()
@@ -2549,6 +2576,10 @@ if _ASCEND_AVAILABLE:
             in ``piggyback_sigs`` by the time the (serial) recv thread dequeues it. ``metadata.ff_sigs``
             crossed from the scheduler with the rest of the metadata; empty at TP>1 fallback or when
             piggyback is off, in which case this is a no-op and D asks as before."""
+            # The scheduler's pool occupancy, for the dedup gate. Plain attribute rather than a
+            # queue: the gate wants the latest reading, and a step that ships nothing else still
+            # ships this. See _dedup_gate_closed for why a local read is not an option at TP>1.
+            self._kv_usage = getattr(metadata, "kv_usage", None)
             if v1.SIG_PIGGYBACK and self.kv_recv_thread is not None:
                 sigs = getattr(metadata, "ff_sigs", None)
                 if sigs:
@@ -2570,6 +2601,16 @@ if _ASCEND_AVAILABLE:
             self._group_layers.clear()
             for ln, gi in self._layer_group.items():
                 self._group_layers.setdefault(int(gi), set()).add(ln)
+
+            # The hybrid geometry, derived once from the tensors that were just handed over. Fatal
+            # if it cannot be derived: a wrong scale signs the wrong rows and nothing notices.
+            from kv_fast_fusion import fast_fusion_block_pool as _bp
+            self._layout = build_hybrid_layout(
+                self._kv_cache_config,
+                runner=getattr(_bp, "_ACTIVE_RUNNER", None),
+                kv_caches=kv_caches,
+                configured_block_size=self.vllm_config.cache_config.block_size)
+            self._layout.log_engagement("pull-v2")
 
             host = self.side_channel_host
             port = self.side_channel_port + FF_PULL_V2_PORT_OFFSET + self.tp_rank
@@ -2650,19 +2691,47 @@ if _ASCEND_AVAILABLE:
                 logger.warning("BFF pull-v2: signature warm-up failed (%s); the first real exchange "
                                "will pay for it instead.", e)
 
+        # -- hybrid geometry ----------------------------------------------------------------
+        # Three one-liners rather than reaching into `self._layout` at each site, because each of
+        # them has a safe answer when the layout could not be built (non-hybrid fallbacks) and
+        # spelling that out four times is how two of them end up different.
+        def _group_scale(self, gi: int) -> int:
+            return self._layout.scale(gi) if self._layout is not None else 1
+
+        def _group_rows(self, gi: int) -> int:
+            """The group's TENSOR row count — the pool's only when scale is 1.
+
+            `self.num_blocks` (the vendored base's, taken from the FIRST layer's tensor) is an
+            attention-derived figure applied to every group. On a hybrid model that is 4824 for a
+            402-block pool, so every mamba group refuses and every attention group is judged
+            against the wrong number depending on layer order."""
+            if self._layout is not None:
+                return self._layout.tensor_rows(gi)
+            return self.num_blocks
+
+        def _skip_group(self, gi: int) -> bool:
+            """Groups that must never be signed: mamba state, and anything already found
+            unindexable. A mamba block holds one request's recurrent state, not a token window —
+            there is nothing to match, and aliasing one hands another request's state over."""
+            if gi in self._unsignable:
+                return True
+            return self._layout is not None and self._layout.is_mamba(gi)
+
         # -- producer side ----------------------------------------------------------------
         def signatures_for_group(self, gi: int, block_ids):
             """Signature payload for one group's blocks, computed on demand from the registered KV.
 
             No forward-path hook is involved: this reads whatever is in the cache when D asks, which
             is why v2 needs none of v1's save_kv_layer accumulation."""
-            layer_names = sorted(self._group_layers.get(int(gi), ()))
-            if not layer_names or not block_ids:
+            gi = int(gi)
+            layer_names = sorted(self._group_layers.get(gi, ()))
+            if not layer_names or not block_ids or self._skip_group(gi):
                 return None
             is_mla = bool(getattr(self.vllm_config.model_config, "use_mla", False))
             return signatures_for_group(
                 self.kv_caches, layer_names, [int(b) for b in block_ids], is_mla,
-                self._jl, num_blocks=self.num_blocks, proj_holder=self._proj)
+                self._jl, num_blocks=self._group_rows(gi), proj_holder=self._proj,
+                scale=self._group_scale(gi))
 
         def signatures_for_groups_split(self, plan: dict):
             """``{group: (flat ids, lengths)}`` → ``({group: [payload per length]}, failures)``.
@@ -2695,11 +2764,19 @@ if _ASCEND_AVAILABLE:
                 out[gi] = [None] * len(lengths)
                 layer_names = sorted(self._group_layers.get(gi, ()))
                 layers = [self.kv_caches[ln] for ln in layer_names if ln in self.kv_caches]
-                if not layers or not block_ids:
+                if not layers or not block_ids or self._skip_group(gi):
                     continue
                 try:
                     sig, norms = signature_matrix(layers, [int(b) for b in block_ids], is_mla,
-                                                  self._jl, num_blocks=self.num_blocks)
+                                                  self._jl, num_blocks=self._group_rows(gi),
+                                                  scale=self._group_scale(gi))
+                except KVLayoutError as e:
+                    # Sticky: the layout is a property of the allocation, so a group that cannot be
+                    # indexed now will never be indexable. Retrying it costs the gather again and
+                    # logs again, once per group per exchange, for the whole run.
+                    self._unsignable.add(gi)
+                    failures.append((gi, e))
+                    continue
                 except Exception as e:  # noqa: BLE001 - reported per group, never fatal to the batch
                     failures.append((gi, e))
                     continue
@@ -2766,12 +2843,22 @@ if _ASCEND_AVAILABLE:
             ids = [int(b) for b in block_ids]
             if not ids:
                 return []
-            layer_names = sorted(self._group_layers.get(int(gi), ()))
+            gi = int(gi)
+            layer_names = sorted(self._group_layers.get(gi, ()))
             layers = [self.kv_caches[ln] for ln in layer_names if ln in self.kv_caches]
-            if not layers:
+            if not layers or self._skip_group(gi):
                 return [None] * len(ids)
             is_mla = bool(getattr(self.vllm_config.model_config, "use_mla", False))
-            sig, norms = signature_matrix(layers, ids, is_mla, self._jl, num_blocks=self.num_blocks)
+            try:
+                sig, norms = signature_matrix(layers, ids, is_mla, self._jl,
+                                              num_blocks=self._group_rows(gi),
+                                              scale=self._group_scale(gi))
+            except KVLayoutError:
+                # The docstring's promise: this path never raises, it misses. It did raise —
+                # `signature_matrix` is called unguarded here — which turned a precompute for an
+                # unindexable group into a failed step rather than a full read.
+                self._unsignable.add(gi)
+                return [None] * len(ids)
             if sig is None:
                 return [None] * len(ids)
             proj = pd_lsh.get_proj(self._proj, sig.shape[1], sig.device)
@@ -2934,8 +3021,19 @@ if _ASCEND_AVAILABLE:
             """Blocks D declined that were then never read and could not be aliased.
 
             Routed into vLLM's KV-load-failure path so the owning request recomputes locally —
-            slower, never wrong."""
-            self._ff_failed_blocks |= {int(b) for b in block_ids}
+            slower, never wrong.
+
+            Accepts a flat iterable of ids or the per-group list-of-lists that BFF stores block ids
+            as, because both shapes exist in this file and ``int()`` on a list raises `TypeError`
+            on the FIRST failed pull — i.e. exactly when the recompute path is what is keeping the
+            run correct. Flattening costs nothing; the failure it avoids ends the run."""
+            flat: set[int] = set()
+            for b in block_ids:
+                if isinstance(b, (list, tuple, set)):
+                    flat.update(int(x) for x in b)
+                else:
+                    flat.add(int(b))
+            self._ff_failed_blocks |= flat
 
         def take_failed_blocks(self) -> set:
             out, self._ff_failed_blocks = self._ff_failed_blocks, set()
@@ -2966,6 +3064,22 @@ if _ASCEND_AVAILABLE:
             self._ff_step = 0
             self._hot_collisions = 0
             self._traced: dict = {}          # BFF_V2_TRACE_SLOTS: rid -> (position, slot)
+            # TP>1 only: this step's block-merge map, staged by _v2_apply for the stats carrier.
+            self._ff_pending_merges = None
+
+        def get_kv_connector_stats(self):
+            """Under TP>1 the scheduler is a separate process, so this step's D-side block-merge map
+            rides the connector-stats carrier; at TP=1 the in-process ``_ACTIVE_RUNNER`` channel is
+            used instead and this falls through to the base.
+
+            Without this the aliases apply, the block tables are rewritten, ``aliases_applied``
+            counts up — and the scheduler frees nothing, because the map never leaves the worker
+            process. That is the whole "no block free under TP=2" symptom."""
+            merges = self._ff_pending_merges
+            self._ff_pending_merges = None
+            if merges and tp_group_if_sharded() is not None:
+                return BFFMergeStats(data={"bff_merges": merges})
+            return super().get_kv_connector_stats()
 
         def save_kv_layer(self, layer_name, kv_layer, attn_metadata, **kwargs) -> None:
             """No-op: signatures are computed on demand from the registered KV cache."""
@@ -3194,12 +3308,18 @@ if _ASCEND_AVAILABLE:
                             logger.info(
                                 "BFF pull-v2 sharing | refs=%d distinct=%d redundancy=%.1f%% "
                                 "batchable=%.1f%% | fanout %s | mean_shared=%.2f max=%d "
-                                "aligned=%.1f%%",
+                                "aligned=%.1f%% | ALIGNED fanout %s max_aligned=%d | per-group %s",
                                 sh["refs"], sh["distinct"], 100.0 * sh["redundancy"],
                                 100.0 * sh["batchable"],
                                 " ".join(f"{k}:{v}" for k, v in sh["fanout"].items()),
                                 sh["mean_fanout_shared"], sh["max_fanout"],
-                                100.0 * sh["aligned_frac"])
+                                100.0 * sh["aligned_frac"],
+                                " ".join(f"{k}:{v}" for k, v in sh["aligned_fanout"].items()),
+                                sh["max_aligned_fanout"],
+                                " ".join(
+                                    "g%s(batch=%.1f%%,maxal=%d)"
+                                    % (g, 100.0 * v["batchable"], v["max_aligned_fanout"])
+                                    for g, v in sh["per_group"].items()))
                         except Exception as e:  # noqa: BLE001 - profiling must never break the dump
                             logger.warning("BFF pull-v2: occupancy split failed (%s).", e)
                 except Exception as e:  # noqa: BLE001 - profiling must never break the dump
@@ -3208,12 +3328,17 @@ if _ASCEND_AVAILABLE:
 
         def _v2_apply(self) -> None:
             """Apply landed aliases; see :class:`~kv_fast_fusion.pd_dedup_v2.AliasApplier`."""
+            self._ff_pending_merges = None
             try:
                 from kv_fast_fusion import fast_fusion_block_pool as _bp
                 applier = self._applier()
                 runner = getattr(_bp, "_ACTIVE_RUNNER", None)
                 before = applier._engine.stats.applied
                 applier.apply(runner)
+                # apply() publishes in-process by assigning runner._updated_block_tables, which the
+                # scheduler cannot see at TP>1. `pending_merges` is the same map; stage it for
+                # get_kv_connector_stats to carry across the process boundary.
+                self._ff_pending_merges = applier.pending_merges or None
                 n = applier._engine.stats.applied - before
                 if n:
                     hot = sum(applier._engine.stats.hot_block_aliases.values())

@@ -89,3 +89,62 @@ def test_ragged_and_malformed_group_lists_are_tolerated():
     and a profiling helper must never be the thing that breaks the stats dump."""
     s = sharing_stats({"a": [[1], [], None], "b": [[1]], "c": []})
     assert s["refs"] == 2 and s["distinct"] == 1 and s["redundancy"] == 0.5
+
+
+# =====================================================================================
+# max_aligned_fanout and per_group (Update 39). `batchable` is an aggregate; what a shared/unique
+# attention split is actually worth is the largest cohort holding ONE block at ONE slot, because
+# serving a cohort of m costs one read plus a log-sum-exp merge. At m=2 the split is strictly worse
+# than re-reading, whatever `redundancy` says — our balanced-4 runs show one hub block at fan-out
+# 1,046-2,506 whose sharers sit at different slots, which is why redundancy ~12 % is batchable ~2 %.
+# =====================================================================================
+def test_max_aligned_fanout_is_the_cohort_at_ONE_slot_not_the_fanout():
+    """Five requests hold block 7, but only three of them at the same slot — a shared GEMM can serve
+    those three, and re-reading is all that is left for the other two."""
+    per_req = {                    # distinct filler ids, so block 7 is the only shared one
+        "a": [[7, 101, 102]],      # block 7 at slot 0
+        "b": [[7, 103, 104]],      # slot 0
+        "c": [[7, 105, 106]],      # slot 0
+        "d": [[107, 7, 108]],      # slot 1
+        "e": [[109, 110, 7]],      # slot 2
+    }
+    s = sharing_stats(per_req)
+    assert s["max_fanout"] == 5, "five references to block 7"
+    assert s["max_aligned_fanout"] == 3, "but the largest single-slot cohort is three"
+    assert s["aligned_fanout"]["3-4"] == 1
+
+
+def test_a_hub_block_shared_at_every_different_slot_is_worth_nothing_to_a_split():
+    """The measured shape on balanced-4: huge fan-out, no two sharers aligned. redundancy is high and
+    the split is still dead — the distinction wire_saving_pct cannot make."""
+    # block 99 sits at a different slot in each request; every other id is unique to its request
+    per_req = {f"r{i}": [[1000 * i + j for j in range(i)] + [99]] for i in range(1, 9)}
+    s = sharing_stats(per_req)
+    assert s["max_fanout"] == 8, "eight requests read block 99"
+    assert s["max_aligned_fanout"] == 1, "no two of them at the same slot — no cohort at all"
+    assert s["redundancy"] > 0.1 and s["batchable"] == 0.0
+
+
+def test_per_group_splits_the_headline_and_sums_back_to_the_pool():
+    """Only some groups are dedup-eligible and the layouts differ 4x on batchable, so which group
+    carries the aligned sharing is the whole question."""
+    per_req = {
+        "a": [[1, 2], [5, 6]],
+        "b": [[1, 2], [7, 8]],     # group 0 fully aligned with a; group 1 shares nothing
+        "c": [[1, 2], [9, 10]],
+    }
+    s = sharing_stats(per_req)
+    assert set(s["per_group"]) == {"0", "1"}
+    assert sum(g["refs"] for g in s["per_group"].values()) == s["refs"]
+    assert s["per_group"]["0"]["max_aligned_fanout"] == 3, "three requests hold 1 and 2 at one slot"
+    assert s["per_group"]["1"]["max_aligned_fanout"] == 0, "no shared block at all in group 1"
+    assert s["per_group"]["1"]["batchable"] == 0.0
+    assert s["per_group"]["0"]["batchable"] > 0.5
+
+
+def test_the_new_fields_survive_an_empty_and_a_single_request_batch():
+    for per_req in ({}, {"solo": [[1, 2, 3]]}):
+        s = sharing_stats(per_req)
+        assert s["max_aligned_fanout"] == 0
+        assert all(v == 0 for v in s["aligned_fanout"].values())
+        assert isinstance(s["per_group"], dict)

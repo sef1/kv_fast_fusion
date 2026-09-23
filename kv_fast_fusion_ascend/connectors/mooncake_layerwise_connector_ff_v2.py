@@ -63,6 +63,11 @@ from kv_fast_fusion.pd_dedup_v2 import (
     SignatureCodec,
     signature_matrix,
 )
+from kv_fast_fusion_ascend.hybrid_layout import (
+    HybridLayout,
+    HybridLayoutError,
+    build_hybrid_layout,
+)
 
 logger = init_logger("vllm." + __name__)
 
@@ -124,7 +129,7 @@ def to_external_request_id(request_id: str) -> str:
 
 
 def signatures_for_group(kv_caches: dict, layer_names, block_ids, is_mla, jl_holder,
-                         num_blocks=None, proj_holder=None):
+                         num_blocks=None, proj_holder=None, scale: int = 1):
     """Producer-side signature payload for one group's blocks.
 
     ``layer_names`` is however much of the group has been written when the transport wants to send
@@ -136,11 +141,16 @@ def signatures_for_group(kv_caches: dict, layer_names, block_ids, is_mla, jl_hol
     ``proj_holder`` caches the SimHash projection ACROSS calls and a real caller must pass one that
     outlives them: the fixed-seed matrix is identical every time, so rebuilding it per group per
     request is pure waste on the producer's critical path. It defaults to a throwaway only so the
-    pure-function tests stay callable without one."""
+    pure-function tests stay callable without one.
+
+    ``block_ids`` are POOL blocks and ``scale`` is this group's rows-per-pool-block; ``num_blocks``
+    is the tensor's row count, i.e. the pool's count times ``scale``. See
+    :func:`~kv_fast_fusion.pd_dedup_v2.signature_matrix` for why the pool is the id space."""
     layers = [kv_caches[ln] for ln in layer_names if ln in kv_caches]
     if not layers or not block_ids:
         return None
-    sig, norms = signature_matrix(layers, block_ids, is_mla, jl_holder, num_blocks=num_blocks)
+    sig, norms = signature_matrix(layers, block_ids, is_mla, jl_holder, num_blocks=num_blocks,
+                                  scale=scale)
     if sig is None:
         return None
     proj = pd_lsh.get_proj(proj_holder if proj_holder is not None else [None],
@@ -160,6 +170,10 @@ try:
     from vllm.utils.network_utils import make_zmq_path, make_zmq_socket
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
+    from kv_fast_fusion_ascend.connectors.merge_stats import (
+        BFFMergeStats,
+        tp_group_if_sharded,
+    )
     from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
         MooncakeLayerwiseConnector,
         get_external_request_id,
@@ -311,6 +325,9 @@ if _ASCEND_AVAILABLE:
             self._kv_caches: dict = {}
             self._send_tasks = 0
             self._inert_warned = False
+            self._layout: HybridLayout | None = None
+            # TP>1 only: this step's block-merge map, staged for the stats carrier.
+            self._ff_pending_merges = None
             cfg = self._vllm_config.kv_transfer_config
             self.is_producer = cfg.is_kv_producer
             if self._v2_enabled and self.connector_worker is not None:
@@ -354,6 +371,18 @@ if _ASCEND_AVAILABLE:
             # reading `worker.kv_caches` yields {} forever, which is exactly what made the first
             # Ascend v2 run inert for a whole benchmark with an all-zero stats file and no warning.
             self._kv_caches = dict(kv_caches)
+            # Derive the hybrid geometry once, now that the tensors exist. It is the only reader of
+            # `scale`; every other site asks this object rather than recomputing.
+            # Fatal by design if it cannot be derived: a wrong scale signs the wrong rows and
+            # nothing downstream notices, so HybridLayoutError is left to propagate.
+            worker = self.connector_worker
+            from kv_fast_fusion import fast_fusion_block_pool as _bp
+            self._layout = build_hybrid_layout(
+                getattr(worker, "kv_cache_config", None),
+                runner=getattr(_bp, "_ACTIVE_RUNNER", None),
+                kv_caches=self._kv_caches,
+                configured_block_size=self._vllm_config.cache_config.block_size)
+            self._layout.log_engagement("layerwise-v2")
             if not self._v2_enabled or not self.is_producer:
                 return
             worker = self.connector_worker
@@ -425,9 +454,19 @@ if _ASCEND_AVAILABLE:
                 stats.note_skip("no_kv_tensors")
                 return self._warn_if_inert()
 
+            layout = self._layout
+            if layout is not None and layout.is_mamba(gi):
+                # A mamba block holds one request's recurrent state, not a token window. There is
+                # nothing to match and aliasing one would hand another request's state over.
+                stats.note_skip("mamba_group")
+                return
+            scale = layout.scale(gi) if layout is not None else 1
             layer_names = self._signature_layers(worker, gi, layer_name)
             is_mla = bool(getattr(worker, "use_mla", False))
-            num_blocks = getattr(getattr(worker, "kv_cache_config", None), "num_blocks", None)
+            # The TENSOR's row count, which is the pool's only when scale == 1. Passing the pool's
+            # count for a split group is what refused every exchange and disabled dedup for a run.
+            num_blocks = (layout.tensor_rows(gi) if layout is not None
+                          else getattr(getattr(worker, "kv_cache_config", None), "num_blocks", None))
             by_host: dict[tuple, dict] = {}
             for req_id, req_meta in send_task.send_request.items():
                 if gi >= len(req_meta.local_block_ids) or gi >= len(req_meta.remote_block_ids):
@@ -440,10 +479,23 @@ if _ASCEND_AVAILABLE:
                     # this decision cannot reason about. Send it whole.
                     stats.note_skip("length_mismatch")
                     continue
+                if scale > 1:
+                    # The vendored worker has ALREADY kernel-expanded these
+                    # (`_get_kernel_block_ids`, applied in update_req_meta before the send task is
+                    # built). Fold them back: the signature, the alias map and the free hook are all
+                    # keyed by POOL block, and a kernel row id would fail to resolve at substitution
+                    # while silently desyncing the free hook.
+                    local_ids = layout.to_pool(gi, local_ids)
+                    remote_ids = layout.to_pool(gi, remote_ids)
+                    if len(remote_ids) != len(local_ids):
+                        # Both sides expand from the same scale, so this cannot happen from the
+                        # fold alone — it means P and D disagree about the geometry.
+                        stats.note_skip("length_mismatch")
+                        continue
                 try:
                     payload = signatures_for_group(self._kv_caches, layer_names, local_ids,
                                                    is_mla, self._jl, num_blocks=num_blocks,
-                                                   proj_holder=self._proj)
+                                                   proj_holder=self._proj, scale=scale)
                 except KVLayoutError as e:
                     # Refusing is the point: a mis-indexed signature does not fail, it merges
                     # blocks that are not alike. Once per run is enough noise.
@@ -551,14 +603,27 @@ if _ASCEND_AVAILABLE:
                 if self._v2_enabled and self._stats.should_dump(self._ff_step):
                     self._stats.dump()
                 return
+            self._ff_pending_merges = None
             try:
                 from kv_fast_fusion import fast_fusion_block_pool as _bp
                 self._applier.apply(getattr(_bp, "_ACTIVE_RUNNER", None))
+                # apply() publishes in-process via runner._updated_block_tables, which the
+                # scheduler cannot see at TP>1; stage the same map for the stats carrier.
+                self._ff_pending_merges = self._applier.pending_merges or None
                 stats = self._engine.stats
                 if stats.should_dump(self._ff_step):
                     stats.dump()
             except Exception as e:  # pragma: no cover - defensive
                 logger.warning("BFF v2 consumer apply failed: %s", e)
+
+        def get_kv_connector_stats(self):
+            """TP>1: carry this step's block-merge map to the scheduler process. See
+            :class:`~kv_fast_fusion_ascend.connectors.merge_stats.BFFMergeStats`."""
+            merges = self._ff_pending_merges
+            self._ff_pending_merges = None
+            if merges and tp_group_if_sharded() is not None:
+                return BFFMergeStats(data={"bff_merges": merges})
+            return super().get_kv_connector_stats()
 
         def get_finished(self, finished_req_ids: set[str]):
             """The transport's "KV has landed" signal.

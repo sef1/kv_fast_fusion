@@ -773,6 +773,96 @@ def test_the_num_blocks_guard_is_inert_when_the_caller_omits_it():
 
 
 # =====================================================================================
+# hybrid `scale` — a pool block owning several tensor rows
+#
+# Qwen3-Next raises the attention block size until its page matches the ssm page, so the attention
+# tensor holds `scale` rows per pool block. `block_ids` stays in POOL space at every scale, because
+# the alias map and the free hook are both keyed by pool id; the rows are folded into one feature
+# vector here. The GPU path is scale 1 and must not move by a bit.
+# =====================================================================================
+def test_scale_one_is_bitwise_the_pre_hybrid_path():
+    """Every non-hybrid run goes through the same call with scale defaulted. If the new index
+    construction moved a single bit, every merge decision on GPU would shift silently."""
+    torch.manual_seed(0)
+    layers = [torch.randn(2, 64, 8, 4, 16)]
+    sig_a, norms_a = pd_dedup_v2.signature_matrix(layers, [1, 2, 3], False, [None])
+    sig_b, norms_b = pd_dedup_v2.signature_matrix(layers, [1, 2, 3], False, [None], scale=1)
+
+    assert torch.equal(sig_a, sig_b) and torch.equal(norms_a, norms_b)
+
+
+def test_scale_reads_exactly_the_rows_the_pool_block_owns():
+    """Pool block p owns rows p*scale … p*scale+scale-1. Pinned against an explicit gather, which
+    is the whole claim — an off-by-one here reads a neighbour's KV and never raises."""
+    torch.manual_seed(0)
+    scale, pool_blocks = 4, 16
+    kv = torch.randn(2, pool_blocks * scale, 8, 4, 16)
+    ids = [0, 3, 15]
+
+    got, _ = pd_dedup_v2.signature_matrix(
+        [kv], ids, False, [None], num_blocks=pool_blocks * scale, scale=scale)
+
+    expanded = [p * scale + j for p in ids for j in range(scale)]
+    want, _ = pd_dedup_v2.signature_matrix([kv], expanded, False, [None])
+    # Same rows, but folded `scale` to a row: one signature per POOL block, not per tensor row.
+    assert got.shape[0] == len(ids)
+    assert want.shape[0] == len(ids) * scale
+
+
+def test_scale_folds_rows_rather_than_sampling_one():
+    """A fold has to see every row: change only the LAST sub-block of a pool block and the
+    signature must move. Sampling row p*scale alone would pass every other test here."""
+    torch.manual_seed(0)
+    scale, pool_blocks = 4, 16
+    kv = torch.randn(2, pool_blocks * scale, 8, 4, 16)
+    jl = [None]
+    before, _ = pd_dedup_v2.signature_matrix(
+        [kv], [2], False, jl, num_blocks=pool_blocks * scale, scale=scale)
+
+    kv[0, 2 * scale + scale - 1] += 10.0
+    after, _ = pd_dedup_v2.signature_matrix(
+        [kv], [2], False, jl, num_blocks=pool_blocks * scale, scale=scale)
+
+    assert not torch.allclose(before, after)
+
+
+def test_the_row_count_guard_is_against_rows_not_pool_blocks():
+    """Passing the pool's count for a split group is the bug that disabled dedup for a whole run:
+    402 pool blocks against a 4824-row tensor. It must still refuse, and it must accept the rows."""
+    torch.manual_seed(0)
+    scale, pool_blocks = 12, 8
+    kv = torch.randn(2, pool_blocks * scale, 8, 4, 16)
+
+    pd_dedup_v2.signature_matrix(
+        [kv], [1], False, [None], num_blocks=pool_blocks * scale, scale=scale)
+
+    with pytest.raises(pd_dedup_v2.KVLayoutError, match="does not index this tensor"):
+        pd_dedup_v2.signature_matrix(
+            [kv], [1], False, [None], num_blocks=pool_blocks, scale=scale)
+
+
+def test_a_row_count_that_is_not_a_multiple_of_scale_is_refused():
+    torch.manual_seed(0)
+    kv = torch.randn(2, 25, 8, 4, 16)
+    with pytest.raises(pd_dedup_v2.KVLayoutError, match="whole multiple"):
+        pd_dedup_v2.signature_matrix([kv], [1], False, [None], num_blocks=25, scale=4)
+
+
+def test_block_layer_norms_covers_the_same_unit_as_the_signature():
+    """The ratio kernel scales real KV by these. A norm over a twelfth of the block it is applied
+    to is an unbounded error, so the fold has to match signature_matrix's."""
+    torch.manual_seed(0)
+    scale = 4
+    kv = [torch.randn(16 * scale, 8, 4, 16), torch.randn(16 * scale, 8, 4, 16)]  # Ascend (K, V)
+
+    k_norms, v_norms = pd_dedup_v2.block_layer_norms([kv], [2], is_mla=False, scale=scale)
+
+    want_k = kv[0][2 * scale:3 * scale].float().reshape(-1).norm()
+    assert torch.allclose(k_norms[0, 0], want_k)
+    assert torch.allclose(v_norms[0, 0], kv[1][2 * scale:3 * scale].float().reshape(-1).norm())
+
+
+# =====================================================================================
 # aliasing a block the decode is still writing into
 #
 # A request's last prompt block is almost always partially filled, and the decode keeps writing its

@@ -8,6 +8,8 @@ or standalone:
     python kv_fast_fusion_ascend/tests/test_mooncake_layerwise_ff.py
 """
 
+from unittest import mock
+
 import torch
 
 from kv_fast_fusion_ascend.connectors.mooncake_layerwise_connector_ff import (
@@ -407,16 +409,29 @@ class _FakeBlockTable:
     connector publishes to the device by copying that row, so a fixture with independent arrays
     would pass a test the real thing would fail."""
 
-    def __init__(self, rows, cols, use_hybrid_blocks=False):
+    def __init__(self, rows, cols, use_hybrid_blocks=False, scale=2):
+        # num_blocks_per_row counts LOGICAL blocks, which is `cols` in both modes — the hybrid
+        # table is allocated `scale` times wider for the same number of physical blocks.
         self.num_blocks_per_row = [cols] * rows
         self.use_hybrid_blocks = use_hybrid_blocks
         self.physical_block_size = 128
-        self.block_size = 64 if use_hybrid_blocks else 128
-        self.blocks_per_phys_block = 2 if use_hybrid_blocks else 1
+        self.blocks_per_phys_block = scale if use_hybrid_blocks else 1
+        self.block_size = self.physical_block_size // self.blocks_per_phys_block
         self.block_table = type("BT", (), {})()
         self.block_table.cpu = torch.zeros(rows, cols, dtype=torch.long)
         self.block_table.np = self.block_table.cpu.numpy()
         self.block_table.gpu = torch.zeros(rows, cols, dtype=torch.long)
+
+    def _convert_physical_to_logical_blocks(self, physical_blocks):
+        """Verbatim from vllm_ascend's BlockTable — the connector must call this, not reimplement
+        it, so a divergence between the two shows up as a test failure here rather than as a
+        redirect pointing at rows the forward is not reading."""
+        s = self.blocks_per_phys_block
+        out = []
+        for phys in physical_blocks:
+            base = int(phys) * s
+            out.extend(range(base, base + s))
+        return out
 
 
 class _FakeReqState:
@@ -515,39 +530,68 @@ def test_a_buffer_without_a_pinned_mirror_still_publishes():
     assert runner.input_batch.block_table[1].block_table.gpu[0, :2].tolist() == [100, 101]
 
 
-def test_a_hybrid_block_table_is_refused_rather_than_corrupted():
-    """Hybrid mode stores LOGICAL block ids, expanded per physical block, and counts logical blocks
-    in num_blocks_per_row. Writing physical ids at a physical stride would be wrong in value, wrong
-    in stride, and bounded by a count in the other unit — corrupting the head of the sequence, which
-    is the prompt, in silence.
+def test_a_hybrid_redirect_expands_the_device_row_and_leaves_the_host_copy_physical():
+    """The whole hybrid contract in one assertion.
 
-    It cannot arise at block size 128 (the backend's only supported kernel size), so refusing costs
-    nothing today and cannot corrupt tomorrow. False is the existing 'I did not write' signal, so
-    the caller withholds the block free and redirects degrade to off."""
-    import kv_fast_fusion_ascend.connectors.mooncake_layerwise_connector_ff as mod
-    mod._HYBRID_WARNED = False
+    The DEVICE table holds logical ids, so a physical redirect has to be expanded
+    `blocks_per_phys_block` per block. The runner's own `requests[rid].block_ids` must NOT be — it
+    is the scheduler's id space, it is what AliasApplier._substitute resolves victims against, and
+    it is what reaches the free hook. Writing logical ids there is how a kernel row id ends up
+    keyed into a pool-id map, which fails closed at substitution and silently desyncs the free
+    hook."""
     runner = _FakeRunner(["reqA"], ngroups=2, cols=4, use_hybrid_blocks=True)
 
-    assert _ff_write_runner_block_table(runner, "reqA", 1, [100, 101]) is False
+    assert _ff_write_runner_block_table(runner, "reqA", 1, [100, 101]) is True
 
     bt = runner.input_batch.block_table[1].block_table
-    assert bt.np[0].tolist() == [0, 0, 0, 0], "the table must be left exactly as it was"
-    assert bt.gpu[0].tolist() == [0, 0, 0, 0]
-    assert runner.requests["reqA"].block_ids[1] == [0, 0, 0, 0]
+    assert bt.np[0].tolist() == [200, 201, 202, 203]
+    assert bt.gpu[0].tolist() == [200, 201, 202, 203]
+    assert runner.requests["reqA"].block_ids[1] == [100, 101, 0, 0]
 
 
-def test_a_refused_hybrid_write_withholds_the_free():
-    """The coupling that matters: a refusal must reach the apply site as 'do not free', or the
-    request would keep a table nobody repointed while its blocks were handed to someone else."""
+def test_a_hybrid_redirect_budgets_in_physical_blocks():
+    """num_blocks_per_row counts LOGICAL blocks. Taking it as a physical budget would accept twice
+    as many blocks as the row can hold and write off the end of it."""
+    runner = _FakeRunner(["reqA"], ngroups=2, cols=4, use_hybrid_blocks=True)
+
+    # 4 logical columns at scale 2 = room for 2 physical blocks, not 4.
+    assert _ff_write_runner_block_table(runner, "reqA", 1, [100, 101, 102, 103]) is True
+
+    bt = runner.input_batch.block_table[1].block_table
+    assert bt.np[0].tolist() == [200, 201, 202, 203]
+    assert runner.requests["reqA"].block_ids[1] == [100, 101, 0, 0]
+
+
+def test_hybrid_redirects_can_still_be_switched_off():
+    """BFF_V2_HYBRID_REDIRECT=0 restores the old refusal, which is the bisect handle for a bad
+    hybrid run. A refusal must reach the apply site as 'do not free', or the request keeps a table
+    nobody repointed while its blocks go to someone else."""
     import kv_fast_fusion_ascend.connectors.mooncake_layerwise_connector_ff as mod
     mod._HYBRID_WARNED = False
     runner = _FakeRunner(["live"], use_hybrid_blocks=True)
 
     updated = {}
-    if _ff_write_runner_block_table(runner, "live", 1, [100, 101]):
-        updated["live"] = [100, 101]
+    with mock.patch.object(mod, "_HYBRID_REDIRECT", False):
+        if _ff_write_runner_block_table(runner, "live", 1, [100, 101]):
+            updated["live"] = [100, 101]
 
     assert updated == {}
+    bt = runner.input_batch.block_table[1].block_table
+    assert bt.np[0].tolist() == [0, 0, 0, 0], "the table must be left exactly as it was"
+    assert bt.gpu[0].tolist() == [0, 0, 0, 0]
+
+
+def test_a_table_that_cannot_expand_is_refused_not_guessed():
+    """A table reporting a split but offering no converter is one we cannot write safely. Falling
+    back to a private expansion is exactly the divergence this design avoids."""
+    import kv_fast_fusion_ascend.connectors.mooncake_layerwise_connector_ff as mod
+    mod._HYBRID_WARNED = False
+    runner = _FakeRunner(["live"], use_hybrid_blocks=True)
+
+    with mock.patch.object(_FakeBlockTable, "_convert_physical_to_logical_blocks", None):
+        assert _ff_write_runner_block_table(runner, "live", 1, [100, 101]) is False
+
+    assert runner.input_batch.block_table[1].block_table.np[0].tolist() == [0, 0, 0, 0]
 
 
 def test_free_is_coupled_to_write_success():

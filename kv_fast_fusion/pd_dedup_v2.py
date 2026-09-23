@@ -176,6 +176,13 @@ def sharing_stats(per_req_groups) -> dict:
       real and the idea is still dead — the distinction `wire_saving_pct` cannot make.
     * ``fanout`` — distribution of references per block (the speedup factor on the shared slice),
       with ``mean_fanout_shared`` and ``max_fanout``.
+    * ``max_aligned_fanout`` / ``aligned_fanout`` (Update 39) — the largest cohort holding ONE block at
+      ONE slot, and its histogram. This, not ``max_fanout``, is the speedup factor of the shared call:
+      a cohort of 2 replaces one read with one read plus a log-sum-exp merge and is strictly worse.
+      Our balanced-4 runs show a single hub block at fan-out 1,046-2,506 whose sharers sit at DIFFERENT
+      slots — the reason ``redundancy`` ~12 % collapses to ``batchable`` ~2 %.
+    * ``per_group`` — the same three headline numbers per group, because only some groups are
+      dedup-eligible and the layouts differ 4x on ``batchable`` (GS=4 ~9 %, balanced-4 ~2 %).
 
     Fan-out is counted in REFERENCES, not distinct requests, so a block a single request holds twice
     counts as the re-read it is. Pure dict arithmetic over ids — no device, no torch, no engine state.
@@ -188,20 +195,45 @@ def sharing_stats(per_req_groups) -> dict:
             for slot, bid in enumerate(blocks):
                 refs_by_block.setdefault((int(gi), int(bid)), []).append(slot)
 
-    refs = sum(len(s) for s in refs_by_block.values())
-    distinct = len(refs_by_block)
-    hist = {f"{lo}+" if hi is None else (str(lo) if lo == hi else f"{lo}-{hi}"): 0
+    pooled = _tally(refs_by_block.values())
+    # Per group, off the same tally: only some groups are dedup-eligible, and which layers carry the
+    # aligned sharing is the whole question for a shared/unique split.
+    by_group: dict = {}
+    for (gi, _bid), slots in refs_by_block.items():
+        by_group.setdefault(gi, []).append(slots)
+    pooled["per_group"] = {
+        str(gi): {k: v for k, v in _tally(slot_lists).items()
+                  if k in ("refs", "redundancy", "batchable", "max_aligned_fanout")}
+        for gi, slot_lists in sorted(by_group.items())
+    }
+    return pooled
+
+
+def _bucket_hist():
+    return {f"{lo}+" if hi is None else (str(lo) if lo == hi else f"{lo}-{hi}"): 0
             for lo, hi in _FANOUT_BUCKETS}
+
+
+def _bump(hist, keys, n):
+    for (lo, hi), key in zip(_FANOUT_BUCKETS, keys):
+        if n >= lo and (hi is None or n <= hi):
+            hist[key] += 1
+            return
+
+
+def _tally(slot_lists) -> dict:
+    """The headline numbers over one collection of per-block slot lists (pooled, or one group)."""
+    slot_lists = list(slot_lists)
+    refs = sum(len(s) for s in slot_lists)
+    distinct = len(slot_lists)
+    hist, aligned_hist = _bucket_hist(), _bucket_hist()
     keys = list(hist)
     shared_blocks = shared_refs = aligned_refs = 0
-    max_fanout = 0
-    for slots in refs_by_block.values():
+    max_fanout = max_aligned = 0
+    for slots in slot_lists:
         n = len(slots)
         max_fanout = max(max_fanout, n)
-        for (lo, hi), key in zip(_FANOUT_BUCKETS, keys):
-            if n >= lo and (hi is None or n <= hi):
-                hist[key] += 1
-                break
+        _bump(hist, keys, n)
         if n > 1:
             shared_blocks += 1
             shared_refs += n
@@ -210,7 +242,10 @@ def sharing_stats(per_req_groups) -> dict:
             counts: dict = {}
             for s in slots:
                 counts[s] = counts.get(s, 0) + 1
-            aligned_refs += max(counts.values())
+            cohort = max(counts.values())
+            aligned_refs += cohort
+            max_aligned = max(max_aligned, cohort)
+            _bump(aligned_hist, keys, cohort)
     # Serving a cohort of m with one read saves m-1 reads, so the batchable saving over all shared
     # blocks is (aligned_refs - shared_blocks) — references minus the one read each block still costs.
     return {
@@ -219,8 +254,12 @@ def sharing_stats(per_req_groups) -> dict:
         "redundancy": round(1.0 - distinct / refs, 4) if refs else 0.0,
         "batchable": round((aligned_refs - shared_blocks) / refs, 4) if refs else 0.0,
         "fanout": hist,
+        "aligned_fanout": aligned_hist,
         "mean_fanout_shared": round(shared_refs / shared_blocks, 2) if shared_blocks else 0.0,
         "max_fanout": max_fanout,
+        # THE number a shared/unique split lives or dies on: serving a cohort of m costs one read plus
+        # a log-sum-exp merge, so at m=2 the split is strictly worse than re-reading.
+        "max_aligned_fanout": max_aligned,
         "aligned_frac": round(aligned_refs / shared_refs, 4) if shared_refs else 0.0,
     }
 
@@ -280,7 +319,7 @@ def value_blocks(kv, idx: "torch.Tensor", is_mla: bool):
     return v.index_select(0, idx)
 
 
-def block_layer_norms(kv_layers: list, block_ids: list[int], is_mla: bool):
+def block_layer_norms(kv_layers: list, block_ids: list[int], is_mla: bool, scale: int = 1):
     """Exact per-(block, layer) L2 norms of K and V, as ``([N, L], [N, L])`` float32 on CPU.
 
     These are what the ratio kernel scales by, and they are deliberately NOT the norms
@@ -293,12 +332,16 @@ def block_layer_norms(kv_layers: list, block_ids: list[int], is_mla: bool):
     concatenated), but the kernel's buffer is indexed ``[layer, slot, block]`` and each layer's KV
     has its own magnitude. Collapsing the group to one scale would mis-scale every layer but one.
 
-    Where a layer has no separate V (MLA), that column is left at 1.0 — see :func:`value_blocks`."""
+    Where a layer has no separate V (MLA), that column is left at 1.0 — see :func:`value_blocks`.
+
+    ``scale`` matches :func:`signature_matrix`: on a hybrid model a pool block owns ``scale``
+    tensor rows, and the norm has to cover the same unit the signature does, or the ratio kernel
+    scales by a factor derived from a twelfth of the block it is applied to."""
     if not block_ids or not kv_layers:
         return None, None
     first = kv_layers[0]
     probe = first[0] if isinstance(first, (list, tuple)) else first
-    idx = torch.as_tensor(block_ids, dtype=torch.long, device=probe.device)
+    idx = _row_index(block_ids, int(scale), probe.device)
     n, L = len(block_ids), len(kv_layers)
     k_out = torch.ones(n, L, dtype=torch.float32)
     v_out = torch.ones(n, L, dtype=torch.float32)
@@ -311,8 +354,21 @@ def block_layer_norms(kv_layers: list, block_ids: list[int], is_mla: bool):
     return k_out, v_out
 
 
+def _row_index(block_ids: list[int], scale: int, device):
+    """Pool block ids → the tensor rows they own, as a gather index.
+
+    ``scale`` is the hybrid split factor (kernel blocks per pool block) — see
+    ``kv_fast_fusion_ascend.hybrid_layout``. At 1 this is the identity and builds exactly the tensor
+    the pre-hybrid path built, which is what keeps every non-hybrid run bit-identical."""
+    if scale == 1:
+        return torch.as_tensor(block_ids, dtype=torch.long, device=device)
+    base = torch.as_tensor(block_ids, dtype=torch.long, device=device)
+    return (base.unsqueeze(1) * scale
+            + torch.arange(scale, dtype=torch.long, device=device)).reshape(-1)
+
+
 def signature_matrix(kv_layers: list, block_ids: list[int], is_mla: bool, jl_holder: list,
-                     num_blocks: int | None = None, compute_dtype=None):
+                     num_blocks: int | None = None, compute_dtype=None, scale: int = 1):
     """Concatenate the given layers' per-block K and project to :data:`SIG_DIM`.
 
     Mirrors ``FFProducerFusion.block_repr`` + the concat the v1 clustering used, so a v2 signature
@@ -320,9 +376,24 @@ def signature_matrix(kv_layers: list, block_ids: list[int], is_mla: bool, jl_hol
     whichever layers of the group are available — all of them on a whole-request transport, possibly
     only the first on a layerwise one that streams a layer the moment it is computed.
 
-    ``num_blocks``, when given, is the block count the *connector* speaks. Ascend allows a cache
-    tensor whose block count is an integer multiple of it (``block_size_scale``), in which case a
-    connector block id does not index the tensor and the only safe answer is to refuse.
+    ``num_blocks``, when given, is the row count this tensor is expected to have — i.e. the pool's
+    block count times ``scale``. It is a shape assertion, not an id space: a mismatch means the
+    caller's picture of the layout and the allocation disagree, and the only safe answer is to
+    refuse rather than index something.
+
+    ``scale`` is the hybrid split factor. On a hybrid model (attention + Mamba) ``vllm_ascend``
+    raises the attention block size so its page matches the ssm page, and the attention tensor then
+    holds ``scale`` rows per pool block. ``block_ids`` stays in **pool** space at every scale — that
+    is deliberate and load-bearing, because the alias map is keyed by pool id
+    (:meth:`AliasApplier._substitute` resolves against the runner's ``block_ids``) and the free hook
+    feeds pool ids. Signing in row space would fail closed at substitution *and* silently desync the
+    free hook, leaving the index handing out reps for recycled blocks.
+
+    The aggregation is a concatenation: a pool block's ``scale`` rows are flattened into one feature
+    vector before the JL projection, so the projection cost is unchanged and the signature still
+    means "this whole pool block". Note what that costs — the dedup **unit** becomes ``block_size``
+    tokens rather than the kernel's 128, so two blocks now have to match over a ~``scale``x longer
+    window. Expect the match rate to fall accordingly; it is measured, not assumed.
 
     ``compute_dtype`` is the dtype the gather + JL matmul run in (default :data:`SIG_COMPUTE_DTYPE`,
     normally bf16); the small ``[N, d]`` result is re-upcast to fp32 before the norm so the returned
@@ -335,19 +406,28 @@ def signature_matrix(kv_layers: list, block_ids: list[int], is_mla: bool, jl_hol
     dt = SIG_COMPUTE_DTYPE if compute_dtype is None else compute_dtype
     first = kv_layers[0]
     probe = first[0] if isinstance(first, (list, tuple)) else first
+    scale = int(scale)
+    if scale < 1:
+        raise KVLayoutError(f"scale must be >= 1, got {scale}")
     if num_blocks is not None and getattr(probe, "shape", None) is not None:
         rows = int(probe.shape[1] if (not isinstance(first, (list, tuple)) and not is_mla
                                       and probe.ndim >= 4 and probe.shape[0] == 2)
                    else probe.shape[0])
         if rows != int(num_blocks):
             raise KVLayoutError(
-                f"cache holds {rows} blocks but the connector addresses {num_blocks} "
-                "(block_size_scale != 1); a connector block id does not index this tensor")
-    idx = torch.as_tensor(block_ids, dtype=torch.long, device=probe.device)
+                f"cache holds {rows} rows but the caller expects {num_blocks} "
+                f"(scale={scale}); a block id does not index this tensor")
+        if int(num_blocks) % scale != 0:
+            raise KVLayoutError(
+                f"{num_blocks} rows is not a whole multiple of scale={scale}; the caller's layout "
+                "and this tensor disagree")
+    idx = _row_index(block_ids, scale, probe.device)
+    n = len(block_ids)
     parts = []
     for kv in kv_layers:
         blk = key_blocks(kv, idx, is_mla).to(dt)
-        parts.append(blk.reshape(idx.shape[0], -1))
+        # reshape(n, -1) folds a pool block's `scale` consecutive rows into one feature vector.
+        parts.append(blk.reshape(n, -1))
     full = torch.cat(parts, dim=1)
     # The projection is seeded in fp32 on the host (so P and D derive the same one), then cast to the
     # compute dtype and cached at that dtype; the shape guard rebuilds only on a feature-width change,

@@ -101,6 +101,13 @@ _FF_REP_SAFE = os.environ.get("BFF_FF_REP_SAFE", "0") == "1"
 # Diagnostic: count applied redirects whose REP was resolved from the (stale-prone) load-metadata overlay
 # vs live runner state, surfaced in the apply log + stats. Cheap; helps confirm the mechanism at con512.
 _FF_AUDIT = os.environ.get("BFF_FF_AUDIT", "0") == "1"
+# Hybrid (attention + Mamba) models split one physical block into `blocks_per_phys_block` logical
+# ones in the DEVICE block table, so a redirect has to be expanded on the way in while the runner's
+# own copy stays physical. Until Qwen3-Next was brought up no run ever had a split table, and the
+# redirect refused outright rather than exercise an untested conversion. It converts now; the gate
+# is here so a bad hybrid run is bisected against "redirects off" without a rebuild, which is the
+# same shape as BFF_FF_SHIP/BFF_FF_APPLY. Off means the old refusal, i.e. fusion frees nothing.
+_HYBRID_REDIRECT = os.environ.get("BFF_V2_HYBRID_REDIRECT", "1") == "1"
 
 
 def _parse_groups(raw: str | None):
@@ -1274,33 +1281,48 @@ def _ff_write_runner_block_table(runner, rid, gi, new_blocks) -> bool:
         return False
     # NPU `MultiGroupBlockTable.__getitem__(gi)` → the per-group BlockTable (valid on GPU too).
     bt_obj = runner.input_batch.block_table[gi]
-    if getattr(bt_obj, "use_hybrid_blocks", False):
-        # Hybrid mode changes the table's contract entirely: it holds LOGICAL block ids, expanded
-        # `blocks_per_phys_block` per physical block (`append_row` converts before writing), and
-        # `num_blocks_per_row` counts logical blocks. Writing physical ids at a physical stride
-        # would be wrong in value, wrong in stride, and bounded by a count in the other unit — and
-        # it would corrupt the head of the sequence, which is the prompt, in silence.
-        #
-        # It cannot happen today: BFF requires block size 128 and AscendAttentionBackend's only
-        # supported kernel size is 128, so blocks_per_phys_block is 1 and hybrid is off. Refused
-        # rather than converted because the conversion would be a code path no run exercises;
-        # returning False is this function's existing "I did not write" signal, so the caller
-        # withholds the block free and redirects degrade to off.
-        _warn_hybrid_block_table(bt_obj)
-        return False
-    n = min(len(new_blocks), int(bt_obj.num_blocks_per_row[ridx]))
-    row = new_blocks[:n]
-    bt_obj.block_table.np[ridx, :n] = row
+    # Hybrid mode changes the table's contract: it holds LOGICAL block ids, expanded
+    # `blocks_per_phys_block` per physical block, and `num_blocks_per_row` counts logical blocks.
+    # `new_blocks` is always PHYSICAL — that is the id space the scheduler, the alias map and the
+    # free hook all speak — so the device row has to be expanded on the way in, and the host copy
+    # at the bottom of this function must NOT be.
+    #
+    # The expansion is the runner's own (`_convert_physical_to_logical_blocks`), not a private
+    # reimplementation: if the two ever disagree the redirect points at rows the forward is not
+    # reading and nothing raises.
+    scale = int(getattr(bt_obj, "blocks_per_phys_block", 1) or 1)
+    if getattr(bt_obj, "use_hybrid_blocks", False) or scale > 1:
+        if not _HYBRID_REDIRECT:
+            _warn_hybrid_block_table(bt_obj)
+            return False
+        convert = getattr(bt_obj, "_convert_physical_to_logical_blocks", None)
+        if convert is None:
+            # A table that reports a split but cannot expand it is not one we can write safely.
+            _warn_hybrid_block_table(bt_obj)
+            return False
+        # num_blocks_per_row is in LOGICAL units, so the physical budget is it divided by scale.
+        n = min(len(new_blocks), int(bt_obj.num_blocks_per_row[ridx]) // scale)
+        row = new_blocks[:n]
+        device_row = list(convert(row))
+        nl = n * scale
+        bt_obj.block_table.np[ridx, :nl] = device_row
+    else:
+        n = nl = min(len(new_blocks), int(bt_obj.num_blocks_per_row[ridx]))
+        row = device_row = new_blocks[:n]
+        bt_obj.block_table.np[ridx, :n] = row
     # Published from the PINNED host row we just wrote, which is what CpuGpuBuffer exists for
     # (`.np` is a numpy view of `.cpu`). Building a tensor from the Python list instead meant a
     # pageable host->device copy for every applied (request, group) on the forward thread. Copying
     # from `.cpu` also cannot diverge from `.np`, because it IS `.np`.
     cpu = getattr(bt_obj.block_table, "cpu", None)
     if cpu is not None:
-        bt_obj.block_table.gpu[ridx, :n].copy_(cpu[ridx, :n], non_blocking=True)
+        bt_obj.block_table.gpu[ridx, :nl].copy_(cpu[ridx, :nl], non_blocking=True)
     else:       # a buffer without a pinned mirror (fakes, future types) — still publish correctly
-        bt_obj.block_table.gpu[ridx, :n] = torch.tensor(
-            row, device=bt_obj.block_table.gpu.device, dtype=bt_obj.block_table.gpu.dtype)
+        bt_obj.block_table.gpu[ridx, :nl] = torch.tensor(
+            device_row, device=bt_obj.block_table.gpu.device, dtype=bt_obj.block_table.gpu.dtype)
+    # The runner's own copy stays PHYSICAL: it is the scheduler's id space, it is what
+    # `AliasApplier._substitute` resolves victims against, and it is what reaches the free hook.
+    # Writing logical ids here is how a kernel row id ends up keyed into a pool-id map.
     st = runner.requests.get(rid)
     if st is not None and gi < len(st.block_ids):
         st.block_ids[gi][:n] = row
@@ -1318,10 +1340,9 @@ def _warn_hybrid_block_table(bt_obj) -> None:
     _HYBRID_WARNED = True
     logger.error(
         "BFF: the runner's block table is in HYBRID mode (physical block size %s split into %s "
-        "logical blocks of %s). It stores logical block ids, which this connector does not emit, so "
-        "block-table redirects are DISABLED — fusion will free nothing rather than corrupt the "
-        "prompt. Run with --block-size equal to the attention backend's supported kernel block "
-        "size (128) to re-enable them.",
+        "logical blocks of %s) and block-table redirects are DISABLED — fusion will free nothing "
+        "rather than corrupt the prompt. Either BFF_V2_HYBRID_REDIRECT=0 is set, or this table "
+        "reports a split but offers no _convert_physical_to_logical_blocks to expand it with.",
         getattr(bt_obj, "physical_block_size", "?"),
         getattr(bt_obj, "blocks_per_phys_block", "?"), getattr(bt_obj, "block_size", "?"))
 

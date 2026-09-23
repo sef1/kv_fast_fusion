@@ -37,6 +37,7 @@ alignment logic is unit-testable without an NPU.
 """
 
 import base64
+import math
 import os
 import threading
 import time
@@ -698,6 +699,20 @@ def resolve_kv_cache_groups(kv_cache_config, runner):
     return groups
 
 
+def _kv_cache_usage() -> float | None:
+    """Pool occupancy in [0, 1], read in the SCHEDULER process, or None when unreadable.
+
+    Wrapped rather than called inline so ``build_connector_meta`` can never be the thing that fails
+    a step: the gate treats None as "closed", which costs dedup but is always safe."""
+    try:
+        from kv_fast_fusion import fast_fusion_block_pool as _bp
+        return _bp.kv_cache_usage()
+    except Exception as e:      # noqa: BLE001 - a missing pool is a normal answer, not an error
+        logger.warning_once("MooncakeConnectorFF: KV usage unreadable (%s); the dedup gate will "
+                            "treat it as closed.", e)
+        return None
+
+
 def dedup_registration_regions(ptrs, sizes) -> tuple[list[int], list[int]]:
     """Drop repeated base pointers from a transfer-engine registration list, first occurrence wins.
 
@@ -741,6 +756,14 @@ try:
         SupportsHMA,
     )
     from vllm.v1.kv_cache_interface import KVCacheConfig
+
+    from kv_fast_fusion_ascend.hybrid_layout import (
+        HybridLayoutError,
+        block_len_table,
+        build_hybrid_layout,
+        hybrid_registration_regions,
+        narrow_mamba_groups,
+    )
     from vllm_ascend import envs as ascend_envs
     from vllm_ascend.ascend_config import get_ascend_config
     from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import (
@@ -861,6 +884,13 @@ if _ASCEND_AVAILABLE:
             # id the recv thread pairs on). Serialized to the worker with the rest of the metadata, so
             # unlike the producer's _FF_SIGS this crosses the scheduler->worker boundary at TP>1 too.
             self.ff_sigs: dict = {}
+            # Pool occupancy in [0, 1], or None when unknown. The dedup gate needs it, and the pool
+            # object only exists in THIS (scheduler) process — `fast_fusion_block_pool._BLOCK_POOL`
+            # is captured inside `patched_free_blocks`, a BlockPool method. A worker reading it
+            # directly gets None at TP>1 and, since the gate is deliberately closed-when-unknown,
+            # dedup is then off for the entire run with no error. This is the channel that was
+            # missing; it rides the metadata the worker already receives every step.
+            self.kv_usage: float | None = None
 
         def add_new_req(self, request_id, local_block_ids, num_external_tokens,
                         kv_transfer_params):
@@ -988,6 +1018,7 @@ if _ASCEND_AVAILABLE:
             self._reqs_need_send = {}
             meta.reqs_in_batch = self._reqs_in_batch
             self._reqs_in_batch = set()
+            meta.kv_usage = _kv_cache_usage()
             self._collect_fuse_reqs(scheduler_output, meta)
             return meta
 
@@ -1105,6 +1136,37 @@ if _ASCEND_AVAILABLE:
         # inside its registered region. None until then, and the audit simply reports no buckets.
         region_map: "RegionMap | None" = None
         _logged_amplification: bool = False
+        # Hybrid only, both injected by the worker's register_kv_caches alongside base_addr_groups.
+        # None on every non-hybrid model, where the base's uniform block_len is correct.
+        _block_len_by_addr: list[int] | None = None
+        _layout = None
+
+        def _block_len_at(self, addr_idx: int, block_length: int) -> int:
+            """Bytes per BLOCK for registered address ``addr_idx``.
+
+            Non-hybrid: ``self.block_len[addr_idx % block_length]``, exactly as the vendored base
+            does — one or two values (K/V, or the MLA triple) taken from the first layer and reused
+            for every other, which is correct when every layer has the same geometry.
+
+            Hybrid: that assumption fails four ways at once — attention K, attention V, mamba conv
+            and mamba ssm all have different bytes per block, and the attention tensors are
+            ``scale`` rows per pool block while the mamba ones are one. So the table is built per
+            address in ``register_kv_caches``, and a pool block of an attention group is the whole
+            ``scale``-row span (they are consecutive rows of a contiguous tensor, so one segment
+            still covers it — no id expansion needed anywhere in this path)."""
+            table = self._block_len_by_addr
+            if table is not None and addr_idx < len(table):
+                return table[addr_idx]
+            return self.block_len[addr_idx % block_length]
+
+        def _narrow_mamba_groups(self, local_groups, remote_groups):
+            """See :func:`~kv_fast_fusion_ascend.hybrid_layout.narrow_mamba_groups`; this only
+            supplies the two config values the rule depends on."""
+            spec = (int(getattr(self.vllm_config.speculative_config,
+                                "num_speculative_tokens", 0) or 0)
+                    if self.vllm_config.speculative_config is not None else 0)
+            align = getattr(self.vllm_config.cache_config, "mamba_cache_mode", "align") == "align"
+            return narrow_mamba_groups(self._layout, local_groups, remote_groups, spec, align)
 
         def _align_and_group(self, req_meta, local_groups, remote_groups, tp_num_need_pulls):
             """Per group: tail-align, then coalesce contiguous runs.
@@ -1116,6 +1178,7 @@ if _ASCEND_AVAILABLE:
             between the two steps. That position is not negotiable: after the tail-align so the
             pair's indices already correspond, and before the coalesce so a dropped block breaks a
             contiguous run instead of being silently absorbed into one."""
+            local_groups, remote_groups = self._narrow_mamba_groups(local_groups, remote_groups)
             aligned = align_per_group(local_groups, remote_groups)
             grouped: list[tuple[list, list]] = []
             for remote_ids, local_ids in aligned:
@@ -1472,7 +1535,7 @@ if _ASCEND_AVAILABLE:
             for k in keep:
                 src_layer_base_addr = local_base[k]
                 dst_layer_base_addr = remote_base[k]
-                block_len = self.block_len[k % block_length]
+                block_len = self._block_len_at(lo + k, block_length)
                 inner_block_len = block_len // tp_num_need_pulls
                 for gi in addr_groups[k]:
                     if gi >= len(grouped):
@@ -1577,7 +1640,70 @@ if _ASCEND_AVAILABLE:
             self._kv_cache_config = kv_cache_config
             self._layer_group: dict[str, int] = {}
             self._n_groups = 0
+            # Hybrid geometry, derived in register_kv_caches once the tensors exist.
+            self._layout = None
             super().__init__(vllm_config, engine_id)
+
+        def _build_block_len_table(self, kv_caches) -> list[int] | None:
+            """Per-address bytes-per-block, index-aligned with ``kv_caches_base_addr``. See
+            :func:`~kv_fast_fusion_ascend.hybrid_layout.block_len_table`; this only supplies the
+            layer→group lookup, which tolerates the ``.attn`` suffix mismatch."""
+            return block_len_table(
+                self._layout, kv_caches, lambda ln: group_of(self._layer_group, ln))
+
+        def _hybrid_regions(self, kv_caches):
+            """``(ptrs, sizes)`` for a hybrid model's registration, or None when not hybrid.
+
+            On an attention+Mamba model every KV is a *view* into one shared int8 allocation::
+
+                tensor1: [(kv_padding), conv           , ...]
+                tensor2: [k           , ssm            , ...]
+                tensor3: [v           , (mamba_padding), ...]
+
+            The vendored base registers one region per view, sized `num_blocks * block_len` where
+            BOTH figures come from the FIRST layer only — so the regions overlap and Mooncake
+            refuses the batch ("Transfer Engine does not support overlapped memory region"), and
+            the view pointers are at arbitrary offsets inside the allocation, which is what CANN's
+            rtsIpcMemGetExportKey rejects as unaligned.
+
+            Registering whole allocations fixes both at once and needs no pointer arithmetic: the
+            runner already 2 MiB-aligns each raw buffer when a kv_transfer_config is present, and
+            an allocation by definition does not overlap another. This is the same recipe the
+            sibling LAYERWISE connector uses for `use_attn_mamba_hybrid`; it lives in
+            ``hybrid_layout`` so the two cannot drift.
+
+            Returns None for a non-hybrid model, where `dedup_registration_regions` already handles
+            BFF's own shared-tensor layout and is the measured path."""
+            try:
+                from kv_fast_fusion import fast_fusion_block_pool as _bp
+                layout = build_hybrid_layout(
+                    self._kv_cache_config,
+                    runner=getattr(_bp, "_ACTIVE_RUNNER", None),
+                    kv_caches=kv_caches,
+                    configured_block_size=self.vllm_config.cache_config.block_size)
+            except HybridLayoutError as e:
+                # Not fatal HERE only because a non-hybrid model may legitimately reach this before
+                # the groups are readable; the geometry is re-derived (and fatal) in v2's
+                # register_kv_caches. Say so rather than silently taking the non-hybrid path.
+                logger.warning("MooncakeConnectorFF: hybrid geometry unavailable (%s); using the "
+                               "uniform registration path.", e)
+                return None
+            self._layout = layout
+            layout.log_engagement("pull-v1")
+            if not layout.is_hybrid:
+                return None
+            tensors = getattr(self._kv_cache_config, "kv_cache_tensors", None)
+            if not tensors:
+                raise KVGroupLayoutError(
+                    "this is a hybrid model but the KV cache config lists no kv_cache_tensors, so "
+                    "the allocations cannot be registered whole. Registering the views instead is "
+                    "what Mooncake refuses as overlapped.")
+            layer_base_addrs = {
+                ln: [c.data_ptr() for c in (caches if isinstance(caches, (list, tuple))
+                                            else [caches])]
+                for ln, caches in kv_caches.items()
+            }
+            return hybrid_registration_regions(tensors, layer_base_addrs)
 
         def register_kv_caches(self, kv_caches):
             # The base class constructs and STARTS the recv thread inside this call, so the class
@@ -1597,15 +1723,25 @@ if _ASCEND_AVAILABLE:
             )
             _orig_register = _mte.global_te.register_buffer
 
+            hybrid_regions = self._hybrid_regions(kv_caches)
+
             def _dedup_register(ptrs, sizes, _orig=_orig_register):
-                kept_ptrs, kept_sizes = dedup_registration_regions(ptrs, sizes)
-                logger.info(
-                    "MooncakeConnectorFF: registering %d of %d KV regions (%d dropped as duplicates "
-                    "of BFF's shared-tensor layout), %.2f GiB total — %.2f GiB each, %s 2^32.",
-                    len(kept_ptrs), len(ptrs), len(ptrs) - len(kept_ptrs),
-                    sum(kept_sizes) / (1024 ** 3),
-                    (sum(kept_sizes) / len(kept_ptrs) / (1024 ** 3)) if kept_ptrs else 0.0,
-                    "CROSSING" if any(s > (1 << 32) for s in kept_sizes) else "under")
+                if hybrid_regions is not None:
+                    kept_ptrs, kept_sizes = hybrid_regions
+                    logger.info(
+                        "MooncakeConnectorFF: HYBRID registration — %d whole allocations in place "
+                        "of %d per-view regions, %.2f GiB total, every base 2 MiB aligned.",
+                        len(kept_ptrs), len(ptrs), sum(kept_sizes) / (1024 ** 3))
+                else:
+                    kept_ptrs, kept_sizes = dedup_registration_regions(ptrs, sizes)
+                    logger.info(
+                        "MooncakeConnectorFF: registering %d of %d KV regions (%d dropped as "
+                        "duplicates of BFF's shared-tensor layout), %.2f GiB total — %.2f GiB "
+                        "each, %s 2^32.",
+                        len(kept_ptrs), len(ptrs), len(ptrs) - len(kept_ptrs),
+                        sum(kept_sizes) / (1024 ** 3),
+                        (sum(kept_sizes) / len(kept_ptrs) / (1024 ** 3)) if kept_ptrs else 0.0,
+                        "CROSSING" if any(s > (1 << 32) for s in kept_sizes) else "under")
                 # Kept so the audit can turn a descriptor address into (region, offset). This is the
                 # only place the registered geometry is known, and it is the geometry that most
                 # obviously differs between this connector and the stock one.
@@ -1621,10 +1757,34 @@ if _ASCEND_AVAILABLE:
                     _mc.KVCacheRecvingThread = _orig_cls
 
             self._layer_names = list(kv_caches.keys())
-            self._caches_per_layer = len(next(iter(kv_caches.values())))
+            # `len()` of a bare TENSOR is its block count, not its cache count — an attention layer
+            # that arrives as a single stacked tensor rather than a (K, V) tuple would set this to
+            # thousands and mis-attribute every base address to a layer. Count only what is
+            # genuinely a sequence of caches.
+            _first = next(iter(kv_caches.values()))
+            self._caches_per_layer = len(_first) if isinstance(_first, (list, tuple)) else 1
+            if any(isinstance(c, (list, tuple)) and len(c) != self._caches_per_layer
+                   for c in kv_caches.values()):
+                # Hybrid: attention layers report (K, V) while mamba layers report [conv, ssm].
+                # They happen to both be 2 today, but a model where they differ would make the
+                # `j // caches_per_layer` address→layer arithmetic below silently wrong.
+                raise KVGroupLayoutError(
+                    "layers report different numbers of KV caches "
+                    f"({sorted({len(c) for c in kv_caches.values() if isinstance(c, (list, tuple))})}); "
+                    "the base address map assumes one fixed count per layer and would attribute "
+                    "addresses to the wrong layers.")
             self.base_addr_groups = self._build_base_addr_groups()
+            # Needs _layer_group, which _build_base_addr_groups fills.
+            self._block_len_by_addr = self._build_block_len_table(kv_caches)
+            if self._block_len_by_addr is not None:
+                logger.info("MooncakeConnectorFF: HYBRID per-address block lengths — %s bytes "
+                            "across %d addresses (the base would have used %s for all of them).",
+                            sorted(set(self._block_len_by_addr)), len(self._block_len_by_addr),
+                            list(self.block_len))
             if self.kv_role != "kv_producer" and self.kv_recv_thread is not None:
                 self.kv_recv_thread.base_addr_groups = self.base_addr_groups
+                self.kv_recv_thread._block_len_by_addr = self._block_len_by_addr
+                self.kv_recv_thread._layout = self._layout
                 regions = getattr(self, "_registered_regions", None)
                 if regions is not None:
                     self.kv_recv_thread.region_map = RegionMap(*regions)
