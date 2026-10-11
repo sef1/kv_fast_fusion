@@ -93,7 +93,11 @@ def _initialize_kv_caches(
         kv_cache_configs = get_kv_cache_configs(
             vllm_config, kv_cache_specs, available_gpu_memory
         )
-        if True: #vllm_config.kv_transfer_config.kv_role != "kv_producer":
+        original_spec = None  # set by the rebuild; read by the measurement log below
+        # BFF_REBUILD_GROUPS=0 keeps vLLM's own groups untouched. It is the bisect handle for "is the
+        # regrouping what breaks this model": run dedup=0 with it off and compare against the stock
+        # connector. Default on, so every existing run is unchanged.
+        if os.environ.get("BFF_REBUILD_GROUPS", "1") == "1":  # was `if True:`
             # Re-derive the KV cache config for the warmup/fusion group split.
             #
             # IMPORTANT: the previous version only swapped kv_cache_groups in place
@@ -117,13 +121,29 @@ def _initialize_kv_caches(
             )
 
             # Reference (global) layer ordering + a concrete per-layer spec.
-            ref_group = kv_cache_configs[0].kv_cache_groups[0]
-            original_layers = list(ref_group.layer_names)
-            ref_spec = ref_group.kv_cache_spec
-            if isinstance(ref_spec, UniformTypeKVCacheSpecs):
-                per_layer_spec = next(iter(ref_spec.kv_cache_specs.values()))
+            #
+            # HYBRID (attention + Mamba, e.g. Qwen3-Next): vLLM emits an attention group AND
+            # MambaSpec groups. Rebuilding from groups[0] alone keeps only the attention layers and
+            # stamps every group with the attention spec, so no recurrent-state layer survives
+            # intact — while the attention spec's `page_size_padded` (set so an attention page
+            # shares an allocation with a Mamba page) is kept for a partner that is gone. BFF
+            # regroups the ATTENTION layers only; Mamba groups are appended untouched.
+            # `split_hybrid_groups` returns (None, None, []) for a non-hybrid model, which takes the
+            # legacy lines below unchanged.
+            from kv_fast_fusion.hybrid_groups import split_hybrid_groups
+            _attn_layers, _attn_spec, mamba_groups = split_hybrid_groups(
+                kv_cache_configs[0].kv_cache_groups)
+            if mamba_groups:
+                original_layers = list(_attn_layers)
+                per_layer_spec = _attn_spec
             else:
-                per_layer_spec = ref_spec
+                ref_group = kv_cache_configs[0].kv_cache_groups[0]
+                original_layers = list(ref_group.layer_names)
+                ref_spec = ref_group.kv_cache_spec
+                if isinstance(ref_spec, UniformTypeKVCacheSpecs):
+                    per_layer_spec = next(iter(ref_spec.kv_cache_specs.values()))
+                else:
+                    per_layer_spec = ref_spec
 
             # first 2 + last 2 layers → warmup group; the rest → fusion.
             # NOTE: HybridKVCacheCoordinator.verify_and_split_kv_cache_groups groups
@@ -150,6 +170,16 @@ def _initialize_kv_caches(
                     original_layers, BFF_BALANCED_GROUPS, BFF_GROUP_SIZE, BFF_EDGE_LAYERS
                 )
             ]
+            # Attention groups first so group 0 stays the warmup group every downstream consumer
+            # treats as never-fused; Mamba groups follow, verbatim (same layers, same spec object).
+            # The v2 connectors skip them by spec type, never by index.
+            global_groups += list(mamba_groups)
+            logger.info(
+                "BFF KV group rebuild | hybrid=%s | %s", bool(mamba_groups),
+                " ".join(
+                    f"g{i}={type(g.kv_cache_spec).__name__}(layers={len(g.layer_names)},"
+                    f"page={g.kv_cache_spec.page_size_bytes})"
+                    for i, g in enumerate(global_groups)))
             if BFF_EDGE_LAYERS >= 1:
                 sizes = [len(g.layer_names) for g in global_groups]
                 logger.info("BFF_EDGE_LAYERS=%d: edge+middle layout, group sizes %s (group 0 = "
