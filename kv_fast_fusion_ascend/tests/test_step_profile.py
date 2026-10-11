@@ -62,8 +62,29 @@ def test_a_fresh_profile_divides_by_zero_steps_without_exploding():
 
 def test_the_report_cadence_widens_so_a_long_run_does_not_drown_the_log():
     p = sp.StepProfile()
-    due = [i for i in range(1, 1001) if p.note_step()]
-    assert due == [1, 10, 100, 1000], "1, 10, 100, 1000 — the connector's own tally cadence"
+    due = [i for i in range(1, 7001) if p.note_step()]
+    assert due == [1, 10, 100, 1000, 3000, 5000, 7000], (
+        "1, 10, 100, 1000 proves engagement; then a fixed stride gives a long run several windows")
+
+
+def test_each_report_describes_only_the_steps_since_the_last_one():
+    """A cumulative mean is diluted by the idle steps before load arrives."""
+    p = sp.StepProfile()
+    for _ in range(10):                      # idle start: cheap steps, no requests
+        p.last_num_reqs = 0
+        p.note("step_total", 1.0)
+        p.note_step()
+    first = p.render()
+    assert "window=10" in first and "step_total 1.00 ms" in first
+    for _ in range(5):                       # loaded stretch
+        p.last_num_reqs = 60
+        p.note("step_total", 40.0)
+        p.note("alloc", 0.01)
+        p.note_step()
+    second = p.render()
+    assert "steps=15 window=5 mean_reqs=60.0" in second
+    assert "step_total 40.00 ms" in second, "the window must not be averaged with the idle start"
+    assert p.snapshot()["steps"] == 15, "snapshot stays cumulative"
 
 
 def test_mean_num_reqs_is_carried_because_the_cost_scales_with_concurrency():
@@ -88,7 +109,10 @@ def test_the_scheduler_half_of_the_step_is_in_the_line():
         p.note("sched", 1.5)
         p.note("sched_update", 0.5)
     line = p.render()
-    assert "sched 1.50" in line and "sched_update 0.50" in line
+    assert "sched 1.50 ms/step over 1.0 calls" in line
+    assert "sched_update 0.50 ms/step over 1.0 calls" in line
+    for phase in ("engine_step", "alloc", "computed", "free", "conn_meta"):
+        assert phase in line
 
 
 def test_the_logger_is_in_the_namespace_vllm_actually_prints():

@@ -68,6 +68,14 @@ _WRAP_SENTINEL = "_bff_step_profiled"
 # the excess arithmetic cannot drift apart from what is actually wrapped.
 PER_GROUP_PHASES = ("bt_commit", "slot_map", "slot_commit")
 
+# The scheduler half of the step and what is inside it. Reported with their call counts, because a
+# cost that is paid once per running request reads very differently from one paid once per step.
+SCHED_PHASES = ("sched", "sched_update", "alloc", "computed", "free", "conn_meta")
+
+# After the engagement proof (1, 10, 100, 1000) report on a fixed stride, so a 15k-step run yields
+# several comparable windows instead of one.
+REPORT_STRIDE = 2000
+
 
 class StepProfile:
     """Calls and milliseconds per phase, plus the step count they are divided by.
@@ -82,6 +90,7 @@ class StepProfile:
         self.last_num_reqs = 0
         self.phases: dict[str, list] = {}     # name -> [calls, ms]
         self._next_report = 1
+        self._mark = (0, 0, {})      # (steps, reqs_total, phases) as of the last render()
 
     # -- recording -----------------------------------------------------------------------
     def note(self, phase: str, ms: float) -> None:
@@ -95,14 +104,31 @@ class StepProfile:
     def note_step(self) -> bool:
         """Close one decode step. Returns True when this step should be reported.
 
-        The cadence widens (1, 10, 100, 1000, ...) so the first step proves the profiler engaged and a
-        long run does not drown the decode log — the same shape the connector's own tallies use."""
+        The cadence widens (1, 10, 100, 1000) so the first step proves the profiler engaged, then
+        holds at every ``REPORT_STRIDE`` steps so a long run yields several windows to compare."""
         self.steps += 1
         self.reqs_total += self.last_num_reqs
         if self.steps < self._next_report:
             return False
-        self._next_report *= 10
+        if self._next_report < 1000:
+            self._next_report *= 10
+        else:
+            self._next_report += REPORT_STRIDE
         return True
+
+    def window(self) -> "StepProfile":
+        """The steps since the last ``render()``, as a profile of their own.
+
+        A cumulative mean is diluted by the idle steps before load arrives (the first 1,000 steps of
+        a run average ~2 requests), so each report describes only its own stretch."""
+        steps0, reqs0, phases0 = self._mark
+        w = StepProfile()
+        w.steps = self.steps - steps0
+        w.reqs_total = self.reqs_total - reqs0
+        for name, (calls, ms) in self.phases.items():
+            c0, m0 = phases0.get(name, (0, 0.0))
+            w.phases[name] = [calls - c0, ms - m0]
+        return w
 
     # -- reading -------------------------------------------------------------------------
     def per_step(self, phase: str) -> float:
@@ -136,16 +162,22 @@ class StepProfile:
         return out
 
     def render(self) -> str:
-        total = self.per_step("step_total")
-        pct = (100.0 * self.group_excess_ms() / total) if total else 0.0
-        parts = [(f"BFF step profile | steps={self.steps} mean_reqs={self.mean_reqs():.1f} | "
-                  f"step_total {total:.2f} ms | prepare_inputs {self.per_step('prepare_inputs'):.2f} "
-                  f"attn_meta {self.per_step('attn_meta'):.2f} | sched {self.per_step('sched'):.2f} "
-                  f"sched_update {self.per_step('sched_update'):.2f}")]
+        """One line for the window since the previous ``render()``; advances the window."""
+        w = self.window()
+        self._mark = (self.steps, self.reqs_total, {k: tuple(v) for k, v in self.phases.items()})
+        total = w.per_step("step_total")
+        pct = (100.0 * w.group_excess_ms() / total) if total else 0.0
+        parts = [(f"BFF step profile | steps={self.steps} window={w.steps} "
+                  f"mean_reqs={w.mean_reqs():.1f} | engine_step {w.per_step('engine_step'):.2f} ms | "
+                  f"step_total {total:.2f} ms | prepare_inputs {w.per_step('prepare_inputs'):.2f} "
+                  f"attn_meta {w.per_step('attn_meta'):.2f}")]
+        for phase in SCHED_PHASES:
+            parts.append(f"{phase} {w.per_step(phase):.2f} ms/step over "
+                         f"{w.calls_per_step(phase):.1f} calls")
         for phase in PER_GROUP_PHASES:
-            parts.append(f"{phase} {self.per_step(phase):.2f} ms/step over "
-                         f"{self.calls_per_step(phase):.1f} calls ({self.per_call(phase):.3f} ms/call)")
-        parts.append(f"GROUP EXCESS (calls-1)xms/call = {self.group_excess_ms():.2f} ms/step "
+            parts.append(f"{phase} {w.per_step(phase):.2f} ms/step over "
+                         f"{w.calls_per_step(phase):.1f} calls ({w.per_call(phase):.3f} ms/call)")
+        parts.append(f"GROUP EXCESS (calls-1)xms/call = {w.group_excess_ms():.2f} ms/step "
                      f"({pct:.1f}% of the step)")
         return " | ".join(parts)
 
@@ -282,6 +314,26 @@ def _note_num_reqs(_self, num_reqs, *_a, **_k) -> None:
     PROFILE.last_num_reqs = int(num_reqs)
 
 
+_CONNECTOR_WRAPPED = [False]
+
+
+def _note_connector(scheduler, *_a, **_k) -> None:
+    """Time the live connector's ``build_connector_meta`` as ``conn_meta``.
+
+    Done from inside the first ``schedule()`` because the connector class is only known once the
+    scheduler has built it. One attempt, whatever the outcome."""
+    if _CONNECTOR_WRAPPED[0]:
+        return
+    _CONNECTOR_WRAPPED[0] = True
+    try:
+        connector = getattr(scheduler, "connector", None)
+        if connector is not None and _wrap(type(connector), "build_connector_meta", "conn_meta"):
+            logger.info("BFF step profile: timing %s.build_connector_meta as conn_meta.",
+                        type(connector).__name__)
+    except Exception as e:  # noqa: BLE001 - a diagnostic must never break scheduling
+        logger.warning("BFF step profile: could not wrap the connector (%s).", e)
+
+
 def _wrap_step(cls, name: str) -> bool:
     """``execute_model`` — the denominator. Times the whole step AND closes it, so every other phase
     is reported per step of the same run rather than against a step count guessed elsewhere."""
@@ -345,11 +397,32 @@ def install() -> None:
         try:
             import importlib
             cls = getattr(importlib.import_module(mod), cls_name)
-            for name, phase in (("schedule", "sched"), ("update_from_output", "sched_update")):
-                if name in cls.__dict__ and _wrap(cls, name, phase):
+            for name, phase, on_call in (("schedule", "sched", _note_connector),
+                                         ("update_from_output", "sched_update", None)):
+                if name in cls.__dict__ and _wrap(cls, name, phase, on_call=on_call):
                     wrapped.append(f"{cls_name}.{phase}")
         except Exception as e:  # noqa: BLE001 - as above
             logger.warning("BFF step profile: could not wrap %s (%s).", cls_name, e)
+    # What is inside the scheduler's time. This installs before the BFF patch captures
+    # get_computed_blocks, so BFF's own wrapper stays outside `computed`; `free` contains BFF's
+    # patched free_blocks and with it the NPU free-flush, which a stock arm does not pay.
+    try:
+        from vllm.v1.core.kv_cache_manager import KVCacheManager
+        for name, phase in (("allocate_slots", "alloc"), ("get_computed_blocks", "computed"),
+                            ("free", "free")):
+            if _wrap(KVCacheManager, name, phase):
+                wrapped.append(phase)
+    except Exception as e:  # noqa: BLE001 - as above
+        logger.warning("BFF step profile: could not wrap the KV cache manager (%s).", e)
+    # The whole engine step, so time that no phase above sees is still counted. step_fn is bound in
+    # EngineCore.__init__, which runs after this.
+    try:
+        from vllm.v1.engine.core import EngineCore
+        for name in ("step", "step_with_batch_queue"):
+            if name in EngineCore.__dict__ and _wrap(EngineCore, name, "engine_step"):
+                wrapped.append(f"engine_step({name})")
+    except Exception as e:  # noqa: BLE001 - as above
+        logger.warning("BFF step profile: could not wrap the engine core (%s).", e)
     if wrapped:
         logger.info("BFF step profile ON (BFF_STEP_PROFILE=1): timing %s. Read GROUP EXCESS at "
                     "Running ~200 — the cost scales with requests x groups, so the drain tail is "
