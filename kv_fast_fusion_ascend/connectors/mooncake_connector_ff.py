@@ -759,9 +759,11 @@ try:
 
     from kv_fast_fusion_ascend.hybrid_layout import (
         HybridLayoutError,
+        RegroupedHybridError,
         block_len_table,
         build_hybrid_layout,
         hybrid_registration_regions,
+        model_declares_mamba,
         narrow_mamba_groups,
     )
     from vllm_ascend import envs as ascend_envs
@@ -1680,7 +1682,11 @@ if _ASCEND_AVAILABLE:
                     self._kv_cache_config,
                     runner=getattr(_bp, "_ACTIVE_RUNNER", None),
                     kv_caches=kv_caches,
-                    configured_block_size=self.vllm_config.cache_config.block_size)
+                    configured_block_size=self.vllm_config.cache_config.block_size,
+                    expect_mamba=model_declares_mamba(self.vllm_config))
+            except RegroupedHybridError:
+                # Never tolerated: the groups ARE readable, and they are wrong.
+                raise
             except HybridLayoutError as e:
                 # Not fatal HERE only because a non-hybrid model may legitimately reach this before
                 # the groups are readable; the geometry is re-derived (and fatal) in v2's

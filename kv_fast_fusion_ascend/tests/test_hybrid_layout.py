@@ -15,10 +15,12 @@ from kv_fast_fusion_ascend.hybrid_layout import (
     GroupGeometry,
     HybridLayout,
     HybridLayoutError,
+    RegroupedHybridError,
     block_len_table,
     build_hybrid_layout,
     hybrid_registration_regions,
     mamba_state_index,
+    model_declares_mamba,
     narrow_mamba_groups,
     scales_from_tensors,
 )
@@ -130,6 +132,51 @@ def test_non_hybrid_model_is_scale_one_everywhere():
     layout = build_hybrid_layout(_Config(groups), kv_caches=kv_caches)
     assert not layout.is_hybrid and not layout.is_split
     assert layout.scale(0) == 1
+
+
+def test_a_hybrid_model_regrouped_as_attention_is_fatal_not_inert():
+    """The failure that costs a run: BFF's rebuild leaves attention-only groups, `is_hybrid` is
+    False, and every hybrid path in this package quietly does not run. Both witnesses must trip."""
+    groups = [_Group(_AttnSpec(SCALE * 128), [f"attn.{i}" for i in range(12)])]
+    kv = {ln: (_Tensor(POOL_BLOCKS * SCALE), _Tensor(POOL_BLOCKS * SCALE))
+          for ln in groups[0].layer_names}
+    cfg = _Config(groups)
+
+    # witness 1: the model config says it is hybrid
+    with pytest.raises(RegroupedHybridError, match="none of the 1 KV-cache groups"):
+        build_hybrid_layout(cfg, kv_caches=kv, expect_mamba=True)
+
+    # witness 2: the runner's own naming of recurrent layers, with no config to ask
+    kv["model.layers.3.linear_attn"] = [_Tensor(POOL_BLOCKS), _Tensor(POOL_BLOCKS)]
+    with pytest.raises(RegroupedHybridError):
+        build_hybrid_layout(cfg, kv_caches=kv)
+
+
+def test_a_non_hybrid_model_is_not_flagged():
+    groups = [_Group(_AttnSpec(128), [f"attn.{i}" for i in range(4)])]
+    kv = {ln: (_Tensor(POOL_BLOCKS), _Tensor(POOL_BLOCKS)) for ln in groups[0].layer_names}
+    assert not build_hybrid_layout(_Config(groups), kv_caches=kv).is_hybrid
+
+
+def test_regrouped_is_a_subclass_so_a_tolerant_caller_must_opt_out_explicitly():
+    """The pull connector tolerates 'groups not readable yet' by catching HybridLayoutError. This
+    must NOT be absorbed by that: the groups are readable and they are wrong."""
+    assert issubclass(RegroupedHybridError, HybridLayoutError)
+
+
+def test_model_declares_mamba_reads_the_config_not_the_groups():
+    class _Cfg:
+        layer_types = ["linear_attention", "linear_attention", "linear_attention", "full_attention"]
+
+    class _Mc:
+        hf_text_config = _Cfg()
+
+    class _Vc:
+        model_config = _Mc()
+
+    assert model_declares_mamba(_Vc())
+    _Cfg.layer_types = ["full_attention"] * 4
+    assert not model_declares_mamba(_Vc())
 
 
 def test_missing_groups_is_fatal_not_defaulted():

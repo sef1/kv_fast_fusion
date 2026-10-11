@@ -1169,7 +1169,7 @@ try:
     from kv_fast_fusion_ascend.connectors.mooncake_layerwise_connector_ff_v2 import (
         signatures_for_group,
     )
-    from kv_fast_fusion_ascend.hybrid_layout import build_hybrid_layout
+    from kv_fast_fusion_ascend.hybrid_layout import build_hybrid_layout, model_declares_mamba
 
     _ASCEND_AVAILABLE = True
 except Exception as _e:  # pragma: no cover - optional dependency
@@ -2609,7 +2609,8 @@ if _ASCEND_AVAILABLE:
                 self._kv_cache_config,
                 runner=getattr(_bp, "_ACTIVE_RUNNER", None),
                 kv_caches=kv_caches,
-                configured_block_size=self.vllm_config.cache_config.block_size)
+                configured_block_size=self.vllm_config.cache_config.block_size,
+                expect_mamba=model_declares_mamba(self.vllm_config))
             self._layout.log_engagement("pull-v2")
 
             host = self.side_channel_host

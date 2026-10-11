@@ -1550,6 +1550,29 @@ if _ASCEND_AVAILABLE:
                         "owner_not_written ~= applied in bff_apply_stats). Set BFF_FF_PROMO_APPLY=1 "
                         "unless you are deliberately measuring that dead window.")
 
+        def register_kv_caches(self, kv_caches):
+            """As the base, plus the one thing v1 never had: a look at the geometry it is running on.
+
+            v1 transfers per group and needs no scale, so nothing here *uses* the layout — but it is
+            the only connector `BASELINE=bff` runs, and without this a hybrid model whose groups
+            BFF regrouped as attention is indistinguishable from a healthy one until the F1 comes
+            back near zero. `build_hybrid_layout` raises `RegroupedHybridError` in exactly that
+            case and logs the per-group geometry otherwise, which is the engagement line a run is
+            read by."""
+            from kv_fast_fusion import fast_fusion_block_pool as _bp
+            from kv_fast_fusion_ascend.hybrid_layout import (
+                build_hybrid_layout,
+                model_declares_mamba,
+            )
+            layout = build_hybrid_layout(
+                getattr(self.connector_worker, "kv_cache_config", None),
+                runner=getattr(_bp, "_ACTIVE_RUNNER", None),
+                kv_caches=kv_caches,
+                configured_block_size=self._vllm_config.cache_config.block_size,
+                expect_mamba=model_declares_mamba(self._vllm_config))
+            layout.log_engagement("layerwise-v1")
+            return super().register_kv_caches(kv_caches)
+
         # -- worker (producer + consumer) integration --------------------------------------
         def _ff_install_worker_hooks(self) -> None:
             """Install the fusion hooks on the inner worker without editing the vendored connector.

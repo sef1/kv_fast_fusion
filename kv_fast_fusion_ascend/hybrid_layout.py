@@ -49,6 +49,14 @@ class HybridLayoutError(RuntimeError):
     decode serves garbage, so there is no run to salvage by continuing."""
 
 
+class RegroupedHybridError(HybridLayoutError):
+    """The model is hybrid but its KV groups are not — something regrouped it as attention.
+
+    A subclass so a caller that legitimately tolerates "groups not readable yet" (the pull
+    connector's registration fallback) can catch the parent and still let this one through: the two
+    look alike at the ``except`` and are opposite in meaning."""
+
+
 @dataclass(frozen=True)
 class GroupGeometry:
     """Per-KV-cache-group geometry, in both id spaces."""
@@ -160,15 +168,22 @@ class HybridLayout:
 # =================================================================================================
 # derivation — two independent sources, cross-checked
 # =================================================================================================
-def _is_mamba_spec(spec) -> bool:
-    """MambaSpec without importing it — the class moved between vLLM versions and this module is
-    meant to import on a GPU box where ``vllm_ascend`` is absent."""
-    if spec is None:
+from kv_fast_fusion.hybrid_groups import is_mamba_spec as _is_mamba_spec  # one detector, not two
+
+
+def model_declares_mamba(vllm_config) -> bool:
+    """True when the MODEL has recurrent-state layers, read from its config rather than from the
+    KV groups — because the groups are exactly what a regrouping bug corrupts, so they cannot be
+    the witness. Covers Qwen3-Next / Qwen3.5-style configs (``layer_types`` containing
+    ``linear_attention``, or a ``full_attention_interval``)."""
+    try:
+        cfg = vllm_config.model_config.hf_text_config
+    except AttributeError:
         return False
-    if any(cls.__name__ == "MambaSpec" for cls in type(spec).__mro__):
+    types = getattr(cfg, "layer_types", None) or ()
+    if any("linear" in str(t) or "mamba" in str(t) for t in types):
         return True
-    # MambaSpec is the only spec carrying per-state shapes/dtypes tuples.
-    return hasattr(spec, "shapes") and hasattr(spec, "dtypes")
+    return getattr(cfg, "full_attention_interval", None) not in (None, 0, 1)
 
 
 def _first_cache_rows(cache_or_caches) -> int | None:
@@ -241,7 +256,7 @@ def scales_from_block_tables(runner, n_groups) -> dict[int, int]:
 
 
 def build_hybrid_layout(kv_cache_config, runner=None, kv_caches=None,
-                        configured_block_size=None) -> HybridLayout:
+                        configured_block_size=None, expect_mamba: bool = False) -> HybridLayout:
     """Derive the geometry, cross-checking every scale that two sources can both see.
 
     ``kv_caches`` is the runner's ``layer_name -> caches`` map, as handed to
@@ -326,6 +341,20 @@ def build_hybrid_layout(kv_cache_config, runner=None, kv_caches=None,
             pool_num_blocks=pool_num_blocks,
             block_size=block_size,
         ))
+
+    # The inert-by-omission guard. Every hybrid path in this package keys off `is_hybrid`, so a
+    # regrouping bug that leaves attention-only groups does not fail — it makes ALL of them quietly
+    # not run, and the model decodes against missing recurrent state. Two independent witnesses that
+    # the model really is hybrid: the model config (`expect_mamba`), and the runner's own idiom of
+    # naming recurrent layers `...linear_attn` among the registered caches.
+    declared = expect_mamba or any("linear_attn" in ln for ln in (kv_caches or ()))
+    if declared and not any(g.is_mamba for g in geometries):
+        raise RegroupedHybridError(
+            "the model has recurrent-state (Mamba / linear-attention) layers but none of the "
+            f"{len(geometries)} KV-cache groups is a MambaSpec group. Something regrouped the layers "
+            "as attention — in BFF that is `_initialize_kv_caches` rebuilding every group from "
+            "groups[0]. Continuing would run every hybrid code path inert and decode against "
+            "state that was never allocated.")
 
     return HybridLayout(geometries)
 

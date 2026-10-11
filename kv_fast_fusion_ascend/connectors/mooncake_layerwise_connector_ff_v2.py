@@ -67,6 +67,7 @@ from kv_fast_fusion_ascend.hybrid_layout import (
     HybridLayout,
     HybridLayoutError,
     build_hybrid_layout,
+    model_declares_mamba,
 )
 
 logger = init_logger("vllm." + __name__)
@@ -381,7 +382,8 @@ if _ASCEND_AVAILABLE:
                 getattr(worker, "kv_cache_config", None),
                 runner=getattr(_bp, "_ACTIVE_RUNNER", None),
                 kv_caches=self._kv_caches,
-                configured_block_size=self._vllm_config.cache_config.block_size)
+                configured_block_size=self._vllm_config.cache_config.block_size,
+                expect_mamba=model_declares_mamba(self._vllm_config))
             self._layout.log_engagement("layerwise-v2")
             if not self._v2_enabled or not self.is_producer:
                 return
