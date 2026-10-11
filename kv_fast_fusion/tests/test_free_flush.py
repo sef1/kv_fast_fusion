@@ -67,3 +67,54 @@ def test_free_flush_is_on_by_default():
     """The write-race fix ships ON: a stock BFF run must drain before reallocation without any flag,
     or the F1-0.44 corruption is latent. BFF_FREE_FLUSH=0 is the opt-out (unset here in CI)."""
     assert m._FREE_FLUSH is True
+
+
+def _recv_state(monkeypatch, mode):
+    calls = {"n": 0}
+    monkeypatch.setattr(m, "_flush_npu", lambda: calls.__setitem__("n", calls["n"] + 1))
+    monkeypatch.setattr(m, "_FREE_FLUSH_MODE", mode)
+    monkeypatch.setattr(m, "_FREE_FLUSH", mode == "1")
+    monkeypatch.setattr(m, "_RECV_FLUSH",
+                        {"calls": 0, "ms": 0.0, "next_report": 1, "announced": False})
+    monkeypatch.setattr(m, "_KEEP_FUSED_HASH", True, raising=False)
+    monkeypatch.setattr(m, "_ACTIVE_RUNNER", None, raising=False)
+    monkeypatch.setattr(m, "_ON_BLOCKS_FREED", [], raising=False)
+    return calls
+
+
+def test_recv_mode_moves_the_barrier_from_the_free_to_the_load(monkeypatch):
+    """The scheduler thread must not drain the device on a free; the recv thread drains once per
+    load instead. This is the 5 ms/step the cProfile window found."""
+    calls = _recv_state(monkeypatch, "recv")
+    pool = _pool()
+    m.patched_free_blocks(pool, _blocks([(5, 0)]))
+    assert calls["n"] == 0 and pool.free_block_queue.appended == [5]
+    m.flush_before_load()
+    m.flush_before_load()
+    assert calls["n"] == 2 and m._RECV_FLUSH["calls"] == 2
+
+
+def test_default_mode_keeps_the_barrier_on_the_free_only(monkeypatch):
+    calls = _recv_state(monkeypatch, "1")
+    m.flush_before_load()
+    assert calls["n"] == 0, "the load-side barrier is recv-mode only"
+    m.patched_free_blocks(_pool(), _blocks([(5, 0)]))
+    assert calls["n"] == 1
+
+
+def test_off_mode_has_no_barrier_anywhere(monkeypatch):
+    calls = _recv_state(monkeypatch, "0")
+    m.patched_free_blocks(_pool(), _blocks([(5, 0)]))
+    m.flush_before_load()
+    assert calls["n"] == 0
+
+
+def test_the_live_mode_is_announced_once(monkeypatch):
+    _recv_state(monkeypatch, "recv")
+    said = []
+    monkeypatch.setattr(m, "_flush_log", lambda: types.SimpleNamespace(
+        info=lambda fmt, *a: said.append(fmt % a)))
+    m.flush_before_load()
+    m.flush_before_load()
+    assert sum("free-flush mode: recv" in x for x in said) == 1
+    assert any("free-flush(recv) | barriers=1" in x for x in said)

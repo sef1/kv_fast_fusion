@@ -1,4 +1,5 @@
 import os
+import time
 
 # NOTE: this module deliberately imports nothing from vllm. patched_cache_full_blocks used to
 # carry a verbatim copy of BlockPool.cache_full_blocks (and needed its kv_cache_utils imports);
@@ -35,8 +36,22 @@ _BLOCK_POOL = None
 # `_flush_npu` is a no-op without `torch.npu`, so GPU/CPU paths are untouched. Set BFF_FREE_FLUSH=0 to
 # disable (e.g. to reproduce the race). `torch` is imported lazily so this module stays vllm/torch-free
 # for off-device unit tests (see the module note above).
-_FREE_FLUSH = os.environ.get("BFF_FREE_FLUSH", "1") == "1"
+#
+# BFF_FREE_FLUSH=recv (2026-10-11) keeps the guarantee but moves the barrier. The drain above runs on
+# the SCHEDULER thread, and with async scheduling the scheduler runs while the previous forward is
+# still on the device, so every free event blocks it for the rest of that forward: a cProfile window
+# measured 392 syncs in 2,000 steps, 10.2 s of 20.5 s of scheduler time, 5.1 ms/step — the whole
+# 0.62 vs ~5 ms schedule() gap to the baseline. The hazard is only reuse BY AN RDMA LOAD, which
+# writes outside device stream order (a running request's own forward is ordered behind the stale
+# write), so the barrier can sit immediately before the pull instead: see flush_before_load. Every
+# forward that could still write to a freed block was submitted before that block could be
+# re-allocated, and allocation precedes the pull, so a drain at pull start covers them.
+_FREE_FLUSH_MODE = os.environ.get("BFF_FREE_FLUSH", "1").strip().lower()
+if _FREE_FLUSH_MODE == "free":
+    _FREE_FLUSH_MODE = "1"
+_FREE_FLUSH = _FREE_FLUSH_MODE == "1"
 _FLUSH_WARNED = False
+_RECV_FLUSH = {"calls": 0, "ms": 0.0, "next_report": 1, "announced": False}
 
 
 def _flush_npu() -> None:
@@ -51,6 +66,39 @@ def _flush_npu() -> None:
     except Exception:  # noqa: BLE001 - a barrier that cannot run must never break block freeing
         if not _FLUSH_WARNED:
             _FLUSH_WARNED = True
+
+
+def flush_before_load() -> None:
+    """Drain the NPU right before a remote-KV load writes into local blocks (BFF_FREE_FLUSH=recv).
+
+    Called on the connector's recv thread, so the scheduler never waits on the device. A no-op in
+    every other mode. Says which mode is live on first use and reports its own cost on a widening
+    cadence, because a barrier that silently did not run is the F1-0.44 corruption again."""
+    st = _RECV_FLUSH
+    if not st["announced"]:
+        st["announced"] = True
+        _flush_log().info(
+            "BFF free-flush mode: %s", {
+                "recv": "recv — barrier before each remote-KV load, none on free",
+                "1": "free — barrier on every block free (scheduler thread)",
+            }.get(_FREE_FLUSH_MODE, "OFF — no barrier; the freed-block write race is unguarded"))
+    if _FREE_FLUSH_MODE != "recv":
+        return
+    t0 = time.perf_counter()
+    _flush_npu()
+    st["calls"] += 1
+    st["ms"] += (time.perf_counter() - t0) * 1e3
+    if st["calls"] >= st["next_report"]:
+        st["next_report"] *= 10
+        _flush_log().info("BFF free-flush(recv) | barriers=%d mean=%.2f ms",
+                          st["calls"], st["ms"] / st["calls"])
+
+
+def _flush_log():
+    # stdlib logging under the `vllm.` namespace: it prints through vLLM's handler without this
+    # module importing vllm (see the note at the top of the file).
+    import logging
+    return logging.getLogger("vllm.bff_free_flush")
 
 
 def kv_cache_usage():

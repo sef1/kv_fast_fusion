@@ -1357,6 +1357,10 @@ if _ASCEND_AVAILABLE:
             with dedup OFF — and a transport that drops writes is indifferent to dedup. The blocks
             were not un-written; they were read from the producer BEFORE the producer wrote them.
             See ``wait_for_save``."""
+            # BFF_FREE_FLUSH=recv: land any in-flight KV write to a just-freed block before this
+            # pull writes into it. A no-op in the other modes.
+            from kv_fast_fusion import fast_fusion_block_pool as _bp
+            _bp.flush_before_load()
             for src, dst, lengths in chunk_segments(
                     src_list, dst_list, length_list, self._MAX_XFER_SEGMENTS):
                 ret = self._one_batch(session_id, src, dst, lengths)
