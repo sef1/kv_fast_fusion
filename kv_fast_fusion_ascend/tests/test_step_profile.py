@@ -82,6 +82,21 @@ def test_the_headline_number_and_its_share_of_the_step_are_both_in_the_line():
     assert "5.8% of the step" in line, "a ms figure with no share of the step is not actionable"
 
 
+def test_the_scheduler_half_of_the_step_is_in_the_line():
+    p = _profile(steps=10)
+    for _ in range(10):
+        p.note("sched", 1.5)
+        p.note("sched_update", 0.5)
+    line = p.render()
+    assert "sched 1.50" in line and "sched_update 0.50" in line
+
+
+def test_the_logger_is_in_the_namespace_vllm_actually_prints():
+    """vLLM attaches its handler to `vllm.*` only; a logger named after this module prints nothing,
+    which made a working profiler look inert for five box runs."""
+    assert sp.logger.name.startswith("vllm.")
+
+
 def test_install_is_a_complete_no_op_when_the_flag_is_off(monkeypatch):
     """A diagnostic must cost a normal run nothing at all — not a wrapper, not an attribute."""
     class _Fake:

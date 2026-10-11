@@ -34,7 +34,10 @@ import time
 
 from vllm.logger import init_logger
 
-logger = init_logger(__name__)
+# Named under ``vllm.`` on purpose: vLLM's logging config attaches a handler to that namespace only, so
+# ``init_logger(__name__)`` (``kv_fast_fusion_ascend.step_profile``) had every line of this module
+# discarded — the profiler timed correctly and printed nothing, which read as "inert" for five runs.
+logger = init_logger("vllm.bff_step_profile")
 
 STEP_PROFILE = os.environ.get("BFF_STEP_PROFILE", "0") == "1"
 
@@ -137,7 +140,8 @@ class StepProfile:
         pct = (100.0 * self.group_excess_ms() / total) if total else 0.0
         parts = [(f"BFF step profile | steps={self.steps} mean_reqs={self.mean_reqs():.1f} | "
                   f"step_total {total:.2f} ms | prepare_inputs {self.per_step('prepare_inputs'):.2f} "
-                  f"attn_meta {self.per_step('attn_meta'):.2f}")]
+                  f"attn_meta {self.per_step('attn_meta'):.2f} | sched {self.per_step('sched'):.2f} "
+                  f"sched_update {self.per_step('sched_update'):.2f}")]
         for phase in PER_GROUP_PHASES:
             parts.append(f"{phase} {self.per_step(phase):.2f} ms/step over "
                          f"{self.calls_per_step(phase):.1f} calls ({self.per_call(phase):.3f} ms/call)")
@@ -300,7 +304,7 @@ def _wrap_step(cls, name: str) -> bool:
 
 
 def install() -> None:
-    """Wrap the five call sites, or do nothing at all when the flag is off.
+    """Wrap the runner and scheduler call sites, or do nothing at all when the flag is off.
 
     Every target is wrapped independently inside its own try/except: this is a diagnostic, and a
     vLLM-ascend version that renamed one method must cost that one phase, never the run."""
@@ -331,6 +335,21 @@ def install() -> None:
             wrapped.append("step_total")
     except Exception as e:  # noqa: BLE001 - as above
         logger.warning("BFF step profile: could not wrap the model runner (%s).", e)
+    # The scheduler half of the step. Block allocation runs once per KV-cache group for every running
+    # request, so it is the other place requests x groups work can hide, and nothing above sees it.
+    # Only where the class DEFINES the method (same rule as the patch's update_from_output wrapper), so
+    # no MRO times a call twice. This runs before the BFF patch wraps update_from_output, so BFF's own
+    # merge hook stays outside the timed region.
+    for mod, cls_name in (("vllm.v1.core.sched.scheduler", "Scheduler"),
+                          ("vllm_ascend.core.recompute_scheduler", "RecomputeScheduler")):
+        try:
+            import importlib
+            cls = getattr(importlib.import_module(mod), cls_name)
+            for name, phase in (("schedule", "sched"), ("update_from_output", "sched_update")):
+                if name in cls.__dict__ and _wrap(cls, name, phase):
+                    wrapped.append(f"{cls_name}.{phase}")
+        except Exception as e:  # noqa: BLE001 - as above
+            logger.warning("BFF step profile: could not wrap %s (%s).", cls_name, e)
     if wrapped:
         logger.info("BFF step profile ON (BFF_STEP_PROFILE=1): timing %s. Read GROUP EXCESS at "
                     "Running ~200 — the cost scales with requests x groups, so the drain tail is "
