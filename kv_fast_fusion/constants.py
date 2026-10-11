@@ -18,3 +18,9 @@ BFF_GROUP_SIZE = int(os.environ.get("BFF_GROUP_SIZE", "4"))
 # minimum (>1 group is required by verify_and_split). Only meaningful with BFF_V2_DEDUP=0, where
 # the group split is a pure storage layout and no layer is fused.
 BFF_BALANCED_GROUPS = int(os.environ.get("BFF_BALANCED_GROUPS", "0"))
+# Two-group "edge + middle" layout for dedup=1: group 0 = the first K + last K layers, group 1 = the
+# middle. The uniform layers sit at BOTH ends of the model, and group 0 is never dedup-eligible, so
+# this quarantines them by construction (no BFF_FF_GROUPS) with the minimum group count. K=7 on a
+# 28-layer model gives 14+14, i.e. max_layers×num_groups at its floor. 0 = off; takes precedence over
+# BFF_BALANCED_GROUPS.
+BFF_EDGE_LAYERS = int(os.environ.get("BFF_EDGE_LAYERS", "0"))

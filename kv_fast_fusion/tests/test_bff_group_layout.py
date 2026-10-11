@@ -76,3 +76,29 @@ def test_default_layout_respects_group_size():
     # 24 middle layers, chunk 24 → 1 fusion group; warmup + 1 fusion = 2 groups.
     assert len(layout) == 2
     assert [sid for _, sid in layout] == [1, 0]
+
+
+def test_edge_layout_is_two_even_groups_with_both_ends_in_group_zero():
+    """Group 0 is never dedup-eligible, so it must hold BOTH uniform ends; 7 on 28 layers keeps
+    max_layers x num_groups at its floor (no stranded pool)."""
+    layers = _layers(28)
+    layout = bff_group_layout(layers, balanced_groups=0, group_size=4, edge_layers=7)
+    (edges, edge_sid), (middle, mid_sid) = layout
+    assert edges == layers[:7] + layers[21:]
+    assert middle == layers[7:21]
+    assert edge_sid != mid_sid, "two groups need distinct specs to survive verify_and_split"
+    assert sorted(_flat(layout)) == sorted(layers)
+    assert max(len(n) for n, _ in layout) * len(layout) == 28
+
+
+def test_edge_layout_takes_precedence_and_always_leaves_a_middle():
+    layout = bff_group_layout(_layers(28), balanced_groups=4, group_size=4, edge_layers=7)
+    assert len(layout) == 2
+    edges, middle = (names for names, _ in bff_group_layout(_layers(6), 0, 4, edge_layers=99))
+    assert len(middle) >= 1 and len(edges) + len(middle) == 6
+
+
+def test_edge_layers_zero_leaves_the_other_layouts_untouched():
+    for bal in (0, 2, 4):
+        assert (bff_group_layout(_layers(28), bal, 4, edge_layers=0)
+                == bff_group_layout(_layers(28), bal, 4))

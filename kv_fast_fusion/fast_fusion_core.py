@@ -13,7 +13,7 @@ from vllm.v1.core.kv_cache_utils import (
     init_none_hash,
 )
 
-def bff_group_layout(original_layers, balanced_groups, group_size):
+def bff_group_layout(original_layers, balanced_groups, group_size, edge_layers=0):
     """Pure partition of the model's layer names into BFF storage groups.
 
     Returns ``list[(layer_names, spec_id)]``. ``spec_id`` selects one of the two page-identical
@@ -26,10 +26,17 @@ def bff_group_layout(original_layers, balanced_groups, group_size):
       contiguous groups (sizes differ by <=1), spec_id alternating so adjacent groups differ. This
       holds ``max_layers_per_group × num_groups`` at its floor (== total layers == baseline
       concurrency) while minimizing the per-step per-group block-table tax. N=2 is the optimum.
+    * ``edge_layers >= 1`` (takes precedence): TWO groups — the first ``edge_layers`` + last
+      ``edge_layers`` layers (alt spec, group 0), then the middle (group 1). Group 0 is never
+      dedup-eligible, so the uniform layers at both ends are quarantined with the fewest groups.
+      Clamped so the middle keeps at least one layer; balanced when ``4 × edge_layers == n``.
     * otherwise: today's layout — warmup group (first 2 + last 2 layers, alt spec) + the middle
       layers chunked by ``group_size`` (per_layer_spec). Byte-for-byte the prior behaviour.
     """
     n = len(original_layers)
+    if edge_layers and edge_layers >= 1 and n >= 3:
+        k = min(edge_layers, (n - 1) // 2)
+        return [(original_layers[:k] + original_layers[n - k:], 1), (original_layers[k:n - k], 0)]
     if balanced_groups and balanced_groups >= 2:
         g = max(2, min(balanced_groups, n))
         base, extra = divmod(n, g)
@@ -106,7 +113,7 @@ def _initialize_kv_caches(
                 get_kv_cache_config_from_groups, _report_kv_cache_config,
             )
             from kv_fast_fusion.constants import (
-                BFF_GROUP_SIZE, BFF_BALANCED_GROUPS,
+                BFF_GROUP_SIZE, BFF_BALANCED_GROUPS, BFF_EDGE_LAYERS,
             )
 
             # Reference (global) layer ordering + a concrete per-layer spec.
@@ -140,10 +147,19 @@ def _initialize_kv_caches(
             global_groups = [
                 KVCacheGroupSpec(layer_names, _specs[spec_id])
                 for layer_names, spec_id in bff_group_layout(
-                    original_layers, BFF_BALANCED_GROUPS, BFF_GROUP_SIZE
+                    original_layers, BFF_BALANCED_GROUPS, BFF_GROUP_SIZE, BFF_EDGE_LAYERS
                 )
             ]
-            if BFF_BALANCED_GROUPS >= 2 and os.environ.get("BFF_V2_DEDUP") == "1":
+            if BFF_EDGE_LAYERS >= 1:
+                sizes = [len(g.layer_names) for g in global_groups]
+                logger.info("BFF_EDGE_LAYERS=%d: edge+middle layout, group sizes %s (group 0 = "
+                            "edges, never dedup-eligible).", BFF_EDGE_LAYERS, sizes)
+                if len(set(sizes)) > 1:
+                    logger.warning(
+                        "BFF_EDGE_LAYERS=%d gives unequal groups %s: the pool is sized by the "
+                        "fattest group, so the thinner one strands KV. Balanced needs "
+                        "4 x edge_layers == %d layers.", BFF_EDGE_LAYERS, sizes, len(original_layers))
+            elif BFF_BALANCED_GROUPS >= 2 and os.environ.get("BFF_V2_DEDUP") == "1":
                 logger.warning(
                     "BFF_BALANCED_GROUPS=%d with BFF_V2_DEDUP=1: balanced groups fuse boundary "
                     "layers and coarsen dedup granularity — supported combo is dedup=0.",
