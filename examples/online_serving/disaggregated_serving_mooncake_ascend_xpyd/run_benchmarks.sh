@@ -169,6 +169,7 @@ BFF_V2_SIG_PRECOMPUTE_PER_STEP=${BFF_V2_SIG_PRECOMPUTE_PER_STEP:-32}
 # needs no instrumented baseline run.
 BFF_STEP_PROFILE=${BFF_STEP_PROFILE:-0}
 BFF_SCHED_CPROFILE=${BFF_SCHED_CPROFILE:-0}   # with BFF_STEP_PROFILE=1: cProfile the scheduler for steps 4000-6000
+BFF_RUNNER_CPROFILE=${BFF_RUNNER_CPROFILE:-0} # same window over execute_model/sample_tokens
 # Attribute the fixed 0.88 GiB BFF costs before the KV pool is sized (Update 33) — 2.5 % of KV at
 # GPU_MEM_UTIL=1.0, 9.8 % at 0.5. Exported for EVERY arm, ahead of the BFF_ON gate, because the
 # comparison that matters is BFF's `Available KV cache memory` against the baseline's.
@@ -472,7 +473,7 @@ export_bff_env() {
   # Ahead of the gate on purpose: the memory probe's whole job is to compare BFF against the
   # BASELINE's available KV, so it must reach the arm where BFF is off too.
   export BFF_MEM_PROBE=$BFF_MEM_PROBE BFF_STEP_PROFILE=$BFF_STEP_PROFILE \
-         BFF_SCHED_CPROFILE=$BFF_SCHED_CPROFILE
+         BFF_SCHED_CPROFILE=$BFF_SCHED_CPROFILE BFF_RUNNER_CPROFILE=$BFF_RUNNER_CPROFILE
   if [[ "$BFF_ON" != "1" ]]; then
     export BFF_PD_FUSE=0
     unset BFF_PD_STATS_DIR

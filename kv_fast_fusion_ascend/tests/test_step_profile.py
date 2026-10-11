@@ -369,3 +369,26 @@ def test_a_wrapped_scheduler_call_logs_the_table_when_the_window_closes(monkeypa
         sp.PROFILE.note_step()
     tables = [m for m in logged if m.startswith("BFF sched cprofile |")]
     assert len(tables) == 1 and "3 scheduler calls" in tables[0]
+
+
+def test_the_runner_window_profiles_execute_model_and_reports_under_its_own_name(monkeypatch):
+    class _Runner:
+        def execute_model(self):
+            return _busy_inside()
+
+    logged = []
+    monkeypatch.setattr(sp, "PROFILE", sp.StepProfile())
+    monkeypatch.setattr(sp, "RUNNER_CPROFILE", True)
+    monkeypatch.setattr(sp, "RUNNER_CPROF", sp.SchedCProfile(start=2, steps=3, label="runner"))
+    monkeypatch.setattr(sp.logger, "info", lambda fmt, *a: logged.append(fmt % a if a else fmt))
+    assert sp._wrap_step(_Runner, "execute_model")
+    r = _Runner()
+    for _ in range(8):
+        r.execute_model()
+    tables = [m for m in logged if m.startswith("BFF runner cprofile |")]
+    assert len(tables) == 1 and "3 runner calls" in tables[0] and "_busy_inside" in tables[0]
+    assert not any(m.startswith("BFF sched cprofile") for m in logged)
+
+
+def test_the_runner_window_is_off_by_default():
+    assert sp.RUNNER_CPROFILE is False and sp.RUNNER_CPROF._prof is None

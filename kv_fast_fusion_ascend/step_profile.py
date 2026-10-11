@@ -201,7 +201,8 @@ class SchedCProfile:
     cProfile inflates what it measures, so the window is short and its throughput is not to be read;
     the table's value is the ranking, and ``cumtime / steps`` as a per-step upper bound."""
 
-    def __init__(self, start: int, steps: int) -> None:
+    def __init__(self, start: int, steps: int, label: str = "sched") -> None:
+        self.label = label
         self.start = start
         self.end = start + steps
         self.calls = 0
@@ -234,7 +235,8 @@ class SchedCProfile:
         import pstats
         self.reported = True
         out = io.StringIO()
-        out.write(f"BFF sched cprofile | steps {self.start}-{self.end} | {self.calls} scheduler "
+        what = "scheduler" if self.label == "sched" else self.label
+        out.write(f"BFF {self.label} cprofile | steps {self.start}-{self.end} | {self.calls} {what} "
                   f"calls profiled | per-step cost of a row = cumtime / {self.end - self.start}\n")
         stats = pstats.Stats(self._prof, stream=out).strip_dirs()
         stats.sort_stats("cumulative").print_stats(40)
@@ -243,6 +245,14 @@ class SchedCProfile:
 
 
 SCHED_CPROF = SchedCProfile(SCHED_CPROFILE_START, SCHED_CPROFILE_STEPS)
+
+# The same window over the RUNNER (execute_model + sample_tokens). With dedup off the two-group layout
+# is still ~2 ms/step slower than one group and most of it sits inside execute_model, where the phase
+# timers cannot tell host work from waiting on the device. In the table, host work shows as Python
+# rows and device waits as time in a builtin (synchronize / .cpu() / tolist), so the two arms can be
+# compared row by row. Its own Profile object: the runner may not share a thread with the scheduler.
+RUNNER_CPROFILE = os.environ.get("BFF_RUNNER_CPROFILE", "0") == "1"
+RUNNER_CPROF = SchedCProfile(SCHED_CPROFILE_START, SCHED_CPROFILE_STEPS, label="runner")
 
 
 def announce_once(key: str, level: str, msg: str, *args) -> bool:
@@ -346,7 +356,7 @@ def install_mem_probe() -> None:
     logger.info("BFF mem probe: bracketing NPUWorker.determine_available_memory.")
 
 
-def _wrap(cls, name: str, phase: str, on_call=None, cprofile: bool = False) -> bool:
+def _wrap(cls, name: str, phase: str, on_call=None, cprofile=None) -> bool:
     """Time ``cls.name`` into ``phase``. Returns True if it wrapped something new.
 
     ``on_call`` gets the call's args before the inner function runs, which is how ``num_reqs`` is
@@ -356,19 +366,24 @@ def _wrap(cls, name: str, phase: str, on_call=None, cprofile: bool = False) -> b
     if orig is None or getattr(orig, _WRAP_SENTINEL, False):
         return False
 
-    def _timed(*args, _orig=orig, _phase=phase, _on=on_call, _cprof=cprofile, **kwargs):
+    if cprofile is True:          # the scheduler window, by its original spelling
+        cprofile = "sched"
+
+    def _timed(*args, _orig=orig, _phase=phase, _on=on_call, _which=cprofile, **kwargs):
         if _on is not None:
             _on(*args, **kwargs)
-        profiling = _cprof and SCHED_CPROF.maybe_enable(PROFILE.steps)
+        # Looked up per call, not bound at wrap time, so a test (or a reload) can swap the window.
+        cprof = SCHED_CPROF if _which == "sched" else RUNNER_CPROF if _which == "runner" else None
+        profiling = cprof is not None and cprof.maybe_enable(PROFILE.steps)
         t0 = time.perf_counter()
         try:
             return _orig(*args, **kwargs)
         finally:
             PROFILE.note(_phase, (time.perf_counter() - t0) * 1e3)
             if profiling:
-                SCHED_CPROF.disable()
-            elif _cprof and SCHED_CPROF.due(PROFILE.steps):
-                logger.info("%s", SCHED_CPROF.report())
+                cprof.disable()
+            elif cprof is not None and cprof.due(PROFILE.steps):
+                logger.info("%s", cprof.report())
 
     setattr(_timed, _WRAP_SENTINEL, True)
     setattr(cls, name, _timed)
@@ -407,11 +422,17 @@ def _wrap_step(cls, name: str) -> bool:
         return False
 
     def _timed(*args, _orig=orig, **kwargs):
+        cprof = RUNNER_CPROF if RUNNER_CPROFILE else None
+        profiling = cprof is not None and cprof.maybe_enable(PROFILE.steps)
         t0 = time.perf_counter()
         try:
             return _orig(*args, **kwargs)
         finally:
             PROFILE.note("step_total", (time.perf_counter() - t0) * 1e3)
+            if profiling:
+                cprof.disable()
+            elif cprof is not None and cprof.due(PROFILE.steps):
+                logger.info("%s", cprof.report())
             if PROFILE.note_step():
                 logger.info("%s", PROFILE.render())
 
@@ -452,7 +473,8 @@ def install() -> None:
             wrapped.append("step_total")
         # With async scheduling the device wait can land here instead of in execute_model, so the
         # runner's share of the step is only comparable across arms as step_total + sample.
-        if _wrap(NPUModelRunner, "sample_tokens", "sample"):
+        if _wrap(NPUModelRunner, "sample_tokens", "sample",
+                 cprofile="runner" if RUNNER_CPROFILE else None):
             wrapped.append("sample")
     except Exception as e:  # noqa: BLE001 - as above
         logger.warning("BFF step profile: could not wrap the model runner (%s).", e)
@@ -469,7 +491,7 @@ def install() -> None:
             for name, phase, on_call in (("schedule", "sched", _note_connector),
                                          ("update_from_output", "sched_update", None)):
                 if name in cls.__dict__ and _wrap(cls, name, phase, on_call=on_call,
-                                                  cprofile=SCHED_CPROFILE):
+                                                  cprofile="sched" if SCHED_CPROFILE else None):
                     wrapped.append(f"{cls_name}.{phase}")
         except Exception as e:  # noqa: BLE001 - as above
             logger.warning("BFF step profile: could not wrap %s (%s).", cls_name, e)
@@ -498,6 +520,11 @@ def install() -> None:
                       "BFF sched cprofile: ON, profiling schedule/update_from_output for steps "
                       "%d-%d; the table prints once when the window closes.",
                       SCHED_CPROF.start, SCHED_CPROF.end)
+    if RUNNER_CPROFILE:
+        announce_once("runner_cprofile:on", "info",
+                      "BFF runner cprofile: ON, profiling execute_model/sample_tokens for steps "
+                      "%d-%d; the table prints once when the window closes.",
+                      RUNNER_CPROF.start, RUNNER_CPROF.end)
     if wrapped:
         logger.info("BFF step profile ON (BFF_STEP_PROFILE=1): timing %s. Read GROUP EXCESS at "
                     "Running ~200 — the cost scales with requests x groups, so the drain tail is "
