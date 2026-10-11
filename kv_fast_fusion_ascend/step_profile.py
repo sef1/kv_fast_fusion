@@ -169,7 +169,7 @@ class StepProfile:
         pct = (100.0 * w.group_excess_ms() / total) if total else 0.0
         parts = [(f"BFF step profile | steps={self.steps} window={w.steps} "
                   f"mean_reqs={w.mean_reqs():.1f} | engine_step {w.per_step('engine_step'):.2f} ms | "
-                  f"step_total {total:.2f} ms | prepare_inputs {w.per_step('prepare_inputs'):.2f} "
+                  f"step_total {total:.2f} ms sample {w.per_step('sample'):.2f} | prepare_inputs {w.per_step('prepare_inputs'):.2f} "
                   f"attn_meta {w.per_step('attn_meta'):.2f}")]
         for phase in SCHED_PHASES:
             parts.append(f"{phase} {w.per_step(phase):.2f} ms/step over "
@@ -450,6 +450,10 @@ def install() -> None:
             wrapped.append("attn_meta")
         if _wrap_step(NPUModelRunner, "execute_model"):
             wrapped.append("step_total")
+        # With async scheduling the device wait can land here instead of in execute_model, so the
+        # runner's share of the step is only comparable across arms as step_total + sample.
+        if _wrap(NPUModelRunner, "sample_tokens", "sample"):
+            wrapped.append("sample")
     except Exception as e:  # noqa: BLE001 - as above
         logger.warning("BFF step profile: could not wrap the model runner (%s).", e)
     # The scheduler half of the step. Block allocation runs once per KV-cache group for every running

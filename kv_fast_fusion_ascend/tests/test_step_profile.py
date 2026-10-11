@@ -111,7 +111,7 @@ def test_the_scheduler_half_of_the_step_is_in_the_line():
     line = p.render()
     assert "sched 1.50 ms/step over 1.0 calls" in line
     assert "sched_update 0.50 ms/step over 1.0 calls" in line
-    for phase in ("engine_step", "alloc", "computed", "free", "conn_meta"):
+    for phase in ("engine_step", "sample", "alloc", "computed", "free", "conn_meta"):
         assert phase in line
 
 
