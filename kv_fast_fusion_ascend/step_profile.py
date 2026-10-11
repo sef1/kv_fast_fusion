@@ -185,6 +185,66 @@ class StepProfile:
 PROFILE = StepProfile()
 
 
+# Function-level attribution for the scheduler (2026-10-11). At matched load BFF's schedule() costs
+# 4.96 ms/step against the baseline's 0.62, and update_from_output 2.03 against 0.36, with nothing in
+# BFF's scheduler-side code that obviously explains it. Rather than guess phase by phase, profile the
+# two calls with cProfile for a window of loaded steps and print the table once. Off unless
+# BFF_SCHED_CPROFILE=1 (and BFF_STEP_PROFILE=1, which installs the wrappers this rides on).
+SCHED_CPROFILE = os.environ.get("BFF_SCHED_CPROFILE", "0") == "1"
+SCHED_CPROFILE_START = int(os.environ.get("BFF_SCHED_CPROFILE_START", "4000"))
+SCHED_CPROFILE_STEPS = int(os.environ.get("BFF_SCHED_CPROFILE_STEPS", "2000"))
+
+
+class SchedCProfile:
+    """cProfile over the wrapped scheduler calls, for steps in ``[start, start + steps)``.
+
+    cProfile inflates what it measures, so the window is short and its throughput is not to be read;
+    the table's value is the ranking, and ``cumtime / steps`` as a per-step upper bound."""
+
+    def __init__(self, start: int, steps: int) -> None:
+        self.start = start
+        self.end = start + steps
+        self.calls = 0
+        self.reported = False
+        self._active = False
+        self._prof = None
+
+    def maybe_enable(self, step: int) -> bool:
+        """Start profiling this call if ``step`` is in the window. True when it did."""
+        if self._active or self.reported or not (self.start <= step < self.end):
+            return False
+        if self._prof is None:
+            import cProfile
+            self._prof = cProfile.Profile()
+        self._active = True
+        self.calls += 1
+        self._prof.enable()
+        return True
+
+    def disable(self) -> None:
+        self._prof.disable()
+        self._active = False
+
+    def due(self, step: int) -> bool:
+        return not self.reported and self._prof is not None and step >= self.end
+
+    def report(self) -> str:
+        """The table, once: by cumulative time (who owns the cost), then by self time (who burns it)."""
+        import io
+        import pstats
+        self.reported = True
+        out = io.StringIO()
+        out.write(f"BFF sched cprofile | steps {self.start}-{self.end} | {self.calls} scheduler "
+                  f"calls profiled | per-step cost of a row = cumtime / {self.end - self.start}\n")
+        stats = pstats.Stats(self._prof, stream=out).strip_dirs()
+        stats.sort_stats("cumulative").print_stats(40)
+        stats.sort_stats("tottime").print_stats(25)
+        return out.getvalue()
+
+
+SCHED_CPROF = SchedCProfile(SCHED_CPROFILE_START, SCHED_CPROFILE_STEPS)
+
+
 def announce_once(key: str, level: str, msg: str, *args) -> bool:
     """Say a diagnostic's state exactly once. Returns True when it printed.
 
@@ -286,7 +346,7 @@ def install_mem_probe() -> None:
     logger.info("BFF mem probe: bracketing NPUWorker.determine_available_memory.")
 
 
-def _wrap(cls, name: str, phase: str, on_call=None) -> bool:
+def _wrap(cls, name: str, phase: str, on_call=None, cprofile: bool = False) -> bool:
     """Time ``cls.name`` into ``phase``. Returns True if it wrapped something new.
 
     ``on_call`` gets the call's args before the inner function runs, which is how ``num_reqs`` is
@@ -296,14 +356,19 @@ def _wrap(cls, name: str, phase: str, on_call=None) -> bool:
     if orig is None or getattr(orig, _WRAP_SENTINEL, False):
         return False
 
-    def _timed(*args, _orig=orig, _phase=phase, _on=on_call, **kwargs):
+    def _timed(*args, _orig=orig, _phase=phase, _on=on_call, _cprof=cprofile, **kwargs):
         if _on is not None:
             _on(*args, **kwargs)
+        profiling = _cprof and SCHED_CPROF.maybe_enable(PROFILE.steps)
         t0 = time.perf_counter()
         try:
             return _orig(*args, **kwargs)
         finally:
             PROFILE.note(_phase, (time.perf_counter() - t0) * 1e3)
+            if profiling:
+                SCHED_CPROF.disable()
+            elif _cprof and SCHED_CPROF.due(PROFILE.steps):
+                logger.info("%s", SCHED_CPROF.report())
 
     setattr(_timed, _WRAP_SENTINEL, True)
     setattr(cls, name, _timed)
@@ -399,7 +464,8 @@ def install() -> None:
             cls = getattr(importlib.import_module(mod), cls_name)
             for name, phase, on_call in (("schedule", "sched", _note_connector),
                                          ("update_from_output", "sched_update", None)):
-                if name in cls.__dict__ and _wrap(cls, name, phase, on_call=on_call):
+                if name in cls.__dict__ and _wrap(cls, name, phase, on_call=on_call,
+                                                  cprofile=SCHED_CPROFILE):
                     wrapped.append(f"{cls_name}.{phase}")
         except Exception as e:  # noqa: BLE001 - as above
             logger.warning("BFF step profile: could not wrap %s (%s).", cls_name, e)
@@ -423,6 +489,11 @@ def install() -> None:
                 wrapped.append(f"engine_step({name})")
     except Exception as e:  # noqa: BLE001 - as above
         logger.warning("BFF step profile: could not wrap the engine core (%s).", e)
+    if SCHED_CPROFILE:
+        announce_once("sched_cprofile:on", "info",
+                      "BFF sched cprofile: ON, profiling schedule/update_from_output for steps "
+                      "%d-%d; the table prints once when the window closes.",
+                      SCHED_CPROF.start, SCHED_CPROF.end)
     if wrapped:
         logger.info("BFF step profile ON (BFF_STEP_PROFILE=1): timing %s. Read GROUP EXCESS at "
                     "Running ~200 — the cost scales with requests x groups, so the drain tail is "

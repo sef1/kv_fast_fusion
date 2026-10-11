@@ -321,3 +321,51 @@ def test_install_mem_probe_brackets_profiling_and_wraps_once(monkeypatch):
 
     assert W().determine_available_memory() == 8_650_000_000, "the return value must pass through"
     assert calls == ["worker:before-profile", "profiled", "worker:after-profile"]
+
+
+def _busy_inside():
+    return sum(range(200))
+
+
+def _busy_outside():
+    return sum(range(200))
+
+
+def test_sched_cprofile_is_off_by_default():
+    assert sp.SCHED_CPROFILE is False
+    assert sp.SCHED_CPROF._prof is None, "no profiler object may exist unless it was asked for"
+
+
+def test_sched_cprofile_covers_only_its_window_and_reports_once():
+    c = sp.SchedCProfile(start=10, steps=5)
+    for step in range(20):
+        on = c.maybe_enable(step)
+        (_busy_inside if on else _busy_outside)()
+        if on:
+            c.disable()
+        assert on == (10 <= step < 15)
+    assert c.calls == 5
+    assert c.due(15) and not c.due(14)
+    table = c.report()
+    assert "BFF sched cprofile | steps 10-15 | 5 scheduler calls" in table
+    assert "_busy_inside" in table and "_busy_outside" not in table
+    assert not c.due(99), "the table prints once"
+    assert not c.maybe_enable(12), "and profiling does not restart after it"
+
+
+def test_a_wrapped_scheduler_call_logs_the_table_when_the_window_closes(monkeypatch):
+    class _Sched:
+        def schedule(self):
+            return _busy_inside()
+
+    logged = []
+    monkeypatch.setattr(sp, "PROFILE", sp.StepProfile())
+    monkeypatch.setattr(sp, "SCHED_CPROF", sp.SchedCProfile(start=2, steps=3))
+    monkeypatch.setattr(sp.logger, "info", lambda fmt, *a: logged.append(fmt % a if a else fmt))
+    assert sp._wrap(_Sched, "schedule", "sched", cprofile=True)
+    s = _Sched()
+    for _ in range(8):
+        s.schedule()
+        sp.PROFILE.note_step()
+    tables = [m for m in logged if m.startswith("BFF sched cprofile |")]
+    assert len(tables) == 1 and "3 scheduler calls" in tables[0]
