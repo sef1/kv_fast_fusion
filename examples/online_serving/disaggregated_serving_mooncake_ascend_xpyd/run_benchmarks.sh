@@ -85,6 +85,21 @@ MAX_NUM_SEQS=${MAX_NUM_SEQS:-48}
 GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.92}
 BLOCK_SIZE=${BLOCK_SIZE:-128}         # BFF requires 128
 SEED=${SEED:-1024}
+# Hybrid (attention + Mamba) models — Qwen3-Next and friends. Set HYBRID=1.
+#
+# It forces --no-disable-hybrid-kv-cache-manager on EVERY baseline, not just the BFF ones. With a
+# --kv-transfer-config present and that flag unset, vLLM force-disables the hybrid KV manager
+# (config/vllm.py) and then `unify_hybrid_kv_cache_specs` raises: it can fold SlidingWindow and
+# ChunkedLocal into FullAttention, but an attention+mamba mix has no unified type. So the stock
+# baselines — which is where a hybrid bring-up must start, to prove the vendored connector handles
+# the model at all — die before they load. AscendPlatform.support_hybrid_kv_cache() is True and all
+# three BFF Ascend connectors declare SupportsHMA, so nothing here is BFF-specific.
+#
+# Off by default so the recorded Qwen2.5 baselines in this directory keep their exact launch args.
+# Note --block-size is advisory for these models: vllm_ascend's patch_mamba_config raises it to
+# whatever aligns the attention page with the ssm page, and that ratio is the `scale` every part of
+# BFF's hybrid geometry is derived from. Never hardcode it; read it from the layout log line.
+HYBRID=${HYBRID:-0}
 
 # ---- Baseline / connector selection ----
 BASELINE=${BASELINE:-bff}             # bff | layerwise | mooncakev1 | vanilla
@@ -551,6 +566,9 @@ common_args() {
   fi
   if [[ "$BFF_ON" == "1" ]]; then
     extra="--enable-prefix-caching --no-disable-hybrid-kv-cache-manager"
+  elif [[ "$HYBRID" == "1" ]]; then
+    # Stock baselines on a hybrid model need the KV manager too — see HYBRID above.
+    extra="--no-disable-hybrid-kv-cache-manager"
   fi
   if [[ "$tag" == "decode" ]]; then
     extra="${extra} --compilation-config '${COMPILATION_CONFIG}'"
