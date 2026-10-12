@@ -46,12 +46,25 @@ _BLOCK_POOL = None
 # write), so the barrier can sit immediately before the pull instead: see flush_before_load. Every
 # forward that could still write to a freed block was submitted before that block could be
 # re-allocated, and allocation precedes the pull, so a drain at pull start covers them.
-_FREE_FLUSH_MODE = os.environ.get("BFF_FREE_FLUSH", "1").strip().lower()
+#
+# `recv` is the DEFAULT since 2026-10-12: six box runs held quality with it (dedup off: finish_length
+# 10.4-10.9 %, 512/512, F1 0.478; dedup on: F1 0.471-0.473) and it takes the stall off the scheduler.
+# It is only a barrier where something calls flush_before_load — today the pull connector's
+# `_issue_transfer`. A transport that never calls it (the layerwise connectors) must not be left
+# unguarded, so until the first load-side barrier has run, a free still drains as in mode `1`
+# (`armed` below). `1`/`free` forces the old free-time drain; `0` turns the guard off.
+_FREE_FLUSH_MODE = os.environ.get("BFF_FREE_FLUSH", "recv").strip().lower()
 if _FREE_FLUSH_MODE == "free":
     _FREE_FLUSH_MODE = "1"
 _FREE_FLUSH = _FREE_FLUSH_MODE == "1"
 _FLUSH_WARNED = False
-_RECV_FLUSH = {"calls": 0, "ms": 0.0, "next_report": 1, "announced": False}
+_RECV_FLUSH = {"calls": 0, "ms": 0.0, "next_report": 1, "announced": False, "armed": False}
+
+
+def _flush_on_free() -> bool:
+    """Whether a free must drain the device itself: always in mode `1`, and in mode `recv` only
+    while no load-side barrier has ever run in this process."""
+    return _FREE_FLUSH or (_FREE_FLUSH_MODE == "recv" and not _RECV_FLUSH["armed"])
 
 
 def _flush_npu() -> None:
@@ -84,6 +97,7 @@ def flush_before_load() -> None:
             }.get(_FREE_FLUSH_MODE, "OFF — no barrier; the freed-block write race is unguarded"))
     if _FREE_FLUSH_MODE != "recv":
         return
+    st["armed"] = True
     t0 = time.perf_counter()
     _flush_npu()
     st["calls"] += 1
@@ -274,7 +288,7 @@ def patched_free_blocks(self, ordered_blocks):
     # now, while the block is still owned — otherwise it lands after the next request's RDMA and
     # clobbers the fresh KV. Once per free EVENT, and only when something is actually being freed;
     # frees run between forward steps, so the sync mostly waits on the just-finished forward anyway.
-    if _FREE_FLUSH and any(b.ref_cnt == 0 and not b.is_null for b in unique_blocks):
+    if _flush_on_free() and any(b.ref_cnt == 0 and not b.is_null for b in unique_blocks):
         _flush_npu()
     freed_ids = []
     for block in unique_blocks:

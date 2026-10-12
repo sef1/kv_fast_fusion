@@ -150,10 +150,10 @@ BFF_FF_GROUPS=${BFF_FF_GROUPS:-}         # set (e.g. "1") -> fold un-chosen fusi
 # KV freeing from output quality (rambling). 0 = normal F1 benchmark.
 THROUGHPUT_ONLY=${THROUGHPUT_ONLY:-0}
 FIXED_OUTPUT_LEN=${FIXED_OUTPUT_LEN:-1024}
-# FREE_FLUSH: a full-device npu.synchronize() per block-free (fast_fusion_block_pool.py) that fixes the
-# decode-side KV write race — needed for F1, but BFF-only per-step overhead. Default on; set 0 to measure
-# throughput without it (the write race only hurts accuracy, so throughput-only runs don't need it).
-BFF_FREE_FLUSH=${BFF_FREE_FLUSH:-1}
+# FREE_FLUSH: the barrier that fixes the decode-side KV write race (needed for F1). recv (default) =
+# drain on the recv thread before each remote-KV load; 1 = drain on every block free (stalls the
+# scheduler ~5 ms/step); 0 = no barrier (throughput-only runs).
+BFF_FREE_FLUSH=${BFF_FREE_FLUSH:-recv}
 # Admission back-pressure (Update 27). vLLM allocates a request's KV blocks and THEN parks it waiting
 # for its remote-KV pull, uncapped — so BFF's slow, exchange-gated admission leaves the pool jammed by
 # requests that cannot decode (measured: ~20k of 34.5k blocks; KV saturated at Running=97 vs the

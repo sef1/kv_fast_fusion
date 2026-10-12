@@ -36,6 +36,7 @@ def _run(monkeypatch, free_flush, specs):
     calls = {"n": 0}
     monkeypatch.setattr(m, "_flush_npu", lambda: calls.__setitem__("n", calls["n"] + 1))
     monkeypatch.setattr(m, "_FREE_FLUSH", free_flush, raising=False)
+    monkeypatch.setattr(m, "_FREE_FLUSH_MODE", "1" if free_flush else "0")
     monkeypatch.setattr(m, "_KEEP_FUSED_HASH", True, raising=False)  # skip _maybe_evict path
     monkeypatch.setattr(m, "_ACTIVE_RUNNER", None, raising=False)
     monkeypatch.setattr(m, "_ON_BLOCKS_FREED", [], raising=False)
@@ -63,10 +64,10 @@ def test_no_flush_when_nothing_is_actually_freed(monkeypatch):
     assert n == 0 and freed == []
 
 
-def test_free_flush_is_on_by_default():
-    """The write-race fix ships ON: a stock BFF run must drain before reallocation without any flag,
-    or the F1-0.44 corruption is latent. BFF_FREE_FLUSH=0 is the opt-out (unset here in CI)."""
-    assert m._FREE_FLUSH is True
+def test_a_barrier_is_on_by_default_and_it_is_the_recv_side_one():
+    """The write-race fix ships ON without any flag, or the F1-0.44 corruption is latent. The default
+    is the load-side barrier; BFF_FREE_FLUSH=0 is the opt-out (unset here in CI)."""
+    assert m._FREE_FLUSH_MODE == "recv"
 
 
 def _recv_state(monkeypatch, mode):
@@ -75,7 +76,8 @@ def _recv_state(monkeypatch, mode):
     monkeypatch.setattr(m, "_FREE_FLUSH_MODE", mode)
     monkeypatch.setattr(m, "_FREE_FLUSH", mode == "1")
     monkeypatch.setattr(m, "_RECV_FLUSH",
-                        {"calls": 0, "ms": 0.0, "next_report": 1, "announced": False})
+                        {"calls": 0, "ms": 0.0, "next_report": 1, "announced": False,
+                         "armed": False})
     monkeypatch.setattr(m, "_KEEP_FUSED_HASH", True, raising=False)
     monkeypatch.setattr(m, "_ACTIVE_RUNNER", None, raising=False)
     monkeypatch.setattr(m, "_ON_BLOCKS_FREED", [], raising=False)
@@ -86,12 +88,21 @@ def test_recv_mode_moves_the_barrier_from_the_free_to_the_load(monkeypatch):
     """The scheduler thread must not drain the device on a free; the recv thread drains once per
     load instead. This is the 5 ms/step the cProfile window found."""
     calls = _recv_state(monkeypatch, "recv")
-    pool = _pool()
-    m.patched_free_blocks(pool, _blocks([(5, 0)]))
-    assert calls["n"] == 0 and pool.free_block_queue.appended == [5]
     m.flush_before_load()
     m.flush_before_load()
     assert calls["n"] == 2 and m._RECV_FLUSH["calls"] == 2
+    pool = _pool()
+    m.patched_free_blocks(pool, _blocks([(5, 0)]))
+    assert calls["n"] == 2, "once a load-side barrier exists, a free does not drain"
+    assert pool.free_block_queue.appended == [5]
+
+
+def test_recv_mode_still_drains_on_free_until_a_load_side_barrier_exists(monkeypatch):
+    """A transport that never calls flush_before_load (the layerwise connectors) must not be left
+    with no barrier at all just because recv is the default."""
+    calls = _recv_state(monkeypatch, "recv")
+    m.patched_free_blocks(_pool(), _blocks([(5, 0)]))
+    assert calls["n"] == 1
 
 
 def test_default_mode_keeps_the_barrier_on_the_free_only(monkeypatch):
