@@ -373,6 +373,17 @@ def slot_trace_fault(prev, cur, block_size):
     return None if c_slot % block_size == 0 else "slot_not_advanced_in_block"
 
 
+def piggyback_sign_here(sig_piggyback: bool, is_producer: bool, dedup_enabled: bool) -> bool:
+    """Sign this step's finished prefills only where the result is used: on the producer, and only
+    when the decode will dedup with it.
+
+    ``wait_for_save`` runs on every worker, and on the DECODE every newly admitted request looks like
+    a prefill that finished this step. Ungated, the decode signed each arriving request — a runner
+    cProfile measured 61 calls per 2,000 steps at ~35 ms each (a host-to-device copy queued behind the
+    in-flight forward), 1.1 ms/step, for payloads nothing on the decode ever reads."""
+    return bool(sig_piggyback and is_producer and dedup_enabled)
+
+
 def signature_request_and_plan_groups(aligned, groups=None):
     """The two block-id spaces this transport has to keep apart, from one aligned pair per group.
 
@@ -3053,6 +3064,7 @@ if _ASCEND_AVAILABLE:
         _logged_hot_collision = False
         _logged_mirror_drift = False
         _warned_piggyback_barrier = False
+        _said_piggyback_skipped = False
 
         def __init__(self, vllm_config, role, kv_cache_config=None):
             super().__init__(vllm_config, role, kv_cache_config)
@@ -3104,7 +3116,15 @@ if _ASCEND_AVAILABLE:
             # Piggyback (Update 13): sign this step's just-finished requests and stage them for the
             # scheduler to staple onto kv_transfer_params. AFTER super().wait_for_save() so the save
             # barrier (when on) has settled the KV — see precompute_and_offer.
-            if v1.SIG_PIGGYBACK and self.connector_worker is not None:
+            sign_here = piggyback_sign_here(v1.SIG_PIGGYBACK, getattr(self, "_is_producer", False),
+                                            pd_dedup_v2.V2_ENABLED)
+            if (v1.SIG_PIGGYBACK and not sign_here
+                    and not MooncakeConnectorFFv2._said_piggyback_skipped):
+                MooncakeConnectorFFv2._said_piggyback_skipped = True
+                logger.info("BFF pull-v2: piggyback signing is producer-only — skipped on this node "
+                            "(producer=%s, V2_DEDUP=%s).",
+                            getattr(self, "_is_producer", False), pd_dedup_v2.V2_ENABLED)
+            if sign_here and self.connector_worker is not None:
                 if not v1._SAVE_BARRIER and not MooncakeConnectorFFv2._warned_piggyback_barrier:
                     MooncakeConnectorFFv2._warned_piggyback_barrier = True
                     logger.warning(

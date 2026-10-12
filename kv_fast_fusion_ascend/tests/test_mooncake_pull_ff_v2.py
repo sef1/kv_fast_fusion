@@ -2951,3 +2951,23 @@ def test_v2_forces_piecewise_only_when_the_group_split_is_on(monkeypatch):
     assert _requires_piecewise_fn(False, False)() is True, "split on -> PIECEWISE, as measured necessary"
     assert _requires_piecewise_fn(True, False)() is False, "the explicit opt-in still reproduces the break"
     assert _requires_piecewise_fn(True, True)() is False, "and materialize + opt-in is the real test"
+
+
+def test_piggyback_signing_happens_only_where_its_result_is_used():
+    """On the decode every admitted request looks like a prefill that finished this step; ungated it
+    signed each one (61 x ~35 ms per 2,000 steps) for payloads nothing there reads."""
+    assert v2.piggyback_sign_here(True, True, True) is True
+    assert v2.piggyback_sign_here(True, False, True) is False, "never on the decode"
+    assert v2.piggyback_sign_here(True, True, False) is False, "nor when dedup will not use it"
+    assert v2.piggyback_sign_here(False, True, True) is False
+
+
+def test_wait_for_save_asks_the_gate_before_it_signs():
+    import inspect
+
+    src = inspect.getsource(v2)
+    fn = src[src.rindex("        def wait_for_save(self):"):]
+    fn = fn[:fn.index("        def request_finished_all_groups")]
+    assert "piggyback_sign_here(" in fn
+    assert fn.index("piggyback_sign_here(") < fn.index("precompute_and_offer(")
+    assert "if sign_here and self.connector_worker is not None" in fn
