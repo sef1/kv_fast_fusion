@@ -174,6 +174,10 @@ class StepProfile:
         for phase in SCHED_PHASES:
             parts.append(f"{phase} {w.per_step(phase):.2f} ms/step over "
                          f"{w.calls_per_step(phase):.1f} calls")
+        # Preemptions are rare per step, so they are reported as a count for the window: a preempted
+        # decode request loses its KV, and the rate against finishes is the number that matters.
+        parts.append(f"preempt {w.phases.get('preempt', (0, 0.0))[0]} in window "
+                     f"({w.per_step('preempt'):.2f} ms/step)")
         for phase in PER_GROUP_PHASES:
             parts.append(f"{phase} {w.per_step(phase):.2f} ms/step over "
                          f"{w.calls_per_step(phase):.1f} calls ({w.per_call(phase):.3f} ms/call)")
@@ -495,6 +499,13 @@ def install() -> None:
                     wrapped.append(f"{cls_name}.{phase}")
         except Exception as e:  # noqa: BLE001 - as above
             logger.warning("BFF step profile: could not wrap %s (%s).", cls_name, e)
+    # Preemptions, counted. Defined on the base Scheduler only and called from both schedule()s.
+    try:
+        from vllm.v1.core.sched.scheduler import Scheduler as _Sched
+        if "_preempt_request" in _Sched.__dict__ and _wrap(_Sched, "_preempt_request", "preempt"):
+            wrapped.append("preempt")
+    except Exception as e:  # noqa: BLE001 - as above
+        logger.warning("BFF step profile: could not wrap preemption (%s).", e)
     # What is inside the scheduler's time. This installs before the BFF patch captures
     # get_computed_blocks, so BFF's own wrapper stays outside `computed`; `free` contains BFF's
     # patched free_blocks and with it the NPU free-flush, which a stock arm does not pay.

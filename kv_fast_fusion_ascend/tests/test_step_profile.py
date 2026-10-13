@@ -392,3 +392,16 @@ def test_the_runner_window_profiles_execute_model_and_reports_under_its_own_name
 
 def test_the_runner_window_is_off_by_default():
     assert sp.RUNNER_CPROFILE is False and sp.RUNNER_CPROF._prof is None
+
+
+def test_preemptions_are_reported_as_a_count_for_the_window():
+    """0.07 preemptions a step rounds to nothing as a rate; the count against finishes is the point."""
+    p = _profile(steps=10)
+    assert "preempt 0 in window" in p.render()
+    for _ in range(10):
+        p.last_num_reqs = 60
+        p.note("step_total", 40.0)
+        p.note_step()
+    for _ in range(3):
+        p.note("preempt", 2.0)
+    assert "preempt 3 in window (0.60 ms/step)" in p.render()
