@@ -170,6 +170,10 @@ BFF_V2_SIG_PRECOMPUTE_PER_STEP=${BFF_V2_SIG_PRECOMPUTE_PER_STEP:-32}
 BFF_STEP_PROFILE=${BFF_STEP_PROFILE:-0}
 BFF_SCHED_CPROFILE=${BFF_SCHED_CPROFILE:-0}   # with BFF_STEP_PROFILE=1: cProfile the scheduler for steps 4000-6000
 BFF_RUNNER_CPROFILE=${BFF_RUNNER_CPROFILE:-0} # same window over execute_model/sample_tokens
+# Dedup index compaction (pd_lsh): rebuild only once max(MIN_DEAD, FRAC x rows) entries are dead.
+# FRAC=0 = rebuild on every eviction (the old behaviour, ~0.6 ms/step of scheduler time).
+BFF_LSH_COMPACT_DEAD_FRAC=${BFF_LSH_COMPACT_DEAD_FRAC:-0.25}
+BFF_LSH_COMPACT_MIN_DEAD=${BFF_LSH_COMPACT_MIN_DEAD:-256}
 # Attribute the fixed 0.88 GiB BFF costs before the KV pool is sized (Update 33) — 2.5 % of KV at
 # GPU_MEM_UTIL=1.0, 9.8 % at 0.5. Exported for EVERY arm, ahead of the BFF_ON gate, because the
 # comparison that matters is BFF's `Available KV cache memory` against the baseline's.
@@ -501,7 +505,8 @@ export_bff_env() {
          BFF_V2_MAX_RESIDENT=$BFF_V2_MAX_RESIDENT BFF_V2_SIG_TIMEOUT=$BFF_V2_SIG_TIMEOUT \
          BFF_PULL_V2_SIG_TIMEOUT=$BFF_PULL_V2_SIG_TIMEOUT BFF_SIG_LAYERS=$BFF_SIG_LAYERS \
          BFF_V2_MAX_REQ_DECLINE=$BFF_V2_MAX_REQ_DECLINE \
-         BFF_V2_PROTECT_HOT_BLOCKS=$BFF_V2_PROTECT_HOT_BLOCKS
+         BFF_V2_PROTECT_HOT_BLOCKS=$BFF_V2_PROTECT_HOT_BLOCKS \
+         BFF_LSH_COMPACT_DEAD_FRAC=$BFF_LSH_COMPACT_DEAD_FRAC BFF_LSH_COMPACT_MIN_DEAD=$BFF_LSH_COMPACT_MIN_DEAD
   # BOTH roles dump fuse stats: the producer counts blocks + redirects shipped, the decode side counts
   # the redirects that actually landed and the REAL freed-block delta (the measured compression).
   export BFF_PD_STATS_DIR="$results_root"
