@@ -627,12 +627,19 @@ launch_engines() {
     export ASCEND_RT_VISIBLE_DEVICES=$npu
     local kv_cfg; kv_cfg=$(build_kv_transfer_config "$role" "$kv_port")
 
+    # Record what this node was actually handed, at the top of its own log. A diagnostic that prints
+    # "OFF (… unset)" says the engine did not see the flag, but not whether the launching shell ever
+    # had it; this header settles that from the log alone.
+    { echo "[launch] $(date -Is) role=${role} tag=${tag} npu=${npu}"
+      env | grep -E '^(BFF_|THROUGHPUT_ONLY=|FIXED_OUTPUT_LEN=|GPU_MEM_UTIL=)' | sort | sed 's/^/[launch env] /'
+    } > "${logs_root}/${tag}-${i}.txt"
+
     nohup bash -c "python -m ${LAUNCHER} serve \"${MODEL}\" \
         $(common_args "$tag") \
         --port ${port} \
         --gpu-memory-utilization ${GPU_MEM_UTIL} \
         --kv-transfer-config '${kv_cfg}' \
-        > \"${logs_root}/${tag}-${i}.txt\" 2>&1" &
+        >> \"${logs_root}/${tag}-${i}.txt\" 2>&1" &
     echo "    PID: $!"
   done
 }
@@ -1395,6 +1402,7 @@ main() {
   if [ "$KILL_ONLY" = true ]; then kill_all_nodes; echo "Cleanup done."; exit 0; fi
 
   echo "BFF Ascend config: BASELINE=$BASELINE launcher=$LAUNCHER connector=$CONNECTOR ${NUM_PREFILL}Px${NUM_DECODE}D tp=$TP_SIZE use_ascend_store=$USE_ASCEND_STORE"
+  echo "  diagnostics: BFF_STEP_PROFILE=$BFF_STEP_PROFILE BFF_SCHED_CPROFILE=$BFF_SCHED_CPROFILE BFF_RUNNER_CPROFILE=$BFF_RUNNER_CPROFILE BFF_MEM_PROBE=$BFF_MEM_PROBE"
   echo "  decode: cudagraph_mode=$DECODE_CUDAGRAPH_MODE (requested; a BFF connector may force PIECEWISE) max_num_batched_tokens=$DECODE_MAX_NUM_BATCHED_TOKENS | prefill max_num_batched_tokens=$MAX_NUM_BATCHED_TOKENS"
   [[ "$BFF_ON" == "1" ]] && echo "  BFF: fuse=$BFF_PD_FUSE scale=$BFF_SCALE_MODE merge=$BFF_PD_MERGE repr=$BFF_PD_REPR thr=$BFF_THRESHOLD gs=$BFF_GROUP_SIZE eb=$BFF_PD_ENCODED_BATCH_SIZE max_rel_err=$BFF_MAX_REL_ERR"
   [[ "$BASELINE" == "bff_v2" ]] && echo "  BFF v2: dedup=$BFF_V2_DEDUP resident=$BFF_V2_RESIDENT sig_dim=$BFF_SIG_DIM sig_layers=$BFF_SIG_LAYERS sig_timeout=${BFF_V2_SIG_TIMEOUT}s"
