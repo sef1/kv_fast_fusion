@@ -50,6 +50,13 @@ LSH_MAX_OWNERS = int(os.environ.get("BFF_LSH_MAX_LIVE_OWNERS", "512"))
 # low BITS against a large index makes the verify dominate. >0 keeps only the top-K candidates by
 # table-collision count (multi-probe ranking); 0 = verify every bucket candidate.
 LSH_MAX_CAND = int(os.environ.get("BFF_LSH_MAX_CANDIDATES", "0"))
+# Lazy compaction. An evicted row is already gone from every bucket, `meta`, `lru` and the owner
+# view, so it can never be a probe candidate; compaction only renumbers rows densely and reclaims
+# their slots in `mat`. Doing that on every eviction cost the decode ~0.6 ms/step on the scheduler
+# thread (100 compactions x ~13 ms per 2,000 steps: every block free evicts). Compact once this many
+# rows are dead: max(MIN_DEAD, FRAC x rows). FRAC=0 restores compact-on-every-eviction.
+LSH_COMPACT_DEAD_FRAC = float(os.environ.get("BFF_LSH_COMPACT_DEAD_FRAC", "0.25"))
+LSH_COMPACT_MIN_DEAD = int(os.environ.get("BFF_LSH_COMPACT_MIN_DEAD", "256"))
 _LSH_POWERS = (2 ** torch.arange(LSH_BITS, dtype=torch.int64)).tolist()
 
 # Accepted-cosine histogram bins. `probe` already pays the .item() sync for the accept decision, so
@@ -193,7 +200,8 @@ class LshIndex:
         self.owner_lru = OrderedDict()                      # owner -> None (oldest first)
         self.row_norm = {}                                  # row -> ||rep|| before normalisation
         self.mat = None                                     # [cap, d] float32 rep vectors
-        self.n_rows = 0
+        self.n_rows = 0                                     # rows in `mat`, live or dead
+        self.n_dead = 0                                     # evicted rows awaiting compaction
         self.accept_cos = [0] * len(ACCEPT_COS_LABELS)
         self.accept_rel_err = [0] * len(REL_ERR_LABELS)
         # Candidates that cleared the cosine bar and were then rejected by MAX_REL_ERR — i.e. the
@@ -208,7 +216,8 @@ class LshIndex:
         self.reject_cos = [0] * len(ACCEPT_COS_LABELS)
 
     def size(self) -> int:
-        return self.n_rows
+        """Live representatives. ``n_rows`` also counts evicted rows not yet compacted away."""
+        return len(self.meta)
 
     def n_owners(self) -> int:
         return len(self.by_owner)
@@ -266,7 +275,8 @@ class LshIndex:
                 for t, h in enumerate(hashes[i]):
                     cand.update(self.tables[t].get(h, ()))
                 # Rows ARE the index into mat, so there is no id→row lookup — and buckets only ever
-                # hold live rows (evict+compact run together), so no liveness check either.
+                # hold live rows (evict removes a row from every bucket), so no liveness check
+                # either, even while dead rows are waiting for a lazy compaction.
                 cand_rows = [r for r in cand if self.meta[r][2] != owner_i]
             if not cand_rows:
                 continue
@@ -326,6 +336,8 @@ class LshIndex:
         sync per group, not two."""
         if not rows_to_add:
             return
+        if self.n_rows >= LSH_MAX_ENTRIES and self.n_dead:
+            self.compact()                       # reclaim dead rows before dropping live ones
         if self.n_rows >= LSH_MAX_ENTRIES:
             for row in list(itertools.islice(self.lru.keys(), max(1, LSH_MAX_ENTRIES // 2))):
                 self.evict(row)
@@ -364,8 +376,14 @@ class LshIndex:
                 dropped += 1
             self.owner_lru.pop(owner, None)
         if dropped:
-            self.compact()
+            self._maybe_compact()
         return dropped
+
+    def _maybe_compact(self) -> None:
+        """Compact once enough rows are dead (see LSH_COMPACT_DEAD_FRAC); otherwise leave them."""
+        if (LSH_COMPACT_DEAD_FRAC <= 0
+                or self.n_dead >= max(LSH_COMPACT_MIN_DEAD, LSH_COMPACT_DEAD_FRAC * self.n_rows)):
+            self.compact()
 
     def evict_owner(self, owner) -> int:
         return self.evict_owners([owner])
@@ -375,6 +393,8 @@ class LshIndex:
         :meth:`compact` that always follows a batch evict."""
         sh = self.row_hashes.pop(row, None)
         entry = self.meta.pop(row, None)
+        if entry is not None:
+            self.n_dead += 1
         self.row_norm.pop(row, None)
         self.lru.pop(row, None)
         if entry is not None:
@@ -410,6 +430,7 @@ class LshIndex:
             self.owner_lru = OrderedDict()
             self.mat = None
             self.n_rows = 0
+            self.n_dead = 0
             return
         remap = {old: new for new, old in enumerate(survivors)}
         self.mat = self.mat.index_select(
@@ -430,3 +451,4 @@ class LshIndex:
                 tables[t].setdefault(h, []).append(r)
         self.tables = tables
         self.n_rows = len(survivors)
+        self.n_dead = 0

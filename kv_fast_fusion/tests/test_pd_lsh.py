@@ -250,7 +250,8 @@ def test_evict_owner_removes_all_of_one_requests_reps():
     assert matched == [True] and hits == [(0, hash("reqB"), 0)], "the survivor still matches"
 
 
-def test_evict_owner_leaves_buckets_pointing_only_at_live_rows():
+def test_evict_owner_leaves_buckets_pointing_only_at_live_rows(monkeypatch):
+    monkeypatch.setattr(pd_lsh, "LSH_COMPACT_DEAD_FRAC", 0.0)     # eager: test compaction itself
     torch.manual_seed(19)
     reps = torch.randn(12, 16).tolist()
     idx, _proj = _index_with(reps, [f"r{i // 3}" for i in range(12)])   # 4 owners x 3 reps
@@ -339,7 +340,8 @@ def test_rel_err_is_not_recorded_without_norms():
     assert sum(idx.accept_cos) == 1 and sum(idx.accept_rel_err) == 0
 
 
-def test_norms_survive_eviction_and_compaction():
+def test_norms_survive_eviction_and_compaction(monkeypatch):
+    monkeypatch.setattr(pd_lsh, "LSH_COMPACT_DEAD_FRAC", 0.0)     # eager: test compaction itself
     torch.manual_seed(31)
     reps = torch.randn(6, 8).tolist()
     cur = _norm(reps)
@@ -458,3 +460,53 @@ def test_min_cos_for_budget_inverts_min_rel_err():
     assert pd_lsh.min_cos_for_budget(0.30) == pytest.approx(0.9539392, abs=1e-6)
     assert pd_lsh.min_cos_for_budget(0.20) == pytest.approx(0.9797959, abs=1e-6)
     assert pd_lsh.min_cos_for_budget(1.0) == 0.0, "an inert budget rules nothing out"
+
+
+# =====================================================================================
+# lazy compaction (BFF_LSH_COMPACT_DEAD_FRAC)
+# =====================================================================================
+def test_a_small_eviction_leaves_dead_rows_but_never_returns_them(monkeypatch):
+    """Every block free evicts, so compacting each time cost ~0.6 ms/step; dead rows wait instead."""
+    monkeypatch.setattr(pd_lsh, "LSH_COMPACT_DEAD_FRAC", 0.25)
+    monkeypatch.setattr(pd_lsh, "LSH_COMPACT_MIN_DEAD", 256)
+    torch.manual_seed(37)
+    reps = torch.randn(12, 16)
+    idx, proj = _index_with(reps.tolist(), [f"r{i // 3}" for i in range(12)])
+    assert idx.evict_owners(["r0"]) == 3
+    assert idx.n_dead == 3 and idx.n_rows == 12, "not compacted yet"
+    assert idx.size() == 9, "size counts live reps only"
+    matched, _ = _probe(idx, proj, [reps[0].tolist()], ["q"])
+    assert matched == [False], "an evicted rep is never matched"
+    matched, _ = _probe(idx, proj, [reps[5].tolist()], ["q"])
+    assert matched == [True], "a live one still is"
+
+
+def test_crossing_the_dead_threshold_compacts(monkeypatch):
+    monkeypatch.setattr(pd_lsh, "LSH_COMPACT_DEAD_FRAC", 0.25)
+    monkeypatch.setattr(pd_lsh, "LSH_COMPACT_MIN_DEAD", 2)
+    torch.manual_seed(41)
+    reps = torch.randn(12, 16)
+    idx, proj = _index_with(reps.tolist(), [f"r{i // 3}" for i in range(12)])
+    idx.evict_owners(["r0"])                  # 3 dead >= max(2, 0.25 x 12) -> compact
+    assert idx.n_dead == 0 and idx.n_rows == 9
+    assert set(idx.meta) == set(range(9))
+    for rows in (b for t in idx.tables for b in t.values()):
+        assert all(r < idx.n_rows for r in rows)
+    matched, _ = _probe(idx, proj, [reps[11].tolist()], ["q"])
+    assert matched == [True]
+
+
+def test_at_capacity_dead_rows_are_reclaimed_before_live_ones_are_dropped(monkeypatch):
+    monkeypatch.setattr(pd_lsh, "LSH_MAX_ENTRIES", 8)
+    monkeypatch.setattr(pd_lsh, "LSH_COMPACT_DEAD_FRAC", 0.25)
+    monkeypatch.setattr(pd_lsh, "LSH_COMPACT_MIN_DEAD", 256)
+    torch.manual_seed(43)
+    reps = torch.randn(8, 16).tolist()
+    idx, _proj = _index_with(reps, [f"r{i // 2}" for i in range(8)])
+    idx.evict_owners(["r0", "r1"])            # 4 dead, below MIN_DEAD -> still 8 rows
+    assert idx.n_rows == 8 and idx.size() == 4
+    cur = _norm(torch.randn(1, 16).tolist())
+    proj = pd_lsh.get_proj([None], 16, cur.device)
+    idx.register(cur, pd_lsh.sub_hashes(cur, proj), [(0, 99, 0, "new")])
+    assert idx.size() == 5, "no live rep was evicted to make room"
+    assert {m[2] for m in idx.meta.values()} == {"r2", "r3", "new"}
