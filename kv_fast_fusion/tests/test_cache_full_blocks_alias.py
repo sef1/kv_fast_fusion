@@ -29,8 +29,9 @@ class _RecordingStock:
     def __call__(self, pool, request, blocks, num_cached_blocks, num_full_blocks,
                  block_size, kv_cache_group_id):
         # The whole point of the wrapper: stock must never receive an already-hashed block.
-        for i in range(num_cached_blocks, num_full_blocks):
-            assert blocks[i].block_hash is None, (
+        # Slice like stock does, so a block list shorter than num_full_blocks is tolerated here too.
+        for i, blk in enumerate(blocks[num_cached_blocks:num_full_blocks], num_cached_blocks):
+            assert blk.block_hash is None, (
                 f"stock received an already-hashed block at absolute index {i}")
         self.calls.append((num_cached_blocks, num_full_blocks))
 
@@ -99,6 +100,21 @@ def test_empty_range_returns_without_calling_stock():
     calls, skips = _run(4, hashed_idx=(), num_cached=3, num_full=3)
     assert calls == []
     assert skips == 0
+
+
+def test_a_block_list_shorter_than_num_full_blocks_does_not_crash():
+    """Stock slices `blocks[num_cached:num_full]` and tolerates a short list; the wrapper indexed
+    every position and raised IndexError on GLM. With no hashed block it must pass the original
+    arguments straight through, exactly as stock would receive them."""
+    calls, skips = _run(3, hashed_idx=(), num_cached=0, num_full=5)
+    assert calls == [(0, 5)]
+    assert skips == 0
+
+
+def test_a_short_list_with_a_hashed_block_bounds_the_segments_to_what_exists():
+    calls, skips = _run(4, hashed_idx=(1,), num_cached=0, num_full=6)
+    assert calls == [(0, 1), (2, 4)]
+    assert skips == 1
 
 
 if __name__ == "__main__":

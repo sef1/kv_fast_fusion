@@ -386,9 +386,14 @@ def patched_cache_full_blocks(
     if num_cached_blocks >= num_full_blocks:
         return
 
+    # Stock slices `blocks[num_cached_blocks:num_full_blocks]`, which tolerates a block list shorter
+    # than `num_full_blocks` (seen on GLM under async scheduling: IndexError here, nothing in stock).
+    # Scan only the blocks that exist, so this wrapper never fails where stock would not.
+    end = min(num_full_blocks, len(blocks))
+
     # Absolute indices of blocks that already carry a hash (shared/aliased) → must be skipped.
     hashed = {
-        i for i in range(num_cached_blocks, num_full_blocks)
+        i for i in range(num_cached_blocks, end)
         if getattr(blocks[i], "block_hash", None) is not None
     }
 
@@ -401,8 +406,8 @@ def patched_cache_full_blocks(
 
     # Hand each maximal run of unhashed blocks to stock, with absolute bounds.
     start = None
-    for i in range(num_cached_blocks, num_full_blocks + 1):
-        if i < num_full_blocks and i not in hashed:
+    for i in range(num_cached_blocks, end + 1):
+        if i < end and i not in hashed:
             if start is None:
                 start = i
             continue
