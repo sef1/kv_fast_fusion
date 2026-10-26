@@ -697,6 +697,8 @@ run_benchmark() {
     mode="THROUGHPUT-only (no F1, ignore_eos, fixed output=${FIXED_OUTPUT_LEN})"
   else
     eval_flags="--compute-f1 --compute-code-metrics"
+    # Also average F1 over every prompt with failed / thinking-only requests scored 0 (same set per arm).
+    [[ "${SCORE_FAILED_AS_ZERO:-1}" == "1" ]] && eval_flags="${eval_flags} --score-failed-as-zero"
     max_tok_flag="${MAX_TOKENS}"
     mode="F1 benchmark"
   fi

@@ -135,6 +135,10 @@ async def _parse_stream(response, st: float) -> Dict[str, Any]:
     parts: List[str] = []
     finish_reason = None
     completion_tokens = None
+    # Reasoning models served with --reasoning-parser stream their thinking as `reasoning_content`.
+    # It is not the answer (F1 scores `content` only), but a request that spends all of max_tokens
+    # thinking returns empty content and must be told apart from a real failure.
+    reasoning_chars = 0
     async for raw in response.content:
         line = raw.decode("utf-8", "ignore").strip()
         if not line or not line.startswith("data:"):
@@ -155,7 +159,11 @@ async def _parse_stream(response, st: float) -> Dict[str, Any]:
         c0 = choices[0]
         if c0.get("finish_reason"):
             finish_reason = c0["finish_reason"]
-        tok = (c0.get("delta") or {}).get("content")
+        delta = c0.get("delta") or {}
+        reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+        if reasoning:
+            reasoning_chars += len(reasoning)
+        tok = delta.get("content")
         if tok:
             now = time.perf_counter()
             if ttft == 0.0:
@@ -169,6 +177,8 @@ async def _parse_stream(response, st: float) -> Dict[str, Any]:
         len(itl) + 1 if parts else 0)
     return {
         "generated_text": content,
+        "reasoning_chars": reasoning_chars,
+        "thinking_only": (not content) and reasoning_chars > 0,
         "finish_reason": finish_reason,
         "completion_tokens": completion_tokens,
         "gen_chars": len(content),
@@ -339,6 +349,9 @@ async def main():
     parser.add_argument("--disable-tqdm", action="store_true")
     parser.add_argument("--no-stream", dest="stream", action="store_false")
     parser.add_argument("--max-tokens", type=int, default=6000)
+    parser.add_argument("--score-failed-as-zero", action="store_true",
+                        help="Also report F1 over every prompt, scoring failed and thinking-only "
+                             "requests as 0, so runs are compared over the same set.")
     parser.add_argument("--ignore-eos", action="store_true",
                         help="Never stop on EOS: every request decodes exactly --max-tokens. "
                              "Throughput-only mode — removes generation-length as a confound.")
@@ -374,8 +387,13 @@ async def main():
 
     elapsed = end_time - start_time
     n_ok = sum(1 for o in outputs if o["success"])
+    n_thinking = sum(1 for o in outputs if not o["success"] and o.get("thinking_only"))
+    n_errors = len(outputs) - n_ok - n_thinking
     print(f"Inference completed in {elapsed:.2f} s  |  {n_ok}/{len(outputs)} ok  |  "
           f"achieved {len(outputs)/elapsed:.2f} req/s")
+    if n_thinking or n_errors:
+        print(f"  not ok: {n_thinking} thinking-only (hit max_tokens before answering) | "
+              f"{n_errors} error/empty")
 
     ok_outs = [o for o in outputs if o.get("success")]
     n_len = sum(1 for o in ok_outs if o.get("finish_reason") == "length")
@@ -500,6 +518,14 @@ async def main():
             eval_results["mean_f1"] = mean_f1
             eval_results["per_sample_f1"] = f1_scores
             print(f"  Mean F1 Score: {mean_f1:.4f} (over {len(f1_scores)} samples)")
+            if args.score_failed_as_zero:
+                # Every prompt with a reference counts, failed and thinking-only ones as 0, so two
+                # runs are averaged over the same set instead of each dropping its own hardest cases.
+                n_scored = sum(1 for sid in sample_ids if references.get(sid))
+                all_f1 = float(np.sum(f1_scores)) / n_scored if n_scored else None
+                eval_results["mean_f1_all_prompts"] = all_f1
+                if all_f1 is not None:
+                    print(f"  Mean F1, failed scored as 0: {all_f1:.4f} (over {n_scored} prompts)")
 
         if args.compute_code_metrics and eval_preds:
             mean_ast = float(np.mean(ast_valid_scores)) * 100
@@ -531,6 +557,8 @@ async def main():
             "max_tokens": args.max_tokens, "stream": args.stream,
         },
         "completed": n_ok,
+        "thinking_only": n_thinking,
+        "errors": n_errors,
         "elapsed_s": elapsed,
         "request_throughput_rps": (len(outputs) / elapsed) if elapsed else None,
         "finish_length_pct": length_pct,
