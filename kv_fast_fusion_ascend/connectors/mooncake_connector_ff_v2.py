@@ -401,6 +401,19 @@ def piggyback_sign_here(sig_piggyback: bool, is_producer: bool, dedup_enabled: b
     return bool(sig_piggyback and is_producer and dedup_enabled)
 
 
+def claim_piggyback_sign(holder, meta) -> bool:
+    """True the first time ``holder`` asks for this step's connector ``meta``, False after.
+
+    Signing is reached from ``wait_for_save`` and, at TP>1, from ``get_kv_connector_stats`` — in
+    either order, because with a speculative config vllm-ascend defers finalize and the stats are
+    taken first. Holds the object, not ``id(meta)``: a freed metadata's id can be reused by the next
+    step's, which would silently skip that step."""
+    if meta is None or getattr(holder, "_ff_signed_meta", None) is meta:
+        return False
+    holder._ff_signed_meta = meta
+    return True
+
+
 def signature_request_and_plan_groups(aligned, groups=None):
     """The two block-id spaces this transport has to keep apart, from one aligned pair per group.
 
@@ -3090,6 +3103,7 @@ if _ASCEND_AVAILABLE:
         _logged_mirror_drift = False
         _warned_piggyback_barrier = False
         _said_piggyback_skipped = False
+        _said_piggyback_stats = False
 
         def __init__(self, vllm_config, role, kv_cache_config=None):
             super().__init__(vllm_config, role, kv_cache_config)
@@ -3120,6 +3134,15 @@ if _ASCEND_AVAILABLE:
             # can pick its own.
             sigs: dict = {}
             worker = self.connector_worker
+            if worker is not None and tp_group_if_sharded() is not None:
+                deferred = getattr(self, "_ff_signed_meta", None) is not getattr(
+                    self, "_connector_metadata", None)
+                self._ff_piggyback_sign()
+                n = len(getattr(worker, "_sig_outbox", None) or {})
+                if n and not MooncakeConnectorFFv2._said_piggyback_stats:
+                    MooncakeConnectorFFv2._said_piggyback_stats = True
+                    logger.info("BFF pull-v2 producer: piggyback: %d request(s) signed into "
+                                "connector stats (deferred finalize=%s).", n, deferred)
             outbox = getattr(worker, "_sig_outbox", None) if worker is not None else None
             if outbox:
                 worker._sig_outbox = {}
@@ -3151,6 +3174,20 @@ if _ASCEND_AVAILABLE:
             # Piggyback (Update 13): sign this step's just-finished requests and stage them for the
             # scheduler to staple onto kv_transfer_params. AFTER super().wait_for_save() so the save
             # barrier (when on) has settled the KV — see precompute_and_offer.
+            self._ff_piggyback_sign()
+
+        def _ff_piggyback_sign(self) -> None:
+            """Sign this step's finished prefills once per connector metadata.
+
+            Called from ``wait_for_save`` and, at TP>1, from ``get_kv_connector_stats``. With a
+            speculative config vllm-ascend defers finalize (``defer_finalize=True``), so vLLM takes
+            the connector stats BEFORE ``wait_for_save`` runs — signing only there filled the outbox
+            one step after ``request_finished`` had already stapled an empty set (GLM-5.1 + MTP:
+            ``piggyback_hits 0`` on every rank). Whichever call comes first signs; the other is a
+            no-op. The forward has completed by the stats call, and group 0 (where the MTP layer's
+            not-yet-written KV lives) is never signed."""
+            if not claim_piggyback_sign(self, getattr(self, "_connector_metadata", None)):
+                return
             sign_here = piggyback_sign_here(v1.SIG_PIGGYBACK, getattr(self, "_is_producer", False),
                                             pd_dedup_v2.V2_ENABLED)
             if (v1.SIG_PIGGYBACK and not sign_here

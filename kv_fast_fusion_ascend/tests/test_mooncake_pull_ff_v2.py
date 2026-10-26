@@ -2968,9 +2968,35 @@ def test_wait_for_save_asks_the_gate_before_it_signs():
     src = inspect.getsource(v2)
     fn = src[src.rindex("        def wait_for_save(self):"):]
     fn = fn[:fn.index("        def request_finished_all_groups")]
+    assert "self._ff_piggyback_sign()" in fn
+    fn = fn[fn.index("        def _ff_piggyback_sign(self)"):]
     assert "piggyback_sign_here(" in fn
+    assert fn.index("claim_piggyback_sign(") < fn.index("piggyback_sign_here(")
     assert fn.index("piggyback_sign_here(") < fn.index("precompute_and_offer(")
     assert "if sign_here and self.connector_worker is not None" in fn
+
+
+def test_piggyback_signs_once_per_step_metadata_in_either_order():
+    """MTP: vllm-ascend defers finalize, so stats are taken BEFORE wait_for_save. Whichever call
+    comes first signs this step's prefills; the second is a no-op; the next step signs again."""
+    holder = types.SimpleNamespace()
+    step1, step2 = object(), object()
+    assert v2.claim_piggyback_sign(holder, step1) is True       # get_kv_connector_stats (deferred)
+    assert v2.claim_piggyback_sign(holder, step1) is False      # the later wait_for_save
+    assert v2.claim_piggyback_sign(holder, step2) is True       # next step
+    assert v2.claim_piggyback_sign(holder, None) is False       # no metadata bound
+
+
+def test_sharded_stats_sign_before_draining_the_outbox():
+    """At TP>1 the stats call must sign first, or a deferred finalize ships this step's sigs a step
+    after request_finished has stapled an empty set (GLM-5.1 + MTP: piggyback_hits 0)."""
+    import inspect
+
+    src = inspect.getsource(v2)
+    fn = src[src.index("        def get_kv_connector_stats(self):"):]
+    fn = fn[:fn.index("        def save_kv_layer")]
+    assert "self._ff_piggyback_sign()" in fn
+    assert fn.index("self._ff_piggyback_sign()") < fn.index("worker._sig_outbox = {}")
 
 
 # =====================================================================================

@@ -208,6 +208,12 @@ BFF_V2_PROTECT_HOT_BLOCKS=${BFF_V2_PROTECT_HOT_BLOCKS:-1}
 # This, not BFF_THRESHOLD, governs accuracy — cosine is scale-free, so a pair can clear any cosine
 # bar and still be a bad substitution. 1.0 is inert. Note min_r rel_err = sqrt(1-cos^2), so a 0.3
 # budget implies cos >= 0.954 whatever the norms do.
+# REL_ERR is accepted as a shorthand: a GLM run passed REL_ERR=0.15, which nothing read, and ran
+# at 1.0 (stats: max_rel_err 1.0) while being labelled as the 0.15 arm.
+if [[ -n "${REL_ERR:-}" && -z "${BFF_MAX_REL_ERR:-}" ]]; then
+  echo "REL_ERR=${REL_ERR} -> BFF_MAX_REL_ERR"
+  BFF_MAX_REL_ERR=${REL_ERR}
+fi
 BFF_MAX_REL_ERR=${BFF_MAX_REL_ERR:-1.0}
 # Which layers of a fusion group feed the signature. "first" (default) uses only the group's first
 # layer, which is all that exists when layerwise wants to send it, and preserves the compute/
