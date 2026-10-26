@@ -369,6 +369,29 @@ def _wrap_scheduler_promotion(scheduler_cls) -> bool:
     return True
 
 
+def _bff_ingest_piggyback_sigs(model_runner_output) -> int:
+    """Stash the producer's TP>1 piggybacked signatures for ``request_finished`` to staple.
+
+    At TP>1 the worker cannot reach the scheduler's ``_FF_SIGS``, so its signatures ride
+    ``kv_connector_stats.data["bff_sigs"] = {ext_id: {tp_rank: {gi: payload}}}`` (merge_stats.py).
+    Must run BEFORE the original ``update_from_output``: that is where a finished prefill's
+    ``request_finished`` staples ``ff_sigs`` onto its ``kv_transfer_params``. Returns how many
+    requests were stashed; a no-op at TP=1 and on the decode."""
+    kvo = getattr(model_runner_output, "kv_connector_output", None)
+    data = getattr(getattr(kvo, "kv_connector_stats", None), "data", None)
+    sigs = data.get("bff_sigs") if isinstance(data, dict) else None
+    if not sigs:
+        return 0
+    from kv_fast_fusion_ascend.connectors import mooncake_connector_ff as _v1
+    stash = getattr(_v1, "_FF_SIGS", None)        # defined only where the Ascend stack imports
+    if stash is None:
+        return 0
+    for ext_id, by_rank in sigs.items():
+        if by_rank:
+            stash.offer(ext_id, {"ranks": dict(by_rank)})
+    return len(sigs)
+
+
 def _wrap_scheduler_update_from_output(cls) -> bool:
     """Wrap ``cls.update_from_output`` (only if the class DEFINES it in its own __dict__) so the BFF
     merge hook runs before the original. Returns True if it wrapped. Idempotent."""
@@ -377,6 +400,10 @@ def _wrap_scheduler_update_from_output(cls) -> bool:
         return False
 
     def wrapped(self, scheduler_output, model_runner_output, _orig=orig):
+        try:
+            _bff_ingest_piggyback_sigs(model_runner_output)
+        except Exception as e:      # pragma: no cover - a missed staple only costs an exchange
+            logger.warning("BFF Ascend piggyback-signature ingest failed: %s", e)
         _bff_apply_block_merge(self, model_runner_output)
         try:
             _bff_sweep_late_maps(self)

@@ -604,6 +604,20 @@ def ff_sig_encode(sigs_by_group) -> "dict | None":
     return out or None
 
 
+def ff_sig_encode_any(stash) -> "dict | None":
+    """Encode what :class:`FFSigStash` holds for one request, in either shape.
+
+    At TP=1 that is ``{gi: payload}`` (encoded exactly as before). At TP>1 the producer scheduler
+    receives every rank's signatures through the connector stats and stashes
+    ``{"ranks": {tp_rank: {gi: payload}}}``: each rank signs its own head shard, so each decode rank
+    must get its own. Encoded as ``{"ranks": {"<rank>": <ff_sig_encode of that rank>}}``."""
+    if isinstance(stash, dict) and "ranks" in stash:
+        ranks = {str(int(r)): enc for r, m in (stash.get("ranks") or {}).items()
+                 if (enc := ff_sig_encode(m))}
+        return {"ranks": ranks} if ranks else None
+    return ff_sig_encode(stash)
+
+
 def ff_sig_decode(raw) -> "dict | None":
     """Inverse of :func:`ff_sig_encode`: coerce the ``ff_sigs`` field back from its JSON round trip.
 
@@ -613,6 +627,18 @@ def ff_sig_decode(raw) -> "dict | None":
     not decode simply falls back to the on-demand exchange, never a wrong alias."""
     if not isinstance(raw, dict) or not raw:
         return None
+    if "ranks" in raw:
+        # TP>1 shape (see ff_sig_encode_any): one payload set per producer rank.
+        ranks = {}
+        for r, per_rank in (raw.get("ranks") or {}).items():
+            try:
+                rank = int(r)
+            except (TypeError, ValueError):
+                continue
+            dec = ff_sig_decode(per_rank)
+            if dec:
+                ranks[rank] = dec
+        return {"ranks": ranks} if ranks else None
     out: dict[int, dict] = {}
     for gi, payload in raw.items():
         try:
@@ -1108,7 +1134,7 @@ if _ASCEND_AVAILABLE:
             # and D falls back to the on-demand exchange — best-effort, never a wrong alias.
             ff_sigs = None
             if SIG_PIGGYBACK:
-                ff_sigs = ff_sig_encode(_FF_SIGS.take(_ext_of(request.request_id)))
+                ff_sigs = ff_sig_encode_any(_FF_SIGS.take(_ext_of(request.request_id)))
             return delay_free_blocks, dict(
                 do_remote_prefill=True,
                 do_remote_decode=False,

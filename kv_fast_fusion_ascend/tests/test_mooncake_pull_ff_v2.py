@@ -2971,3 +2971,79 @@ def test_wait_for_save_asks_the_gate_before_it_signs():
     assert "piggyback_sign_here(" in fn
     assert fn.index("piggyback_sign_here(") < fn.index("precompute_and_offer(")
     assert "if sign_here and self.connector_worker is not None" in fn
+
+
+# =====================================================================================
+# TP>1 signature piggyback: per-rank payloads across the worker -> scheduler -> decode hops
+# =====================================================================================
+def test_rank_keyed_sigs_survive_the_json_proxy_round_trip():
+    """At TP>1 each producer rank signs its own head shard; every rank's set must reach D intact."""
+    import json
+
+    from kv_fast_fusion_ascend.connectors import mooncake_connector_ff as v1
+    stash = {"ranks": {0: {1: _pyld(4)}, 1: {1: _pyld(3)}}}
+    wire = json.loads(json.dumps(v1.ff_sig_encode_any(stash)))
+    back = v1.ff_sig_decode(wire)
+    assert set(back["ranks"]) == {0, 1}
+    for r in (0, 1):
+        assert back["ranks"][r][1]["sig"] == stash["ranks"][r][1]["sig"]
+
+
+def test_the_tp1_signature_format_is_unchanged():
+    from kv_fast_fusion_ascend.connectors import mooncake_connector_ff as v1
+    sigs = {1: _pyld(2)}
+    assert v1.ff_sig_encode_any(sigs) == v1.ff_sig_encode(sigs)
+    assert v1.ff_sig_encode_any(None) is None
+
+
+def test_a_rank_whose_sigs_do_not_decode_is_dropped_not_fatal():
+    from kv_fast_fusion_ascend.connectors import mooncake_connector_ff as v1
+    import json
+    good = json.loads(json.dumps(v1.ff_sig_encode({1: _pyld(2)})))
+    back = v1.ff_sig_decode({"ranks": {"0": good, "1": {"1": {"sig": "!!bad!!", "dim": 8}}}})
+    assert set(back["ranks"]) == {0}
+    assert v1.ff_sig_decode({"ranks": {"1": {"1": {"sig": "!!bad!!", "dim": 8}}}}) is None
+
+
+def test_each_decode_rank_keeps_only_its_own_signatures():
+    staged = {"reqA": {"ranks": {0: {1: "p0"}, 1: {1: "p1"}}},
+              "reqB": {"ranks": {1: {1: "only-rank-1"}}},
+              "reqC": {1: "tp1-format"}}
+    assert v2.select_rank_sigs(staged, 0) == {"reqA": {1: "p0"}, "reqC": {1: "tp1-format"}}
+    assert v2.select_rank_sigs(staged, 1) == {"reqA": {1: "p1"}, "reqB": {1: "only-rank-1"},
+                                              "reqC": {1: "tp1-format"}}
+
+
+def test_merge_stats_unions_signatures_across_ranks_and_keeps_one_merge_map():
+    from kv_fast_fusion_ascend.connectors.merge_stats import BFFMergeStats
+    a = BFFMergeStats(data={"bff_merges": {"r": {1: [1, 2]}}, "bff_sigs": {"e": {0: "s0"}}})
+    b = BFFMergeStats(data={"bff_merges": {"r": {1: [1, 2]}}, "bff_sigs": {"e": {1: "s1"},
+                                                                           "f": {1: "t1"}}})
+    agg = a.aggregate(b)
+    assert agg.data["bff_sigs"] == {"e": {0: "s0", 1: "s1"}, "f": {1: "t1"}}
+    assert agg.data["bff_merges"] == {"r": {1: [1, 2]}}, "merges are never concatenated"
+    assert not BFFMergeStats(data={"bff_merges": {}, "bff_sigs": {"e": {0: "s"}}}).is_empty()
+    assert BFFMergeStats(data={"bff_merges": {}, "bff_sigs": {}}).is_empty()
+
+
+def test_the_producer_scheduler_stashes_every_ranks_signatures_for_the_staple(monkeypatch):
+    import kv_fast_fusion_ascend.fast_fusion_ascend_patch as patch
+    from kv_fast_fusion_ascend.connectors import mooncake_connector_ff as v1
+    monkeypatch.setattr(v1, "_FF_SIGS", v1.FFSigStash(), raising=False)  # Ascend-only global
+    stats = types.SimpleNamespace(data={"bff_sigs": {"ext-1": {0: {1: "s0"}, 1: {1: "s1"}}}})
+    mro = types.SimpleNamespace(kv_connector_output=types.SimpleNamespace(kv_connector_stats=stats))
+    assert patch._bff_ingest_piggyback_sigs(mro) == 1
+    assert v1._FF_SIGS.take("ext-1") == {"ranks": {0: {1: "s0"}, 1: {1: "s1"}}}
+    assert patch._bff_ingest_piggyback_sigs(types.SimpleNamespace(kv_connector_output=None)) == 0
+
+
+def test_a_sharded_producer_routes_signatures_to_the_outbox_not_the_local_stash():
+    import inspect
+
+    src = inspect.getsource(v2)
+    body = src[src.index("def precompute_and_offer"):]
+    body = body[:body.index("def serve_signatures_cached")]
+    assert "tp_group_if_sharded() is not None" in body and "self._sig_outbox[ext_id]" in body
+    stats_fn = src[src.index("        def get_kv_connector_stats(self):"):]
+    stats_fn = stats_fn[:stats_fn.index("        def save_kv_layer")]
+    assert '"bff_sigs": sigs' in stats_fn

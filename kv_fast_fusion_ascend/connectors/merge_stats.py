@@ -10,6 +10,10 @@ produce is on the scheduler's side of that boundary.
 ``KVConnectorOutput.kv_connector_stats`` is the only serializable connector→scheduler slot, so the
 map rides it: ``data["bff_merges"] = {req_id: {group_idx: [block_ids]}}``.
 
+The producer's piggybacked signatures cross the same boundary the same way:
+``data["bff_sigs"] = {ext_id: {tp_rank: {group_idx: payload}}}``. Unlike the merge map these are
+per-rank (each rank signs its own head shard), so :meth:`aggregate` unions them across ranks.
+
 This is a straight port of the GPU connectors' ``BFFMergeStats``
 (``kv_fast_fusion/connectors/mooncake_connector_ff.py``), lifted into its own module because Ascend
 has **two** v1 transports — the pull connector and the layerwise one — and their v2 subclasses both
@@ -30,16 +34,23 @@ class BFFMergeStats(KVConnectorStats):
         self.data = {}
 
     def aggregate(self, other: "KVConnectorStats") -> "KVConnectorStats":
+        other_data = getattr(other, "data", None) or {}
         # Ranks are coherent → identical maps; keep the accumulator's, never concatenate.
-        if not self.data.get("bff_merges") and getattr(other, "data", None):
-            self.data = other.data
+        if not self.data.get("bff_merges") and other_data.get("bff_merges"):
+            self.data["bff_merges"] = other_data["bff_merges"]
+        # Signatures differ per rank: union them, request by request.
+        if other_data.get("bff_sigs"):
+            mine = self.data.setdefault("bff_sigs", {})
+            for ext_id, by_rank in other_data["bff_sigs"].items():
+                mine.setdefault(ext_id, {}).update(by_rank)
         return self
 
     def reduce(self) -> dict:
-        return {"bff_merge_reqs": len(self.data.get("bff_merges", {}) or {})}
+        return {"bff_merge_reqs": len(self.data.get("bff_merges", {}) or {}),
+                "bff_sig_reqs": len(self.data.get("bff_sigs", {}) or {})}
 
     def is_empty(self) -> bool:
-        return not self.data.get("bff_merges")
+        return not self.data.get("bff_merges") and not self.data.get("bff_sigs")
 
 
 def tp_group_if_sharded():

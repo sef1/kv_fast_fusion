@@ -373,6 +373,23 @@ def slot_trace_fault(prev, cur, block_size):
     return None if c_slot % block_size == 0 else "slot_not_advanced_in_block"
 
 
+def select_rank_sigs(staged: dict, tp_rank: int) -> dict:
+    """``{req: sigs}`` as this decode rank should see it.
+
+    At TP>1 a request's piggybacked signatures arrive as ``{"ranks": {rank: {gi: payload}}}`` (each
+    producer rank signs its own head shard); keep this rank's set, and drop the request when its rank
+    is missing so that rank falls back to the on-demand exchange. TP=1 entries pass through."""
+    out = {}
+    for rid, sigs in (staged or {}).items():
+        if isinstance(sigs, dict) and "ranks" in sigs:
+            mine = (sigs.get("ranks") or {}).get(tp_rank)
+            if mine:
+                out[rid] = mine
+        elif sigs:
+            out[rid] = sigs
+    return out
+
+
 def piggyback_sign_here(sig_piggyback: bool, is_producer: bool, dedup_enabled: bool) -> bool:
     """Sign this step's finished prefills only where the result is used: on the producer, and only
     when the decode will dedup with it.
@@ -2572,6 +2589,9 @@ if _ASCEND_AVAILABLE:
             # Requests that completed prefill in a step but lost the piggyback to the per-step cap —
             # each one is an on-demand round trip the decode pays in front of its transfer.
             self._sig_precompute_overflow = 0
+            # TP>1 piggyback: signatures signed here cannot reach the scheduler's _FF_SIGS (another
+            # process), so they wait here for get_kv_connector_stats to carry them across.
+            self._sig_outbox: dict = {}
             # NOTE (Update 34): this init used to be bracketed by mem probes, hunting the flat
             # 0.88 GiB by which BFF's `Available KV cache memory` trails the baseline's. It cannot be
             # here. `ensure_kv_transfer_initialized` — which constructs this object — runs in
@@ -2593,6 +2613,8 @@ if _ASCEND_AVAILABLE:
             self._kv_usage = getattr(metadata, "kv_usage", None)
             if v1.SIG_PIGGYBACK and self.kv_recv_thread is not None:
                 sigs = getattr(metadata, "ff_sigs", None)
+                if sigs:
+                    sigs = select_rank_sigs(sigs, int(getattr(self, "tp_rank", 0)))
                 if sigs:
                     staged = self.kv_recv_thread.piggyback_sigs
                     staged.update(sigs)
@@ -2978,7 +3000,10 @@ if _ASCEND_AVAILABLE:
                     if payload is not None:
                         payload_by_group[int(gi)] = payload
                 if payload_by_group:
-                    v1._FF_SIGS.offer(ext_id, payload_by_group)
+                    if tp_group_if_sharded() is not None:
+                        self._sig_outbox[ext_id] = payload_by_group
+                    else:
+                        v1._FF_SIGS.offer(ext_id, payload_by_group)
                     n += 1
             return n
 
@@ -3090,8 +3115,18 @@ if _ASCEND_AVAILABLE:
             process. That is the whole "no block free under TP=2" symptom."""
             merges = self._ff_pending_merges
             self._ff_pending_merges = None
-            if merges and tp_group_if_sharded() is not None:
-                return BFFMergeStats(data={"bff_merges": merges})
+            # The producer's piggybacked signatures, at TP>1 (see precompute_and_offer): this rank's
+            # share, keyed by rank so the scheduler can staple every rank's set and each decode rank
+            # can pick its own.
+            sigs: dict = {}
+            worker = self.connector_worker
+            outbox = getattr(worker, "_sig_outbox", None) if worker is not None else None
+            if outbox:
+                worker._sig_outbox = {}
+                rank = int(getattr(worker, "tp_rank", 0))
+                sigs = {ext_id: {rank: payload} for ext_id, payload in outbox.items()}
+            if (merges or sigs) and tp_group_if_sharded() is not None:
+                return BFFMergeStats(data={"bff_merges": merges or {}, "bff_sigs": sigs})
             return super().get_kv_connector_stats()
 
         def save_kv_layer(self, layer_name, kv_layer, attn_metadata, **kwargs) -> None:
