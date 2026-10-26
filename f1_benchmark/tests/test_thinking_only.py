@@ -64,3 +64,44 @@ def test_a_plain_model_is_unaffected():
 def test_an_empty_stream_is_not_mistaken_for_thinking():
     rec = _parse([{}])
     assert rec["generated_text"] == "" and rec["thinking_only"] is False
+
+
+def test_requests_ask_reasoning_models_not_to_think_by_default(monkeypatch):
+    """The payload must carry chat_template_kwargs {"enable_thinking": false} unless asked."""
+    import f1_benchmark.f1_main as fm
+
+    sent = []
+
+    class _Resp:
+        status = 200
+        content = _Lines([b'data: {"choices": [{"delta": {"content": "x"}, "finish_reason": "stop"}]}\n',
+                          b"data: [DONE]\n"])
+
+        def raise_for_status(self):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    class _Session:
+        def __init__(self, *a, **k):
+            pass
+
+        def post(self, url, headers=None, json=None):
+            sent.append(json)
+            return _Resp()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    monkeypatch.setattr(fm.aiohttp, "ClientSession", _Session)
+    asyncio.run(fm.run_api_inference(["p"], "m", "http://x", disable_tqdm=True,
+                                     chat_template_kwargs={"enable_thinking": False}))
+    assert sent and sent[0]["chat_template_kwargs"] == {"enable_thinking": False}
+    assert sent[0]["temperature"] == 0.0, "greedy by default"

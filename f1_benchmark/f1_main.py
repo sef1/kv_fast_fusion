@@ -202,6 +202,7 @@ async def run_api_inference(
     disable_tqdm: bool = False,
     stream: bool = True,
     ignore_eos: bool = False,
+    chat_template_kwargs: Dict[str, Any] = None,
 ) -> List[Dict[str, Any]]:
     """Async inference against an OpenAI-compatible server."""
     if gen_config is None:
@@ -222,6 +223,11 @@ async def run_api_inference(
         # This removes generation-length (rambling) as a confound, isolating the pure concurrency/
         # per-step effect of KV freeing from output quality. vLLM's OpenAI server honors this field.
         api_params["ignore_eos"] = True
+    if chat_template_kwargs:
+        # e.g. {"enable_thinking": False}: reasoning models (GLM-4.5+/5, Qwen3) otherwise spend the
+        # budget thinking, and a request that thinks past max_tokens returns no answer at all.
+        # Templates without the variable ignore it.
+        api_params["chat_template_kwargs"] = dict(chat_template_kwargs)
 
     n = len(prompts)
     results: List[Any] = [None] * n
@@ -349,9 +355,13 @@ async def main():
     parser.add_argument("--disable-tqdm", action="store_true")
     parser.add_argument("--no-stream", dest="stream", action="store_false")
     parser.add_argument("--max-tokens", type=int, default=6000)
-    parser.add_argument("--score-failed-as-zero", action="store_true",
+    parser.add_argument("--score-failed-as-zero", action=argparse.BooleanOptionalAction,
+                        default=True,
                         help="Also report F1 over every prompt, scoring failed and thinking-only "
-                             "requests as 0, so runs are compared over the same set.")
+                             "requests as 0, so runs are compared over the same set (default on).")
+    parser.add_argument("--enable-thinking", action=argparse.BooleanOptionalAction, default=False,
+                        help="Let reasoning models think. Off by default: requests carry "
+                             'chat_template_kwargs {"enable_thinking": false}.')
     parser.add_argument("--ignore-eos", action="store_true",
                         help="Never stop on EOS: every request decodes exactly --max-tokens. "
                              "Throughput-only mode — removes generation-length as a confound.")
@@ -375,13 +385,14 @@ async def main():
     print("\nStarting inference...")
     print(f"  request_rate={args.request_rate}  burstiness={args.burstiness}  "
           f"max_concurrency={args.max_concurrency}  num_prompts={len(prompts)}  "
-          f"stream={args.stream}")
+          f"stream={args.stream}  thinking={'on' if args.enable_thinking else 'off'}")
     start_time = time.perf_counter()
     outputs = await run_api_inference(
         prompts, args.model, api_url, gen_config=gen_config,
         request_rate=args.request_rate, burstiness=args.burstiness,
         max_concurrency=args.max_concurrency, request_timeout=args.request_timeout,
         disable_tqdm=args.disable_tqdm, stream=args.stream, ignore_eos=args.ignore_eos,
+        chat_template_kwargs={"enable_thinking": bool(args.enable_thinking)},
     )
     end_time = time.perf_counter()
 
@@ -555,6 +566,7 @@ async def main():
             "request_rate": (args.request_rate if np.isfinite(args.request_rate) else "inf"),
             "burstiness": args.burstiness,
             "max_tokens": args.max_tokens, "stream": args.stream,
+            "enable_thinking": bool(args.enable_thinking),
         },
         "completed": n_ok,
         "thinking_only": n_thinking,

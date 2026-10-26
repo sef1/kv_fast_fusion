@@ -697,8 +697,11 @@ run_benchmark() {
     mode="THROUGHPUT-only (no F1, ignore_eos, fixed output=${FIXED_OUTPUT_LEN})"
   else
     eval_flags="--compute-f1 --compute-code-metrics"
-    # Also average F1 over every prompt with failed / thinking-only requests scored 0 (same set per arm).
-    [[ "${SCORE_FAILED_AS_ZERO:-1}" == "1" ]] && eval_flags="${eval_flags} --score-failed-as-zero"
+    # f1_main defaults: F1 also averaged over every prompt with failed / thinking-only requests
+    # scored 0, and reasoning models asked not to think. SCORE_FAILED_AS_ZERO=0 / ENABLE_THINKING=1
+    # override.
+    [[ "${SCORE_FAILED_AS_ZERO:-1}" == "0" ]] && eval_flags="${eval_flags} --no-score-failed-as-zero"
+    [[ "${ENABLE_THINKING:-0}" == "1" ]] && eval_flags="${eval_flags} --enable-thinking"
     max_tok_flag="${MAX_TOKENS}"
     mode="F1 benchmark"
   fi
