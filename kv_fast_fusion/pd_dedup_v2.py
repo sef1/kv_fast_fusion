@@ -125,6 +125,9 @@ SKIP_REASONS = ("no_kv_tensors", "no_signature", "length_mismatch", "kv_layout_r
 # Buckets for the per-request declined fraction (see DedupStats.note_request_decline). The top ones
 # are deliberately narrow: the difference between a request giving up 75% and 95% of its prompt is
 # the difference between a damaged answer and an answer to someone else's question.
+# Entries kept in DedupStats.request_ledger; well above any benchmark's request count.
+REQUEST_LEDGER_CAP = 20000
+
 DECLINE_BUCKETS = ("0-10%", "10-25%", "25-50%", "50-75%", "75-90%", "90-100%")
 DECLINE_BUCKETS_ORDERED = ((0.90, "90-100%"), (0.75, "75-90%"), (0.50, "50-75%"),
                            (0.25, "25-50%"), (0.10, "10-25%"), (0.0, "0-10%"))
@@ -635,6 +638,11 @@ class DedupStats:
         # declined in all six groups of a single request while the run-level figure read 6.5%.
         self.request_decline_frac = dict.fromkeys(DECLINE_BUCKETS, 0)
         self.requests_capped = 0     # requests read whole because they exceeded MAX_REQ_DECLINE
+        # Per request: {ext_id: {"declined", "planned", "capped", "failed"}}. The decline buckets say
+        # how MANY requests were substituted, not WHICH; joined to the client's per-prompt
+        # response_id (f1_benchmark/alias_attribution.py) this says whether the F1 loss sits on the
+        # aliased prompts or spreads to the rest. Bounded; the first entries win.
+        self.request_ledger: dict = {}
         self._last_dump = 0.0
 
     def note_request_decline(self, declined: int, planned: int) -> None:
@@ -666,9 +674,26 @@ class DedupStats:
         self.rejected_by_rel_err[gi] = (self.rejected_by_rel_err.get(gi, 0)
                                         + plan.rejected_by_rel_err)
 
-    def note_failure(self, reason: str, n: int = 1) -> None:
+    def note_request(self, ext_id: str, declined: int, planned: int, capped: bool) -> None:
+        """Record one request's plan in the ledger (see ``request_ledger``)."""
+        if planned <= 0:
+            return
+        entry = self.request_ledger.get(ext_id)
+        if entry is None:
+            if len(self.request_ledger) >= REQUEST_LEDGER_CAP:
+                return
+            entry = self.request_ledger[ext_id] = {"declined": 0, "planned": 0, "capped": False,
+                                                   "failed": 0}
+        entry["declined"] += int(declined)
+        entry["planned"] += int(planned)
+        entry["capped"] = entry["capped"] or bool(capped)
+
+    def note_failure(self, reason: str, n: int = 1, rid: str | None = None) -> None:
         self.recomputed += n
         self.fail_reasons[reason] = self.fail_reasons.get(reason, 0) + n
+        entry = self.request_ledger.get(rid) if rid is not None else None
+        if entry is not None:
+            entry["failed"] += n
 
     def note_skip(self, reason: str, n: int = 1) -> None:
         """Record that an exchange did NOT happen, and why. See :data:`SKIP_REASONS`."""
@@ -747,6 +772,7 @@ class DedupStats:
             # the distinction the run-level wire saving cannot make.
             "request_decline_frac": dict(self.request_decline_frac),
             "requests_capped": self.requests_capped,
+            "request_ledger": dict(self.request_ledger),
             "signature_phase_failed": self.sig_phase_failed,
             # An all-zero saving means one of two very different things. These separate them:
             # exchanges>0 with no drops = nothing worth merging; exchanges==0 = v2 never ran.
@@ -1201,7 +1227,7 @@ class AliasApplier:
                 done.append(rid)
                 for m in by_group.values():
                     failed.update(m)
-                    stats.note_failure("owner_id_ambiguous", len(m))
+                    stats.note_failure("owner_id_ambiguous", len(m), rid=rid)
                 continue
             if rid not in rid2blocks:
                 if self.step - first_step > APPLY_MAX_AGE:
@@ -1210,7 +1236,7 @@ class AliasApplier:
                     done.append(rid)
                     for m in by_group.values():
                         failed.update(m)
-                        stats.note_failure("owner_never_batched", len(m))
+                        stats.note_failure("owner_never_batched", len(m), rid=rid)
                 continue
             local_rid = rid2local[rid]
             # Mutated in place, so a group that is retried keeps this request's original deadline.
@@ -1224,7 +1250,7 @@ class AliasApplier:
                     rid2blocks, rid, gi, mapping, rid2hot.get(rid, (None, 0)))
                 if hot_victims:
                     failed.update(hot_victims)
-                    stats.note_failure("victim_still_writing", len(hot_victims))
+                    stats.note_failure("victim_still_writing", len(hot_victims), rid=rid)
                     # Written back so a group that goes on to retry (rep_not_resident) does not see
                     # the refused victims again and count them on every step — `by_group` is the
                     # retry state, and `mapping` is now only what survived.
@@ -1279,7 +1305,7 @@ class AliasApplier:
                     continue
                 del by_group[gi]
                 failed.update(mapping)
-                stats.note_failure(why or "block_table_write_refused", len(mapping))
+                stats.note_failure(why or "block_table_write_refused", len(mapping), rid=rid)
             if not by_group:
                 done.append(rid)
         for rid in done:

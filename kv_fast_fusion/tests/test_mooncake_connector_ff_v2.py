@@ -1131,6 +1131,28 @@ def test_each_request_lands_in_the_bucket_for_its_own_fraction():
     assert s.request_decline_frac["90-100%"] == 1
 
 
+def test_the_request_ledger_names_which_requests_were_substituted(monkeypatch):
+    """The buckets count requests; the ledger names them, so F1 can be split aliased vs not."""
+    s = pd_dedup_v2.DedupStats()
+    s.note_request("chatcmpl-a", 3, 10, False)
+    s.note_request("chatcmpl-b", 9, 10, True)
+    s.note_request("chatcmpl-z", 0, 0, False)          # nothing planned: not a request we touched
+    s.note_failure("rep_recycled", 2, rid="chatcmpl-a")
+    s.note_failure("rep_recycled", 1, rid="unknown")   # never planned here: counted, not ledgered
+    s.note_failure("rep_recycled", 1)
+
+    led = s.stats_dict()["request_ledger"]
+    assert led == {"chatcmpl-a": {"declined": 3, "planned": 10, "capped": False, "failed": 2},
+                   "chatcmpl-b": {"declined": 9, "planned": 10, "capped": True, "failed": 0}}
+    assert s.recomputed == 4
+
+    monkeypatch.setattr(pd_dedup_v2, "REQUEST_LEDGER_CAP", 2)
+    s.note_request("chatcmpl-c", 1, 10, False)          # over the cap: dropped
+    s.note_request("chatcmpl-a", 1, 10, False)          # existing entry still accumulates
+    assert "chatcmpl-c" not in s.request_ledger
+    assert s.request_ledger["chatcmpl-a"]["planned"] == 20
+
+
 def test_the_same_average_reads_differently_when_it_is_concentrated():
     """Ten requests at 10% and ten at 5%+95% both average ~10% overall. The histogram is what makes
     those two runs distinguishable — the second has ten ruined requests."""

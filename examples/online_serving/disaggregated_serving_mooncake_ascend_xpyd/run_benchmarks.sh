@@ -1025,6 +1025,8 @@ if v2:
     RC = sum(s.get("aliases_recomputed", 0) for s in v2)
     EX = sum(s.get("exchanges", 0) for s in v2)
     FAIL = sum(s.get("signature_phase_failed", 0) for s in v2)
+    PBH = sum(s.get("piggyback_hits") or 0 for s in v2)
+    PBM = sum(s.get("piggyback_misses") or 0 for s in v2)
     print(f"  bff v2 wire saving: {100.0*D/P if P else 0.0:.1f}% of blocks never requested "
           f"({D} of {P}; {RES} from resident, {SAME} within the same pull) over {len(v2)} node(s)")
     # An all-zero saving reads two completely different ways, and only these separate them:
@@ -1032,6 +1034,10 @@ if v2:
     print(f"    exchanges: {EX} ({FAIL} fell back to a full read) | aliases applied {AP}, "
           f"recomputed {RC}"
           + (f" ({100.0*AP/(AP+RC):.1f}% resolved)" if (AP + RC) else ""))
+    if PBH or PBM:
+        # Piggybacked signatures arrive on kv_transfer_params, so a request served this way makes
+        # no exchange at all: hits are what replace EX, and a fully piggybacked run has EX == 0.
+        print(f"    piggyback: {PBH} hit(s), {PBM} miss(es) — a miss pays an on-demand exchange")
     RT = sum(s.get("sig_batches") or 0 for s in v2)
     if RT:
         # The batched protocol shipped INERT once: 512 requests in 512 round trips, because the
@@ -1065,10 +1071,10 @@ if v2:
         print(f"    async pipeline: exchange ran on ITS OWN thread — {PBUSY/1000:.1f}s over {PBAT} "
               f"round trip(s) ({PBUSY/PBAT:.0f} ms each), {PEX} request(s) exchanged. The recv "
               f"thread's own `exchange` phase should read ~0s above; that gap IS off-critical-path.")
-    if EX == 0:
+    if EX == 0 and PBH == 0:
         print("    -> v2 NEVER ASKED: the mechanism did not engage at all. Check BFF_V2_DEDUP and "
               "the producer's 'signature server (REP) bound on' line in the prefill log.")
-    elif FAIL >= 0.5 * EX:
+    elif EX and FAIL >= 0.5 * EX:
         print(f"    -> {100.0*FAIL/EX:.0f}% of exchanges failed. Grep the PREFILL log: no 'bound on'"
               f" line = the producer never listened; 'bound on' but no 'served' = the decode never "
               f"reached it; both = it answered too slowly (raise BFF_PULL_V2_SIG_TIMEOUT).")

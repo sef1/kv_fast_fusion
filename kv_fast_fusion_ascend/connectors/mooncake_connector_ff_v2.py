@@ -2054,6 +2054,7 @@ if _ASCEND_AVAILABLE:
                 declined, total = decline_fraction(result)
                 stats.note_request_decline(declined, total)
                 result, capped = cap_request_decline(result)
+                stats.note_request(ext_id, declined, total, capped)
                 if capped:
                     # The aliases are already staged in the engine, so dropping the plan is not
                     # enough — forget() must retract them or they would be applied to blocks this

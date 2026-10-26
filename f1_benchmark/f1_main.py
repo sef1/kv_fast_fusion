@@ -139,6 +139,9 @@ async def _parse_stream(response, st: float) -> Dict[str, Any]:
     # It is not the answer (F1 scores `content` only), but a request that spends all of max_tokens
     # thinking returns empty content and must be told apart from a real failure.
     reasoning_chars = 0
+    # The server's id for this completion (chatcmpl-<X-Request-Id>). The P/D proxy sends the decode
+    # the same uuid, so this is what joins a prompt to the decode's per-request BFF ledger.
+    response_id = None
     async for raw in response.content:
         line = raw.decode("utf-8", "ignore").strip()
         if not line or not line.startswith("data:"):
@@ -150,6 +153,8 @@ async def _parse_stream(response, st: float) -> Dict[str, Any]:
             chunk = json.loads(data_str)
         except json.JSONDecodeError:
             continue
+        if response_id is None and chunk.get("id"):
+            response_id = chunk["id"]
         usage = chunk.get("usage")
         if usage:
             completion_tokens = usage.get("completion_tokens")
@@ -177,6 +182,7 @@ async def _parse_stream(response, st: float) -> Dict[str, Any]:
         len(itl) + 1 if parts else 0)
     return {
         "generated_text": content,
+        "response_id": response_id,
         "reasoning_chars": reasoning_chars,
         "thinking_only": (not content) and reasoning_chars > 0,
         "finish_reason": finish_reason,
@@ -472,12 +478,13 @@ async def main():
         _summary_path = args.result_file or os.path.join(args.result_dir, "benchmark_results.json")
         raw_file = os.path.join(os.path.dirname(_summary_path) or ".", "raw_outputs.json")
         os.makedirs(os.path.dirname(raw_file) or ".", exist_ok=True)
-        # Only the three fields scoring reads. Dumping the whole record would carry `itl` — one
-        # float per generated token, ~2.3M of them across a 1024-prompt run — turning a ~5 MB
-        # checkpoint into ~100 MB for data the metrics never look at.
+        # Only the fields scoring (and alias_attribution's join) read. Dumping the whole record would
+        # carry `itl` — one float per generated token, ~2.3M of them across a 1024-prompt run —
+        # turning a ~5 MB checkpoint into ~100 MB for data the metrics never look at.
         slim = [{"prompt": o.get("prompt", ""),
                  "generated_text": o.get("generated_text", ""),
-                 "success": bool(o.get("success"))} for o in outputs]
+                 "success": bool(o.get("success")),
+                 "response_id": o.get("response_id")} for o in outputs]
         with open(raw_file, "w") as f:
             json.dump({"outputs": slim, "sample_ids": list(references.keys())}, f)
         print(f"\nRaw completions saved to {raw_file}")
