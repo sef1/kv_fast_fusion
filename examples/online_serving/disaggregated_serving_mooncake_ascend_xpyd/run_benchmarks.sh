@@ -513,6 +513,13 @@ export_bff_env() {
          BFF_V2_MAX_REQ_DECLINE=$BFF_V2_MAX_REQ_DECLINE \
          BFF_V2_PROTECT_HOT_BLOCKS=$BFF_V2_PROTECT_HOT_BLOCKS \
          BFF_LSH_COMPACT_DEAD_FRAC=$BFF_LSH_COMPACT_DEAD_FRAC BFF_LSH_COMPACT_MIN_DEAD=$BFF_LSH_COMPACT_MIN_DEAD
+  # A GLM "materialize" arm ran with BFF_V2_DEDUP=0 and was read as a materialize result: these knobs
+  # only shape aliases, and with dedup off nothing is aliased. Say so up front.
+  if [[ "$BFF_V2_DEDUP" == "0" && ( "${BFF_V2_MATERIALIZE:-0}" == "1" \
+        || "$BFF_V2_MAX_REQ_DECLINE" != "0.5" || "$BFF_MAX_REL_ERR" != "1.0" ) ]]; then
+    echo "NOTE: BFF_V2_DEDUP=0 — BFF_V2_MATERIALIZE/BFF_V2_MAX_REQ_DECLINE/BFF_MAX_REL_ERR have no" \
+         "effect (nothing is aliased)."
+  fi
   # BOTH roles dump fuse stats: the producer counts blocks + redirects shipped, the decode side counts
   # the redirects that actually landed and the REAL freed-block delta (the measured compression).
   export BFF_PD_STATS_DIR="$results_root"
@@ -1071,7 +1078,9 @@ if v2:
         print(f"    async pipeline: exchange ran on ITS OWN thread — {PBUSY/1000:.1f}s over {PBAT} "
               f"round trip(s) ({PBUSY/PBAT:.0f} ms each), {PEX} request(s) exchanged. The recv "
               f"thread's own `exchange` phase should read ~0s above; that gap IS off-critical-path.")
-    if EX == 0 and PBH == 0:
+    if EX == 0 and PBH == 0 and os.environ.get("BFF_V2_DEDUP", "1") == "0":
+        print("    -> dedup OFF (BFF_V2_DEDUP=0): nothing planned, by request.")
+    elif EX == 0 and PBH == 0:
         print("    -> v2 NEVER ASKED: the mechanism did not engage at all. Check BFF_V2_DEDUP and "
               "the producer's 'signature server (REP) bound on' line in the prefill log.")
     elif EX and FAIL >= 0.5 * EX:
