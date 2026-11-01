@@ -1,18 +1,25 @@
-"""Build a prompt set whose CONCURRENT requests share near-duplicate KV that prefix caching cannot.
+"""A DIAGNOSTIC prompt set: identical document tokens at identical positions, different context.
 
-BFF's capacity gain needs live requests whose prompt blocks are near-duplicates of each other. On
-Magicoder there are none (a correct dedup index finds 0 matches at con48), so the mechanism cannot
-be judged there. Here each prompt is
+**Not BFF's target workload.** The shared documents are exact token copies — shared prefill, a
+RAG-like case — whereas BFF's meaning is fusing blocks with different content but similar KV. Use
+this for two things only:
 
-    [distinct preamble, padded so the document starts at token D]  +  [one of K shared documents]
-    +  [a short task]
+* **Does context destroy KV similarity?** Each prompt is
 
-* The preambles differ, so the prompts share no prefix and exact prefix caching hits nothing.
-* Every document starts at the same templated token offset D (a multiple of the block size), so
-  its blocks line up at identical positions across requests: same tokens, same RoPE phase. They
-  differ only by what attention mixed in from the preamble — the near-duplicate regime BFF targets.
-* Small K and short outputs keep many copies of each document resident at once and make
-  transferred prompt KV the bulk of the decode pool.
+      [distinct preamble, padded so the document starts at token D]  +  [one of K shared documents]
+      +  [a short task]
+
+  so a document's blocks are identical in tokens AND RoPE phase across requests, and differ only
+  by what attention mixed in from the preamble. On Magicoder (MIN_TOKENS 2048), 8.75% of blocks
+  have a token-level near-duplicate at the same position in a live request
+  (f1_benchmark/scan_block_redundancy.py), yet the middle-layer signatures found candidates for
+  0.3%. If the document blocks here also find none, middle-layer KV is context-dominated and that
+  explains the gap; if they match, the loss is in the signature/LSH path.
+* **Mechanism / capacity stress test**: there IS sharing here, so freed blocks
+  (BFF_V2_FREE_AT_PROMOTION) should visibly raise Running.
+
+The preambles differ, so prefix caching hits nothing. Small K and short outputs keep many copies of
+each document resident and make transferred prompt KV the bulk of the decode pool.
 
 Alignment is MEASURED with the model's own chat template and tokenizer, not assumed: the script
 pads each preamble until the templated prefix before the document is exactly D tokens, checks that
