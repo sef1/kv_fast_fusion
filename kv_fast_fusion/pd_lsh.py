@@ -50,6 +50,30 @@ LSH_MAX_OWNERS = int(os.environ.get("BFF_LSH_MAX_LIVE_OWNERS", "512"))
 # low BITS against a large index makes the verify dominate. >0 keeps only the top-K candidates by
 # table-collision count (multi-probe ranking); 0 = verify every bucket candidate.
 LSH_MAX_CAND = int(os.environ.get("BFF_LSH_MAX_CANDIDATES", "0"))
+# Verify EVERY live row instead of the bucket union. 16 tables x 20 bits find a pair at cos 0.98 with
+# ~99% probability but at 0.85 with ~28% and at 0.75 with ~8%, so the band an error budget like 0.5
+# (floor 0.866) admits is mostly never even looked at. Once the index holds only live blocks — a few
+# hundred on a decode — checking all of them is a [N, d] x [d] product per block, cheaper than the
+# bucket bookkeeping it replaces.
+LSH_EXACT = os.environ.get("BFF_LSH_EXACT", "0") == "1"
+_announced = False
+
+
+def search_mode() -> str:
+    """The candidate-search mode as the engagement line states it."""
+    return ("EXACT (all live rows)" if LSH_EXACT
+            else f"bucket ({LSH_TABLES} tables x {LSH_BITS} bits)")
+
+
+def _announce() -> None:
+    """Say once per process which candidate search is live — a knob that is silent when on cannot
+    be told apart from a build that does not have it (an exact-search run was read before this)."""
+    global _announced
+    if _announced:
+        return
+    _announced = True
+    from vllm.logger import init_logger
+    init_logger("vllm.pd_lsh").info("BFF LSH: candidate search = %s.", search_mode())
 # Lazy compaction. An evicted row is already gone from every bucket, `meta`, `lru` and the owner
 # view, so it can never be a probe candidate; compaction only renumbers rows densely and reclaims
 # their slots in `mat`. Doing that on every eviction cost the decode ~0.6 ms/step on the scheduler
@@ -190,6 +214,7 @@ class LshIndex:
         # decode-side dedup index, where blocks are freed one at a time. The default is sized for
         # the former, so the latter passes its own cap — see pd_dedup_plan.DedupPlanner.
         self.max_owners = LSH_MAX_OWNERS if max_owners is None else int(max_owners)
+        _announce()
         self.tables = [dict() for _ in range(LSH_TABLES)]   # bucket_hash -> [row]
         self.meta = {}                                      # row -> (rep_key, slot, owner)
         self.row_hashes = {}                                # row -> sub_hashes (for eviction)
@@ -262,7 +287,9 @@ class LshIndex:
         cos_bar = max(threshold, min_cos_for_budget(MAX_REL_ERR)) if RATIO_MODE else threshold
         for i in range(n):
             owner_i = owners[i]
-            if LSH_MAX_CAND > 0:
+            if LSH_EXACT:
+                cand_rows = [r for r, m in self.meta.items() if m[2] != owner_i]
+            elif LSH_MAX_CAND > 0:
                 # Multi-probe ranking: prefer candidates colliding in the MOST tables (more likely
                 # to be similar), then keep at most LSH_MAX_CAND of them.
                 counts: Counter = Counter()

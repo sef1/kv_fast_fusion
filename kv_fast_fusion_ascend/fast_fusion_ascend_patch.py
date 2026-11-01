@@ -412,7 +412,8 @@ def _bff_landed_promotion_apply(scheduler, request) -> None:
         return getattr(managers[gi], "block_size", 0) if gi < len(managers) else 0
 
     own = _blocks_of(request.request_id)
-    merged, refused = promotion_swaps(own, consensus, found.get, _block_size)
+    merged, refused = promotion_swaps(own, consensus, found.get, _block_size,
+                                      own_computed=request.num_computed_tokens)
     for why, n in refused.items():
         st[why] += n
     if merged:
@@ -421,12 +422,13 @@ def _bff_landed_promotion_apply(scheduler, request) -> None:
         scheduler._handle_block_merging_with_counts({request.request_id: merged})
         st["freed"] += pool.get_num_free_blocks() - before
         st["swapped"] += sum(1 for gi, t in merged.items() for a, b in zip(t, own[gi]) if a != b)
-    if st["promotions"] % _LANDED_LOG_EVERY == 0:
+    # First one too, so a short run (or one with a single landed request) still says what happened.
+    if st["promotions"] == 1 or st["promotions"] % _LANDED_LOG_EVERY == 0:
         logger.info("BFF promotion free | promotions=%d swapped=%d freed=%d | refused: %s",
                     st["promotions"], st["swapped"], st["freed"],
                     " ".join(f"{k}={st[k]}" for k in (
                         "incomplete_ranks", "no_consensus", "owner_gone", "owner_loading",
-                        "rep_moved", "rep_hot", "victim_moved")))
+                        "rep_moved", "rep_hot", "victim_moved", "victim_hot")))
 
 
 def _wrap_scheduler_promotion(scheduler_cls) -> bool:

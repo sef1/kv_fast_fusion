@@ -61,18 +61,6 @@ def test_declined_pairs_agree_with_filter_sentinels():
 
 
 # =====================================================================================
-# landing_hot_victims — the block each group's decode writes first
-# =====================================================================================
-def test_the_hot_victim_is_each_group_s_last_prompt_block():
-    assert v2.landing_hot_victims([[], [50, 51, 52], [60]]) == {1: 52, 2: 60}
-
-
-def test_no_groups_means_no_hot_victims():
-    assert v2.landing_hot_victims(None) == {}
-    assert v2.landing_hot_victims([]) == {}
-
-
-# =====================================================================================
 # repull_segments — a re-read restores every address of the block
 # =====================================================================================
 def test_a_refused_victim_is_re_read_at_every_address_it_spans():

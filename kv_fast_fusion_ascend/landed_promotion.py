@@ -31,7 +31,7 @@ FREE_AT_PROMOTION = os.environ.get("BFF_V2_FREE_AT_PROMOTION", "0") == "1"
 # ``incomplete_ranks`` includes a rank that landed NO alias for the request (it ships no map): the
 # consensus would be empty then anyway, so nothing that could be freed is lost to it.
 REFUSALS = ("incomplete_ranks", "no_consensus", "owner_gone", "owner_loading", "rep_moved",
-            "rep_hot", "victim_moved")
+            "rep_hot", "victim_moved", "victim_hot")
 
 
 def consensus_landed(per_rank: dict, n_ranks: int):
@@ -63,14 +63,19 @@ def _landed_at(m, gi, v):
     return None if ro is None else (int(ro[0]), ro[1])
 
 
-def promotion_swaps(own_blocks, consensus: dict, owner_state, block_size):
+def promotion_swaps(own_blocks, consensus: dict, owner_state, block_size, own_computed=None):
     """``({gi: new_block_ids}, {reason: n})`` — this request's tables with every provable swap made.
 
     ``own_blocks`` is the request's ``[[block ids] per group]``. ``owner_state(owner)`` returns
     ``None`` (gone), ``"loading"`` (still WAITING_FOR_REMOTE_KVS — its KV is incomplete) or
     ``(blocks_by_group, num_computed_tokens)``. A representative is usable only at a position below
     ``num_computed_tokens // block_size`` in its owner's table: a full block the owner will never
-    write again. ``block_size`` is an int or ``block_size(gi)``, since groups may differ."""
+    write again. ``block_size`` is an int or ``block_size(gi)``, since groups may differ.
+
+    ``own_computed`` is the request's own ``num_computed_tokens``: a victim at or past
+    ``own_computed // block_size`` is the block its decode writes next, so sharing it would send the
+    request's new tokens into the owner's rep. Such a victim keeps its own (already copied) block.
+    None disables the check, for callers that cannot know it."""
     refused = {r: 0 for r in REFUSALS}
     merged: dict[int, list[int]] = {}
     for gi, vs in consensus.items():
@@ -84,6 +89,9 @@ def promotion_swaps(own_blocks, consensus: dict, owner_state, block_size):
         for victim, (rep, owner) in vs.items():
             if victim not in pos:
                 refused["victim_moved"] += 1
+                continue
+            if own_computed is not None and (bs <= 0 or pos[victim] >= int(own_computed) // bs):
+                refused["victim_hot"] += 1
                 continue
             st = owner_state(owner)
             if st is None:

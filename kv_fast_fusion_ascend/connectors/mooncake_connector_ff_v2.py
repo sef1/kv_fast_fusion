@@ -54,6 +54,7 @@ from typing import Any, ClassVar
 from vllm.logger import init_logger
 
 from kv_fast_fusion_ascend import landed_promotion
+from kv_fast_fusion_ascend.build import BFF_BUILD
 
 logger = init_logger("vllm.mooncake_connector_ff_v2_ascend")
 
@@ -268,15 +269,6 @@ def declined_pairs(planned, local_ids, remote_ids) -> dict:
     carries the id, so the id is read from ``local_ids`` and never from ``planned``."""
     return {int(local_ids[i]): int(remote_ids[i]) for i, b in enumerate(planned)
             if b < 0 and i < len(local_ids) and i < len(remote_ids)}
-
-
-def landing_hot_victims(local_groups) -> dict:
-    """``{group: last block}`` — the block each group's decode writes its first new token into.
-
-    At landing the request has not run, so its frontier is its LAST prompt block: partially filled
-    unless the prompt is block-aligned, and in that case refusing it costs one re-read. Conservative
-    by one block rather than guessing the token count, which the recv thread is not given."""
-    return {gi: int(ids[-1]) for gi, ids in enumerate(local_groups or ()) if ids}
 
 
 def repull_segments(descriptors, victims):
@@ -2222,10 +2214,14 @@ if _ASCEND_AVAILABLE:
                 from kv_fast_fusion import fast_fusion_block_pool as _bp
                 _bp.flush_before_load()
             landed = {} if self.ff_landed_sink is not None else None
+            # Every alias is copied, the request's LAST block included: it has not decoded yet, so
+            # its own block holds nothing to protect. Only SHARING a partly filled last block is
+            # unsafe (its decode would write into the rep), and only the scheduler knows the token
+            # count — landed_promotion refuses that swap as `victim_hot`. Refusing it here cost
+            # ~35% of all landed candidates in a re-read each (GLM err 0.5: 56 of ~160).
             with self._engine_lock:
                 refused = self.dedup_engine.release_materialized(
-                    ext_id, self.ff_copy_alias_blocks,
-                    landing_hot_victims(req_meta.get("local_block_ids")), landed=landed)
+                    ext_id, self.ff_copy_alias_blocks, None, landed=landed)
             if landed:
                 # Before the vendored `finally` reports this request done: vLLM drains get_finished
                 # before get_kv_connector_stats each step, so the map can never trail the "done".
@@ -2842,7 +2838,7 @@ if _ASCEND_AVAILABLE:
                 # (copy into own blocks, no table write, full graph legal) vs the default redirect
                 # (pointer share + free, PIECEWISE-only). A stale build or an unset flag is then
                 # visible without inference, the trap the async work kept falling into.
-                logger.info("BFF pull-v2: alias apply mode = %s%s%s.",
+                logger.info("BFF pull-v2 [build %s]: alias apply mode = %s%s%s.", BFF_BUILD,
                             "MATERIALIZE (copy into own blocks; no post-capture table write; "
                             "retains own blocks, no orphan free — memory NOT shared, concurrency at "
                             "baseline, by design)"
@@ -2850,6 +2846,7 @@ if _ASCEND_AVAILABLE:
                             ", FULL_DECODE_ONLY permitted"
                             if (ALLOW_FULL_GRAPH and pd_dedup_v2.MATERIALIZE_ALIASES) else "",
                             ("; copied at LANDING on the recv thread, refusals re-read from P"
+                             "; last block: copied at landing, hotness decided at promotion"
                              + ("; free-at-promotion ON (scheduler frees rank-agreed copies)"
                                 if landed_promotion.FREE_AT_PROMOTION else
                                 "; free-at-promotion off (BFF_V2_FREE_AT_PROMOTION=1 frees them)")

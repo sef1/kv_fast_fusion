@@ -1035,6 +1035,24 @@ if v2:
     FAIL = sum(s.get("signature_phase_failed", 0) for s in v2)
     PBH = sum(s.get("piggyback_hits") or 0 for s in v2)
     PBM = sum(s.get("piggyback_misses") or 0 for s in v2)
+    # Which build ran, and did every knob that was SET say it engaged? A knob that is silent when on
+    # cannot be told from a box that never pulled it — one "exact search" run was analysed before
+    # anyone noticed the box was two changes behind. Printed first so it is read first.
+    try:
+        with open(os.path.join(logs, "decode-0.txt"), errors="replace") as f:
+            dlog = f.read()
+    except OSError:
+        dlog = ""
+    if dlog:
+        mb = re.search(r"BFF pull-v2 \[build ([^\]]+)\]", dlog)
+        print(f"  bff build: {mb.group(1)}" if mb else
+              "  -> WARNING: no BFF build stamp in decode-0.txt — the box runs a build older than "
+              "the engagement checks; nothing below says which code produced it.")
+        for env, needle in (("BFF_LSH_EXACT", "candidate search = EXACT"),
+                            ("BFF_V2_FREE_AT_PROMOTION", "free-at-promotion ON")):
+            if os.environ.get(env) == "1" and needle not in dlog:
+                print(f"  -> WARNING: {env}=1 was set but decode-0.txt never says '{needle}' — "
+                      "the build on this box does not have it.")
     print(f"  bff v2 wire saving: {100.0*D/P if P else 0.0:.1f}% of blocks never requested "
           f"({D} of {P}; {RES} from resident, {SAME} within the same pull) over {len(v2)} node(s)")
     # An all-zero saving reads two completely different ways, and only these separate them:
@@ -1295,6 +1313,70 @@ if v2:
               f"({', '.join(f'group {g}: {n}' for g, n in sorted(over.items()))}) — it holds rows "
               "for freed blocks, and aliases onto them read unrelated KV. This run's dedup "
               "saving and quality are not trustworthy.")
+
+    # Compression, the number capacity actually follows. REALIZED is what the scheduler freed;
+    # POTENTIAL is the share of planned blocks that had any candidate at each cosine, accepted or
+    # not — the ceiling no threshold or error budget can exceed on this workload. Per rank: every
+    # rank plans the same blocks, so planned and the histograms are averaged, not summed.
+    nr = len(v2)
+    planned_r = P / nr if nr else 0
+    freed = 0
+    try:
+        with open(os.path.join(logs, "decode-0.txt"), errors="replace") as f:
+            for line in f:
+                m = re.search(r"Block merging freed (-?\d+) blocks", line)
+                if m:
+                    freed += int(m.group(1))
+    except OSError:
+        pass
+    edges = ("0.75", "0.85", "0.90", "0.95", "0.98")
+    found = dict.fromkeys(edges, 0)
+    for s in v2:
+        for key in ("lsh_accept_cos", "lsh_reject_cos"):
+            for bins in (s.get(key) or {}).values():
+                for label, n in bins.items():
+                    lo = label.split("-")[0]
+                    for e in edges:
+                        if float(lo) >= float(e) - 1e-9:
+                            found[e] += n or 0
+    if planned_r:
+        pot = "  ".join(f">={e}: {100.0 * found[e] / nr / planned_r:.2f}%" for e in edges)
+        cap = f", {100.0 * freed / pool:.1f}% of the {pool}-block pool (cumulative)" if pool else ""
+        print(f"    compression: realized {freed} block(s) freed = {100.0 * freed / planned_r:.3f}% "
+              f"of {planned_r:.0f} planned per rank{cap}")
+        print(f"    compression potential (blocks with ANY candidate, per rank): {pot}")
+        # CAPACITY is what was freed AT ONCE, not cumulatively: a freed block helps only while its
+        # request lives on D. Time-average ≈ freed × mean decode residency (E2E − TTFT) ÷ wall.
+        # One request costs a block per block_size tokens in EVERY group (they share the pool),
+        # so requests-equivalent divides by groups × (prompt blocks + output blocks).
+        serv = {}
+        for fp in glob.glob(os.path.join(logs, "*-serving.txt")):
+            with open(fp, errors="replace") as f:
+                txt = f.read()
+            for key, pat in (("wall", r"Inference completed in ([\d.]+) s"),
+                             ("ok", r"\|\s*(\d+)/\d+ ok"),
+                             ("ttft", r"TTFT\[mean=([\d.]+)"), ("e2e", r"E2E\[mean=([\d.]+)"),
+                             ("out", r"completion_tokens mean=([\d.]+)")):
+                m = re.search(pat, txt)
+                if m:
+                    serv[key] = float(m.group(1))
+        n_groups, bsz = 2, 128
+        try:
+            with open(os.path.join(logs, "decode-0.txt"), errors="replace") as f:
+                for line in f:
+                    m = re.search(r"BFF hybrid layout.*?: (\d+) groups.*?block_size=(\d+)", line)
+                    if m:
+                        n_groups, bsz = int(m.group(1)), int(m.group(2))
+                        break
+        except OSError:
+            pass
+        if freed and pool and all(k in serv for k in ("wall", "ok", "ttft", "e2e", "out")):
+            resid = max(0.0, serv["e2e"] - serv["ttft"]) / 1000.0
+            held = freed * resid / serv["wall"]
+            per_req = n_groups * (planned_r / max(1.0, serv["ok"]) + serv["out"] / bsz)
+            print(f"    capacity: ~{held:.1f} block(s) freed at any moment = "
+                  f"{100.0 * held / pool:.2f}% of the pool ≈ {held / per_req:.2f} extra concurrent "
+                  f"request(s) (residency {resid:.0f} s, {per_req:.0f} blocks/request)")
 
     # THE distribution. A run-level saving of a few percent reads identically whether every request
     # gave up a little or a handful gave up nearly everything — and only the second answers the

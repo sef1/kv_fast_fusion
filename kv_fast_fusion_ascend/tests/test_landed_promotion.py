@@ -109,6 +109,22 @@ def test_the_block_size_is_read_per_group():
     assert merged == {1: [50, 41]}
 
 
+def test_a_partly_filled_last_victim_keeps_its_own_block():
+    """The request's decode writes its next token into its last block; sharing that block would
+    write into the owner's rep. 300 computed tokens: index 2 (tokens 256-383) is unfinished."""
+    merged, refused = lp.promotion_swaps([[], [50, 51, 52]], {1: {52: (42, "rA")}},
+                                         _owner([40, 41, 42], 3 * BS), BS, own_computed=300)
+
+    assert merged == {} and refused["victim_hot"] == 1
+
+
+def test_a_full_last_block_is_still_swapped():
+    merged, refused = lp.promotion_swaps([[], [50, 51, 52]], {1: {52: (42, "rA")}},
+                                         _owner([40, 41, 42], 3 * BS), BS, own_computed=3 * BS)
+
+    assert merged == {1: [50, 51, 42]} and refused["victim_hot"] == 0
+
+
 # =====================================================================================
 # the worker's half: what landing copied, and the carrier across ranks
 # =====================================================================================

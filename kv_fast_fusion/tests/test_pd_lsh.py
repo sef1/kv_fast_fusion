@@ -510,3 +510,69 @@ def test_at_capacity_dead_rows_are_reclaimed_before_live_ones_are_dropped(monkey
     idx.register(cur, pd_lsh.sub_hashes(cur, proj), [(0, 99, 0, "new")])
     assert idx.size() == 5, "no live rep was evicted to make room"
     assert {m[2] for m in idx.meta.values()} == {"r2", "r3", "new"}
+
+
+# =====================================================================================
+# exact search (BFF_LSH_EXACT) — recall at the cosines an error budget admits
+# =====================================================================================
+def _pair_missed_by_lsh(cos, d=64, tries=200):
+    """A (rep, query) pair at cosine ``cos`` that shares no bucket in any table."""
+    g = torch.Generator().manual_seed(7)
+    proj = pd_lsh.get_proj([None], d, torch.device("cpu"))
+    for _ in range(tries):
+        a = torch.randn(d, generator=g)
+        a = a / a.norm()
+        r = torch.randn(d, generator=g)
+        r = r - (r @ a) * a
+        r = r / r.norm()
+        b = cos * a + (1 - cos ** 2) ** 0.5 * r
+        ha, hb = pd_lsh.sub_hashes(torch.stack([a, b]), proj)
+        if all(x != y for x, y in zip(ha, hb)):
+            return a.tolist(), b.tolist()
+    raise AssertionError("no LSH-separated pair found")
+
+
+def test_exact_search_finds_a_pair_lsh_never_buckets_together(monkeypatch):
+    rep, query = _pair_missed_by_lsh(0.88)
+    idx, proj = _index_with([rep], ["rA"])
+
+    monkeypatch.setattr(pd_lsh, "LSH_EXACT", False)
+    assert _probe(idx, proj, [query], ["rB"])[0] == [False], "LSH misses it"
+
+    monkeypatch.setattr(pd_lsh, "LSH_EXACT", True)
+    matched, hits = _probe(idx, proj, [query], ["rB"])
+    assert matched == [True] and hits[0][1] == hash("rA"), "exact search finds it"
+
+
+def test_exact_search_still_skips_the_block_s_own_owner(monkeypatch):
+    monkeypatch.setattr(pd_lsh, "LSH_EXACT", True)
+    v = [1.0, 0.0, 0.5, 0.25]
+    idx, proj = _index_with([v], ["rA"])
+
+    assert _probe(idx, proj, [v], ["rA"])[0] == [False]
+
+
+def test_exact_search_never_returns_an_evicted_row(monkeypatch):
+    monkeypatch.setattr(pd_lsh, "LSH_EXACT", True)
+    v = [1.0, 0.0, 0.5, 0.25]
+    idx, proj = _index_with([v], ["rA"])
+    idx.evict_owners(["rA"])
+
+    assert _probe(idx, proj, [v], ["rB"])[0] == [False]
+
+
+def test_the_search_mode_announces_itself_once_and_names_the_mode(monkeypatch):
+    """A knob that is silent when on cannot be told from a build that lacks it."""
+    import vllm.logger as vl
+    said = []
+    monkeypatch.setattr(vl, "init_logger",
+                        lambda name: type("L", (), {"info": lambda self, *a: said.append(a)})())
+    monkeypatch.setattr(pd_lsh, "_announced", False)
+    monkeypatch.setattr(pd_lsh, "LSH_EXACT", True)
+
+    pd_lsh.LshIndex()
+    pd_lsh.LshIndex()
+
+    assert len(said) == 1 and "EXACT" in said[0][1]
+    monkeypatch.setattr(pd_lsh, "LSH_EXACT", False)
+    assert pd_lsh.search_mode().startswith("bucket (")
