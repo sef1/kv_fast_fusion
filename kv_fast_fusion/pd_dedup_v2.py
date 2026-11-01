@@ -1073,7 +1073,7 @@ class DedupEngine:
         with self.lock:
             self._release_locked(req_id)
 
-    def release_materialized(self, req_id: str, copy, hot_victims=None) -> dict:
+    def release_materialized(self, req_id: str, copy, hot_victims=None, landed=None) -> dict:
         """:meth:`release`, then realise this request's aliases NOW by copying each representative
         into the request's own victim block — instead of leaving them for the forward-path applier.
 
@@ -1093,7 +1093,9 @@ class DedupEngine:
         those are refused (``victim_still_writing``) rather than overwritten.
 
         Returns ``{group: {victim: reason}}`` for every refused alias. Refusals are counted under
-        their cause but NOT as recomputes — see :meth:`DedupStats.note_refused`."""
+        their cause but NOT as recomputes — see :meth:`DedupStats.note_refused`. ``landed``, when
+        given, is filled with ``{group: {victim: (rep, owner)}}`` for every alias actually copied —
+        what the scheduler may later turn into a real free (landed_promotion)."""
         refused: dict[int, dict[int, str]] = {}
         hot_victims = hot_victims or {}
         with self.lock:
@@ -1101,12 +1103,13 @@ class DedupEngine:
             ready = self._alias_ready.pop(req_id, None) or {}
             n_applied = 0
             for gi, mapping in ready.items():
-                pairs = []
+                pairs, owners = [], []
                 for victim, (rep, owner, _scale) in mapping.items():
                     why = ("victim_still_writing" if hot_victims.get(gi) == int(victim)
                            else self.rep_status(gi, rep, owner))
                     if why is None:
                         pairs.append((int(rep), int(victim)))
+                        owners.append(owner)
                     else:
                         refused.setdefault(int(gi), {})[int(victim)] = why
                 if pairs and not copy(int(gi), pairs):
@@ -1114,6 +1117,8 @@ class DedupEngine:
                     for _rep, victim in pairs:
                         refused.setdefault(int(gi), {})[victim] = "block_table_write_refused"
                     pairs = []
+                if pairs and landed is not None:
+                    landed[int(gi)] = {v: (r, o) for (r, v), o in zip(pairs, owners)}
                 n_applied += len(pairs)
             self.stats.applied += n_applied
             self.stats.materialized += n_applied

@@ -26,9 +26,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStat
 class BFFMergeStats(KVConnectorStats):
     """Carries the D-side block-merge map worker→scheduler under TP>1.
 
-    Every TP rank produces the identical (all-reduced) map, so the cross-rank :meth:`aggregate`
-    keeps the accumulator's copy rather than concatenating — double-applying a merge would corrupt
-    the block ref counts, which is a worse failure than losing one."""
+    The merge map is assumed identical on every TP rank, so the cross-rank :meth:`aggregate` keeps
+    the accumulator's copy rather than concatenating — double-applying a merge would corrupt the
+    block ref counts. **That assumption does not hold for pull-v2**: nothing all-reduces the plan,
+    and each rank plans from its own signature shard, so redirect at TP>1 frees by one rank's
+    decisions. Free-at-promotion (``bff_landed``) is the per-rank, consensus-checked replacement."""
 
     def reset(self):
         self.data = {}
@@ -38,19 +40,23 @@ class BFFMergeStats(KVConnectorStats):
         # Ranks are coherent → identical maps; keep the accumulator's, never concatenate.
         if not self.data.get("bff_merges") and other_data.get("bff_merges"):
             self.data["bff_merges"] = other_data["bff_merges"]
-        # Signatures differ per rank: union them, request by request.
-        if other_data.get("bff_sigs"):
-            mine = self.data.setdefault("bff_sigs", {})
-            for ext_id, by_rank in other_data["bff_sigs"].items():
-                mine.setdefault(ext_id, {}).update(by_rank)
+        # Signatures and landed aliases differ per rank: union them, request by request. (The
+        # scheduler frees a landed alias only where every rank's map agrees — landed_promotion.)
+        for key in ("bff_sigs", "bff_landed"):
+            if other_data.get(key):
+                mine = self.data.setdefault(key, {})
+                for ext_id, by_rank in other_data[key].items():
+                    mine.setdefault(ext_id, {}).update(by_rank)
         return self
 
     def reduce(self) -> dict:
         return {"bff_merge_reqs": len(self.data.get("bff_merges", {}) or {}),
-                "bff_sig_reqs": len(self.data.get("bff_sigs", {}) or {})}
+                "bff_sig_reqs": len(self.data.get("bff_sigs", {}) or {}),
+                "bff_landed_reqs": len(self.data.get("bff_landed", {}) or {})}
 
     def is_empty(self) -> bool:
-        return not self.data.get("bff_merges") and not self.data.get("bff_sigs")
+        return not (self.data.get("bff_merges") or self.data.get("bff_sigs")
+                    or self.data.get("bff_landed"))
 
 
 def tp_group_if_sharded():

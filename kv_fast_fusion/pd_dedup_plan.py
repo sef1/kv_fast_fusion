@@ -91,6 +91,13 @@ class DedupPlanner:
         if idx is None:
             idx = self._idx[group] = pd_lsh.LshIndex(max_owners=MAX_RESIDENT)
         live = self._resident.setdefault(group, set())
+        # An id registered again was freed and reissued without its free reaching us. Its old rows
+        # describe the previous tenant's KV but resolve to this id, so a match on one aliases the
+        # new tenant's — the TP>1 index grew to 5,498 rows over a 751-block pool exactly this way.
+        # One id, one signature.
+        again = [int(b) for b in block_ids if int(b) in live]
+        if again:
+            idx.evict_owners(again)
         rows = [(i, int(b), 0, int(b)) for i, b in enumerate(block_ids)]
         idx.register(sigs, hashes, rows, norms)
         live.update(int(b) for b in block_ids)

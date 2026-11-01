@@ -995,9 +995,10 @@ PY
 
 collect_bff_stats() {
   [[ "$BFF_ON" != "1" ]] && return 0
-  python3 - "$results_root" <<'PY' || true
-import glob, json, os, sys
+  python3 - "$results_root" "$logs_root" <<'PY' || true
+import glob, json, os, re, sys
 d = sys.argv[1]
+logs = sys.argv[2] if len(sys.argv) > 2 else ""
 
 
 def load(pat):
@@ -1259,6 +1260,41 @@ if v2:
     if any("freed_blocks_shipped" in s for s in v2) and not FS:
         print("    -> WARNING: no scheduler frees reached the dedup index; at TP>1 resident "
               "aliasing cannot see a representative being reissued.")
+    # An index can never legitimately hold more blocks than the decode pool: anything past that is
+    # rows for blocks that were freed and reissued, and a match on one aliases the new tenant's KV.
+    # The TP>1 runs before frees were shipped reached 5,498 rows over a 751-block pool.
+    pool = None
+    try:
+        with open(os.path.join(logs, "decode-0.txt"), errors="replace") as f:
+            for line in f:
+                m = re.search(r"BFF hybrid layout.*?pool=(\d+) blocks", line)
+                if m:
+                    pool = int(m.group(1))
+                    break
+    except OSError:
+        pass
+    # BFF_V2_FREE_AT_PROMOTION: the scheduler's own count of copies it turned into real frees —
+    # the only BFF number that is capacity rather than wire. Logged by EngineCore every N promotions.
+    promo = None
+    try:
+        with open(os.path.join(logs, "decode-0.txt"), errors="replace") as f:
+            for line in f:
+                if "BFF promotion free |" in line:
+                    promo = line.split("BFF promotion free |", 1)[1].strip()
+    except OSError:
+        pass
+    if promo:
+        print(f"    free at promotion: {promo}")
+    idx = {}
+    for s in v2:
+        for g, n in (s.get("dedup_index_blocks") or {}).items():
+            idx[g] = max(idx.get(g, 0), n or 0)
+    over = {g: n for g, n in idx.items() if pool and n > pool}
+    if over:
+        print(f"    -> WARNING: dedup index larger than the {pool}-block decode pool "
+              f"({', '.join(f'group {g}: {n}' for g, n in sorted(over.items()))}) — it holds rows "
+              "for freed blocks, and aliases onto them read unrelated KV. This run's dedup "
+              "saving and quality are not trustworthy.")
 
     # THE distribution. A run-level saving of a few percent reads identically whether every request
     # gave up a little or a handful gave up nearly everything — and only the second answers the

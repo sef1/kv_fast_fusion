@@ -158,6 +158,22 @@ def test_forgetting_a_freed_block_stops_it_being_offered():
     assert plan.keep[("rA", 1)] == [0], "a freed block can never serve a later request"
 
 
+def test_a_reissued_id_carries_only_its_new_signature():
+    """A free that never arrives (the TP>1 index before frees were shipped) must not leave the old
+    tenant's signature resolving to the new tenant's block: that aliased unrelated KV, and the index
+    grew past the pool. Re-registering an id replaces its row."""
+    old_v, new_v = [1.0, 0.0, 0.5, 0.25], [0.0, 1.0, 0.0, -0.5]
+    p = DedupPlanner()
+    old = _sig([old_v])
+    p.register(1, *old, block_ids=[900])
+
+    p.register(1, *_sig([new_v]), block_ids=[900])     # reissued, no forget in between
+
+    assert p.size(1) == 1, "one id, one row"
+    plan = p.plan(1, _incoming([("rA", 0, 41)]), *old, THR)
+    assert plan.keep[("rA", 1)] == [0], "the previous tenant's KV is not on block 900 any more"
+
+
 def test_forgetting_an_unknown_block_is_harmless():
     p = DedupPlanner()
     assert p.forget(1, [12345]) == 0

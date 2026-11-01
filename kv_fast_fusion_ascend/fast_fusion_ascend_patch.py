@@ -343,6 +343,92 @@ def _bff_promotion_apply(scheduler, request) -> None:
             stats["promo_merge_calls"] += 1
 
 
+_LANDED_STATS: "defaultdict[str, int]" = defaultdict(int)
+_LANDED_LOG_EVERY = int(os.environ.get("BFF_V2_PROMOTION_LOG_EVERY", "50"))
+_LANDED_CAP = 8192
+
+
+def _bff_ingest_landed(scheduler, model_runner_output) -> int:
+    """Stash pull-v2's landed aliases (``kv_connector_stats.data["bff_landed"]``, per rank) until
+    their request is promoted. Returns how many requests arrived this step."""
+    kvo = getattr(model_runner_output, "kv_connector_output", None)
+    data = getattr(getattr(kvo, "kv_connector_stats", None), "data", None)
+    landed = data.get("bff_landed") if isinstance(data, dict) else None
+    if not landed:
+        return 0
+    store = scheduler.__dict__.setdefault("_bff_landed", {})
+    for ext_id, by_rank in landed.items():
+        store.setdefault(ext_id, {}).update(by_rank)
+    if len(store) > _LANDED_CAP:
+        # Entries are popped at promotion; what remains belongs to requests that never got there
+        # (aborted). Bounded by dropping anything no live request owns.
+        live = {_ext_of(rid) for rid in scheduler.requests}
+        for ext_id in [e for e in store if e not in live]:
+            store.pop(ext_id, None)
+    if not _LANDED_STATS["ingested"]:
+        logger.info("BFF pull-v2: free-at-promotion ON — first landed alias map(s) reached the "
+                    "scheduler (%d request(s)).", len(landed))
+    _LANDED_STATS["ingested"] += len(landed)
+    return len(landed)
+
+
+def _bff_landed_promotion_apply(scheduler, request) -> None:
+    """Free this request's materialized aliases at promotion, where every TP rank agrees and the
+    scheduler can prove the representative is still the block the worker copied. See
+    kv_fast_fusion_ascend/landed_promotion.py for the argument; anything unproven keeps its own
+    (already valid) block."""
+    from kv_fast_fusion_ascend.landed_promotion import consensus_landed, promotion_swaps
+    store = scheduler.__dict__.get("_bff_landed")
+    if not store or request.status != RequestStatus.WAITING:
+        return
+    per_rank = store.pop(_ext_of(request.request_id), None)
+    if not per_rank:
+        return
+    st = _LANDED_STATS
+    st["promotions"] += 1
+    pc = getattr(getattr(scheduler, "vllm_config", None), "parallel_config", None)
+    n_ranks = int(getattr(pc, "tensor_parallel_size", 1) or 1)
+    consensus, n_disagreed = consensus_landed(per_rank, n_ranks)
+    if consensus is None:
+        st["incomplete_ranks"] += sum(len(vs) for m in per_rank.values() for vs in m.values())
+        return
+    st["no_consensus"] += n_disagreed
+    if not consensus:
+        return
+    managers = scheduler.kv_cache_manager.coordinator.single_type_managers
+
+    def _blocks_of(rid):
+        return [[b.block_id for b in m.req_to_blocks.get(rid, [])] for m in managers]
+
+    owners = {o for vs in consensus.values() for (_r, o) in vs.values()}
+    found = {}
+    for rid2, req2 in scheduler.requests.items():
+        e2 = _ext_of(rid2)
+        if e2 in owners:
+            found[e2] = ("loading" if req2.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+                         else (_blocks_of(rid2), req2.num_computed_tokens))
+
+    def _block_size(gi):
+        return getattr(managers[gi], "block_size", 0) if gi < len(managers) else 0
+
+    own = _blocks_of(request.request_id)
+    merged, refused = promotion_swaps(own, consensus, found.get, _block_size)
+    for why, n in refused.items():
+        st[why] += n
+    if merged:
+        pool = scheduler.kv_cache_manager.coordinator.block_pool
+        before = pool.get_num_free_blocks()
+        scheduler._handle_block_merging_with_counts({request.request_id: merged})
+        st["freed"] += pool.get_num_free_blocks() - before
+        st["swapped"] += sum(1 for gi, t in merged.items() for a, b in zip(t, own[gi]) if a != b)
+    if st["promotions"] % _LANDED_LOG_EVERY == 0:
+        logger.info("BFF promotion free | promotions=%d swapped=%d freed=%d | refused: %s",
+                    st["promotions"], st["swapped"], st["freed"],
+                    " ".join(f"{k}={st[k]}" for k in (
+                        "incomplete_ranks", "no_consensus", "owner_gone", "owner_loading",
+                        "rep_moved", "rep_hot", "victim_moved")))
+
+
 def _wrap_scheduler_promotion(scheduler_cls) -> bool:
     """Wrap ``_try_promote_blocked_waiting_request`` so a successful promotion immediately applies
     the request's pending fusion redirect (see :func:`_bff_promotion_apply`). Promotion and first
@@ -361,6 +447,11 @@ def _wrap_scheduler_promotion(scheduler_cls) -> bool:
                 _bff_promotion_apply(self, request)
             except Exception as e:  # pragma: no cover - never break scheduling
                 logger.warning("BFF Ascend promotion apply failed for %s: %s",
+                               request.request_id, e, exc_info=True)
+            try:
+                _bff_landed_promotion_apply(self, request)
+            except Exception as e:  # pragma: no cover - a skipped free keeps a valid copy
+                logger.warning("BFF pull-v2 free-at-promotion failed for %s: %s",
                                request.request_id, e, exc_info=True)
         return promoted
 
@@ -404,6 +495,10 @@ def _wrap_scheduler_update_from_output(cls) -> bool:
             _bff_ingest_piggyback_sigs(model_runner_output)
         except Exception as e:      # pragma: no cover - a missed staple only costs an exchange
             logger.warning("BFF Ascend piggyback-signature ingest failed: %s", e)
+        try:
+            _bff_ingest_landed(self, model_runner_output)
+        except Exception as e:      # pragma: no cover - a missed map only costs a free
+            logger.warning("BFF pull-v2 landed-alias ingest failed: %s", e)
         _bff_apply_block_merge(self, model_runner_output)
         try:
             _bff_sweep_late_maps(self)

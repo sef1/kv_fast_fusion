@@ -53,6 +53,8 @@ from typing import Any, ClassVar
 
 from vllm.logger import init_logger
 
+from kv_fast_fusion_ascend import landed_promotion
+
 logger = init_logger("vllm.mooncake_connector_ff_v2_ascend")
 
 CONNECTOR_NAME = "MooncakeConnectorFFv2"
@@ -1636,6 +1638,9 @@ if _ASCEND_AVAILABLE:
         # returns) and its KV-load-failure sink, for a refusal whose re-read cannot run.
         ff_copy_alias_blocks = None
         ff_note_failed_blocks = None
+        # BFF_V2_FREE_AT_PROMOTION: the worker's outbox for what landing actually copied, which the
+        # scheduler turns into real frees at promotion (landed_promotion).
+        ff_landed_sink = None
         # The worker's signatures_for_group_split, for BFF_V2_VERIFY_TRANSFER only. The decode uses
         # the producer's own method against its OWN cache, which is what makes the two sides
         # comparable: same code, same fixed-seed projection, same group layout.
@@ -2216,10 +2221,15 @@ if _ASCEND_AVAILABLE:
                 # drain, and the forward thread must not wait on it.
                 from kv_fast_fusion import fast_fusion_block_pool as _bp
                 _bp.flush_before_load()
+            landed = {} if self.ff_landed_sink is not None else None
             with self._engine_lock:
                 refused = self.dedup_engine.release_materialized(
                     ext_id, self.ff_copy_alias_blocks,
-                    landing_hot_victims(req_meta.get("local_block_ids")))
+                    landing_hot_victims(req_meta.get("local_block_ids")), landed=landed)
+            if landed:
+                # Before the vendored `finally` reports this request done: vLLM drains get_finished
+                # before get_kv_connector_stats each step, so the map can never trail the "done".
+                self.ff_landed_sink(ext_id, landed)
             if refused:
                 self._repull_refused(req_meta, ext_id, refused)
 
@@ -2711,6 +2721,10 @@ if _ASCEND_AVAILABLE:
             # The recv thread notes failures too (a landing re-read that could not run), while the
             # forward thread takes them; an unlocked swap could hand a block id over twice.
             self._ff_failed_lock = threading.Lock()
+            # Landed aliases awaiting the scheduler (BFF_V2_FREE_AT_PROMOTION): filled by the recv
+            # thread, drained by get_kv_connector_stats on the forward thread.
+            self._ff_landed_outbox: dict = {}
+            self._ff_landed_lock = threading.Lock()
             self._group_layers: dict[int, set] = {}
             # Producer-side signature precompute cache (PRODUCER_SIGCACHE): (gi, block_id) -> per-block
             # payload, filled at save time and read by the _SigServer thread, so guarded by a lock.
@@ -2810,6 +2824,9 @@ if _ASCEND_AVAILABLE:
                     self.kv_recv_thread.sig_client = self._sig_client
                     self.kv_recv_thread.ff_copy_alias_blocks = _make_landing_copy(self)
                     self.kv_recv_thread.ff_note_failed_blocks = self.note_failed_blocks
+                    if (landed_promotion.FREE_AT_PROMOTION and pd_dedup_v2.MATERIALIZE_ALIASES
+                            and MATERIALIZE_ON_LANDING):
+                        self.kv_recv_thread.ff_landed_sink = self.note_landed
                     # The producer's own method, pointed at THIS node's cache — that sameness is
                     # what makes the two sides' signatures comparable at all.
                     self.kv_recv_thread.local_sigs = self.signatures_for_group_split
@@ -2833,9 +2850,20 @@ if _ASCEND_AVAILABLE:
                             ", FULL_DECODE_ONLY permitted"
                             if (ALLOW_FULL_GRAPH and pd_dedup_v2.MATERIALIZE_ALIASES) else "",
                             ("; copied at LANDING on the recv thread, refusals re-read from P"
+                             + ("; free-at-promotion ON (scheduler frees rank-agreed copies)"
+                                if landed_promotion.FREE_AT_PROMOTION else
+                                "; free-at-promotion off (BFF_V2_FREE_AT_PROMOTION=1 frees them)")
                              if MATERIALIZE_ON_LANDING and pd_dedup_v2.SCALE_MODE != "ratio"
                              else "; copied on the forward path, refusals recomputed")
                             if pd_dedup_v2.MATERIALIZE_ALIASES else "")
+                pc = getattr(self.vllm_config, "parallel_config", None)
+                if (pd_dedup_v2.V2_ENABLED and not pd_dedup_v2.MATERIALIZE_ALIASES
+                        and int(getattr(pc, "tensor_parallel_size", 1) or 1) > 1):
+                    logger.error(
+                        "BFF pull-v2: redirect mode at TP>1 frees by ONE rank's merge map, but each "
+                        "rank plans from its own signatures and nothing reconciles them — other ranks "
+                        "can be left reading freed blocks. Use BFF_V2_MATERIALIZE=1 with "
+                        "BFF_V2_FREE_AT_PROMOTION=1 instead.")
                 if VERIFY_TRANSFER > 0:
                     logger.warning(
                         "BFF pull-v2: TRANSFER VERIFICATION on for the first %d request(s). Each "
@@ -3225,6 +3253,15 @@ if _ASCEND_AVAILABLE:
             with self._ff_failed_lock:
                 self._ff_failed_blocks |= flat
 
+        def note_landed(self, ext_id, landed) -> None:
+            with self._ff_landed_lock:
+                self._ff_landed_outbox[ext_id] = landed
+
+        def take_landed(self) -> dict:
+            with self._ff_landed_lock:
+                out, self._ff_landed_outbox = self._ff_landed_outbox, {}
+            return out
+
         def take_failed_blocks(self) -> set:
             with self._ff_failed_lock:
                 out, self._ff_failed_blocks = self._ff_failed_blocks, set()
@@ -3289,8 +3326,19 @@ if _ASCEND_AVAILABLE:
                 worker._sig_outbox = {}
                 rank = int(getattr(worker, "tp_rank", 0))
                 sigs = {ext_id: {rank: payload} for ext_id, payload in outbox.items()}
-            if (merges or sigs) and tp_group_if_sharded() is not None:
-                return BFFMergeStats(data={"bff_merges": merges or {}, "bff_sigs": sigs})
+            # Landed aliases ride this carrier at EVERY TP size: the scheduler needs all ranks' maps
+            # to agree before it frees anything, and at TP=1 the one rank is simply all of them.
+            landed = worker.take_landed() if worker is not None else {}
+            if landed:
+                rank = int(getattr(worker, "tp_rank", 0))
+                landed = {ext_id: {rank: m} for ext_id, m in landed.items()}
+            sharded = tp_group_if_sharded() is not None
+            if ((merges or sigs) and sharded) or landed:
+                data = {"bff_merges": (merges or {}) if sharded else {},
+                        "bff_sigs": sigs if sharded else {}}
+                if landed:
+                    data["bff_landed"] = landed
+                return BFFMergeStats(data=data)
             return super().get_kv_connector_stats()
 
         def save_kv_layer(self, layer_name, kv_layer, attn_metadata, **kwargs) -> None:
