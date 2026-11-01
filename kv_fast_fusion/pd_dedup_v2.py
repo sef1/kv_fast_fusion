@@ -516,6 +516,18 @@ class DedupStats:
         self.applied = 0            # aliases that reached the block table (or were materialised)
         self.materialized = 0       # aliases realised by KV copy into the own block (Variant A)
         self.recomputed = 0         # aliases that could not be applied -> local recompute
+        # Landing-time materialize (see DedupEngine.release_materialized): an alias refused at
+        # landing is re-read from the producer instead of recomputed. A recompute on D re-prefills
+        # the whole prompt through the decode's token budget and stalls every running request —
+        # 25-50 s each on the GLM con48 runs — so these two say how many such stalls were avoided
+        # and how many still happened.
+        self.repulled = 0
+        self.repull_failed = 0
+        # Scheduler frees shipped on the connector metadata (TP>1 has no in-process free hook), and
+        # how many resident entries they invalidated. A run with shipped > 0 and invalidated > 0 was
+        # aliasing onto freed blocks before this channel existed.
+        self.freed_shipped = 0
+        self.resident_invalidated = 0
         # Wall time spent inside AliasApplier.apply, which runs on the decode's critical path once
         # per forward step. Measured because the 2026-08-19 A/B showed the current connector paying
         # ~15% more TPOT than the legacy one AT MATCHED CONCURRENCY (80.6ms vs 94.3ms at ~101
@@ -689,8 +701,16 @@ class DedupStats:
         entry["capped"] = entry["capped"] or bool(capped)
 
     def note_failure(self, reason: str, n: int = 1, rid: str | None = None) -> None:
-        self.recomputed += n
+        self.note_refused(reason, n)
+        self.note_recompute(n, rid)
+
+    def note_refused(self, reason: str, n: int = 1) -> None:
+        """An alias refused for ``reason``, counted under its cause WITHOUT counting a recompute —
+        the landing path re-reads such a block from the producer, and only a failed re-read is one."""
         self.fail_reasons[reason] = self.fail_reasons.get(reason, 0) + n
+
+    def note_recompute(self, n: int = 1, rid: str | None = None) -> None:
+        self.recomputed += n
         entry = self.request_ledger.get(rid) if rid is not None else None
         if entry is not None:
             entry["failed"] += n
@@ -755,6 +775,10 @@ class DedupStats:
             "aliases_applied": self.applied,
             "aliases_materialized": self.materialized,
             "aliases_recomputed": self.recomputed,
+            "aliases_repulled": self.repulled,
+            "repull_failed": self.repull_failed,
+            "freed_blocks_shipped": self.freed_shipped,
+            "resident_invalidated": self.resident_invalidated,
             "dedup_gated_batches": self.dedup_gated_batches,
             "piggyback_hits": self.piggyback_hits,
             "piggyback_misses": self.piggyback_misses,
@@ -869,6 +893,8 @@ class DedupEngine:
         self._pending_resident: dict[str, dict[int, tuple]] = {}
         # (group, block id) -> the request that brought it in, for the apply-time check.
         self._resident_owner: dict[tuple[int, int], str] = {}
+        # Groups that have ever held a resident entry — the keys on_blocks_freed probes.
+        self._resident_groups: set[int] = set()
         # (group, block id) -> exact per-layer (||K||, ||V||) as the producer measured them.
         # Only the representative side needs this: the victim's norms arrive with its own signature
         # and are consumed the moment the alias is decided. Kept in lockstep with _resident_owner —
@@ -897,11 +923,14 @@ class DedupEngine:
     def on_blocks_freed(self, freed_ids) -> None:
         with self.lock:
             self._planner.forget_any(freed_ids)
-            # One pass over the index per free EVENT, not per freed block: the old form rescanned
-            # every resident key for each id, which is O(freed x index) on the block pool's hot
-            # release path with an index that holds tens of thousands of blocks.
+            # O(freed x groups) lookups, never a scan of the index (which holds tens of thousands of
+            # blocks): this runs on the pool's release path at TP=1 and once per STEP on the
+            # forward thread at TP>1, where the scheduler's frees arrive on the step metadata.
             gone = {int(b) for b in freed_ids}
-            for key in [k for k in self._resident_owner if k[1] in gone]:
+            stale = [(g, b) for b in gone for g in self._resident_groups
+                     if (g, b) in self._resident_owner]
+            self.stats.resident_invalidated += len(stale)
+            for key in stale:
                 self._resident_owner.pop(key, None)
                 # Kept in lockstep: a scale computed from a freed block's norms would describe KV
                 # that no longer exists there.
@@ -1042,15 +1071,66 @@ class DedupEngine:
         """This request's KV has landed: its aliases become appliable and its blocks become legal
         alias targets. Call this from the transport's completion signal, never earlier."""
         with self.lock:
-            got = self._pending_alias.pop(req_id, None)
-            if got:
-                self._alias_ready.setdefault(req_id, {}).update(got)
-            pend = self._pending_resident.pop(req_id, None)
-        if not pend or not self._resident_enabled:
-            return
+            self._release_locked(req_id)
+
+    def release_materialized(self, req_id: str, copy, hot_victims=None) -> dict:
+        """:meth:`release`, then realise this request's aliases NOW by copying each representative
+        into the request's own victim block — instead of leaving them for the forward-path applier.
+
+        The forward path applies one to sixteen steps after landing, and a representative whose
+        owner finishes in that window is gone: the victim was never fetched, the producer has been
+        told to free it, and the only recovery is a full local re-prefill. Here the producer still
+        holds the block, so whatever is refused can be re-read instead (the caller's job — this
+        returns what to re-read).
+
+        One lock acquisition for release + validate + copy, which is the safety argument: a free
+        reaches this engine through :meth:`on_blocks_freed` (the connector ships the scheduler's
+        frees on the step metadata, bound before that step's forward can write a reissued block),
+        so a copy either completes before the invalidation or sees it. ``copy(gi, pairs) -> bool``
+        must therefore have COMPLETED its device work when it returns.
+
+        ``hot_victims`` is ``{group: victim}``, the block each group's decode will write into first;
+        those are refused (``victim_still_writing``) rather than overwritten.
+
+        Returns ``{group: {victim: reason}}`` for every refused alias. Refusals are counted under
+        their cause but NOT as recomputes — see :meth:`DedupStats.note_refused`."""
+        refused: dict[int, dict[int, str]] = {}
+        hot_victims = hot_victims or {}
         with self.lock:
+            self._release_locked(req_id)
+            ready = self._alias_ready.pop(req_id, None) or {}
+            n_applied = 0
+            for gi, mapping in ready.items():
+                pairs = []
+                for victim, (rep, owner, _scale) in mapping.items():
+                    why = ("victim_still_writing" if hot_victims.get(gi) == int(victim)
+                           else self.rep_status(gi, rep, owner))
+                    if why is None:
+                        pairs.append((int(rep), int(victim)))
+                    else:
+                        refused.setdefault(int(gi), {})[int(victim)] = why
+                if pairs and not copy(int(gi), pairs):
+                    # Same cause the forward path reports for a copy that cannot run.
+                    for _rep, victim in pairs:
+                        refused.setdefault(int(gi), {})[victim] = "block_table_write_refused"
+                    pairs = []
+                n_applied += len(pairs)
+            self.stats.applied += n_applied
+            self.stats.materialized += n_applied
+            for reasons in refused.values():
+                for why in reasons.values():
+                    self.stats.note_refused(why)
+        return refused
+
+    def _release_locked(self, req_id: str) -> None:
+        got = self._pending_alias.pop(req_id, None)
+        if got:
+            self._alias_ready.setdefault(req_id, {}).update(got)
+        pend = self._pending_resident.pop(req_id, None)
+        if pend and self._resident_enabled:
             for gi, (sig, hsh, nrm, ids, kvn) in pend.items():
                 self._planner.register(gi, sig, hsh, nrm, ids)
+                self._resident_groups.add(gi)
                 for i, b in enumerate(ids):
                     self._resident_owner[(gi, int(b))] = req_id
                     if kvn[i] is not None:
@@ -1083,6 +1163,17 @@ class DedupEngine:
         across time must compare this against the owner recorded when the alias was decided."""
         return self._resident_owner.get((group, int(block_id)))
 
+    def rep_status(self, group: int, rep: int, owner) -> str | None:
+        """None if ``rep`` is still the block chosen at decision time, else why it is not.
+
+        Residency says the id is a legal target; only the owner recorded at decision time says it is
+        still the SAME block — between decision and apply an id can be freed and reissued."""
+        if not self.is_resident(group, rep):
+            return "rep_not_resident"
+        if self.resident_owner(group, rep) != owner:
+            return "rep_recycled"
+        return None
+
     def held_block_counts(self) -> dict:
         """Blocks the dedup machinery pins OUTSIDE the live decode set — the suspected concurrency
         cap (Update 21). Diagnostic only; lock-guarded and cheap (sizes of the bookkeeping maps).
@@ -1109,6 +1200,7 @@ class DedupEngine:
         if not self._resident_enabled:
             return
         self._planner.register(group, sigs, hashes, norms, block_ids)
+        self._resident_groups.add(group)
         for b in block_ids:
             self._resident_owner[(group, int(b))] = owner
         self.stats.index_blocks[group] = self._planner.size(group)
@@ -1388,15 +1480,11 @@ class AliasApplier:
         for victim, (rep, owner, scale) in mapping.items():
             if victim not in pos:
                 return None, None, "victim_not_in_table"
-            if not self._engine.is_resident(gi, rep):
-                return None, None, "rep_not_resident"
-            # Residency says a block with this id is a legal target; it does not say it is the
-            # block we chose. Between decision and apply the id can be freed and reissued to
-            # another request, and applying then would point the victim at unrelated KV — silently,
-            # which is the one failure mode in this file that no counter would catch. The owner
-            # recorded at decision time is what distinguishes them.
-            if self._engine.resident_owner(gi, rep) != owner:
-                return None, None, "rep_recycled"
+            # Residency alone would let a freed-and-reissued id through, pointing the victim at
+            # unrelated KV silently — the one failure mode no counter would catch. See rep_status.
+            why = self._engine.rep_status(gi, rep, owner)
+            if why is not None:
+                return None, None, why
             blocks[pos[victim]] = int(rep)
             if scale is not None:
                 scales[pos[victim]] = scale

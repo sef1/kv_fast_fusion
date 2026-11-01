@@ -739,6 +739,42 @@ def _kv_cache_usage() -> float | None:
         return None
 
 
+# req_meta key under which v2 leaves the (gi -> {local_id: remote_id}) pairs it declined, so the
+# emission loop can address them for a re-read even though they are not transferred.
+FF_DECLINED_SLOT = "_bff_declined"
+
+
+class FreedBlockLog:
+    """Block ids the SCHEDULER's pool freed since the last drain, for the worker's dedup index.
+
+    The decode's dedup engine lives in the worker and the pool frees only in the scheduler, so at
+    TP>1 the in-process free hook never fires there and the index never learns a representative
+    was reissued — it then copies (or points at) whatever the new tenant wrote. This rides the step
+    metadata instead, which the worker binds before that step's forward can write a reissued block.
+    One scheduler thread both notes and drains, so it needs no lock."""
+
+    def __init__(self) -> None:
+        self._ids: list[int] = []
+
+    def note(self, freed_ids) -> None:
+        self._ids.extend(int(b) for b in freed_ids)
+
+    def drain(self) -> list[int]:
+        out, self._ids = self._ids, []
+        return out
+
+    def install(self) -> bool:
+        """Register on the patched block pool. False when the pool patch is unavailable."""
+        try:
+            from kv_fast_fusion import fast_fusion_block_pool as _bp
+            _bp.on_blocks_freed(self.note)
+            return True
+        except Exception as e:  # noqa: BLE001 - no hook means no channel, never a failed step
+            logger.warning("MooncakeConnectorFF: no block-free hook (%s) — the decode's dedup "
+                           "index will not see scheduler frees.", e)
+            return False
+
+
 def dedup_registration_regions(ptrs, sizes) -> tuple[list[int], list[int]]:
     """Drop repeated base pointers from a transfer-engine registration list, first occurrence wins.
 
@@ -919,6 +955,8 @@ if _ASCEND_AVAILABLE:
             # dedup is then off for the entire run with no error. This is the channel that was
             # missing; it rides the metadata the worker already receives every step.
             self.kv_usage: float | None = None
+            # Pool block ids freed since the previous step. See FreedBlockLog.
+            self.freed_blocks: list[int] = []
 
         def add_new_req(self, request_id, local_block_ids, num_external_tokens,
                         kv_transfer_params):
@@ -966,6 +1004,8 @@ if _ASCEND_AVAILABLE:
             # counter, so a duplicate registration (update_state_after_alloc runs on EVERY allocation
             # for a request, not just the first) cannot inflate it and wedge admission shut.
             self._inflight_loads: set[str] = set()
+            self._freed_log = FreedBlockLog()
+            self._freed_log.install()
             if _MAX_INFLIGHT_LOADS > 0:
                 logger.info("MooncakeConnectorFF: admitting at most %d concurrent remote-KV load(s); "
                             "over-quota requests wait WITHOUT holding blocks.", _MAX_INFLIGHT_LOADS)
@@ -1047,6 +1087,7 @@ if _ASCEND_AVAILABLE:
             meta.reqs_in_batch = self._reqs_in_batch
             self._reqs_in_batch = set()
             meta.kv_usage = _kv_cache_usage()
+            meta.freed_blocks = self._freed_log.drain()
             self._collect_fuse_reqs(scheduler_output, meta)
             return meta
 
@@ -1229,6 +1270,10 @@ if _ASCEND_AVAILABLE:
         last_descriptors = None
         last_session_id = None
         last_segment_count = 0
+        # {(gi, local_id): segments} for the blocks v2 declined, and the session that can re-read
+        # them; set on every request that reaches the emission loop. Same None-default reasoning.
+        declined_descriptors = None
+        declined_session_id = None
         # Segments per batch_transfer_sync_read call. 0 = unlimited, i.e. exactly what this
         # connector has always done. See chunk_segments for why bounding it is worth a knob.
         _MAX_XFER_SEGMENTS = int(os.environ.get("BFF_MAX_XFER_SEGMENTS", "0"))
@@ -1456,6 +1501,7 @@ if _ASCEND_AVAILABLE:
             # prefix-cache hit, a fully-deduped request) that never reach the emission loop, and a
             # stale count would attribute the PREVIOUS request's segments to this one.
             self.last_segment_count = 0
+            self.declined_descriptors = None
             try:
                 self._transfer_kv_cache_timed(req_meta, phases)
             finally:
@@ -1564,6 +1610,10 @@ if _ASCEND_AVAILABLE:
             _t = time.perf_counter()
             groups_covered: set = set()
             per_block: dict = {}
+            # v2's declined pairs: addressed with the same arithmetic but NOT transferred, so the
+            # landing path can still re-read one whose alias is refused (see FF_DECLINED_SLOT).
+            declined = req_meta.get(FF_DECLINED_SLOT) or {}
+            declined_segs: dict = {}
             for k in keep:
                 src_layer_base_addr = local_base[k]
                 dst_layer_base_addr = remote_base[k]
@@ -1590,6 +1640,10 @@ if _ASCEND_AVAILABLE:
                                 per_block.setdefault((int(gi), int(lb)), []).append(block_segment(
                                     src_layer_base_addr, dst_layer_base_addr, lb, rb,
                                     block_len, inner_block_len, inner_offset))
+                    for lb, rb in declined.get(gi, {}).items():
+                        declined_segs.setdefault((int(gi), int(lb)), []).append(block_segment(
+                            src_layer_base_addr, dst_layer_base_addr, lb, rb,
+                            block_len, inner_block_len, inner_offset))
 
             # Per-request coverage check. `build_base_addr_groups` proves at startup that every
             # group is reachable through SOME address; this proves that for THIS request every group
@@ -1600,6 +1654,9 @@ if _ASCEND_AVAILABLE:
             if self.capture_descriptors:
                 self.last_descriptors = per_block
                 self.last_session_id = session_id
+            # Unconditional, unlike the diagnostic capture above: the re-read is a recovery path.
+            self.declined_descriptors = declined_segs
+            self.declined_session_id = session_id
             self.last_segment_count = len(src_list)
             phases["descriptors"] = (time.perf_counter() - _t) * 1e3
             self._audit_descriptor_coverage(req_meta, grouped, keep, addr_groups, len(src_list))

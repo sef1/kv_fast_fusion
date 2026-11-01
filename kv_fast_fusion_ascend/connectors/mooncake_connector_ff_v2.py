@@ -163,6 +163,11 @@ TRACE_SLOTS = int(os.environ.get("BFF_V2_TRACE_SLOTS", "0"))
 # Ceiling on how much of ONE request may be satisfied from other requests' blocks. Above it the
 # request is read whole. See cap_request_decline for why a per-block cosine bar cannot express this.
 MAX_REQ_DECLINE = float(os.environ.get("BFF_V2_MAX_REQ_DECLINE", "0.5"))
+# Under BFF_V2_MATERIALIZE, copy each alias at LANDING on the recv thread, and re-read a refused one
+# from the producer, instead of applying on the forward path and recomputing a refusal. A refusal on
+# the forward path re-prefills the whole prompt on D (KV-load failure) — on the GLM con48 runs each
+# one stalled the batch for 25-50 s and four of them cost the run ~100 s. 0 restores the old path.
+MATERIALIZE_ON_LANDING = os.environ.get("BFF_V2_MATERIALIZE_ON_LANDING", "1") == "1"
 
 # Message tags for our own channel.
 MSG_SIG_REQUEST = b"bff_pull_v2_sig_req"
@@ -251,6 +256,45 @@ def filter_sentinels(planned, *paired):
     kept = [i for i, b in enumerate(planned) if b >= 0]
     return ([planned[i] for i in kept],
             *([lst[i] for i in kept if i < len(lst)] for lst in paired))
+
+
+def declined_pairs(planned, local_ids, remote_ids) -> dict:
+    """``{local_id: remote_id}`` for every position D declined — the blocks that are NOT read.
+
+    Same positional pairing as :func:`filter_sentinels`, which drops these; kept here so a refused
+    alias can still be re-read from the producer. ``planned`` carries a sentinel where ``local_ids``
+    carries the id, so the id is read from ``local_ids`` and never from ``planned``."""
+    return {int(local_ids[i]): int(remote_ids[i]) for i, b in enumerate(planned)
+            if b < 0 and i < len(local_ids) and i < len(remote_ids)}
+
+
+def landing_hot_victims(local_groups) -> dict:
+    """``{group: last block}`` — the block each group's decode writes its first new token into.
+
+    At landing the request has not run, so its frontier is its LAST prompt block: partially filled
+    unless the prompt is block-aligned, and in that case refusing it costs one re-read. Conservative
+    by one block rather than guessing the token count, which the recv thread is not given."""
+    return {gi: int(ids[-1]) for gi, ids in enumerate(local_groups or ()) if ids}
+
+
+def repull_segments(descriptors, victims):
+    """``(srcs, dsts, lens, missing)`` re-reading ``victims`` (``[(gi, local_id)]``).
+
+    ``descriptors`` is the emission loop's ``{(gi, local_id): [(src, dst, len), ...]}`` for the
+    declined blocks — every address of the block, so a re-read restores all of its layers. A victim
+    with no entry is ``missing`` and cannot be re-read."""
+    descriptors = descriptors or {}
+    srcs, dsts, lens, missing = [], [], [], []
+    for key in victims:
+        segs = descriptors.get((int(key[0]), int(key[1])))
+        if not segs:
+            missing.append(key)
+            continue
+        for s, d, n in segs:
+            srcs.append(s)
+            dsts.append(d)
+            lens.append(n)
+    return srcs, dsts, lens, missing
 
 
 def hot_block_collisions(per_request, block_size):
@@ -1588,6 +1632,10 @@ if _ASCEND_AVAILABLE:
         # here has to be checked against that __init__; the test suite does it mechanically.
         sig_client: "_SigClient | None" = None
         dedup_engine: "DedupEngine | None" = None
+        # Landing-time materialize: the worker's copy callback (own stream, completes before it
+        # returns) and its KV-load-failure sink, for a refusal whose re-read cannot run.
+        ff_copy_alias_blocks = None
+        ff_note_failed_blocks = None
         # The worker's signatures_for_group_split, for BFF_V2_VERIFY_TRANSFER only. The decode uses
         # the producer's own method against its OWN cache, which is what makes the two sides
         # comparable: same code, same fixed-seed projection, same group layout.
@@ -2112,10 +2160,15 @@ if _ASCEND_AVAILABLE:
                 planned = self._plan_aligned(req_meta, aligned)
             grouped = []
             n_declined = 0
+            declined: dict[int, dict] = {}
+            req_meta[v1.FF_DECLINED_SLOT] = declined
             for gi, (remote_ids, local_ids) in enumerate(aligned):
                 plan_g = planned.get(gi)
                 if plan_g is not None and len(plan_g) == len(local_ids):
                     before = len(local_ids)
+                    pairs = declined_pairs(plan_g, local_ids, remote_ids)
+                    if pairs:
+                        declined[gi] = pairs
                     # The planned list is D's, so it filters the LOCAL side directly and the remote
                     # side by position. Reading the remote ids back out of `plan_g` instead would
                     # feed D's block ids to the transfer as source addresses.
@@ -2146,12 +2199,75 @@ if _ASCEND_AVAILABLE:
             until its KV has actually arrived."""
             self._verify_transfer(req_meta)
             self._audit_self_consistency(req_meta)
-            if self.dedup_engine is not None:
+            if self.dedup_engine is None:
+                return
+            ext_id = v1._ext_of(req_meta["remote_request_id"])
+            if not self._materialize_on_landing(req_meta):
                 # Same lock as plan/forget: under ASYNC_PLAN this release (transfer thread) races the
                 # exchange thread's plan for other requests, and the lock is what serialises their
                 # touches on the engine's shared maps.
                 with self._engine_lock:
-                    self.dedup_engine.release(v1._ext_of(req_meta["remote_request_id"]))
+                    self.dedup_engine.release(ext_id)
+                return
+            if self.last_segment_count == 0:
+                # Fully deduped: no pull ran, so nothing has yet landed a previous tenant's in-flight
+                # write to these freshly allocated blocks — the copy below must not be clobbered by
+                # one. _issue_transfer does this for every pull. Outside both locks: it is a device
+                # drain, and the forward thread must not wait on it.
+                from kv_fast_fusion import fast_fusion_block_pool as _bp
+                _bp.flush_before_load()
+            with self._engine_lock:
+                refused = self.dedup_engine.release_materialized(
+                    ext_id, self.ff_copy_alias_blocks,
+                    landing_hot_victims(req_meta.get("local_block_ids")))
+            if refused:
+                self._repull_refused(req_meta, ext_id, refused)
+
+        def _materialize_on_landing(self, req_meta) -> bool:
+            """Realise aliases here, at landing, rather than on the forward path?
+
+            Only for the copy variant (a redirect must write the runner's block table), only without
+            ratio scales (they live on the runner, which this thread cannot reach), and only for a
+            single-pull transfer: with several pulls per request the declined descriptors cover the
+            last pull only, so a refusal could not be re-read in full."""
+            return (MATERIALIZE_ON_LANDING and pd_dedup_v2.MATERIALIZE_ALIASES
+                    and pd_dedup_v2.SCALE_MODE != "ratio"
+                    and self.ff_copy_alias_blocks is not None
+                    and int(req_meta.get("tp_num_need_pulls", 1)) == 1)
+
+        def _repull_refused(self, req_meta, ext_id, refused) -> None:
+            """Read the refused victims from the producer, which still holds them.
+
+            Runs before the vendored ``finally`` tells P this request is done, which is what makes
+            the re-read possible at all; by the forward path P has freed the blocks and a refusal
+            costs a full local re-prefill instead. Only a re-read that cannot run goes there."""
+            stats = self.dedup_engine.stats
+            victims = [(gi, v) for gi, vs in refused.items() for v in vs]
+            srcs, dsts, lens, missing = repull_segments(self.declined_descriptors, victims)
+            failed = list(missing)
+            ok = []
+            if srcs and self.declined_session_id is not None:
+                fetch = [x for x in victims if x not in missing]
+                try:
+                    self._issue_transfer(req_meta, self.declined_session_id, srcs, dsts, lens)
+                    mini = [([], []) for _ in range(max(gi for gi, _v in fetch) + 1)]
+                    for gi, v in fetch:
+                        mini[gi][1].append([v])
+                    self._reformat_after_pull(mini, req_meta["offset"],
+                                              req_meta["tp_num_need_pulls"])
+                    ok = fetch
+                except Exception as e:  # noqa: BLE001 - a failed re-read degrades to recompute
+                    logger.warning("BFF pull-v2: re-read of %d refused alias(es) failed (%s) — "
+                                   "recomputing them.", len(fetch), e)
+                    failed.extend(fetch)
+            else:
+                failed = victims
+            stats.repulled += len(ok)
+            if failed:
+                stats.repull_failed += len(failed)
+                stats.note_recompute(len(failed), rid=ext_id)
+                if self.ff_note_failed_blocks is not None:
+                    self.ff_note_failed_blocks([v for _gi, v in failed])
 
         def _audit_self_consistency(self, req_meta) -> None:
             """Did this request's KV change when the identical descriptors were issued again?
@@ -2571,6 +2687,7 @@ if _ASCEND_AVAILABLE:
         """v1's worker plus the signature server (on P) and the dedup engine (on D)."""
 
         _RECV_THREAD_CLS = KVCacheRecvingThreadFFv2
+        _logged_freed = False
 
         def __init__(self, vllm_config, engine_id, kv_cache_config=None):
             # `_dedup_engine`, never `_engine`: the vendored worker's `self.engine` is the Mooncake
@@ -2591,6 +2708,9 @@ if _ASCEND_AVAILABLE:
             self._jl = [None]        # JL projection cache, must outlive the calls
             self._proj = [None]      # SimHash projection cache — same reason
             self._ff_failed_blocks: set = set()
+            # The recv thread notes failures too (a landing re-read that could not run), while the
+            # forward thread takes them; an unlocked swap could hand a block id over twice.
+            self._ff_failed_lock = threading.Lock()
             self._group_layers: dict[int, set] = {}
             # Producer-side signature precompute cache (PRODUCER_SIGCACHE): (gi, block_id) -> per-block
             # payload, filled at save time and read by the _SigServer thread, so guarded by a lock.
@@ -2625,6 +2745,18 @@ if _ASCEND_AVAILABLE:
             # queue: the gate wants the latest reading, and a step that ships nothing else still
             # ships this. See _dedup_gate_closed for why a local read is not an option at TP>1.
             self._kv_usage = getattr(metadata, "kv_usage", None)
+            # The scheduler's frees since the last step: at TP>1 the only way the dedup index hears
+            # of them (FreedBlockLog). Bound here, before this step's forward can write a reissued
+            # block, and under the engine's own lock, which a landing copy holds until its device
+            # work is done — so a representative is either copied intact or seen as gone.
+            freed = getattr(metadata, "freed_blocks", None)
+            if freed and self._dedup_engine is not None:
+                self._dedup_engine.on_blocks_freed(freed)
+                self._dedup_engine.stats.freed_shipped += len(freed)
+                if not MooncakeConnectorWorkerFFv2._logged_freed:
+                    MooncakeConnectorWorkerFFv2._logged_freed = True
+                    logger.info("BFF pull-v2: scheduler frees reach the dedup index (%d id(s) in "
+                                "the first batch).", len(freed))
             if v1.SIG_PIGGYBACK and self.kv_recv_thread is not None:
                 sigs = getattr(metadata, "ff_sigs", None)
                 if sigs:
@@ -2676,6 +2808,8 @@ if _ASCEND_AVAILABLE:
                 if self.kv_recv_thread is not None:
                     self.kv_recv_thread.dedup_engine = self._dedup_engine
                     self.kv_recv_thread.sig_client = self._sig_client
+                    self.kv_recv_thread.ff_copy_alias_blocks = _make_landing_copy(self)
+                    self.kv_recv_thread.ff_note_failed_blocks = self.note_failed_blocks
                     # The producer's own method, pointed at THIS node's cache — that sameness is
                     # what makes the two sides' signatures comparable at all.
                     self.kv_recv_thread.local_sigs = self.signatures_for_group_split
@@ -2691,13 +2825,17 @@ if _ASCEND_AVAILABLE:
                 # (copy into own blocks, no table write, full graph legal) vs the default redirect
                 # (pointer share + free, PIECEWISE-only). A stale build or an unset flag is then
                 # visible without inference, the trap the async work kept falling into.
-                logger.info("BFF pull-v2: alias apply mode = %s%s.",
+                logger.info("BFF pull-v2: alias apply mode = %s%s%s.",
                             "MATERIALIZE (copy into own blocks; no post-capture table write; "
                             "retains own blocks, no orphan free — memory NOT shared, concurrency at "
                             "baseline, by design)"
                             if pd_dedup_v2.MATERIALIZE_ALIASES else "redirect (pointer share + free)",
                             ", FULL_DECODE_ONLY permitted"
-                            if (ALLOW_FULL_GRAPH and pd_dedup_v2.MATERIALIZE_ALIASES) else "")
+                            if (ALLOW_FULL_GRAPH and pd_dedup_v2.MATERIALIZE_ALIASES) else "",
+                            ("; copied at LANDING on the recv thread, refusals re-read from P"
+                             if MATERIALIZE_ON_LANDING and pd_dedup_v2.SCALE_MODE != "ratio"
+                             else "; copied on the forward path, refusals recomputed")
+                            if pd_dedup_v2.MATERIALIZE_ALIASES else "")
                 if VERIFY_TRANSFER > 0:
                     logger.warning(
                         "BFF pull-v2: TRANSFER VERIFICATION on for the first %d request(s). Each "
@@ -3084,10 +3222,12 @@ if _ASCEND_AVAILABLE:
                     flat.update(int(x) for x in b)
                 else:
                     flat.add(int(b))
-            self._ff_failed_blocks |= flat
+            with self._ff_failed_lock:
+                self._ff_failed_blocks |= flat
 
         def take_failed_blocks(self) -> set:
-            out, self._ff_failed_blocks = self._ff_failed_blocks, set()
+            with self._ff_failed_lock:
+                out, self._ff_failed_blocks = self._ff_failed_blocks, set()
             return out
 
     class MooncakeConnectorFFv2(v1.MooncakeConnectorFF):
@@ -3612,6 +3752,37 @@ if _ASCEND_AVAILABLE:
                                gi, len(pairs), e)
                 return False
         return _copy
+
+    def _make_landing_copy(worker):
+        """The materialize copy for the RECV thread: ``copy(gi, pairs) -> bool``, done on return.
+
+        On its own stream, synchronised before returning, because the caller holds the dedup
+        engine's lock across it (DedupEngine.release_materialized) and the forward thread takes that
+        lock to invalidate freed blocks: done-on-return is what makes "copied intact or seen as gone"
+        true. A dedicated stream waits only for this copy — syncing the default stream would also
+        wait out the in-flight forward while the forward thread is blocked on the lock. The sources
+        are prompt KV that has landed (by a host-synchronous read) and the destinations belong to a
+        request that has not run, so no stream ordering is needed — with one caveat shared with the
+        forward-path copy: an owner's LAST prompt block keeps receiving its decode's writes in the
+        free slots, and a copy of it carries whatever those slots hold."""
+        copy = _make_copy_alias_blocks(worker)
+
+        def _landing(gi: int, pairs) -> bool:
+            try:
+                import torch
+                stream = worker.__dict__.get("_ff_landing_stream")
+                if stream is None:
+                    dev = cache_list_device(list(worker.kv_caches.values()))
+                    stream = worker._ff_landing_stream = torch.npu.Stream(device=dev)
+                with torch.npu.stream(stream):
+                    ok = copy(None, gi, pairs)
+                stream.synchronize()
+                return ok
+            except Exception as e:  # noqa: BLE001 - a copy that cannot run is re-read instead
+                logger.warning("BFF pull-v2 landing copy failed (group %s, %d pairs): %s",
+                               gi, len(pairs), e)
+                return False
+        return _landing
 
     def register_mooncake_connector_ff_v2() -> None:
         """Register ``MooncakeConnectorFFv2`` (idempotent)."""

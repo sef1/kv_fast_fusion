@@ -1247,6 +1247,18 @@ if v2:
             reasons[k] = reasons.get(k, 0) + n
     if reasons:
         print("    alias failures: " + " ".join(f"{k}={n}" for k, n in sorted(reasons.items())))
+    # Landing-time materialize: a refusal is re-read from P instead of recomputed on D, and the
+    # scheduler's frees reach the worker's index. A recompute stalls the whole decode batch.
+    RP = sum(s.get("aliases_repulled") or 0 for s in v2)
+    RPF = sum(s.get("repull_failed") or 0 for s in v2)
+    FS = sum(s.get("freed_blocks_shipped") or 0 for s in v2)
+    RI = sum(s.get("resident_invalidated") or 0 for s in v2)
+    if RP or RPF or FS:
+        print(f"    refusals re-read from P: {RP} (re-read failed -> recomputed: {RPF}) | "
+              f"scheduler frees shipped {FS}, resident reps invalidated {RI}")
+    if any("freed_blocks_shipped" in s for s in v2) and not FS:
+        print("    -> WARNING: no scheduler frees reached the dedup index; at TP>1 resident "
+              "aliasing cannot see a representative being reissued.")
 
     # THE distribution. A run-level saving of a few percent reads identically whether every request
     # gave up a little or a handful gave up nearly everything — and only the second answers the
