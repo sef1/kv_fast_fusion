@@ -248,6 +248,54 @@ def test_promotion_keeps_the_copy_when_the_rep_is_unproven(monkeypatch):
     assert pool.free == 0
 
 
+class _Log:
+    def __init__(self):
+        self.lines = []
+
+    def info(self, fmt, *args):
+        self.lines.append(fmt % args)
+
+    warning = info
+
+
+def test_a_swap_is_logged_and_its_freed_victim_remembered(monkeypatch):
+    monkeypatch.setattr(patch, "_ext_of", lambda rid: rid.rsplit("-", 1)[0])
+    log = _Log()
+    monkeypatch.setattr(patch, "logger", log)
+    sched, _pool, _g1 = _scheduler()
+
+    patch._bff_landed_promotion_apply(sched, sched.requests["rB-1"])
+
+    assert "BFF swap | req=rB g=1 pos=1 victim=51 rep=41 owner=rA" in log.lines
+    assert list(sched._bff_freed_victims) == [51]
+    assert sched._bff_freed_victims[51][0] == "rB"
+
+
+def test_a_later_request_holding_a_freed_victim_is_named(monkeypatch):
+    """The attribution the garbage hunt needs: who inherited a block freed at promotion."""
+    monkeypatch.setattr(patch, "_ext_of", lambda rid: rid.rsplit("-", 1)[0])
+    log = _Log()
+    monkeypatch.setattr(patch, "logger", log)
+    sched, pool, g1 = _scheduler()
+    patch._bff_landed_promotion_apply(sched, sched.requests["rB-1"])
+    g1.req_to_blocks["rC-1"] = [pool.blocks[i] for i in (60, 51)]
+
+    patch._bff_victim_reuse(sched, types.SimpleNamespace(request_id="rC-1"))
+
+    assert any(line.startswith("BFF victim reuse | req=rC g=1 pos=1 block=51 freed by rB")
+               for line in log.lines)
+    assert sched._bff_freed_victims == {}, "reported once"
+
+
+def test_a_kept_victim_is_not_remembered_as_freed(monkeypatch):
+    monkeypatch.setattr(patch, "_ext_of", lambda rid: rid.rsplit("-", 1)[0])
+    sched, _pool, _g1 = _scheduler(owner_computed=BS + 10)
+
+    patch._bff_landed_promotion_apply(sched, sched.requests["rB-1"])
+
+    assert not sched.__dict__.get("_bff_freed_victims")
+
+
 def test_the_ingest_stashes_maps_until_promotion():
     sched = types.SimpleNamespace(requests={})
     out = types.SimpleNamespace(kv_connector_output=types.SimpleNamespace(

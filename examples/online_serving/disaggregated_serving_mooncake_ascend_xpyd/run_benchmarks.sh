@@ -993,6 +993,15 @@ PY
   fi
 }
 
+# Garbage outputs, for EVERY run (baseline included): F1 averages them away, and fixed-output runs
+# have no F1 at all. GLM Magicoder-4096 dedup runs had 10-13 of 121 against 0-1 without dedup. With
+# free-at-promotion on, each one is attributed from the decode's swap/reuse trace.
+report_degenerate() {
+  [[ -f "${results_root}/raw_outputs.json" ]] || return 0
+  python -m f1_benchmark.degenerate_outputs "${results_root}" "${logs_root}/decode-0.txt" \
+    2>/dev/null | head -40 || true
+}
+
 collect_bff_stats() {
   [[ "$BFF_ON" != "1" ]] && return 0
   python3 - "$results_root" "$logs_root" <<'PY' || true
@@ -1608,6 +1617,7 @@ main() {
   report_comparability
   report_capacity_bound
   report_recv_thread
+  report_degenerate
   collect_bff_stats
 
   echo "Benchmark done. Logs: ${logs_root}  Results: ${results_root}"

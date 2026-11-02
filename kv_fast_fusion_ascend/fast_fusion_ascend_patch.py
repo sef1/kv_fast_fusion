@@ -18,6 +18,7 @@ Two categories:
 """
 
 import os
+import time
 
 from vllm.logger import init_logger
 from vllm.v1.request import RequestStatus
@@ -439,6 +440,51 @@ def _landed_swap(scheduler, request, per_rank, st) -> None:
         scheduler._handle_block_merging_with_counts({request.request_id: merged})
         st["freed"] += pool.get_num_free_blocks() - before
         st["swapped"] += sum(1 for gi, t in merged.items() for a, b in zip(t, own[gi]) if a != b)
+        _note_swaps(scheduler, request, merged, own, consensus)
+
+
+# Victims freed at promotion, {block_id: (ext of the request that freed it, monotonic time)}, until a
+# later request is promoted holding the block. GLM Magicoder-4096 (2026-11-02): ~95 frees a run and
+# 10-13 garbage outputs, unaliased requests hit as often as aliased ones — this says whether the
+# garbage lands on whoever inherits a freed victim.
+_FREED_VICTIMS_CAP = 4096
+
+
+def _note_swaps(scheduler, request, merged, own, consensus) -> None:
+    """One line per swapped victim, and remember each one that actually went back to the pool."""
+    ext = _ext_of(request.request_id)
+    blocks = getattr(scheduler.kv_cache_manager.coordinator.block_pool, "blocks", None)
+    freed = scheduler.__dict__.setdefault("_bff_freed_victims", OrderedDict())
+    now = time.monotonic()
+    for gi, table in merged.items():
+        for pos, (rep, victim) in enumerate(zip(table, own[gi])):
+            if rep == victim:
+                continue
+            owner = consensus.get(gi, {}).get(victim, (None, None))[1]
+            logger.info("BFF swap | req=%s g=%d pos=%d victim=%d rep=%d owner=%s",
+                        ext, gi, pos, victim, rep, owner)
+            if blocks is not None and blocks[victim].ref_cnt == 0:
+                freed[victim] = (ext, now)
+                freed.move_to_end(victim)
+    while len(freed) > _FREED_VICTIMS_CAP:
+        freed.popitem(last=False)
+
+
+def _bff_victim_reuse(scheduler, request) -> None:
+    """Log every victim freed at an earlier promotion that this promoted request now holds."""
+    freed = scheduler.__dict__.get("_bff_freed_victims")
+    if not freed:
+        return
+    ext = _ext_of(request.request_id)
+    now = time.monotonic()
+    managers = scheduler.kv_cache_manager.coordinator.single_type_managers
+    for gi, m in enumerate(managers):
+        for pos, b in enumerate(m.req_to_blocks.get(request.request_id, ())):
+            src = freed.pop(b.block_id, None)
+            if src is not None:
+                logger.info("BFF victim reuse | req=%s g=%d pos=%d block=%d freed by %s "
+                            "%.0f ms earlier", ext, gi, pos, b.block_id, src[0],
+                            (now - src[1]) * 1e3)
 
 
 def _wrap_scheduler_promotion(scheduler_cls) -> bool:
@@ -455,6 +501,10 @@ def _wrap_scheduler_promotion(scheduler_cls) -> bool:
     def _promote(self, request, _orig=orig):
         promoted = _orig(self, request)
         if promoted:
+            try:
+                _bff_victim_reuse(self, request)
+            except Exception as e:  # pragma: no cover - diagnostic only
+                logger.warning("BFF victim-reuse check failed for %s: %s", request.request_id, e)
             try:
                 _bff_promotion_apply(self, request)
             except Exception as e:  # pragma: no cover - never break scheduling
