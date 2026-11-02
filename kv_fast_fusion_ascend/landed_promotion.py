@@ -77,6 +77,10 @@ def promotion_swaps(own_blocks, consensus: dict, owner_state, block_size, own_co
     request's new tokens into the owner's rep. Such a victim keeps its own (already copied) block.
     None disables the check, for callers that cannot know it."""
     refused = {r: 0 for r in REFUSALS}
+    # Not a refusal — overlaps them. How many landed victims are the request's LAST block: on GLM
+    # Magicoder most matches looked like the prompt's tail (the shared chat-template suffix), which
+    # is partly filled and can never be shared. Counting it says whether that is the whole story.
+    refused["last_block"] = 0
     merged: dict[int, list[int]] = {}
     for gi, vs in consensus.items():
         if gi >= len(own_blocks):
@@ -90,6 +94,8 @@ def promotion_swaps(own_blocks, consensus: dict, owner_state, block_size, own_co
             if victim not in pos:
                 refused["victim_moved"] += 1
                 continue
+            if pos[victim] == len(table) - 1:
+                refused["last_block"] += 1
             if own_computed is not None and (bs <= 0 or pos[victim] >= int(own_computed) // bs):
                 refused["victim_hot"] += 1
                 continue

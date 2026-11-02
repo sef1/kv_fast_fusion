@@ -118,6 +118,23 @@ def test_a_partly_filled_last_victim_keeps_its_own_block():
     assert merged == {} and refused["victim_hot"] == 1
 
 
+def test_a_last_block_victim_is_counted_whether_or_not_it_is_hot():
+    _m, hot = lp.promotion_swaps([[], [50, 51, 52]], {1: {52: (42, "rA")}},
+                                 _owner([40, 41, 42], 3 * BS), BS, own_computed=300)
+    merged, full = lp.promotion_swaps([[], [50, 51, 52]], {1: {52: (42, "rA")}},
+                                      _owner([40, 41, 42], 3 * BS), BS, own_computed=3 * BS)
+
+    assert hot["last_block"] == 1 and hot["victim_hot"] == 1
+    assert full["last_block"] == 1 and merged == {1: [50, 51, 42]}
+
+
+def test_an_interior_victim_is_not_a_last_block():
+    _m, refused = lp.promotion_swaps([[], [50, 51, 52]], {1: {51: (41, "rA")}},
+                                     _owner([40, 41, 42], 3 * BS), BS, own_computed=3 * BS)
+
+    assert refused["last_block"] == 0
+
+
 def test_a_full_last_block_is_still_swapped():
     merged, refused = lp.promotion_swaps([[], [50, 51, 52]], {1: {52: (42, "rA")}},
                                          _owner([40, 41, 42], 3 * BS), BS, own_computed=3 * BS)

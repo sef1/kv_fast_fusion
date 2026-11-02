@@ -345,6 +345,7 @@ def _bff_promotion_apply(scheduler, request) -> None:
 
 _LANDED_STATS: "defaultdict[str, int]" = defaultdict(int)
 _LANDED_LOG_EVERY = int(os.environ.get("BFF_V2_PROMOTION_LOG_EVERY", "50"))
+_LANDED_LOG_ALL = 200
 _LANDED_CAP = 8192
 
 
@@ -377,7 +378,6 @@ def _bff_landed_promotion_apply(scheduler, request) -> None:
     scheduler can prove the representative is still the block the worker copied. See
     kv_fast_fusion_ascend/landed_promotion.py for the argument; anything unproven keeps its own
     (already valid) block."""
-    from kv_fast_fusion_ascend.landed_promotion import consensus_landed, promotion_swaps
     store = scheduler.__dict__.get("_bff_landed")
     if not store or request.status != RequestStatus.WAITING:
         return
@@ -386,6 +386,23 @@ def _bff_landed_promotion_apply(scheduler, request) -> None:
         return
     st = _LANDED_STATS
     st["promotions"] += 1
+    st["landed"] += max(sum(len(vs) for vs in m.values()) for m in per_rank.values())
+    try:
+        _landed_swap(scheduler, request, per_rank, st)
+    finally:
+        # Every landed promotion while they are few (25-38 a run on GLM Magicoder), then every N:
+        # one line per promotion is what lets refusals be attributed rather than inferred.
+        if st["promotions"] <= _LANDED_LOG_ALL or st["promotions"] % _LANDED_LOG_EVERY == 0:
+            logger.info("BFF promotion free | promotions=%d landed=%d swapped=%d freed=%d | "
+                        "refused: %s", st["promotions"], st["landed"], st["swapped"], st["freed"],
+                        " ".join(f"{k}={st[k]}" for k in (
+                            "incomplete_ranks", "no_consensus", "owner_gone", "owner_loading",
+                            "rep_moved", "rep_hot", "victim_moved", "victim_hot", "last_block")))
+
+
+def _landed_swap(scheduler, request, per_rank, st) -> None:
+    """The body of :func:`_bff_landed_promotion_apply`: consensus, proof, swap."""
+    from kv_fast_fusion_ascend.landed_promotion import consensus_landed, promotion_swaps
     pc = getattr(getattr(scheduler, "vllm_config", None), "parallel_config", None)
     n_ranks = int(getattr(pc, "tensor_parallel_size", 1) or 1)
     consensus, n_disagreed = consensus_landed(per_rank, n_ranks)
@@ -422,13 +439,6 @@ def _bff_landed_promotion_apply(scheduler, request) -> None:
         scheduler._handle_block_merging_with_counts({request.request_id: merged})
         st["freed"] += pool.get_num_free_blocks() - before
         st["swapped"] += sum(1 for gi, t in merged.items() for a, b in zip(t, own[gi]) if a != b)
-    # First one too, so a short run (or one with a single landed request) still says what happened.
-    if st["promotions"] == 1 or st["promotions"] % _LANDED_LOG_EVERY == 0:
-        logger.info("BFF promotion free | promotions=%d swapped=%d freed=%d | refused: %s",
-                    st["promotions"], st["swapped"], st["freed"],
-                    " ".join(f"{k}={st[k]}" for k in (
-                        "incomplete_ranks", "no_consensus", "owner_gone", "owner_loading",
-                        "rep_moved", "rep_hot", "victim_moved", "victim_hot")))
 
 
 def _wrap_scheduler_promotion(scheduler_cls) -> bool:
