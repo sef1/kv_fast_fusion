@@ -455,12 +455,18 @@ def _note_swaps(scheduler, request, merged, own, consensus) -> None:
     ext = _ext_of(request.request_id)
     blocks = getattr(scheduler.kv_cache_manager.coordinator.block_pool, "blocks", None)
     freed = scheduler.__dict__.setdefault("_bff_freed_victims", OrderedDict())
+    # {ext: {"swapped", "owner"}} for shared_write_check's preempt/recompute/write lines. Bounded by
+    # the run's request count; never popped, since a role outlives the request that caused it.
+    roles = scheduler.__dict__.setdefault("_bff_swap_roles", {})
     now = time.monotonic()
     for gi, table in merged.items():
         for pos, (rep, victim) in enumerate(zip(table, own[gi])):
             if rep == victim:
                 continue
             owner = consensus.get(gi, {}).get(victim, (None, None))[1]
+            roles.setdefault(ext, set()).add("swapped")
+            if owner is not None:
+                roles.setdefault(owner, set()).add("owner")
             logger.info("BFF swap | req=%s g=%d pos=%d victim=%d rep=%d owner=%s",
                         ext, gi, pos, victim, rep, owner)
             if blocks is not None and blocks[victim].ref_cnt == 0:
@@ -865,6 +871,10 @@ def apply_fast_fusion_ascend_patch() -> None:
     # connector publishes via _FF_PENDING_SOURCE; a no-op on the producer / when unpublished.
     if _wrap_scheduler_promotion(Scheduler):
         logger.info("BFF Ascend: promotion-time redirect apply installed on Scheduler.")
+    from kv_fast_fusion_ascend import shared_write_check
+    if shared_write_check.install(Scheduler):
+        logger.info("BFF Ascend: shared-block write check installed on Scheduler "
+                    "(BFF_V2_SHARED_WRITE_CHECK=0 disables).")
 
     # --- 4. (NPUModelRunner lean init moved to step 0 — see the comment there.) ---
 

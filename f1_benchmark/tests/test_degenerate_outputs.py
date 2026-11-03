@@ -52,6 +52,22 @@ def test_the_report_counts_and_attributes_garbage():
     assert lines[2] == f"  #1 {U3} declined=0/40 | recipient"
 
 
+def test_shared_writes_and_lifecycle_events_join_the_garbage():
+    outputs = [{"generated_text": "x" * 2000, "response_id": f"chatcmpl-{U2}"},
+               {"generated_text": CODE, "response_id": f"chatcmpl-{U1}"}]
+    log = (f"INFO BFF swap | req=chatcmpl-{U1} g=1 pos=0 victim=51 rep=41 owner=chatcmpl-{U2}\n"
+           f"ERROR BFF shared-block write | req=chatcmpl-{U1}-ab12cd34 g=1 pos=0 block=41 "
+           f"ref_cnt=2 tokens=[0,200) roles=swapped | other holders: chatcmpl-{U2}-ef56ab78@0\n"
+           f"INFO BFF preempt | req=chatcmpl-{U1}-ab12cd34 computed=4100 roles=swapped\n")
+
+    lines = dg.report(outputs, {}, log)
+
+    assert lines[0] == "degenerate outputs: 1/2"
+    assert "written=1 writer=0 preempted=0" in lines[2]
+    assert "1 written, 1 writer, 1 preempted, 0 recomputed" in lines[2]
+    assert lines[3] == f"  #0 {U2} declined=-/- | owner | written"
+
+
 def test_without_a_log_the_report_still_counts():
     lines = dg.report([{"generated_text": "x" * 2000}])
 

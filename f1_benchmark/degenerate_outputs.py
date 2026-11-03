@@ -30,6 +30,11 @@ MIN_ALNUM_SHARE = 0.2
 
 _SWAP = re.compile(r"BFF swap \| req=(\S+) .* owner=(\S+)")
 _REUSE = re.compile(r"BFF victim reuse \| req=(\S+) .* freed by (\S+)")
+# kv_fast_fusion_ascend/shared_write_check.py
+_SHARED_WRITE = re.compile(r"BFF shared-block write \| req=(\S+) .*other holders: (.*)$", re.M)
+_PREEMPT = re.compile(r"BFF preempt \| req=(\S+)")
+_RECOMPUTE = re.compile(r"BFF recompute \| req=(\S+)")
+EVENTS = ("written", "writer", "preempted", "recomputed")
 
 
 def is_degenerate(text: str) -> bool:
@@ -56,6 +61,23 @@ def parse_trace(log_text: str) -> dict:
     return roles
 
 
+def parse_events(log_text: str) -> dict:
+    """``{event: {uuid}}`` from the shared-write check: ``written`` holds a block someone else
+    wrote into, ``writer`` did the writing, and the two lifecycle events a rewrite would follow."""
+    ev = {e: set() for e in EVENTS}
+    for m in _SHARED_WRITE.finditer(log_text):
+        ev["writer"].add(uuid_of(m.group(1)))
+        for holder in m.group(2).split():
+            ev["written"].add(uuid_of(holder.split("@")[0]))
+    for m in _PREEMPT.finditer(log_text):
+        ev["preempted"].add(uuid_of(m.group(1)))
+    for m in _RECOMPUTE.finditer(log_text):
+        ev["recomputed"].add(uuid_of(m.group(1)))
+    for ids in ev.values():
+        ids.discard(None)
+    return ev
+
+
 def roles_of(key, roles: dict) -> list:
     got = [r for r in ("swapped", "owner", "recipient") if key in roles[r]]
     return got or ["none"]
@@ -72,7 +94,11 @@ def report(outputs, ledger=None, log_text=None) -> list:
         # every garbage request "none" would read as an exoneration the log cannot give.
         lines.append("  (no free-at-promotion trace in the decode log — attribution skipped)")
         roles = None
+    events = parse_events(log_text) if log_text else None
+    if events is not None and not any(events.values()):
+        events = None             # no shared-write check in this build, or nothing to say
     tally: dict = {}
+    ev_tally: dict = {}
     for i, o in bad:
         key = uuid_of(o.get("response_id"))
         e = ledger.get(key) or {}
@@ -83,7 +109,18 @@ def report(outputs, ledger=None, log_text=None) -> list:
             for r in rs:
                 tally[r] = tally.get(r, 0) + 1
             line += " | " + ",".join(rs)
+        if events is not None:
+            hit = [ev for ev in EVENTS if key in events[ev]]
+            for ev in hit:
+                ev_tally[ev] = ev_tally.get(ev, 0) + 1
+            if hit:
+                line += " | " + ",".join(hit)
         lines.append(line)
+    if events is not None:
+        lines.insert(1, "  shared-write/lifecycle events on the garbage: "
+                     + " ".join(f"{ev}={ev_tally.get(ev, 0)}" for ev in EVENTS)
+                     + "  (run-wide: " + ", ".join(f"{len(events[ev])} {ev}" for ev in EVENTS)
+                     + ")")
     if roles is not None and bad:
         n_all = {r: len(ids) for r, ids in roles.items()}
         lines.insert(1, "  free-path roles of the garbage: "
