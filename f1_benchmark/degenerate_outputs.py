@@ -34,7 +34,16 @@ _REUSE = re.compile(r"BFF victim reuse \| req=(\S+) .* freed by (\S+)")
 _SHARED_WRITE = re.compile(r"BFF shared-block write \| req=(\S+) .*other holders: (.*)$", re.M)
 _PREEMPT = re.compile(r"BFF preempt \| req=(\S+)")
 _RECOMPUTE = re.compile(r"BFF recompute \| req=(\S+)")
-EVENTS = ("written", "writer", "preempted", "recomputed")
+_LANDED_SHARED = re.compile(r"BFF landed-into-shared \| req=(\S+) .*other holders: (.*)$", re.M)
+_PULL_SHARED = re.compile(r"BFF pull-into-shared \| req=(\S+)")
+# kv_fast_fusion/fast_fusion_block_pool.py (BFF_V2_ALIAS_TRACE)
+_ALIAS_HIT = re.compile(r"BFF alias hit \| req=(\S+) g=\d+ pos=\d+ block=(\d+) via=(\S+)")
+_REARRIVAL = re.compile(r"BFF rearrival \| req=(\S+)")
+_SWAP_REP = re.compile(r"BFF swap \| req=\S+ .* rep=(\d+) owner=(\S+)")
+# written/writer: a scheduled write into a shared block. landed_*: a landing copy into one.
+# alias_hitter: a prefix hit through an alias or on a freed victim; hit_owner: owner of the hit rep.
+EVENTS = ("written", "writer", "preempted", "recomputed", "landed_writer", "landed_holder",
+          "pull_shared", "alias_hitter", "hit_owner", "rearrived")
 
 
 def is_degenerate(text: str) -> bool:
@@ -62,8 +71,10 @@ def parse_trace(log_text: str) -> dict:
 
 
 def parse_events(log_text: str) -> dict:
-    """``{event: {uuid}}`` from the shared-write check: ``written`` holds a block someone else
-    wrote into, ``writer`` did the writing, and the two lifecycle events a rewrite would follow."""
+    """``{event: {uuid}}`` from the shared-write check and the alias trace (see ``EVENTS``).
+
+    ``hit_owner`` is approximate: a rep id is mapped to every owner it was ever swapped onto, and
+    block ids are reused over a run."""
     ev = {e: set() for e in EVENTS}
     for m in _SHARED_WRITE.finditer(log_text):
         ev["writer"].add(uuid_of(m.group(1)))
@@ -73,6 +84,21 @@ def parse_events(log_text: str) -> dict:
         ev["preempted"].add(uuid_of(m.group(1)))
     for m in _RECOMPUTE.finditer(log_text):
         ev["recomputed"].add(uuid_of(m.group(1)))
+    for m in _LANDED_SHARED.finditer(log_text):
+        ev["landed_writer"].add(uuid_of(m.group(1)))
+        for holder in m.group(2).split():
+            ev["landed_holder"].add(uuid_of(holder.split("@")[0]))
+    for m in _PULL_SHARED.finditer(log_text):
+        ev["pull_shared"].add(uuid_of(m.group(1)))
+    rep_owner: dict = {}
+    for m in _SWAP_REP.finditer(log_text):
+        rep_owner.setdefault(m.group(1), set()).add(uuid_of(m.group(2)))
+    for m in _ALIAS_HIT.finditer(log_text):
+        ev["alias_hitter"].add(uuid_of(m.group(1)))
+        if m.group(3) == "alias":
+            ev["hit_owner"].update(rep_owner.get(m.group(2), ()))
+    for m in _REARRIVAL.finditer(log_text):
+        ev["rearrived"].add(uuid_of(m.group(1)))
     for ids in ev.values():
         ids.discard(None)
     return ev

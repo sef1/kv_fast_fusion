@@ -85,6 +85,37 @@ def test_check_step_reports_each_write_once(caplog):
     assert sum("shared-block write" in r.getMessage() for r in caplog.records) == 1
 
 
+def test_a_landing_copy_into_a_block_only_this_request_holds_is_fine():
+    blocks = {51: _Blk(51, ref_cnt=1)}
+    assert swc.landed_anomalies([[], [50, 51]], {1: {51: (41, "O")}}, blocks) == []
+
+
+def test_a_landing_copy_into_a_shared_block_is_reported():
+    blocks = {51: _Blk(51, ref_cnt=2)}
+    assert swc.landed_anomalies([[], [50, 51]], {1: {51: (41, "O")}}, blocks) == [(1, 51, 2, True)]
+
+
+def test_a_landing_copy_into_a_block_the_request_no_longer_holds_is_reported():
+    blocks = {51: _Blk(51, ref_cnt=1)}
+    assert swc.landed_anomalies([[], [50, 52]], {1: {51: (41, "O")}}, blocks) == [(1, 51, 1, False)]
+
+
+def test_a_pull_never_targets_a_prefix_hit_block():
+    hit = _Blk(41, ref_cnt=3)
+    hit.block_hash = "hO"
+    fresh = _Blk(60)
+    fresh.block_hash = None
+    assert swc.check_pull_targets(types.SimpleNamespace(request_id="r"),
+                                  types.SimpleNamespace(blocks=([hit, fresh],))) == 0
+
+
+def test_a_pull_into_a_shared_unhashed_block_is_reported():
+    shared = _Blk(60, ref_cnt=2)
+    shared.block_hash = None
+    assert swc.check_pull_targets(types.SimpleNamespace(request_id="r"),
+                                  types.SimpleNamespace(blocks=([shared],))) == 1
+
+
 def test_install_runs_the_check_before_the_original_advances_tokens():
     seen = []
 

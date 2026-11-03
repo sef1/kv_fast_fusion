@@ -337,7 +337,7 @@ def _handle_block_merging_with_counts(self, request_blocks: dict[str, dict[int, 
                             if blk.is_null or blk.block_id == req_blocks[i].block_id:
                                 continue
                             key = make_block_hash_with_group_id(bhs[i], group_idx)
-                            _bp.add_block_alias(block_pool, key, blk)
+                            _bp.add_block_alias(block_pool, key, blk, req=req_id, pos=i)
                 except Exception as e:
                     logger.warning("BFF alias-fused failed for %s: %s", req_id, e)
 

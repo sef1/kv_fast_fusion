@@ -413,6 +413,11 @@ def _landed_swap(scheduler, request, per_rank, st) -> None:
     st["no_consensus"] += n_disagreed
     if not consensus:
         return
+    try:
+        from kv_fast_fusion_ascend import shared_write_check
+        shared_write_check.check_landed(scheduler, request, consensus)
+    except Exception as e:  # noqa: BLE001 - a diagnostic must never block a swap
+        logger.warning("BFF landed-into-shared check failed: %s", e)
     managers = scheduler.kv_cache_manager.coordinator.single_type_managers
 
     def _blocks_of(rid):
@@ -467,11 +472,17 @@ def _note_swaps(scheduler, request, merged, own, consensus) -> None:
             roles.setdefault(ext, set()).add("swapped")
             if owner is not None:
                 roles.setdefault(owner, set()).add("owner")
-            logger.info("BFF swap | req=%s g=%d pos=%d victim=%d rep=%d owner=%s",
-                        ext, gi, pos, victim, rep, owner)
+            # rep_ref/victim_ref AFTER the merge: a rep held by more than its owner plus the
+            # swappers recorded so far, or a victim still referenced, is the anomaly to look for.
+            logger.info("BFF swap | req=%s g=%d pos=%d victim=%d rep=%d owner=%s rep_ref=%s "
+                        "victim_ref=%s", ext, gi, pos, victim, rep, owner,
+                        blocks[rep].ref_cnt if blocks is not None else "?",
+                        blocks[victim].ref_cnt if blocks is not None else "?")
             if blocks is not None and blocks[victim].ref_cnt == 0:
                 freed[victim] = (ext, now)
                 freed.move_to_end(victim)
+                from kv_fast_fusion import fast_fusion_block_pool as _bp
+                _bp._FREED_AT_PROMOTION[victim] = ext
     while len(freed) > _FREED_VICTIMS_CAP:
         freed.popitem(last=False)
 
@@ -848,6 +859,10 @@ def apply_fast_fusion_ascend_patch() -> None:
     if _ffbp._ORIG_GET_COMPUTED is None:
         _ffbp._ORIG_GET_COMPUTED = KVCacheManager.get_computed_blocks
         KVCacheManager.get_computed_blocks = _ffbp.patched_get_computed_blocks
+    # BFF_V2_ALIAS_TRACE needs the prefix-cache key and the cross-P/D request id, both vllm-side.
+    from vllm.v1.core.kv_cache_utils import make_block_hash_with_group_id
+    _ffbp._KEY_OF = make_block_hash_with_group_id
+    _ffbp._EXT_OF = _ext_of
 
     # --- 3. Block-merge handler on the base Scheduler (inherited by the ascend schedulers) ---
     from vllm.v1.core.sched.scheduler import Scheduler

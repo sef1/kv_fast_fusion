@@ -1060,6 +1060,12 @@ if _ASCEND_AVAILABLE:
                 # warmup group — four layers of twenty-eight.
                 local_block_ids = (blocks.get_unhashed_block_ids_all_groups()
                                    if num_external_tokens > 0 else [])
+                if num_external_tokens > 0:
+                    try:
+                        from kv_fast_fusion_ascend import shared_write_check
+                        shared_write_check.check_pull_targets(request, blocks)
+                    except Exception:  # noqa: BLE001 - a diagnostic must never fail admission
+                        pass
                 self._reqs_need_recv[request.request_id] = (
                     request, local_block_ids, num_external_tokens)
                 # This request now holds allocated blocks it cannot decode from until its pull lands.

@@ -109,6 +109,64 @@ def check_step(scheduler, scheduler_output) -> int:
         rid = getattr(info, "request_id", None)
         if rid is not None:
             logger.info("BFF recompute | req=%s roles=%s", rid, _roles(scheduler, rid))
+            # Its next prefix lookup is a re-arrival; fast_fusion_block_pool logs that lookup.
+            from kv_fast_fusion import fast_fusion_block_pool as _bp
+            from kv_fast_fusion_ascend.fast_fusion_ascend_patch import _ext_of
+            _bp._RECOMPUTED_EXT.add(_ext_of(rid))
+    return n
+
+
+def landed_anomalies(own_blocks, consensus: dict, blocks) -> list:
+    """``[(gi, victim, ref_cnt, in_own_table)]`` for every landed copy destination that is NOT a
+    block only this request holds.
+
+    The landing copy writes the representative into each victim on the worker, before promotion,
+    so the scheduler-side write check cannot see it. ``consensus`` is ``{gi: {victim: (rep,
+    owner)}}`` — what every rank copied into. A victim shared with another request (``ref_cnt >
+    1``), or one the request no longer holds at all, means that copy overwrote someone else's KV."""
+    out = []
+    for gi, vs in consensus.items():
+        mine = set(own_blocks[gi]) if gi < len(own_blocks) else set()
+        for victim in vs:
+            ref = blocks[victim].ref_cnt
+            if ref > 1 or victim not in mine:
+                out.append((int(gi), int(victim), int(ref), victim in mine))
+    return out
+
+
+def check_landed(scheduler, request, consensus) -> int:
+    """Log :func:`landed_anomalies` for ``request`` at promotion. Returns the count."""
+    if not ENABLED or not consensus:
+        return 0
+    managers = scheduler.kv_cache_manager.coordinator.single_type_managers
+    own = [[b.block_id for b in m.req_to_blocks.get(request.request_id, [])] for m in managers]
+    blocks = scheduler.kv_cache_manager.coordinator.block_pool.blocks
+    bad = landed_anomalies(own, consensus, blocks)
+    for gi, victim, ref, mine in bad:
+        logger.error("BFF landed-into-shared | req=%s g=%d victim=%d ref_cnt=%d in_own_table=%s "
+                     "roles=%s | other holders: %s", request.request_id, gi, victim, ref, mine,
+                     _roles(scheduler, request.request_id),
+                     " ".join(holders_of(managers, gi, victim, request.request_id)) or "none")
+    return len(bad)
+
+
+def check_pull_targets(request, blocks) -> int:
+    """Log any block the RDMA pull will write that another request also holds.
+
+    ``blocks`` is the ``KVCacheBlocks`` handed to ``update_state_after_alloc``; the pull targets
+    are its unhashed blocks. A hashed (prefix-hit) block is never a target, so a hit through the
+    alias cannot be written this way — this line says whether that holds on the box."""
+    if not ENABLED:
+        return 0
+    n = 0
+    for gi, row in enumerate(getattr(blocks, "blocks", None) or ()):
+        for pos, blk in enumerate(row):
+            if (getattr(blk, "is_null", False) or blk.block_hash is not None
+                    or blk.ref_cnt <= 1):
+                continue
+            n += 1
+            logger.error("BFF pull-into-shared | req=%s g=%d pos=%d block=%d ref_cnt=%d",
+                         request.request_id, gi, pos, blk.block_id, blk.ref_cnt)
     return n
 
 

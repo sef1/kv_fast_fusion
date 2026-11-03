@@ -266,7 +266,8 @@ def test_a_swap_is_logged_and_its_freed_victim_remembered(monkeypatch):
 
     patch._bff_landed_promotion_apply(sched, sched.requests["rB-1"])
 
-    assert "BFF swap | req=rB g=1 pos=1 victim=51 rep=41 owner=rA" in log.lines
+    assert ("BFF swap | req=rB g=1 pos=1 victim=51 rep=41 owner=rA rep_ref=2 victim_ref=0"
+            in log.lines)
     assert list(sched._bff_freed_victims) == [51]
     assert sched._bff_freed_victims[51][0] == "rB"
 

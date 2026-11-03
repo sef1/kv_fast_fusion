@@ -68,6 +68,21 @@ def test_shared_writes_and_lifecycle_events_join_the_garbage():
     assert lines[3] == f"  #0 {U2} declined=-/- | owner | written"
 
 
+def test_an_alias_hit_marks_the_hitter_and_the_owner_of_the_hit_block():
+    outputs = [{"generated_text": "x" * 2000, "response_id": f"chatcmpl-{U2}"},
+               {"generated_text": CODE, "response_id": f"chatcmpl-{U1}"}]
+    log = (f"INFO BFF swap | req=chatcmpl-{U1} g=1 pos=0 victim=51 rep=41 owner=chatcmpl-{U2} "
+           "rep_ref=2 victim_ref=0\n"
+           f"INFO BFF rearrival | req=chatcmpl-{U1}-ab12cd34 local_hit_tokens=128\n"
+           f"INFO BFF alias hit | req=chatcmpl-{U1}-ab12cd34 g=1 pos=0 block=41 via=alias "
+           f"of=chatcmpl-{U1}-00000000@0 ref_cnt=3 hit_tokens=128\n")
+
+    lines = dg.report(outputs, {}, log)
+
+    assert "hit_owner=1" in lines[2] and "rearrived=0" in lines[2]
+    assert lines[3] == f"  #0 {U2} declined=-/- | owner | hit_owner"
+
+
 def test_without_a_log_the_report_still_counts():
     lines = dg.report([{"generated_text": "x" * 2000}])
 

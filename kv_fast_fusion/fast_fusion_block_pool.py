@@ -1,3 +1,4 @@
+import logging
 import os
 import time
 
@@ -175,6 +176,30 @@ _KEEP_FUSED_HASH = os.environ.get(
 _ALIAS_ENABLED = os.environ.get("BFF_ALIAS_FUSED", "1") == "1"
 # rep_block_id -> {alias keys (BlockHashWithGroupId) that point at this block}
 _BLOCK_ALIASES: dict = {}
+# BFF_V2_ALIAS_TRACE: one line per alias insert / drop / prefix hit, plus prefix hits on victims
+# freed at promotion and the first lookup of a request that came back from a kv-consumer
+# recompute. GLM-5.1 free-at-promotion (build 2026-11-03b): alias on 15/121 garbage, off 0/121 at
+# the same swap count, no scheduled write into a shared block — this says which lookup or write
+# the alias enables. Logging only.
+_ALIAS_TRACE = os.environ.get("BFF_V2_ALIAS_TRACE", "1") == "1"
+# rep_block_id -> {alias key: (request id, position)} — whom each alias was made for; trace only.
+_ALIAS_ORIGIN: dict = {}
+# victim block id -> ext id of the request that freed it at promotion (fast_fusion_ascend_patch).
+# Dropped when the block is evicted, i.e. reallocated, so a later hit cannot be misattributed.
+_FREED_AT_PROMOTION: dict = {}
+# ext ids a kv-consumer recompute sent back to the producer (shared_write_check.check_step).
+_RECOMPUTED_EXT: set = set()
+def _ext_identity(rid):
+    return rid
+
+
+# Request id -> ext id. Identity here; the Ascend patch installs vllm_ascend's helper.
+_EXT_OF = _ext_identity
+# (block_hash, group_id) -> prefix-cache key; installed at patch time (make_block_hash_with_group_id)
+# so this module still imports nothing from vllm. None leaves "via=alias" undetectable, not wrong.
+_KEY_OF = None
+# Under the "vllm." namespace so vLLM's own handler prints it.
+_trace_log = logging.getLogger("vllm.bff_alias_trace")
 # Callbacks invoked with the block ids whose ref count just hit zero (see patched_free_blocks).
 # Registered by anything that must stop pointing at a block before it is reallocated.
 _ON_BLOCKS_FREED: list = []
@@ -207,6 +232,11 @@ def patched_get_computed_blocks(self, request):
     """Wrap KVCacheManager.get_computed_blocks to record per-group prefix-cache recovery for
     resumed (previously-preempted) requests. Pure passthrough when BFF_HIT_DEBUG is off."""
     cb, n = _ORIG_GET_COMPUTED(self, request)
+    if _ALIAS_TRACE:
+        try:
+            _trace_hits(request, cb, int(n))
+        except Exception:  # noqa: BLE001 - a trace must never break admission
+            pass
     if _HIT_DEBUG and getattr(request, "num_preemptions", 0) > 0:
         global _resume_lookups, _resume_recovered_tok
         _resume_lookups += 1
@@ -231,14 +261,56 @@ def patched_get_computed_blocks(self, request):
     return cb, n
 
 
-def add_block_alias(block_pool, key, rep_block) -> None:
+def _trace_hits(request, cb, n_hit: int) -> None:
+    """Log every prefix-hit block that is an alias target or a victim freed at promotion, and the
+    lookup of a request returning from a kv-consumer recompute. Cheap: only hit blocks are seen."""
+    rid = getattr(request, "request_id", "?")
+    ext = _EXT_OF(rid)
+    if ext in _RECOMPUTED_EXT:
+        _trace_log.info("BFF rearrival | req=%s local_hit_tokens=%d", rid, n_hit)
+    groups = getattr(cb, "blocks", None) or ()
+    if not n_hit or not (_BLOCK_ALIASES or _FREED_AT_PROMOTION):
+        return
+    bhs = getattr(request, "block_hashes", None) or ()
+    for gi, row in enumerate(groups):
+        for pos, blk in enumerate(row):
+            bid = getattr(blk, "block_id", None)
+            if bid is None or getattr(blk, "is_null", False):
+                continue
+            via = of = None
+            origin = _ALIAS_ORIGIN.get(bid)
+            if origin and pos < len(bhs) and _KEY_OF is not None:
+                hit = origin.get(_KEY_OF(bhs[pos], gi))
+                if hit is not None:
+                    via, of = "alias", f"{hit[0]}@{hit[1]}"
+            if via is None and bid in _FREED_AT_PROMOTION:
+                via, of = "freed_victim", _FREED_AT_PROMOTION[bid]
+            if via is not None:
+                _trace_log.info("BFF alias hit | req=%s g=%d pos=%d block=%d via=%s of=%s ref_cnt=%d "
+                            "hit_tokens=%d", rid, gi, pos, bid, via, of,
+                            getattr(blk, "ref_cnt", -1), n_hit)
+
+
+def add_block_alias(block_pool, key, rep_block, req=None, pos=None) -> None:
     """Register rep_block under an extra prefix-cache key and remember the alias so it
     can be dropped the instant rep_block is recycled/evicted (see
     patched_maybe_evict_cached_block)."""
     global _alias_inserts
+    had = None
+    if _ALIAS_TRACE:
+        try:
+            prev = block_pool.cached_block_hash_to_block.get_one_block(key)
+            had = prev.block_id if prev is not None else None
+        except Exception:  # noqa: BLE001
+            had = "?"
     block_pool.cached_block_hash_to_block.insert(key, rep_block)
     _BLOCK_ALIASES.setdefault(rep_block.block_id, set()).add(key)
     _alias_inserts += 1
+    if _ALIAS_TRACE:
+        _ALIAS_ORIGIN.setdefault(rep_block.block_id, {})[key] = (req, pos)
+        _trace_log.info("BFF alias insert | req=%s pos=%s rep=%d rep_ref=%d rep_hashed=%s key_had=%s",
+                    req, pos, rep_block.block_id, rep_block.ref_cnt,
+                    rep_block.block_hash is not None, had)
 
 
 def on_blocks_freed(hook) -> None:
@@ -261,6 +333,12 @@ def patched_maybe_evict_cached_block(self, block) -> bool:
             for key in aliases:
                 self.cached_block_hash_to_block.pop(key, block.block_id)
                 _alias_drops += 1
+            origin = _ALIAS_ORIGIN.pop(block.block_id, None) or {}
+            if _ALIAS_TRACE:
+                _trace_log.info("BFF alias drop | rep=%d keys=%d ref_cnt=%d for=%s", block.block_id,
+                            len(aliases), block.ref_cnt,
+                            " ".join(f"{r}@{p}" for r, p in origin.values()) or "?")
+    _FREED_AT_PROMOTION.pop(block.block_id, None)
     return _ORIG_MAYBE_EVICT(self, block)
 
 
