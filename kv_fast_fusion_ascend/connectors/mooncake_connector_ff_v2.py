@@ -2844,7 +2844,17 @@ if _ASCEND_AVAILABLE:
             # Phase split of signature_rows_for (BFF_STEP_PROFILE): where the ~41 ms of real signing
             # work per request goes, and the per-layer projection timed against the concat for the
             # first _SIG_ALT_CHECKS calls (time and max |1 - cos| between the two signatures).
-            self._sig_phase_ms = {"project": 0.0, "hash": 0.0, "d2h": 0.0, "encode": 0.0}
+            # project_launch = until the projection call returns (host dispatch); project_device = the
+            # wait after it (device execution). 03i: ~40 ms projection inside a real signing, 3.5-5 ms
+            # when repeated at once, whichever implementation, 0 allocator retries.
+            self._sig_phase_ms = {"project_launch": 0.0, "project_device": 0.0, "hash": 0.0,
+                                  "d2h": 0.0, "encode": 0.0}
+            # Cold-first test (calls _SIG_ALT_CHECKS.._SIG_ALT_CHECKS*2): the per-layer projection runs
+            # FIRST on the just-written KV, the real signing right after. If the first one is the slow
+            # one whatever it is, the cost is the first read after the forward, not the code.
+            self._sig_calls = 0
+            self._sig_skip_phase = False
+            self._sig_cold = {"calls": 0, "cold_ms": 0.0, "warm_after_ms": 0.0}
             self._sig_alt = {"calls": 0, "concat_ms": 0.0, "by_layer_ms": 0.0, "max_dev": 0.0,
                              "spent_ms": 0.0}
             # TP>1 piggyback: signatures signed here cannot reach the scheduler's _FF_SIGS (another
@@ -3175,6 +3185,14 @@ if _ASCEND_AVAILABLE:
                 return [None] * len(ids)
             is_mla = bool(getattr(self.vllm_config.model_config, "use_mla", False))
             prof = _PROFILE_OVERHEAD
+            cold_test = False
+            if prof:
+                self._sig_calls += 1
+                n_alt = self._SIG_ALT_CHECKS
+                cold_test = n_alt < self._sig_calls <= 2 * n_alt
+                self._sig_skip_phase = cold_test
+                if cold_test:
+                    self._sig_cold_first(layers, ids, is_mla, gi)
             t = time.perf_counter() if prof else 0.0
             try:
                 sig, norms = project_signatures(layers, ids, is_mla, self._jl,
@@ -3189,8 +3207,13 @@ if _ASCEND_AVAILABLE:
             if sig is None:
                 return [None] * len(ids)
             if prof:
-                t = self._sig_phase("project", t)
-                self._sig_alt_check(layers, ids, is_mla, gi, sig)
+                t_start = t
+                t = self._sig_phase("project_launch", t, sync=False)
+                t = self._sig_phase("project_device", t)
+                if cold_test:
+                    self._sig_cold_done((t - t_start) * 1e3)
+                else:
+                    self._sig_alt_check(layers, ids, is_mla, gi, sig)
                 t = time.perf_counter()
             proj = pd_lsh.get_proj(self._proj, sig.shape[1], sig.device)
             hashes_dev = pd_lsh.sub_hashes_device(sig, proj)
@@ -3215,8 +3238,33 @@ if _ASCEND_AVAILABLE:
             if sync:
                 _sync_device()
             now = time.perf_counter()
-            self._sig_phase_ms[name] += (now - t0) * 1e3
+            if not self._sig_skip_phase:
+                self._sig_phase_ms[name] += (now - t0) * 1e3
             return now
+
+        def _sig_cold_first(self, layers, ids, is_mla, gi) -> None:
+            """Run the per-layer projection BEFORE the real signing, on the KV the forward just wrote,
+            and time it. BFF_STEP_PROFILE only; its result is discarded."""
+            try:
+                _sync_device()
+                t0 = time.perf_counter()
+                signature_matrix_by_layer(layers, ids, is_mla, self._jl,
+                                          scale=self._group_scale(gi))
+                _sync_device()
+                self._sig_cold["cold_ms"] += (time.perf_counter() - t0) * 1e3
+                self._sig_alt["spent_ms"] += (time.perf_counter() - t0) * 1e3
+            except Exception as e:  # noqa: BLE001 - a diagnostic must never fail a signing
+                logger.warning("BFF pull-v2 producer: cold-first projection test failed (%s).", e)
+
+        def _sig_cold_done(self, warm_ms: float) -> None:
+            c = self._sig_cold
+            c["calls"] += 1
+            c["warm_after_ms"] += warm_ms
+            if c["calls"] == self._SIG_ALT_CHECKS:
+                logger.info("BFF pull-v2 producer: cold-first test over %d calls — a projection run "
+                            "FIRST on the just-written KV %.2f ms/call, the real one right after "
+                            "%.2f ms/call (BFF_STEP_PROFILE).", c["calls"],
+                            c["cold_ms"] / c["calls"], c["warm_after_ms"] / c["calls"])
 
         def _sig_alt_check(self, layers, ids, is_mla, gi, sig) -> None:
             """Time the per-layer projection against the concat on the same blocks, and how far apart

@@ -2004,10 +2004,22 @@ def test_the_barrier_is_verification_only():
              - prof_src.count("_sync_device()"))
     assert calls == 6, f"one before each device read a diagnostic makes (found {calls})"
     rows = src[src.index("        def signature_rows_for("):src.index("        def _sig_phase(")]
-    for helper in ("self._sig_phase(", "self._sig_alt_check("):
-        for at in [i for i in range(len(rows)) if rows.startswith(helper, i)]:
-            assert "if prof:" in rows[rows.rfind("\n", 0, rows.rfind("\n", 0, at)) - 40:at], \
-                f"{helper} must sit behind the profile gate"
+    # Drop every `if prof:` block (by indentation); no profile helper may be left outside one.
+    kept, skip_indent = [], None
+    for line in rows.splitlines():
+        indent = len(line) - len(line.lstrip())
+        if skip_indent is not None and (indent > skip_indent or not line.strip()):
+            continue
+        skip_indent = None
+        if line.strip() == "if prof:":
+            skip_indent = indent
+            continue
+        kept.append(line)
+    outside = "\n".join(kept)
+    for helper in ("self._sig_phase(", "self._sig_alt_check(", "self._sig_cold_first(",
+                   "self._sig_cold_done("):
+        assert helper in rows, f"{helper} should be used in signature_rows_for"
+        assert helper not in outside, f"{helper} must sit behind the profile gate"
     # The sixth splits the producer's signing time (BFF_STEP_PROFILE only): it must come after the
     # profile gate, so an unprofiled run never pays it.
     sign = src[src.index("        def precompute_and_offer("):]
