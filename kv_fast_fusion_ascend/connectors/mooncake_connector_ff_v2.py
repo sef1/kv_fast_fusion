@@ -1217,6 +1217,18 @@ def cache_list_device(kv_caches):
     return probe.device
 
 
+def cache_parts(kv_cache) -> list:
+    """Every per-block tensor of one layer's cache, each indexed by block id on dim 0.
+
+    A tuple is taken whole — under DSA it is ``(latent KV, rope key, indexer key[, indexer key
+    scale])``, and a copy that stops at ``[0]``/``[1]`` leaves the lightning indexer selecting from
+    the destination block's stale keys. A stacked ``[2, num_blocks, ...]`` tensor yields its K and V
+    halves. ``None`` entries (an optional tensor a layer does not have) are skipped."""
+    if isinstance(kv_cache, (list, tuple)):
+        return [t for t in kv_cache if t is not None]
+    return [kv_cache[0], kv_cache[1]]
+
+
 # =================================================================================================
 # Ascend/NPU-only section
 # =================================================================================================
@@ -3769,28 +3781,29 @@ if _ASCEND_AVAILABLE:
         request's own (now-filled) blocks — which is what lets FULL_DECODE_ONLY stay correct: there
         is no post-capture table mutation for the replayed graph to miss.
 
-        Reuses ``AscendAttentionBackend.copy_blocks``, the same primitive vLLM uses for block
-        swap/copy: it does ``key/value_caches[dst] = [src]`` on dim 0 of each ``[2, num_blocks, ...]``
-        layer cache. Defensive by construction — any layout surprise returns False so the alias
+        Copies EVERY tensor of the layer's cache (:func:`cache_parts`), not just ``[0]``/``[1]``.
+        It used to call ``AscendAttentionBackend.copy_blocks``, which copies exactly two: under DSA
+        (GLM-5.1, ``use_sparse``) a layer's cache is ``(latent KV, rope key, indexer key[, indexer
+        key scale])``, so the victim — declined, never read — kept its previous tenant's indexer
+        keys, and the lightning indexer chose its top-k tokens from them while sparse attention read
+        the copied KV. Defensive by construction — any layout surprise returns False so the alias
         degrades to a recompute (``note_failed_blocks``) rather than crashing the forward."""
         def _copy(runner, gi: int, pairs) -> bool:
             if not pairs:
                 return False
             try:
                 import torch
-                from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
                 layer_names = sorted(worker._group_layers.get(int(gi), ()))
                 kv_caches = [worker.kv_caches[ln] for ln in layer_names if ln in worker.kv_caches]
                 if not kv_caches:
                     return False
-                # Layout-aware (a layer's cache is a (key, value) tuple, not a stacked tensor).
-                # copy_blocks below consumes either shape via kv_cache[0]/[1]; only the device read
-                # needs the guard. See cache_list_device.
                 dev = cache_list_device(kv_caches)
-                # Columns are [src, dst] == [representative, own victim], the order copy_blocks reads.
-                src_to_dists = torch.tensor(
-                    [[int(s), int(d)] for s, d in pairs], dtype=torch.int64, device=dev)
-                AscendAttentionBackend.copy_blocks(kv_caches, src_to_dists)
+                # [representative, own victim] per pair.
+                src = torch.tensor([int(s) for s, _d in pairs], dtype=torch.int64, device=dev)
+                dst = torch.tensor([int(d) for _s, d in pairs], dtype=torch.int64, device=dev)
+                for kv_cache in kv_caches:
+                    for part in cache_parts(kv_cache):
+                        part[dst] = part[src]
                 return True
             except Exception as e:  # noqa: BLE001 - a copy that cannot run must recompute, not crash
                 logger.warning("BFF pull-v2 materialize copy failed (group %s, %d pairs): %s",

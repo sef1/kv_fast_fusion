@@ -60,6 +60,62 @@ def test_cache_list_device_of_no_caches_is_none():
 
 
 # =====================================================================================
+# cache_parts — what the materialize copy copies. Under DSA (GLM-5.1) a layer's cache is
+# (latent KV, rope key, indexer key[, indexer key scale]); AscendAttentionBackend.copy_blocks copied
+# [0]/[1] only, so an aliased victim kept its previous tenant's indexer keys and the lightning
+# indexer picked its top-k from them — garbage on 10/121 outputs with nothing ever freed.
+# =====================================================================================
+def test_cache_parts_takes_every_tensor_of_a_dsa_layer():
+    kv, rope, idx = object(), object(), object()
+    assert v2.cache_parts((kv, rope, idx)) == [kv, rope, idx]
+
+
+def test_cache_parts_takes_the_c8_indexer_scale_too():
+    parts = tuple(object() for _ in range(4))
+    assert v2.cache_parts(parts) == list(parts)
+
+
+def test_cache_parts_skips_absent_optional_tensors():
+    k, v = object(), object()
+    assert v2.cache_parts([k, v, None]) == [k, v]
+
+
+def test_cache_parts_splits_a_stacked_tensor_into_k_and_v():
+    stacked = ["K", "V"]          # indexed on dim 0 like a [2, num_blocks, ...] tensor
+    assert v2.cache_parts(_Stacked(stacked)) == ["K", "V"]
+
+
+class _Stacked:
+    """A non-tuple cache indexable on dim 0, standing in for a stacked [2, ...] tensor."""
+    def __init__(self, halves):
+        self._h = halves
+
+    def __getitem__(self, i):
+        return self._h[i]
+
+
+def test_cache_parts_copy_moves_the_indexer_keys():
+    """The property that matters, end to end on CPU: after the copy, the victim's indexer keys are
+    the representative's, not whatever its previous tenant left."""
+    torch = pytest.importorskip("torch")
+    layer = tuple(torch.arange(4 * 3, dtype=torch.float32).view(4, 3) * (i + 1) for i in range(3))
+    src, dst = torch.tensor([1]), torch.tensor([3])
+    for part in v2.cache_parts(layer):
+        part[dst] = part[src]
+    for part in layer:
+        assert torch.equal(part[3], part[1])
+
+
+def test_materialize_copy_does_not_use_the_two_tensor_copy_blocks():
+    """Source check: the copy callback must go through cache_parts, never copy_blocks."""
+    src = open(v2.__file__).read()
+    body = src[src.index("def _make_copy_alias_blocks"):src.index("def _make_landing_copy")]
+    code = "\n".join(ln for ln in body.splitlines() if not ln.strip().startswith(("#", "``")))
+    assert "cache_parts(" in code
+    assert "AscendAttentionBackend.copy_blocks(" not in code
+
+
+# =====================================================================================
 # Producer signature precompute (PRODUCER_SIGCACHE, Update 9): the producer caches per-block
 # signatures at save time and reassembles slot payloads from them. The reassembly MUST be byte-
 # identical to the on-demand monolithic encode, or the decode pairs signatures against the wrong

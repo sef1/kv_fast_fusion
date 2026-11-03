@@ -54,23 +54,23 @@ set -ex
 # Config — everything overridable via env (VAR=... ./run_benchmarks.sh)
 # ============================================================
 # ---- Model / topology ----
-MODEL=${MODEL:-Qwen/Qwen2.5-7B}
-NUM_PREFILL=${NUM_PREFILL:-2}
+MODEL=${MODEL:-/home/kv_fast_fusion/GLM-5.1}
+NUM_PREFILL=${NUM_PREFILL:-1}
 NUM_DECODE=${NUM_DECODE:-1}
 TP_SIZE=${TP_SIZE:-1}                 # tensor-parallel size per instance (connector prefill/decode tp_size)
 DP_SIZE=${DP_SIZE:-1}                 # data-parallel size per instance (connector prefill/decode dp_size)
 
 # ---- Ports ----
-MASTER_PORT=${MASTER_PORT:-57788}     # mooncake_master
-PROXY_PORT=${PROXY_PORT:-8770}
-PREFILL_PORT_BASE=${PREFILL_PORT_BASE:-8771}
-DECODE_PORT_BASE=${DECODE_PORT_BASE:-8773}
-PREFILL_KV_PORT_BASE=${PREFILL_KV_PORT_BASE:-31000}
-DECODE_KV_PORT_BASE=${DECODE_KV_PORT_BASE:-30000}
+MASTER_PORT=${MASTER_PORT:-57798}     # mooncake_master
+PROXY_PORT=${PROXY_PORT:-8790}
+PREFILL_PORT_BASE=${PREFILL_PORT_BASE:-8791}
+DECODE_PORT_BASE=${DECODE_PORT_BASE:-8793}
+PREFILL_KV_PORT_BASE=${PREFILL_KV_PORT_BASE:-31100}
+DECODE_KV_PORT_BASE=${DECODE_KV_PORT_BASE:-30100}
 
 # ---- Engine sizing ----
-MAX_MODEL_LEN=${MAX_MODEL_LEN:-65536}
-MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-65536}   # was 64 in the original (a typo) — 64 starves prefill
+MAX_MODEL_LEN=${MAX_MODEL_LEN:-8192}
+MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-4096}   # was 64 in the original (a typo) — 64 starves prefill
 # The decode's own budget. vLLM sizes its memory-profile forward at this many tokens and reserves the
 # resulting peak for good, but a P/D decode never runs a forward that large: its steps are at most
 # max_num_seqs tokens, and a load-failure recompute is chunked (chunked prefill is on). So on the decode
@@ -124,7 +124,7 @@ esac
 # standalone (it IS HMA-capable). For an apples-to-apples comparison set USE_ASCEND_STORE=0 on the
 # stock baselines too.
 if [[ "$BASELINE" == "bff" || "$BASELINE" == "bff_v2" || "$BASELINE" == "bff_pull" \
-      || "$BASELINE" == "bff_pull_v2" ]]; then
+      || "$BASELINE" == "bff_pull_v2" || "$TP_SIZE" -ge 2 ]]; then
   USE_ASCEND_STORE=${USE_ASCEND_STORE:-0}
 else
   USE_ASCEND_STORE=${USE_ASCEND_STORE:-0}
@@ -241,13 +241,15 @@ MIN_TOKENS=${MIN_TOKENS:-2048}
 # cap, so generation length is pinned and the run measures pure token throughput. This default of
 # 6000 caps only ~9%, which leaves length free — and therefore exposes any effect BFF has on when
 # the model stops, which the GPU runs truncate away. Match it to 1024 to compare the two platforms.
-MAX_TOKENS=${MAX_TOKENS:-6000}
+MAX_TOKENS=${MAX_TOKENS:-2000}
 # Run the same config N times against the same engines. 1 = today's behaviour exactly.
 REPEAT=${REPEAT:-1}
 REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-6000.0}
 # F1_DATASET=${F1_DATASET:-m-a-p/CodeFeedback-Filtered-Instruction}
 # F1_DATASET=${F1_DATASET:-codeparrot_f1_benchmark.jsonl}
 F1_DATASET=${F1_DATASET:-ise-uiuc/Magicoder-Evol-Instruct-110K}
+# F1_DATASET=${F1_DATASET:-$PWD/overlap.jsonl}
+
 
 F1_SPLIT=${F1_SPLIT:-train}
 F1_INPUT_KEY=${F1_INPUT_KEY:-instruction}
@@ -368,13 +370,19 @@ get_free_npus() {
       clean_c2=$2; gsub(/[^0-9]+/," ",clean_c2); split(clean_c2,c2," "); phy_id=c2[2]
       clean_c4=$4; gsub(/[^0-9]+/," ",clean_c4); split(clean_c4,c4," ")
       if (length(c4)>=2) { used=c4[length(c4)-1]; total=c4[length(c4)]
-        if (phy_id!="" && phy_id!="0" && total>0 && (total-used)>=min_free)
+        if (phy_id!="" && total>0 && (total-used)>=min_free)
           free_list=(free_list==""?phy_id:free_list","phy_id) } }
     END { print free_list }'
 }
 
 assign_npu_for_node() {
-  echo "$AVAILABLE_NPUS" | cut -d',' -f$(( $1 + 1 )) 2>/dev/null | tr -d ' '
+  # $1 = 0-based logical node slot (prefill nodes first, then decode — see launch_engines).
+  # Each slot claims TP_SIZE consecutive physical devices from AVAILABLE_NPUS, so a TP_SIZE=2
+  # instance gets e.g. "2,3" in ASCEND_RT_VISIBLE_DEVICES — both ranks it needs to shard across.
+  # TP_SIZE=1 reduces to the original single-device behavior.
+  local slot=$1
+  local start=$(( slot * TP_SIZE + 1 ))   # cut fields are 1-based
+  echo "$AVAILABLE_NPUS" | cut -d',' -f${start}-$((start + TP_SIZE - 1)) 2>/dev/null | tr -d ' '
 }
 
 kill_all_nodes() {
@@ -397,7 +405,7 @@ export_ascend_env() {
   export HCCL_IF_IP=127.0.0.1
   export GLOO_SOCKET_IFNAME="lo" TP_SOCKET_IFNAME="lo" HCCL_SOCKET_IFNAME="lo"
   export OMP_PROC_BIND=false OMP_NUM_THREADS=10
-  export VLLM_USE_V1=1 HCCL_BUFFSIZE=200
+  export VLLM_USE_V1=1 HCCL_BUFFSIZE=512
   export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
   export TASK_QUEUE_ENABLE=1 CPU_AFFINITY_CONF=1 ASCEND_AGGREGATE_ENABLE=1
   export ASCEND_TRANSPORT_PRINT=1 ACL_OP_INIT_MODE=1 HCCL_INTRA_ROCE_ENABLE=1
@@ -511,15 +519,7 @@ export_bff_env() {
          BFF_V2_MAX_RESIDENT=$BFF_V2_MAX_RESIDENT BFF_V2_SIG_TIMEOUT=$BFF_V2_SIG_TIMEOUT \
          BFF_PULL_V2_SIG_TIMEOUT=$BFF_PULL_V2_SIG_TIMEOUT BFF_SIG_LAYERS=$BFF_SIG_LAYERS \
          BFF_V2_MAX_REQ_DECLINE=$BFF_V2_MAX_REQ_DECLINE \
-         BFF_V2_PROTECT_HOT_BLOCKS=$BFF_V2_PROTECT_HOT_BLOCKS \
-         BFF_LSH_COMPACT_DEAD_FRAC=$BFF_LSH_COMPACT_DEAD_FRAC BFF_LSH_COMPACT_MIN_DEAD=$BFF_LSH_COMPACT_MIN_DEAD
-  # A GLM "materialize" arm ran with BFF_V2_DEDUP=0 and was read as a materialize result: these knobs
-  # only shape aliases, and with dedup off nothing is aliased. Say so up front.
-  if [[ "$BFF_V2_DEDUP" == "0" && ( "${BFF_V2_MATERIALIZE:-0}" == "1" \
-        || "$BFF_V2_MAX_REQ_DECLINE" != "0.5" || "$BFF_MAX_REL_ERR" != "1.0" ) ]]; then
-    echo "NOTE: BFF_V2_DEDUP=0 — BFF_V2_MATERIALIZE/BFF_V2_MAX_REQ_DECLINE/BFF_MAX_REL_ERR have no" \
-         "effect (nothing is aliased)."
-  fi
+         BFF_V2_PROTECT_HOT_BLOCKS=$BFF_V2_PROTECT_HOT_BLOCKS
   # BOTH roles dump fuse stats: the producer counts blocks + redirects shipped, the decode side counts
   # the redirects that actually landed and the REAL freed-block delta (the measured compression).
   export BFF_PD_STATS_DIR="$results_root"
@@ -575,6 +575,20 @@ JSON
   fi
 }
 
+build_additional_config() {
+  local tag=$1
+  if [[ "$tag" == "prefill" ]]; then
+    cat <<JSON
+        {"recompute_scheduler_enable": true, "multistream_overlap_shared_expert": true, "fuse_muls_add": true, "fuse_qknorm_rope": false, "enable_npugraph_ex": true, "layer_sharding": ["q_b_proj"]}
+
+JSON
+  else
+    cat <<JSON
+        {"recompute_scheduler_enable": true, "multistream_overlap_shared_expert": true, "fuse_muls_add": true, "fuse_qknorm_rope": false, "enable_npugraph_ex": true}
+JSON
+  fi
+}
+
 # vLLM args shared by P and D. BFF needs block-size 128 + prefix caching + hybrid KV manager.
 # $1 = tag (prefill|decode). --compilation-config (cudagraph) is DECODE-ONLY.
 common_args() {
@@ -586,7 +600,9 @@ common_args() {
     max_concurrency=${DECODE_MAX_CONCURRENCY}
     max_batched=${DECODE_MAX_NUM_BATCHED_TOKENS}
   fi
-  if [[ "$BFF_ON" == "1" ]]; then
+  if [[ "$CONNECTOR" == "MooncakeConnectorV1" ]]; then
+    extra="--disable-hybrid-kv-cache-manager"
+  elif [[ "$BFF_ON" == "1" || "$TP_SIZE" -ge 2 ]]; then
     extra="--enable-prefix-caching --no-disable-hybrid-kv-cache-manager"
   elif [[ "$HYBRID" == "1" ]]; then
     # Stock baselines on a hybrid model need the KV manager too — see HYBRID above.
@@ -644,7 +660,8 @@ launch_engines() {
     export_bff_env "$role"
     export ASCEND_RT_VISIBLE_DEVICES=$npu
     local kv_cfg; kv_cfg=$(build_kv_transfer_config "$role" "$kv_port")
-
+    local additional_cfg; additional_cfg=$(build_additional_config "$tag")
+    
     # Record what this node was actually handed, at the top of its own log. A diagnostic that prints
     # "OFF (… unset)" says the engine did not see the flag, but not whether the launching shell ever
     # had it; this header settles that from the log alone.
@@ -657,9 +674,20 @@ launch_engines() {
         --port ${port} \
         --gpu-memory-utilization ${GPU_MEM_UTIL} \
         --kv-transfer-config '${kv_cfg}' \
-        >> \"${logs_root}/${tag}-${i}.txt\" 2>&1" &
-    echo "    PID: $!"
-  done
+        --speculative-config.method deepseek_mtp \
+        --speculative-config.num_speculative_tokens 1 \
+        --tool-call-parser glm47 \
+        --reasoning-parser glm45 \
+        --enable-auto-tool-choice \
+        --chat-template-content-format=string \
+        --served-model-name ${MODEL} \
+        --enable-expert-parallel \
+        --quantization ascend \
+        --additional-config '${additional_cfg}'\
+       > \"${logs_root}/${tag}-${i}.txt\" 2>&1" &
+      echo "    PID: $!"
+        # --enforce-eager \
+    done
 }
 
 launch_proxy() {
@@ -1560,7 +1588,8 @@ sys.exit(0 if hasattr(m, "SignaturePipeline") and hasattr(m, "ASYNC_SIG") else 3
   echo "           run here can NOT be an async one — do not read it as such." >&2
   return 0
 }
-
+WAIT_TIMEOUT_S=${WAIT_TIMEOUT_S:-0}     # 0 = wait forever; e.g. 3600 = give up after 1 hour
+WAIT_INTERVAL_S=${WAIT_INTERVAL_S:-30}  # seconds between checks
 main() {
   parse_args "$@"
   resolve_host_ip
@@ -1568,7 +1597,7 @@ main() {
   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   logs_root="${SCRIPT_DIR}/${LOG_ROOT}_latest"
   results_root="${SCRIPT_DIR}/${RESULT_ROOT}_latest"
-
+  
   if [ "$KILL_ONLY" = true ]; then kill_all_nodes; echo "Cleanup done."; exit 0; fi
 
   echo "BFF Ascend config: BASELINE=$BASELINE launcher=$LAUNCHER connector=$CONNECTOR ${NUM_PREFILL}Px${NUM_DECODE}D tp=$TP_SIZE use_ascend_store=$USE_ASCEND_STORE"
@@ -1587,7 +1616,34 @@ main() {
   write_mooncake_config
 
   kill_all_nodes
-  echo "Detecting free NPUs..."; AVAILABLE_NPUS=$(get_free_npus ${MIN_FREE_MEMORY_MB}); echo "  $AVAILABLE_NPUS"
+  n_needed=$(( (NUM_PREFILL + NUM_DECODE) * TP_SIZE ))
+  local n_avail waited=0
+
+  while true; do
+    AVAILABLE_NPUS=$(get_free_npus ${MIN_FREE_MEMORY_MB})
+    if [ -z "$AVAILABLE_NPUS" ]; then
+      n_avail=0
+    else
+      n_avail=$(echo "$AVAILABLE_NPUS" | tr ',' '\n' | grep -c .)
+    fi
+
+    if (( n_avail >= n_needed )); then
+      echo "Detected ${n_avail} free NPUs (need ${n_needed}): ${AVAILABLE_NPUS}"
+      break
+    fi
+
+    if (( WAIT_TIMEOUT_S > 0 && waited >= WAIT_TIMEOUT_S )); then
+      echo "ERROR: timed out after ${waited}s. ${NUM_PREFILL}Px${NUM_DECODE}D at TP_SIZE=${TP_SIZE}" \
+          "needs ${n_needed} free NPUs, only ${n_avail} free: ${AVAILABLE_NPUS}." >&2
+      echo "       Free up NPUs, lower TP_SIZE/NUM_PREFILL/NUM_DECODE, or lower MIN_FREE_MEMORY_MB" \
+          "(currently ${MIN_FREE_MEMORY_MB}) if the filter is too strict." >&2
+      exit 1
+    fi
+
+    echo "  ${n_avail}/${n_needed} NPUs free (${AVAILABLE_NPUS:-none}); rechecking in ${WAIT_INTERVAL_S}s (waited ${waited}s)..."
+    sleep "${WAIT_INTERVAL_S}"
+    waited=$(( waited + WAIT_INTERVAL_S ))
+  done
 
   ulimit -l unlimited || true
   launch_mooncake_master
