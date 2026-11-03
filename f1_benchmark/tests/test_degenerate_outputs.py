@@ -83,6 +83,18 @@ def test_an_alias_hit_marks_the_hitter_and_the_owner_of_the_hit_block():
     assert lines[3] == f"  #0 {U2} declined=-/- | owner | hit_owner"
 
 
+def test_clipped_requests_get_their_own_verdict_line():
+    outputs = [{"generated_text": "x" * 2000, "response_id": f"chatcmpl-{U1}"},
+               {"generated_text": CODE, "response_id": f"chatcmpl-{U2}"}]
+    ledger = {U1: {"declined": 30, "planned": 40, "capped": True, "clipped": 10},
+              U2: {"declined": 28, "planned": 40, "capped": True, "clipped": 9}}
+
+    lines = dg.report(outputs, ledger)
+
+    assert lines[1] == "  clipped requests (BFF_V2_CLIP_FRAC): 1/2 degenerate, 19 aliases kept"
+    assert lines[2] == f"  #0 {U1} declined=30/40 capped clipped=10"
+
+
 def test_without_a_log_the_report_still_counts():
     lines = dg.report([{"generated_text": "x" * 2000}])
 

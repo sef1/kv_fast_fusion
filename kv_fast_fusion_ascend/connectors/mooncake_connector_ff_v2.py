@@ -166,6 +166,19 @@ TRACE_SLOTS = int(os.environ.get("BFF_V2_TRACE_SLOTS", "0"))
 # Ceiling on how much of ONE request may be satisfied from other requests' blocks. Above it the
 # request is read whole. See cap_request_decline for why a per-block cosine bar cannot express this.
 MAX_REQ_DECLINE = float(os.environ.get("BFF_V2_MAX_REQ_DECLINE", "0.5"))
+# Clip instead of drop. A request over MAX_REQ_DECLINE is read in full today, and on GLM Magicoder those
+# 10-12 near-duplicate requests hold ~70% of all declinable blocks. With BFF_V2_CLIP_FRAC > 0 such a
+# request keeps its LOWEST-error aliases, up to this fraction of its blocks, and fetches the rest —
+# the blocks that differ most are the ones that make it its own question. 0 (default) = off: the
+# request is read in full exactly as before. See clip_request_decline.
+CLIP_FRAC = float(os.environ.get("BFF_V2_CLIP_FRAC", "0"))
+# Per-block bar for the aliases a clip keeps, on top of BFF_MAX_REL_ERR. 1.0 = no extra bar.
+CLIP_MAX_REL_ERR = float(os.environ.get("BFF_V2_CLIP_MAX_REL_ERR", "1.0"))
+# A clip never aliases a request's last N blocks: the question usually sits at the end.
+CLIP_TAIL = int(os.environ.get("BFF_V2_CLIP_TAIL", "2"))
+# BFF_STEP_PROFILE=1 also times the clip and the landing copy (stats: clip_ms_total,
+# landing_copy_ms_total). Off, nothing is timed and the stats report None.
+_PROFILE_OVERHEAD = os.environ.get("BFF_STEP_PROFILE", "0") == "1"
 # Under BFF_V2_MATERIALIZE, copy each alias at LANDING on the recv thread, and re-read a refused one
 # from the producer, instead of applying on the forward path and recomputing a refusal. A refusal on
 # the forward path re-prefills the whole prompt on D (KV-load failure) — on the GLM con48 runs each
@@ -362,6 +375,46 @@ def cap_request_decline(planned, max_frac=None):
     if total <= 0 or declined <= frac * total:
         return planned, False
     return {}, True
+
+
+def clip_request_decline(planned, plan_ids, errs, frac, max_err=1.0, tail=0):
+    """Keep a capped request's best aliases instead of none. Returns ``(planned, keep)``.
+
+    ``planned`` is ``{group: ids}`` with a negative sentinel at declined positions, ``plan_ids`` the
+    same lists before planning (the decode's own block ids), ``errs`` ``{group: {victim: rel_err}}``
+    as :meth:`DedupEngine.alias_errors` reports it. Up to ``int(frac * total blocks)`` declined
+    positions survive, lowest ``rel_err`` first; a position with unknown error, an error over
+    ``max_err``, or within the group's last ``tail`` blocks is always fetched. Every other declined
+    position gets its own id back, so it is read like any undeclined block.
+
+    ``keep`` is ``{group: {victim}}`` — what the engine must retain (:meth:`DedupEngine.retain`).
+    Empty ``keep`` means nothing qualified: the caller reads the request in full, as the cap would.
+    Pure, so the selection is testable off-NPU."""
+    total = sum(len(ids) for ids in planned.values())
+    budget = int(frac * total)
+    cands = []
+    if budget > 0:
+        for gi, ids in planned.items():
+            own = plan_ids.get(gi) or []
+            for slot, b in enumerate(ids):
+                if b >= 0 or slot >= len(own) or slot >= len(ids) - tail:
+                    continue
+                victim = int(own[slot])
+                e = (errs.get(gi) or {}).get(victim)
+                if e is None or e > max_err:
+                    continue
+                cands.append((e, gi, slot, victim))
+    cands.sort()
+    keep: dict = {}
+    for _e, gi, _slot, victim in cands[:budget]:
+        keep.setdefault(gi, set()).add(victim)
+    out = {}
+    for gi, ids in planned.items():
+        own = plan_ids.get(gi) or []
+        mine = keep.get(gi, ())
+        out[gi] = [b if b >= 0 or slot >= len(own) or int(own[slot]) in mine
+                   else int(own[slot]) for slot, b in enumerate(ids)]
+    return out, keep
 
 
 def write_slot(n_computed, group_blocks, block_size):
@@ -2110,13 +2163,32 @@ if _ASCEND_AVAILABLE:
                 stats = self.dedup_engine.stats
                 declined, total = decline_fraction(result)
                 stats.note_request_decline(declined, total)
-                result, capped = cap_request_decline(result)
-                stats.note_request(ext_id, declined, total, capped)
+                pre_cap = result
+                result, capped = cap_request_decline(pre_cap)
+                kept = None
+                if capped and CLIP_FRAC > 0:
+                    _clip_t0 = time.perf_counter()
+                    clipped, keep = clip_request_decline(
+                        pre_cap, plan_groups, self.dedup_engine.alias_errors(ext_id), CLIP_FRAC,
+                        CLIP_MAX_REL_ERR, CLIP_TAIL)
+                    kept = sum(len(v) for v in keep.values()) or None
+                    if kept:
+                        stats.clip_aliases_dropped += self.dedup_engine.retain(ext_id, keep)
+                        stats.clip_aliases_kept += kept
+                        stats.requests_clipped += 1
+                        result, capped = clipped, False
+                    if _PROFILE_OVERHEAD:
+                        stats.clip_ms = (stats.clip_ms or 0.0) + (
+                            time.perf_counter() - _clip_t0) * 1e3
+                        stats.clip_calls += 1
+                stats.note_request(ext_id, declined, total, capped or kept is not None,
+                                   clipped=kept)
                 if capped:
                     # The aliases are already staged in the engine, so dropping the plan is not
                     # enough — forget() must retract them or they would be applied to blocks this
-                    # request is now going to fetch normally.
-                    self.dedup_engine.forget([ext_id])
+                    # request is now going to fetch normally. uncount: they are fetched, so they
+                    # are not a wire saving either.
+                    self.dedup_engine.forget([ext_id], uncount=True)
                     stats.requests_capped += 1
                     if not KVCacheRecvingThreadFFv2._logged_first_cap:
                         KVCacheRecvingThreadFFv2._logged_first_cap = True
@@ -3832,9 +3904,16 @@ if _ASCEND_AVAILABLE:
                 if stream is None:
                     dev = cache_list_device(list(worker.kv_caches.values()))
                     stream = worker._ff_landing_stream = torch.npu.Stream(device=dev)
+                _t0 = time.perf_counter() if _PROFILE_OVERHEAD else None
                 with torch.npu.stream(stream):
                     ok = copy(None, gi, pairs)
                 stream.synchronize()
+                if _t0 is not None and worker._dedup_engine is not None:
+                    st = worker._dedup_engine.stats
+                    st.landing_copy_ms = (st.landing_copy_ms or 0.0) + (
+                        time.perf_counter() - _t0) * 1e3
+                    st.landing_copy_calls += 1
+                    st.landing_copy_pairs += len(pairs)
                 return ok
             except Exception as e:  # noqa: BLE001 - a copy that cannot run is re-read instead
                 logger.warning("BFF pull-v2 landing copy failed (group %s, %d pairs): %s",

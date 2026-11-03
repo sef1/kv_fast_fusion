@@ -650,6 +650,17 @@ class DedupStats:
         # declined in all six groups of a single request while the run-level figure read 6.5%.
         self.request_decline_frac = dict.fromkeys(DECLINE_BUCKETS, 0)
         self.requests_capped = 0     # requests read whole because they exceeded MAX_REQ_DECLINE
+        # BFF_V2_CLIP_FRAC: capped requests kept partially instead, and what that kept / fetched.
+        self.requests_clipped = 0
+        self.clip_aliases_kept = 0
+        self.clip_aliases_dropped = 0
+        # BFF_STEP_PROFILE=1 only (None otherwise, so a run without it reports nothing): what the
+        # clip and the landing copy cost on the recv thread.
+        self.clip_ms: float | None = None
+        self.clip_calls = 0
+        self.landing_copy_ms: float | None = None
+        self.landing_copy_calls = 0
+        self.landing_copy_pairs = 0
         # Per request: {ext_id: {"declined", "planned", "capped", "failed"}}. The decline buckets say
         # how MANY requests were substituted, not WHICH; joined to the client's per-prompt
         # response_id (f1_benchmark/alias_attribution.py) this says whether the F1 loss sits on the
@@ -686,8 +697,13 @@ class DedupStats:
         self.rejected_by_rel_err[gi] = (self.rejected_by_rel_err.get(gi, 0)
                                         + plan.rejected_by_rel_err)
 
-    def note_request(self, ext_id: str, declined: int, planned: int, capped: bool) -> None:
-        """Record one request's plan in the ledger (see ``request_ledger``)."""
+    def note_request(self, ext_id: str, declined: int, planned: int, capped: bool,
+                     clipped: int | None = None) -> None:
+        """Record one request's plan in the ledger (see ``request_ledger``).
+
+        ``clipped`` is set only for a capped request that BFF_V2_CLIP_FRAC kept partially: how many
+        of its ``declined`` aliases survived. The key is absent otherwise, so a run with the clip
+        off writes exactly the ledger it always did."""
         if planned <= 0:
             return
         entry = self.request_ledger.get(ext_id)
@@ -699,6 +715,8 @@ class DedupStats:
         entry["declined"] += int(declined)
         entry["planned"] += int(planned)
         entry["capped"] = entry["capped"] or bool(capped)
+        if clipped is not None:
+            entry["clipped"] = entry.get("clipped", 0) + int(clipped)
 
     def note_failure(self, reason: str, n: int = 1, rid: str | None = None) -> None:
         self.note_refused(reason, n)
@@ -796,6 +814,15 @@ class DedupStats:
             # the distinction the run-level wire saving cannot make.
             "request_decline_frac": dict(self.request_decline_frac),
             "requests_capped": self.requests_capped,
+            "requests_clipped": self.requests_clipped,
+            "clip_aliases_kept": self.clip_aliases_kept,
+            "clip_aliases_dropped": self.clip_aliases_dropped,
+            "clip_ms_total": None if self.clip_ms is None else round(self.clip_ms, 2),
+            "clip_calls": self.clip_calls,
+            "landing_copy_ms_total": (None if self.landing_copy_ms is None
+                                      else round(self.landing_copy_ms, 2)),
+            "landing_copy_calls": self.landing_copy_calls,
+            "landing_copy_pairs": self.landing_copy_pairs,
             "request_ledger": dict(self.request_ledger),
             "signature_phase_failed": self.sig_phase_failed,
             # An all-zero saving means one of two very different things. These separate them:
@@ -880,6 +907,10 @@ class DedupEngine:
         # unhashed tail while the runner's table is the full list — matching by value removes the
         # offset entirely and rejects a stale entry for free.
         self._pending_alias: dict[str, dict[int, dict[int, tuple[int, str, tuple | None]]]] = {}
+        # Beside _pending_alias, same keys: (rel_err, "resident" | "batch") of each staged alias, so
+        # a capped request can be clipped to its best matches (retain) and the counters it fed in
+        # _record can be taken back (forget(uncount=True)). Popped with _pending_alias.
+        self._pending_meta: dict[str, dict[int, dict[int, tuple]]] = {}
         # Decided AND landed. Only entries here are handed to the apply path.
         #
         # The distinction is the whole reason the first v2 run applied 22 of 26,531 aliases: the
@@ -1030,6 +1061,9 @@ class DedupEngine:
                 planned[rid][g][slot] = SENTINEL
                 self._pending_alias.setdefault(rid, {}).setdefault(g, {})[victim] = (
                     int(rep), rep_owner, scale)
+                self._pending_meta.setdefault(rid, {}).setdefault(g, {})[victim] = (
+                    (plan.alias_err.get((rid, g)) or {}).get(slot),
+                    "batch" if same_transfer else "resident")
                 d = self.stats.dropped_batch if same_transfer else self.stats.dropped_resident
                 d[g] = d.get(g, 0) + 1
 
@@ -1129,6 +1163,7 @@ class DedupEngine:
 
     def _release_locked(self, req_id: str) -> None:
         got = self._pending_alias.pop(req_id, None)
+        self._pending_meta.pop(req_id, None)
         if got:
             self._alias_ready.setdefault(req_id, {}).update(got)
         pend = self._pending_resident.pop(req_id, None)
@@ -1142,13 +1177,56 @@ class DedupEngine:
                         self._block_kvn[(gi, int(b))] = kvn[i]
                 self.stats.index_blocks[gi] = self._planner.size(gi)
 
-    def forget(self, req_ids) -> None:
-        """A transfer that failed leaves nothing written, so its aliases must not be applied."""
+    def forget(self, req_ids, uncount: bool = False) -> None:
+        """A transfer that failed leaves nothing written, so its aliases must not be applied.
+
+        ``uncount`` also takes the request's declines back out of ``blocks_not_requested``: a
+        request dropped by the decline cap is read in full, so counting its declines overstated
+        the wire saving (GLM Magicoder 2026-11-03: 489 reported, 143 real)."""
         with self.lock:
             for rid in req_ids:
+                meta = self._pending_meta.pop(rid, None)
+                if uncount and meta:
+                    for g, vs in meta.items():
+                        self._uncount_locked(g, [kind for _err, kind in vs.values()])
                 self._pending_alias.pop(rid, None)
                 self._alias_ready.pop(rid, None)
                 self._pending_resident.pop(rid, None)
+
+    def _uncount_locked(self, g: int, kinds) -> None:
+        for kind in kinds:
+            d = self.stats.dropped_batch if kind == "batch" else self.stats.dropped_resident
+            d[g] = max(0, d.get(g, 0) - 1)
+
+    def alias_errors(self, rid: str) -> dict:
+        """``{group: {victim: rel_err}}`` of ``rid``'s staged aliases (None = unknown error)."""
+        with self.lock:
+            return {g: {v: m[0] for v, m in vs.items()}
+                    for g, vs in (self._pending_meta.get(rid) or {}).items()}
+
+    def retain(self, rid: str, keep: dict) -> int:
+        """Keep only the staged aliases in ``keep`` (``{group: {victim}}``); drop the rest.
+
+        The caller fetches every dropped victim instead, so its decline is uncounted. The request's
+        pending residency is untouched: the blocks it kept are still written and may serve as
+        representatives later. Returns how many aliases were dropped."""
+        dropped = 0
+        with self.lock:
+            staged = self._pending_alias.get(rid) or {}
+            meta = self._pending_meta.get(rid) or {}
+            for g in list(staged):
+                want = keep.get(g) or set()
+                for victim in [v for v in staged[g] if v not in want]:
+                    staged[g].pop(victim)
+                    _err, kind = (meta.get(g) or {}).pop(victim, (None, "resident"))
+                    self._uncount_locked(g, [kind])
+                    dropped += 1
+                if not staged[g]:
+                    staged.pop(g)
+            if not staged:
+                self._pending_alias.pop(rid, None)
+                self._pending_meta.pop(rid, None)
+        return dropped
 
     def drain_ready(self) -> dict:
         """Aliases whose KV has landed. See ``_alias_ready`` for why this is not ``_pending_alias``."""

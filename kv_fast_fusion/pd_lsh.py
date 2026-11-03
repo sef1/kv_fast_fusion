@@ -262,9 +262,10 @@ class LshIndex:
         new[:self.n_rows] = self.mat[:self.n_rows]
         self.mat = new
 
-    def probe(self, cur, hashes, owners, threshold, norms=None):
+    def probe(self, cur, hashes, owners, threshold, norms=None, return_err=False):
         """Probe for each current block; return ``(matched: list[bool], hits: list[(i, rep_key,
-        rep_slot)])``.
+        rep_slot)])``. With ``return_err`` each hit also carries ``(cosine, rel_err)`` of the
+        accepted match (``rel_err`` None without norms) — the quality BFF_V2_CLIP_FRAC ranks by.
 
         A hit requires a bucket candidate from a DIFFERENT owner whose **exact cosine** with the
         current block is > ``threshold``; the best candidate wins. A raw bucket collision is never
@@ -348,7 +349,7 @@ class LshIndex:
                      rel_err(v, float(self.row_norm.get(row, own or 1.0)) / (own or 1.0))
                      if own is not None else None)
             rep_key, rep_slot, _ = self.meta[row]
-            hits.append((i, rep_key, rep_slot))
+            hits.append((i, rep_key, rep_slot, v, e) if return_err else (i, rep_key, rep_slot))
             matched[i] = True
             self.lru.move_to_end(row)                                   # LRU touch
             self.accept_cos[_bin(v, ACCEPT_COS_BINS)] += 1

@@ -129,7 +129,8 @@ def report(outputs, ledger=None, log_text=None) -> list:
         key = uuid_of(o.get("response_id"))
         e = ledger.get(key) or {}
         line = (f"  #{i} {key or '?'} declined={e.get('declined', '-')}/{e.get('planned', '-')}"
-                f"{' capped' if e.get('capped') else ''}")
+                f"{' capped' if e.get('capped') else ''}"
+                f"{' clipped=' + str(e['clipped']) if e.get('clipped') else ''}")
         if roles is not None:
             rs = roles_of(key, roles)
             for r in rs:
@@ -142,6 +143,12 @@ def report(outputs, ledger=None, log_text=None) -> list:
             if hit:
                 line += " | " + ",".join(hit)
         lines.append(line)
+    clipped = {k for k, e in ledger.items() if e.get("clipped")}
+    if clipped:
+        # BFF_V2_CLIP_FRAC's verdict: the capped requests it kept partially, and how many broke.
+        n_bad = sum(1 for _i, o in bad if uuid_of(o.get("response_id")) in clipped)
+        lines.insert(1, f"  clipped requests (BFF_V2_CLIP_FRAC): {n_bad}/{len(clipped)} degenerate, "
+                        f"{sum(ledger[k]['clipped'] for k in clipped)} aliases kept")
     if events is not None:
         lines.insert(1, "  shared-write/lifecycle events on the garbage: "
                      + " ".join(f"{ev}={ev_tally.get(ev, 0)}" for ev in EVENTS)

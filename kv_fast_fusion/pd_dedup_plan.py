@@ -55,6 +55,9 @@ class DedupPlan:
 
     keep: dict[tuple[str, int], list[int]] = field(default_factory=dict)
     alias: dict[tuple[str, int], dict[int, int]] = field(default_factory=dict)
+    # Same keys as ``alias``: the accepted match's relative substitution error (None when the norms
+    # were unknown). Read only by BFF_V2_CLIP_FRAC, which keeps a capped request's best aliases.
+    alias_err: dict[tuple[str, int], dict[int, float | None]] = field(default_factory=dict)
     n_resident: int = 0      # satisfied by a block already on D
     n_batch: int = 0         # satisfied by another block in this same pull
     # Cleared the cosine bar, rejected by the substitution-error budget: the merges the norm
@@ -154,12 +157,14 @@ class DedupPlanner:
             row = blk.row
             cur = sigs[row:row + 1]
             hit = None
+            err = None
 
             if idx is not None and idx.size():
                 matched, hits = idx.probe(cur, [hashes[row]], [blk.block_id], threshold,
-                                          [norms[row]])
+                                          [norms[row]], return_err=True)
                 if matched[0] and hits:
                     hit = (int(hits[0][1]), True)
+                    err = hits[0][4]
 
             if hit is None and batch_rows:
                 # Same-pull candidates: a small exact comparison, no index needed. Ranked by the
@@ -174,6 +179,7 @@ class DedupPlanner:
                 v, e = sims[j], errs[j]
                 if v > threshold and e <= pd_lsh.MAX_REL_ERR:
                     hit = (batch_ids[j], False)
+                    err = e
                     self._bin(plan, v, norms[batch_rows[j]], norms[row])
                 elif v > threshold:
                     plan.rejected_by_rel_err += 1
@@ -187,6 +193,7 @@ class DedupPlanner:
 
             rep_id, from_resident = hit
             plan.alias.setdefault((blk.req_id, blk.group), {})[blk.slot] = rep_id
+            plan.alias_err.setdefault((blk.req_id, blk.group), {})[blk.slot] = err
             if from_resident:
                 plan.n_resident += 1
             else:

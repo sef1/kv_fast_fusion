@@ -1126,6 +1126,54 @@ def test_the_ceiling_is_exact_and_inclusive():
     assert v2.cap_request_decline(over, max_frac=0.5)[1] is True
 
 
+def _capped_request():
+    """8 blocks (ids 10..17), 6 declined; errors rise with the slot, 13 has no known error."""
+    own = {1: list(range(10, 18))}
+    planned = {1: [SENT, SENT, SENT, SENT, 14, SENT, SENT, 17]}
+    errs = {1: {10: 0.05, 11: 0.4, 12: 0.1, 13: None, 15: 0.2, 16: 0.01}}
+    return planned, own, errs
+
+
+def test_a_clip_keeps_the_lowest_error_aliases_up_to_its_budget():
+    planned, own, errs = _capped_request()
+
+    out, keep = v2.clip_request_decline(planned, own, errs, frac=0.25)
+
+    # budget int(0.25 * 8) = 2: 16 (0.01) and 10 (0.05); every other block is fetched as itself.
+    assert keep == {1: {16, 10}}
+    assert out == {1: [SENT, 11, 12, 13, 14, 15, SENT, 17]}
+
+
+def test_a_clip_never_aliases_the_tail_or_an_unknown_error():
+    planned, own, errs = _capped_request()
+
+    _out, keep = v2.clip_request_decline(planned, own, errs, frac=1.0, tail=2)
+
+    # 16 sits in the last two blocks; 13's error is unknown — both are fetched.
+    assert keep == {1: {10, 11, 12, 15}}
+
+
+def test_a_clip_respects_its_per_block_bar():
+    planned, own, errs = _capped_request()
+
+    _out, keep = v2.clip_request_decline(planned, own, errs, frac=1.0, max_err=0.1)
+
+    assert keep == {1: {16, 10, 12}}
+
+
+def test_a_zero_clip_keeps_nothing_so_the_request_is_read_in_full():
+    planned, own, errs = _capped_request()
+
+    out, keep = v2.clip_request_decline(planned, own, errs, frac=0.0)
+
+    assert keep == {}
+    assert out == {1: list(range(10, 18))}
+
+
+def test_the_clip_is_off_by_default():
+    assert v2.CLIP_FRAC == 0.0
+
+
 def test_a_ceiling_of_one_disables_the_cap():
     """1.0 must be inert, so the cap can be taken out of the picture for an A/B without also
     changing the code path."""

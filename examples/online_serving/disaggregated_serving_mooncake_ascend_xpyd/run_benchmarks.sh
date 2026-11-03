@@ -200,6 +200,12 @@ BFF_PULL_V2_SIG_TIMEOUT=${BFF_PULL_V2_SIG_TIMEOUT:-10}
 # cosine floor is 0.954 — sane for one block, catastrophic for nineteen of twenty, because the model
 # then attends to a coherent prompt that is not the one it was asked. 1.0 disables it.
 BFF_V2_MAX_REQ_DECLINE=${BFF_V2_MAX_REQ_DECLINE:-0.5}
+# Clip instead of drop: a request over the cap keeps its lowest-error aliases up to this fraction of its
+# blocks and fetches the rest (0 = off, the request is read in full as before). The per-block bar for
+# what a clip keeps, and how many of a request's last blocks a clip never aliases.
+BFF_V2_CLIP_FRAC=${BFF_V2_CLIP_FRAC:-0}
+BFF_V2_CLIP_MAX_REL_ERR=${BFF_V2_CLIP_MAX_REL_ERR:-1.0}
+BFF_V2_CLIP_TAIL=${BFF_V2_CLIP_TAIL:-2}
 # Refuse to alias a block the decode has not finished writing (its last prompt block is partially
 # filled). 1 = guard on and count; 0 = reproduce the old behaviour, still counted.
 BFF_V2_PROTECT_HOT_BLOCKS=${BFF_V2_PROTECT_HOT_BLOCKS:-1}
@@ -519,6 +525,8 @@ export_bff_env() {
          BFF_V2_MAX_RESIDENT=$BFF_V2_MAX_RESIDENT BFF_V2_SIG_TIMEOUT=$BFF_V2_SIG_TIMEOUT \
          BFF_PULL_V2_SIG_TIMEOUT=$BFF_PULL_V2_SIG_TIMEOUT BFF_SIG_LAYERS=$BFF_SIG_LAYERS \
          BFF_V2_MAX_REQ_DECLINE=$BFF_V2_MAX_REQ_DECLINE \
+         BFF_V2_CLIP_FRAC=$BFF_V2_CLIP_FRAC BFF_V2_CLIP_MAX_REL_ERR=$BFF_V2_CLIP_MAX_REL_ERR \
+         BFF_V2_CLIP_TAIL=$BFF_V2_CLIP_TAIL \
          BFF_V2_PROTECT_HOT_BLOCKS=$BFF_V2_PROTECT_HOT_BLOCKS
   # BOTH roles dump fuse stats: the producer counts blocks + redirects shipped, the decode side counts
   # the redirects that actually landed and the REAL freed-block delta (the measured compression).
@@ -1429,10 +1437,27 @@ if v2:
         if capped:
             print(f"    -> {capped} request(s) exceeded BFF_V2_MAX_REQ_DECLINE and were read in "
                   f"full: that much substitution answers a neighbouring prompt.")
+        clipped = max((s.get("requests_clipped") or 0) for s in v2)
+        if clipped:
+            kept = max((s.get("clip_aliases_kept") or 0) for s in v2)
+            fetched = max((s.get("clip_aliases_dropped") or 0) for s in v2)
+            print(f"    -> clip (BFF_V2_CLIP_FRAC): {clipped} capped request(s) kept {kept} of their "
+                  f"best aliases and fetched {fetched}; read the degenerate-outputs 'clipped' line "
+                  f"for their quality.")
         if heavy:
             print(f"    -> {heavy} request(s) ({100.0*heavy/n_req:.1f}%) had OVER 75% of their KV "
                   f"replaced. Compare against the length(=max_tokens) share in the serving log — "
                   f"a matching fraction means those are the damaged requests.")
+    clip_ms = [s.get("clip_ms_total") for s in v2 if s.get("clip_ms_total") is not None]
+    copy_ms = [s.get("landing_copy_ms_total") for s in v2
+               if s.get("landing_copy_ms_total") is not None]
+    if clip_ms or copy_ms:
+        calls = max((s.get("landing_copy_calls") or 0) for s in v2)
+        pairs = max((s.get("landing_copy_pairs") or 0) for s in v2)
+        print(f"    overhead (BFF_STEP_PROFILE, worst rank, recv thread): clip "
+              f"{max(clip_ms or [0]):.1f} ms over {max((s.get('clip_calls') or 0) for s in v2)} "
+              f"call(s) | landing copy {max(copy_ms or [0]):.1f} ms over {calls} call(s), {pairs} "
+              f"block(s)" + (f" = {max(copy_ms) / calls:.2f} ms/call" if calls and copy_ms else ""))
     hot = sum(s.get("hot_block_aliases", 0) for s in v2)
     if hot:
         guarded = any(s.get("hot_block_guarded") for s in v2)
