@@ -210,6 +210,7 @@ _ORIG_CACHE_FULL = None
 # Debug counters (alias inserts vs drops) — confirm aliases are invalidated, not leaked.
 _alias_inserts = 0
 _alias_drops = 0
+_alias_self_key_skips = 0   # aliases not made because the key was the rep's own hash
 # Blocks skipped by patched_cache_full_blocks because they already carried a hash (i.e. how
 # often the alias/fusion sharing actually collides with the prefix cache). 0 on a run that
 # crashed on `assert blk.block_hash is None` would mean the crash came from somewhere else.
@@ -295,7 +296,19 @@ def add_block_alias(block_pool, key, rep_block, req=None, pos=None) -> None:
     """Register rep_block under an extra prefix-cache key and remember the alias so it
     can be dropped the instant rep_block is recycled/evicted (see
     patched_maybe_evict_cached_block)."""
-    global _alias_inserts
+    global _alias_inserts, _alias_self_key_skips
+    if key == rep_block.block_hash:
+        # The representative already answers this key under its OWN hash (the two requests share
+        # the exact block). Recording it as an alias as well made eviction pop the block's only
+        # map entry through the alias, so the stock eviction found nothing and skipped
+        # reset_hash(): the block went back to the pool still "hashed", every later tenant's pull
+        # (unhashed blocks only) silently skipped it and tail-aligned the rest of the group one
+        # block off. GLM-5.1 free-at-promotion, 2026-11-03: 7 of 122 aliases, 14-15/121 garbage.
+        _alias_self_key_skips += 1
+        if _ALIAS_TRACE:
+            _trace_log.info("BFF alias skip | req=%s pos=%s rep=%d: key is the rep's own hash",
+                            req, pos, rep_block.block_id)
+        return
     had = None
     if _ALIAS_TRACE:
         try:
@@ -331,6 +344,10 @@ def patched_maybe_evict_cached_block(self, block) -> bool:
         aliases = _BLOCK_ALIASES.pop(block.block_id, None)
         if aliases:
             for key in aliases:
+                if key == block.block_hash:
+                    # The block's own entry is the stock eviction's to remove: popping it here
+                    # makes that eviction miss and skip reset_hash(). See add_block_alias.
+                    continue
                 self.cached_block_hash_to_block.pop(key, block.block_id)
                 _alias_drops += 1
             origin = _ALIAS_ORIGIN.pop(block.block_id, None) or {}

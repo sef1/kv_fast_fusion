@@ -158,16 +158,40 @@ def check_pull_targets(request, blocks) -> int:
     alias cannot be written this way — this line says whether that holds on the box."""
     if not ENABLED:
         return 0
+    from kv_fast_fusion import fast_fusion_block_pool as _bp
+    cache = getattr(_bp._BLOCK_POOL, "cached_block_hash_to_block", None)
     n = 0
     for gi, row in enumerate(getattr(blocks, "blocks", None) or ()):
         for pos, blk in enumerate(row):
-            if (getattr(blk, "is_null", False) or blk.block_hash is not None
-                    or blk.ref_cnt <= 1):
+            if getattr(blk, "is_null", False):
+                continue
+            if blk.block_hash is not None:
+                # A genuine prefix hit is always in the cache under its own hash. A hashed block
+                # that is not was evicted without reset_hash(): the pull skips it and tail-aligns
+                # the group one block off, silently. See fast_fusion_block_pool.add_block_alias.
+                if cache is not None and not maps_to(cache, blk.block_hash, blk.block_id):
+                    n += 1
+                    logger.error("BFF stale-hash block | req=%s g=%d pos=%d block=%d ref_cnt=%d: "
+                                 "hashed but not in the prefix cache — the pull will skip it",
+                                 request.request_id, gi, pos, blk.block_id, blk.ref_cnt)
+                continue
+            if blk.ref_cnt <= 1:
                 continue
             n += 1
             logger.error("BFF pull-into-shared | req=%s g=%d pos=%d block=%d ref_cnt=%d",
                          request.request_id, gi, pos, blk.block_id, blk.ref_cnt)
     return n
+
+
+def maps_to(cache, key, block_id: int) -> bool:
+    """Does vLLM's ``BlockHashToBlockMap`` hold ``block_id`` under ``key``?"""
+    contain = getattr(cache, "contain", None)
+    if contain is not None:
+        return bool(contain(key, block_id))
+    got = getattr(cache, "_cache", {}).get(key)
+    if isinstance(got, dict):
+        return block_id in got
+    return got is not None and getattr(got, "block_id", None) == block_id
 
 
 def install(scheduler_cls) -> bool:

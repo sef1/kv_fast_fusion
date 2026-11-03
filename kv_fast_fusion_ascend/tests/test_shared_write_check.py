@@ -142,3 +142,23 @@ def test_install_runs_the_check_before_the_original_advances_tokens():
     finally:
         swc.check_step = orig_check
     assert seen == ["check", "orig", "preempt"]
+
+
+class _Cache:
+    def __init__(self, entries):
+        self._cache = entries
+
+
+def test_a_hashed_block_the_cache_does_not_hold_is_reported_as_stale(monkeypatch):
+    from kv_fast_fusion import fast_fusion_block_pool as _bp
+    real = _Blk(41, ref_cnt=2)
+    real.block_hash = "hA"
+    stale = _Blk(38, ref_cnt=1)
+    stale.block_hash = "hO"
+    monkeypatch.setattr(_bp, "_BLOCK_POOL",
+                        types.SimpleNamespace(cached_block_hash_to_block=_Cache({"hA": real})))
+
+    n = swc.check_pull_targets(types.SimpleNamespace(request_id="r"),
+                               types.SimpleNamespace(blocks=([real, stale],)))
+
+    assert n == 1, "the genuine prefix hit is fine; only the block missing from the cache is stale"

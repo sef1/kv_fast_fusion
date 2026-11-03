@@ -36,6 +36,7 @@ _PREEMPT = re.compile(r"BFF preempt \| req=(\S+)")
 _RECOMPUTE = re.compile(r"BFF recompute \| req=(\S+)")
 _LANDED_SHARED = re.compile(r"BFF landed-into-shared \| req=(\S+) .*other holders: (.*)$", re.M)
 _PULL_SHARED = re.compile(r"BFF pull-into-shared \| req=(\S+)")
+_STALE_HASH = re.compile(r"BFF stale-hash block \| req=(\S+)")
 # kv_fast_fusion/fast_fusion_block_pool.py (BFF_V2_ALIAS_TRACE)
 _ALIAS_HIT = re.compile(r"BFF alias hit \| req=(\S+) g=\d+ pos=\d+ block=(\d+) via=(\S+)")
 _REARRIVAL = re.compile(r"BFF rearrival \| req=(\S+)")
@@ -43,7 +44,7 @@ _SWAP_REP = re.compile(r"BFF swap \| req=\S+ .* rep=(\d+) owner=(\S+)")
 # written/writer: a scheduled write into a shared block. landed_*: a landing copy into one.
 # alias_hitter: a prefix hit through an alias or on a freed victim; hit_owner: owner of the hit rep.
 EVENTS = ("written", "writer", "preempted", "recomputed", "landed_writer", "landed_holder",
-          "pull_shared", "alias_hitter", "hit_owner", "rearrived")
+          "pull_shared", "alias_hitter", "hit_owner", "rearrived", "stale_hash")
 
 
 def is_degenerate(text: str) -> bool:
@@ -99,6 +100,8 @@ def parse_events(log_text: str) -> dict:
             ev["hit_owner"].update(rep_owner.get(m.group(2), ()))
     for m in _REARRIVAL.finditer(log_text):
         ev["rearrived"].add(uuid_of(m.group(1)))
+    for m in _STALE_HASH.finditer(log_text):
+        ev["stale_hash"].add(uuid_of(m.group(1)))
     for ids in ev.values():
         ids.discard(None)
     return ev

@@ -64,14 +64,20 @@ def load_ledger(results_dir):
 
 
 def bucket_of(entry):
-    """Bucket label for a ledger entry; a capped request was read in full, so it counts as 0%.
+    """Bucket label for a ledger entry; a capped request was read in full, so it counts as 0% —
+    unless BFF_V2_CLIP_FRAC kept part of it (``clipped``), which is what it was then served with.
     ``None`` means the request was planned but never aliased-and-recomputed."""
     if entry is None:
         return "0%"
     if entry.get("failed"):
         return "recomputed"
     planned = entry.get("planned") or 0
-    frac = 0.0 if entry.get("capped") or planned <= 0 else entry.get("declined", 0) / planned
+    if planned <= 0:
+        frac = 0.0
+    elif entry.get("clipped"):
+        frac = entry["clipped"] / planned
+    else:
+        frac = 0.0 if entry.get("capped") else entry.get("declined", 0) / planned
     for label, lo, hi in BUCKETS:
         if lo <= frac < hi:
             return label

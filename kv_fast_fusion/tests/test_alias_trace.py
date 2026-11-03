@@ -145,3 +145,56 @@ def test_evicting_the_rep_drops_its_aliases_and_says_so(trace, monkeypatch):
     assert "rep=41 keys=1 ref_cnt=0 for=S-aaaa@0" in line
     assert pool.cached_block_hash_to_block.get_one_block(("hS", 1)) is None
     assert 41 not in bp._FREED_AT_PROMOTION and 41 not in bp._ALIAS_ORIGIN
+
+
+def _stock_evict(pool, block):
+    """vLLM 0.19.1 BlockPool._maybe_evict_cached_block: reset the hash only if the pop finds it."""
+    if block.block_hash is None:
+        return False
+    if pool.cached_block_hash_to_block.pop(block.block_hash, block.block_id) is None:
+        return False
+    block.block_hash = None
+    return True
+
+
+def test_an_alias_under_the_reps_own_hash_is_not_made(trace, monkeypatch):
+    """The GLM free-at-promotion garbage: S shared O's exact block, so S's key WAS O's hash. The
+    alias made eviction pop that entry first, the stock eviction then missed and never reset the
+    hash, and the block went to every later tenant still "hashed" — skipped by their pulls."""
+    pool = types.SimpleNamespace(cached_block_hash_to_block=_Map())
+    rep = _Blk(38, ref_cnt=0, block_hash=("hO", 1))
+    pool.cached_block_hash_to_block.insert(rep.block_hash, rep)
+    monkeypatch.setattr(bp, "_ORIG_MAYBE_EVICT", _stock_evict)
+
+    bp.add_block_alias(pool, ("hO", 1), rep, req="S-aaaa", pos=0)
+    bp.patched_maybe_evict_cached_block(pool, rep)
+
+    assert rep.block_hash is None, "the block must come back to the pool unhashed"
+    assert _lines(trace, "BFF alias skip") and not _lines(trace, "BFF alias insert")
+
+
+def test_eviction_never_pops_a_blocks_own_hash_as_an_alias(trace, monkeypatch):
+    """The guard on its own, for an alias recorded before the insert-side check existed."""
+    pool = types.SimpleNamespace(cached_block_hash_to_block=_Map())
+    rep = _Blk(38, ref_cnt=0, block_hash=("hO", 1))
+    pool.cached_block_hash_to_block.insert(rep.block_hash, rep)
+    bp._BLOCK_ALIASES[38] = {("hO", 1)}
+    monkeypatch.setattr(bp, "_ORIG_MAYBE_EVICT", _stock_evict)
+
+    bp.patched_maybe_evict_cached_block(pool, rep)
+
+    assert rep.block_hash is None
+
+
+def test_an_ordinary_alias_still_drops_cleanly_with_the_stock_eviction(trace, monkeypatch):
+    pool = types.SimpleNamespace(cached_block_hash_to_block=_Map())
+    rep = _Blk(41, ref_cnt=0, block_hash=("hO", 1))
+    pool.cached_block_hash_to_block.insert(rep.block_hash, rep)
+    monkeypatch.setattr(bp, "_ORIG_MAYBE_EVICT", _stock_evict)
+
+    bp.add_block_alias(pool, ("hS", 1), rep, req="S-aaaa", pos=0)
+    bp.patched_maybe_evict_cached_block(pool, rep)
+
+    assert rep.block_hash is None
+    assert pool.cached_block_hash_to_block.get_one_block(("hS", 1)) is None
+    assert pool.cached_block_hash_to_block.get_one_block(("hO", 1)) is None
