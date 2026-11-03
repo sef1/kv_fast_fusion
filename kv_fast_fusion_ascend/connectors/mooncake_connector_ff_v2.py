@@ -1303,6 +1303,7 @@ try:
         DedupEngine,
         KVLayoutError,
         SignatureCodec,
+        project_signatures,
         signature_matrix,
         signature_matrix_by_layer,
     )
@@ -1361,6 +1362,18 @@ if _ASCEND_AVAILABLE:
                 _SYNC_WARNED = True
                 logger.warning("BFF pull-v2: device barrier unavailable (%s) — verification "
                                "mismatches cannot be distinguished from unsynchronised reads.", e)
+
+    def _alloc_stats() -> str:
+        """The NPU caching allocator's retry count and reserved memory, for the signing profile line.
+
+        A retry is the allocator failing to find a cached block, releasing its cache and asking the
+        device again — the suspected cause of a 40 ms projection whose warm repeat takes 3.5 ms."""
+        try:
+            st = torch.npu.memory_stats()
+            return (f"allocator: {int(st.get('num_alloc_retries', 0))} retries, "
+                    f"{torch.npu.memory_reserved() / 2**30:.2f} GiB reserved")
+        except Exception:  # noqa: BLE001 - telemetry must never fail a signing
+            return "allocator: n/a"
 
     class _SigServer(threading.Thread):
         """Producer side: answer "give me signatures for these blocks".
@@ -3079,7 +3092,7 @@ if _ASCEND_AVAILABLE:
                 if not layers or not block_ids or self._skip_group(gi):
                     continue
                 try:
-                    sig, norms = signature_matrix(layers, [int(b) for b in block_ids], is_mla,
+                    sig, norms = project_signatures(layers, [int(b) for b in block_ids], is_mla,
                                                   self._jl, num_blocks=self._group_rows(gi),
                                                   scale=self._group_scale(gi))
                 except KVLayoutError as e:
@@ -3164,7 +3177,7 @@ if _ASCEND_AVAILABLE:
             prof = _PROFILE_OVERHEAD
             t = time.perf_counter() if prof else 0.0
             try:
-                sig, norms = signature_matrix(layers, ids, is_mla, self._jl,
+                sig, norms = project_signatures(layers, ids, is_mla, self._jl,
                                               num_blocks=self._group_rows(gi),
                                               scale=self._group_scale(gi))
             except KVLayoutError:
@@ -3234,10 +3247,12 @@ if _ASCEND_AVAILABLE:
             alt["by_layer_ms"] += (t2 - t1) * 1e3
             alt["max_dev"] = max(alt["max_dev"], dev)
             if alt["calls"] == self._SIG_ALT_CHECKS:
-                logger.info("BFF pull-v2 producer: projection over %d calls — concat %.2f ms/call, "
-                            "per-layer %.2f ms/call, max |1-cos| between them %.2e (BFF_STEP_PROFILE).",
+                logger.info("BFF pull-v2 producer: projection over %d calls, repeated warm on the "
+                            "same blocks — concat %.2f ms/call, per-layer %.2f ms/call, max |1-cos| "
+                            "between them %.2e; the real path signs with %s (BFF_STEP_PROFILE).",
                             alt["calls"], alt["concat_ms"] / alt["calls"],
-                            alt["by_layer_ms"] / alt["calls"], alt["max_dev"])
+                            alt["by_layer_ms"] / alt["calls"], alt["max_dev"],
+                            pd_dedup_v2.SIG_PROJECTION)
 
         def precompute_signatures(self, blocks_by_group) -> int:
             """Compute + cache per-block signatures for ``{gi: [block_ids]}`` at SAVE time.
@@ -3341,7 +3356,8 @@ if _ASCEND_AVAILABLE:
                                 self._sign_ms / max(1, self._sign_reqs),
                                 100.0 * total / wall if wall > 0 else 0.0,
                                 " ".join(f"{k} {v / max(1, self._sign_reqs):.2f} ms"
-                                         for k, v in self._sig_phase_ms.items()))
+                                         for k, v in self._sig_phase_ms.items())
+                                + f" (projection={pd_dedup_v2.SIG_PROJECTION}; {_alloc_stats()})")
 
         def _precompute_and_offer(self, fuse_reqs, max_reqs) -> int:
             """:meth:`precompute_and_offer` without the timing wrapper."""

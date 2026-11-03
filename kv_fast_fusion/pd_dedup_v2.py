@@ -370,6 +370,23 @@ def _row_index(block_ids: list[int], scale: int, device):
             + torch.arange(scale, dtype=torch.long, device=device)).reshape(-1)
 
 
+def _check_layout(first, probe, is_mla: bool, num_blocks, scale: int) -> None:
+    """Refuse a cache whose row count is not the caller's picture of it (see signature_matrix)."""
+    if num_blocks is None or getattr(probe, "shape", None) is None:
+        return
+    rows = int(probe.shape[1] if (not isinstance(first, (list, tuple)) and not is_mla
+                                  and probe.ndim >= 4 and probe.shape[0] == 2)
+               else probe.shape[0])
+    if rows != int(num_blocks):
+        raise KVLayoutError(
+            f"cache holds {rows} rows but the caller expects {num_blocks} "
+            f"(scale={scale}); a block id does not index this tensor")
+    if int(num_blocks) % scale != 0:
+        raise KVLayoutError(
+            f"{num_blocks} rows is not a whole multiple of scale={scale}; the caller's layout "
+            "and this tensor disagree")
+
+
 def signature_matrix(kv_layers: list, block_ids: list[int], is_mla: bool, jl_holder: list,
                      num_blocks: int | None = None, compute_dtype=None, scale: int = 1):
     """Concatenate the given layers' per-block K and project to :data:`SIG_DIM`.
@@ -412,18 +429,7 @@ def signature_matrix(kv_layers: list, block_ids: list[int], is_mla: bool, jl_hol
     scale = int(scale)
     if scale < 1:
         raise KVLayoutError(f"scale must be >= 1, got {scale}")
-    if num_blocks is not None and getattr(probe, "shape", None) is not None:
-        rows = int(probe.shape[1] if (not isinstance(first, (list, tuple)) and not is_mla
-                                      and probe.ndim >= 4 and probe.shape[0] == 2)
-                   else probe.shape[0])
-        if rows != int(num_blocks):
-            raise KVLayoutError(
-                f"cache holds {rows} rows but the caller expects {num_blocks} "
-                f"(scale={scale}); a block id does not index this tensor")
-        if int(num_blocks) % scale != 0:
-            raise KVLayoutError(
-                f"{num_blocks} rows is not a whole multiple of scale={scale}; the caller's layout "
-                "and this tensor disagree")
+    _check_layout(first, probe, is_mla, num_blocks, scale)
     idx = _row_index(block_ids, scale, probe.device)
     n = len(block_ids)
     parts = []
@@ -456,13 +462,21 @@ def signature_matrix_by_layer(kv_layers: list, block_ids: list[int], is_mla: boo
     ``concat(K_l) @ JL == sum_l K_l @ JL[l*w:(l+1)*w]``, so this projects each layer against its own
     rows of the SAME projection matrix and accumulates: the [N, L*w] intermediate (205 MB per
     request on GLM-5.1: 39 layers x 128 tokens x 512) is never written. Same signature up to bf16
-    summation order. Not used for planning yet — BFF_STEP_PROFILE times it against the concat path on
-    the producer to decide whether it should be (see signature_rows_for)."""
+    summation order (measured max |1-cos| 2.4e-7 on GLM-5.1).
+
+    Why it is the producer's default (BFF_V2_SIG_PROJECTION): on GLM-5.1 the concat path took 40.6 ms
+    per request inside a real signing but 3.5 ms when repeated at once on the same blocks — the cost
+    is acquiring ~400 MB of temporaries right after a prefill forward has used the pool, not the
+    math. This path only ever cycles one per-layer temporary."""
     if not block_ids or not kv_layers:
         return None, None
     dt = SIG_COMPUTE_DTYPE if compute_dtype is None else compute_dtype
     probe = kv_layers[0][0] if isinstance(kv_layers[0], (list, tuple)) else kv_layers[0]
-    idx = _row_index(block_ids, int(scale), probe.device)
+    scale = int(scale)
+    if scale < 1:
+        raise KVLayoutError(f"scale must be >= 1, got {scale}")
+    _check_layout(kv_layers[0], probe, is_mla, num_blocks, scale)
+    idx = _row_index(block_ids, scale, probe.device)
     n = len(block_ids)
     first = key_blocks(kv_layers[0], idx, is_mla).to(dt).reshape(n, -1)
     w = first.shape[1]
@@ -479,6 +493,17 @@ def signature_matrix_by_layer(kv_layers: list, block_ids: list[int], is_mla: boo
         acc += (blk @ jl[li * w:(li + 1) * w]).float()
     norms = acc.norm(dim=1).clamp(min=1e-6)
     return acc / norms.unsqueeze(1), norms
+
+
+# Which projection the producer signs with: "by_layer" (default, no concat temporary) or "concat"
+# (signature_matrix, the original). Same signature either way; see signature_matrix_by_layer.
+SIG_PROJECTION = os.environ.get("BFF_V2_SIG_PROJECTION", "by_layer")
+
+
+def project_signatures(*args, **kwargs):
+    """Sign with the projection BFF_V2_SIG_PROJECTION selects (same contract as signature_matrix)."""
+    fn = signature_matrix if SIG_PROJECTION == "concat" else signature_matrix_by_layer
+    return fn(*args, **kwargs)
 
 
 class SignatureCodec:

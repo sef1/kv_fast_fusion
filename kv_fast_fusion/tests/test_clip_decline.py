@@ -136,3 +136,14 @@ def test_the_per_layer_projection_is_the_concat_projection():
     b, nb = pd_dedup_v2.signature_matrix_by_layer(layers, ids, False, [None],
                                                   compute_dtype=torch.float32)
     assert torch.allclose(a, b, atol=1e-5) and torch.allclose(na, nb, rtol=1e-5)
+
+
+def test_the_per_layer_projection_refuses_a_layout_it_cannot_index():
+    """The shape check the concat path has must hold for the default path too."""
+    layers = [(torch.randn(10, 4, 1, 6), torch.randn(10, 4, 1, 6))]
+    with pytest.raises(pd_dedup_v2.KVLayoutError):
+        pd_dedup_v2.signature_matrix_by_layer(layers, [1], False, [None], num_blocks=12)
+
+
+def test_the_producer_signs_per_layer_by_default():
+    assert pd_dedup_v2.SIG_PROJECTION == "by_layer"

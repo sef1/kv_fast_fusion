@@ -187,6 +187,9 @@ BFF_PD_ENCODED_BATCH_SIZE=${BFF_PD_ENCODED_BATCH_SIZE:-8}   # cross-batch regist
 BFF_V2_DEDUP=${BFF_V2_DEDUP:-1}          # 0 disables the whole mechanism (signature exchange too)
 BFF_V2_RESIDENT=${BFF_V2_RESIDENT:-1}    # alias to blocks left over from earlier transfers
 BFF_SIG_DIM=${BFF_SIG_DIM:-128}          # signature width; ~256 B/block against ~1.6 MB of KV
+# Producer projection: by_layer (default) never builds the [blocks, layers*block*dim] concatenation, which
+# cost ~37 ms/request of allocator churn on GLM-5.1; concat is the original. Same signature either way.
+BFF_V2_SIG_PROJECTION=${BFF_V2_SIG_PROJECTION:-by_layer}
 BFF_V2_MAX_RESIDENT=${BFF_V2_MAX_RESIDENT:-32768}
 BFF_V2_SIG_TIMEOUT=${BFF_V2_SIG_TIMEOUT:-2}   # no answer in this long -> send the group whole
 # bff_pull_v2's own budget, and much larger than the layerwise one above on purpose: there the
@@ -522,6 +525,7 @@ export_bff_env() {
          BFF_STEP_PROFILE=$BFF_STEP_PROFILE
   export BFF_MAX_REL_ERR=$BFF_MAX_REL_ERR BFF_V2_DEDUP=$BFF_V2_DEDUP \
          BFF_V2_RESIDENT=$BFF_V2_RESIDENT BFF_SIG_DIM=$BFF_SIG_DIM \
+         BFF_V2_SIG_PROJECTION=$BFF_V2_SIG_PROJECTION \
          BFF_V2_MAX_RESIDENT=$BFF_V2_MAX_RESIDENT BFF_V2_SIG_TIMEOUT=$BFF_V2_SIG_TIMEOUT \
          BFF_PULL_V2_SIG_TIMEOUT=$BFF_PULL_V2_SIG_TIMEOUT BFF_SIG_LAYERS=$BFF_SIG_LAYERS \
          BFF_V2_MAX_REQ_DECLINE=$BFF_V2_MAX_REQ_DECLINE \
