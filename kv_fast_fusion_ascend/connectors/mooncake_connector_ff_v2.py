@@ -2823,6 +2823,10 @@ if _ASCEND_AVAILABLE:
             self._sign_ms = 0.0
             self._sign_reqs = 0
             self._sign_t0: float | None = None
+            # The first .cpu() of a signing drains the NPU queue, i.e. waits for the prefill forward
+            # still in flight. Draining explicitly first splits the 44 ms/request measured on GLM
+            # (2026-11-03) into that wait and the signing's own work; the total is unchanged.
+            self._sign_drain_ms = 0.0
             # TP>1 piggyback: signatures signed here cannot reach the scheduler's _FF_SIGS (another
             # process), so they wait here for get_kv_connector_stats to carry them across.
             self._sig_outbox: dict = {}
@@ -3247,19 +3251,26 @@ if _ASCEND_AVAILABLE:
             t0 = time.perf_counter()
             if self._sign_t0 is None:
                 self._sign_t0 = t0
+            _sync_device()
+            t1 = time.perf_counter()
             try:
                 return self._precompute_and_offer(fuse_reqs, max_reqs)
             finally:
                 before = self._sign_reqs // 50
-                self._sign_ms += (time.perf_counter() - t0) * 1e3
+                self._sign_drain_ms += (t1 - t0) * 1e3
+                self._sign_ms += (time.perf_counter() - t1) * 1e3
                 self._sign_reqs += min(len(fuse_reqs), max(0, int(max_reqs)))
                 if self._sign_reqs // 50 > before:
                     wall = (time.perf_counter() - self._sign_t0) * 1e3
+                    total = self._sign_ms + self._sign_drain_ms
                     logger.info("BFF pull-v2 producer: piggyback signing %.1f ms over %d request(s) "
-                                "= %.2f ms/request, %.2f%% of wall time since the first signing "
-                                "(BFF_STEP_PROFILE).", self._sign_ms, self._sign_reqs,
+                                "= %.2f ms/request (%.2f waiting for the in-flight forward + %.2f "
+                                "signing), %.2f%% of wall time since the first signing "
+                                "(BFF_STEP_PROFILE).", total, self._sign_reqs,
+                                total / max(1, self._sign_reqs),
+                                self._sign_drain_ms / max(1, self._sign_reqs),
                                 self._sign_ms / max(1, self._sign_reqs),
-                                100.0 * self._sign_ms / wall if wall > 0 else 0.0)
+                                100.0 * total / wall if wall > 0 else 0.0)
 
         def _precompute_and_offer(self, fuse_reqs, max_reqs) -> int:
             """:meth:`precompute_and_offer` without the timing wrapper."""

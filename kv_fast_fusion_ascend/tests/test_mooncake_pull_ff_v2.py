@@ -1998,7 +1998,12 @@ def test_the_barrier_is_verification_only():
     src = inspect.getsource(v2)
 
     calls = src.count("_sync_device()") - src.count("def _sync_device()")
-    assert calls == 5, f"one before each device read a diagnostic makes (found {calls})"
+    assert calls == 6, f"one before each device read a diagnostic makes (found {calls})"
+    # The sixth splits the producer's signing time (BFF_STEP_PROFILE only): it must come after the
+    # profile gate, so an unprofiled run never pays it.
+    sign = src[src.index("        def precompute_and_offer("):]
+    sign = sign[:sign.index("        def _precompute_and_offer(")]
+    assert sign.index("if not _PROFILE_OVERHEAD:") < sign.index("_sync_device()")
     transfer = src[src.index("        def _after_transfer(self, req_meta) -> None:"):]
     transfer = transfer[:transfer.index("        def _audit_self_consistency(")]
     assert "_sync_device()" not in transfer, "not on the request's own path"
