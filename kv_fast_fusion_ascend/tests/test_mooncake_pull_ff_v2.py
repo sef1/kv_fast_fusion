@@ -1997,8 +1997,17 @@ def test_the_barrier_is_verification_only():
 
     src = inspect.getsource(v2)
 
-    calls = src.count("_sync_device()") - src.count("def _sync_device()")
+    # The signing-phase profiler (BFF_STEP_PROFILE only) drains between phases by design; its two
+    # helpers are reached only from behind the `prof` gate in signature_rows_for.
+    prof_src = src[src.index("        def _sig_phase("):src.index("        def precompute_signatures(")]
+    calls = (src.count("_sync_device()") - src.count("def _sync_device()")
+             - prof_src.count("_sync_device()"))
     assert calls == 6, f"one before each device read a diagnostic makes (found {calls})"
+    rows = src[src.index("        def signature_rows_for("):src.index("        def _sig_phase(")]
+    for helper in ("self._sig_phase(", "self._sig_alt_check("):
+        for at in [i for i in range(len(rows)) if rows.startswith(helper, i)]:
+            assert "if prof:" in rows[rows.rfind("\n", 0, rows.rfind("\n", 0, at)) - 40:at], \
+                f"{helper} must sit behind the profile gate"
     # The sixth splits the producer's signing time (BFF_STEP_PROFILE only): it must come after the
     # profile gate, so an unprofiled run never pays it.
     sign = src[src.index("        def precompute_and_offer("):]

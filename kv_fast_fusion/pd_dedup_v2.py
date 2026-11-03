@@ -448,6 +448,39 @@ def signature_matrix(kv_layers: list, block_ids: list[int], is_mla: bool, jl_hol
     return sig / norms.unsqueeze(1), norms
 
 
+def signature_matrix_by_layer(kv_layers: list, block_ids: list[int], is_mla: bool,
+                              jl_holder: list, num_blocks: int | None = None, compute_dtype=None,
+                              scale: int = 1):
+    """:func:`signature_matrix` without materialising the concatenation.
+
+    ``concat(K_l) @ JL == sum_l K_l @ JL[l*w:(l+1)*w]``, so this projects each layer against its own
+    rows of the SAME projection matrix and accumulates: the [N, L*w] intermediate (205 MB per
+    request on GLM-5.1: 39 layers x 128 tokens x 512) is never written. Same signature up to bf16
+    summation order. Not used for planning yet — BFF_STEP_PROFILE times it against the concat path on
+    the producer to decide whether it should be (see signature_rows_for)."""
+    if not block_ids or not kv_layers:
+        return None, None
+    dt = SIG_COMPUTE_DTYPE if compute_dtype is None else compute_dtype
+    probe = kv_layers[0][0] if isinstance(kv_layers[0], (list, tuple)) else kv_layers[0]
+    idx = _row_index(block_ids, int(scale), probe.device)
+    n = len(block_ids)
+    first = key_blocks(kv_layers[0], idx, is_mla).to(dt).reshape(n, -1)
+    w = first.shape[1]
+    full_w = w * len(kv_layers)
+    if (jl_holder[0] is None or jl_holder[0].shape[0] != full_w or jl_holder[0].dtype != dt):
+        g = torch.Generator(device="cpu")
+        g.manual_seed(20240517)
+        jl_holder[0] = torch.randn(full_w, SIG_DIM, generator=g,
+                                   dtype=torch.float32).to(first.device).to(dt)
+    jl = jl_holder[0]
+    acc = (first @ jl[:w]).float()
+    for li, kv in enumerate(kv_layers[1:], start=1):
+        blk = key_blocks(kv, idx, is_mla).to(dt).reshape(n, -1)
+        acc += (blk @ jl[li * w:(li + 1) * w]).float()
+    norms = acc.norm(dim=1).clamp(min=1e-6)
+    return acc / norms.unsqueeze(1), norms
+
+
 class SignatureCodec:
     """Pack/unpack the per-block signatures that cross the wire.
 

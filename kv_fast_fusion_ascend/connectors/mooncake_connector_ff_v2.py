@@ -1304,6 +1304,7 @@ try:
         KVLayoutError,
         SignatureCodec,
         signature_matrix,
+        signature_matrix_by_layer,
     )
     from kv_fast_fusion_ascend.connectors import mooncake_connector_ff as v1
     from kv_fast_fusion_ascend.connectors.merge_stats import (
@@ -2827,6 +2828,12 @@ if _ASCEND_AVAILABLE:
             # still in flight. Draining explicitly first splits the 44 ms/request measured on GLM
             # (2026-11-03) into that wait and the signing's own work; the total is unchanged.
             self._sign_drain_ms = 0.0
+            # Phase split of signature_rows_for (BFF_STEP_PROFILE): where the ~41 ms of real signing
+            # work per request goes, and the per-layer projection timed against the concat for the
+            # first _SIG_ALT_CHECKS calls (time and max |1 - cos| between the two signatures).
+            self._sig_phase_ms = {"project": 0.0, "hash": 0.0, "d2h": 0.0, "encode": 0.0}
+            self._sig_alt = {"calls": 0, "concat_ms": 0.0, "by_layer_ms": 0.0, "max_dev": 0.0,
+                             "spent_ms": 0.0}
             # TP>1 piggyback: signatures signed here cannot reach the scheduler's _FF_SIGS (another
             # process), so they wait here for get_kv_connector_stats to carry them across.
             self._sig_outbox: dict = {}
@@ -3154,6 +3161,8 @@ if _ASCEND_AVAILABLE:
             if not layers or self._skip_group(gi):
                 return [None] * len(ids)
             is_mla = bool(getattr(self.vllm_config.model_config, "use_mla", False))
+            prof = _PROFILE_OVERHEAD
+            t = time.perf_counter() if prof else 0.0
             try:
                 sig, norms = signature_matrix(layers, ids, is_mla, self._jl,
                                               num_blocks=self._group_rows(gi),
@@ -3166,12 +3175,69 @@ if _ASCEND_AVAILABLE:
                 return [None] * len(ids)
             if sig is None:
                 return [None] * len(ids)
+            if prof:
+                t = self._sig_phase("project", t)
+                self._sig_alt_check(layers, ids, is_mla, gi, sig)
+                t = time.perf_counter()
             proj = pd_lsh.get_proj(self._proj, sig.shape[1], sig.device)
-            hashes = pd_lsh.sub_hashes_device(sig, proj).cpu().tolist()
+            hashes_dev = pd_lsh.sub_hashes_device(sig, proj)
+            if prof:
+                t = self._sig_phase("hash", t)
+            hashes = hashes_dev.cpu().tolist()
             sig_host = sig.to(torch.float16).cpu()
             norms_host = norms.detach().float().cpu()
-            return [SignatureCodec.encode(sig_host[j:j + 1], norms_host[j:j + 1], hashes[j:j + 1])
-                    for j in range(len(ids))]
+            if prof:
+                t = self._sig_phase("d2h", t)
+            out = [SignatureCodec.encode(sig_host[j:j + 1], norms_host[j:j + 1], hashes[j:j + 1])
+                   for j in range(len(ids))]
+            if prof:
+                self._sig_phase("encode", t, sync=False)
+            return out
+
+        _SIG_ALT_CHECKS = 20
+
+        def _sig_phase(self, name: str, t0: float, sync: bool = True) -> float:
+            """Charge ``now - t0`` to phase ``name`` (after draining the device, so the phase's own
+            kernels land in it) and return now. BFF_STEP_PROFILE only."""
+            if sync:
+                _sync_device()
+            now = time.perf_counter()
+            self._sig_phase_ms[name] += (now - t0) * 1e3
+            return now
+
+        def _sig_alt_check(self, layers, ids, is_mla, gi, sig) -> None:
+            """Time the per-layer projection against the concat on the same blocks, and how far apart
+            the two signatures are. First _SIG_ALT_CHECKS calls only; never used for the plan."""
+            alt = self._sig_alt
+            if alt["calls"] >= self._SIG_ALT_CHECKS:
+                return
+            try:
+                _sync_device()
+                t0 = time.perf_counter()
+                ref, _n = signature_matrix(layers, ids, is_mla, self._jl,
+                                           num_blocks=self._group_rows(gi),
+                                           scale=self._group_scale(gi))
+                _sync_device()
+                t1 = time.perf_counter()
+                by_layer, _n2 = signature_matrix_by_layer(layers, ids, is_mla, self._jl,
+                                                          scale=self._group_scale(gi))
+                _sync_device()
+                t2 = time.perf_counter()
+                dev = float((1.0 - (ref * by_layer).sum(dim=1)).abs().max().item())
+            except Exception as e:  # noqa: BLE001 - a diagnostic must never fail a signing
+                logger.warning("BFF pull-v2 producer: per-layer projection check failed (%s).", e)
+                alt["calls"] = self._SIG_ALT_CHECKS
+                return
+            alt["calls"] += 1
+            alt["spent_ms"] += (t2 - t0) * 1e3 + 0.0
+            alt["concat_ms"] += (t1 - t0) * 1e3
+            alt["by_layer_ms"] += (t2 - t1) * 1e3
+            alt["max_dev"] = max(alt["max_dev"], dev)
+            if alt["calls"] == self._SIG_ALT_CHECKS:
+                logger.info("BFF pull-v2 producer: projection over %d calls — concat %.2f ms/call, "
+                            "per-layer %.2f ms/call, max |1-cos| between them %.2e (BFF_STEP_PROFILE).",
+                            alt["calls"], alt["concat_ms"] / alt["calls"],
+                            alt["by_layer_ms"] / alt["calls"], alt["max_dev"])
 
         def precompute_signatures(self, blocks_by_group) -> int:
             """Compute + cache per-block signatures for ``{gi: [block_ids]}`` at SAVE time.
@@ -3253,12 +3319,15 @@ if _ASCEND_AVAILABLE:
                 self._sign_t0 = t0
             _sync_device()
             t1 = time.perf_counter()
+            alt_before = self._sig_alt["spent_ms"]
             try:
                 return self._precompute_and_offer(fuse_reqs, max_reqs)
             finally:
                 before = self._sign_reqs // 50
                 self._sign_drain_ms += (t1 - t0) * 1e3
-                self._sign_ms += (time.perf_counter() - t1) * 1e3
+                # The projection check is a diagnostic run on top of the real signing; not its cost.
+                self._sign_ms += ((time.perf_counter() - t1) * 1e3
+                                  - (self._sig_alt["spent_ms"] - alt_before))
                 self._sign_reqs += min(len(fuse_reqs), max(0, int(max_reqs)))
                 if self._sign_reqs // 50 > before:
                     wall = (time.perf_counter() - self._sign_t0) * 1e3
@@ -3266,11 +3335,13 @@ if _ASCEND_AVAILABLE:
                     logger.info("BFF pull-v2 producer: piggyback signing %.1f ms over %d request(s) "
                                 "= %.2f ms/request (%.2f waiting for the in-flight forward + %.2f "
                                 "signing), %.2f%% of wall time since the first signing "
-                                "(BFF_STEP_PROFILE).", total, self._sign_reqs,
-                                total / max(1, self._sign_reqs),
+                                "(BFF_STEP_PROFILE). Signing phases per request: %s.", total,
+                                self._sign_reqs, total / max(1, self._sign_reqs),
                                 self._sign_drain_ms / max(1, self._sign_reqs),
                                 self._sign_ms / max(1, self._sign_reqs),
-                                100.0 * total / wall if wall > 0 else 0.0)
+                                100.0 * total / wall if wall > 0 else 0.0,
+                                " ".join(f"{k} {v / max(1, self._sign_reqs):.2f} ms"
+                                         for k, v in self._sig_phase_ms.items()))
 
         def _precompute_and_offer(self, fuse_reqs, max_reqs) -> int:
             """:meth:`precompute_and_offer` without the timing wrapper."""

@@ -125,3 +125,14 @@ def test_a_plan_records_every_block_in_the_potential_grid(planned, monkeypatch):
     pot = engine.stats.match_potential[1]
     assert sum(pot.values()) + engine.stats.match_potential_none.get(1, 0) == 4
     assert engine.stats.stats_dict()["match_potential"]["1"]["cells"] == dict(sorted(pot.items()))
+
+
+def test_the_per_layer_projection_is_the_concat_projection():
+    """concat(K_l) @ JL == sum_l K_l @ JL[l-th slice]: same signature, no [N, L*w] intermediate."""
+    torch.manual_seed(5)
+    layers = [(torch.randn(10, 4, 1, 6), torch.randn(10, 4, 1, 6)) for _ in range(3)]
+    ids = [1, 4, 7]
+    a, na = pd_dedup_v2.signature_matrix(layers, ids, False, [None], compute_dtype=torch.float32)
+    b, nb = pd_dedup_v2.signature_matrix_by_layer(layers, ids, False, [None],
+                                                  compute_dtype=torch.float32)
+    assert torch.allclose(a, b, atol=1e-5) and torch.allclose(na, nb, rtol=1e-5)
