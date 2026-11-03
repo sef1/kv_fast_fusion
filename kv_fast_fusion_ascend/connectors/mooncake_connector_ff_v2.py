@@ -2817,6 +2817,12 @@ if _ASCEND_AVAILABLE:
             # Requests that completed prefill in a step but lost the piggyback to the per-step cap —
             # each one is an on-demand round trip the decode pays in front of its transfer.
             self._sig_precompute_overflow = 0
+            # BFF_STEP_PROFILE: piggyback signing time on the PRODUCER's forward thread. The prefill node
+            # is the bottleneck of a 1P1D run, so this is the one BFF cost that comes straight out of
+            # throughput. Logged every 50 signed requests with its share of wall time.
+            self._sign_ms = 0.0
+            self._sign_reqs = 0
+            self._sign_t0: float | None = None
             # TP>1 piggyback: signatures signed here cannot reach the scheduler's _FF_SIGS (another
             # process), so they wait here for get_kv_connector_stats to carry them across.
             self._sig_outbox: dict = {}
@@ -3236,6 +3242,27 @@ if _ASCEND_AVAILABLE:
             it saves, because that compute is merely deferred to a worse moment."""
             if not v1.SIG_PIGGYBACK or not fuse_reqs:
                 return 0
+            if not _PROFILE_OVERHEAD:
+                return self._precompute_and_offer(fuse_reqs, max_reqs)
+            t0 = time.perf_counter()
+            if self._sign_t0 is None:
+                self._sign_t0 = t0
+            try:
+                return self._precompute_and_offer(fuse_reqs, max_reqs)
+            finally:
+                before = self._sign_reqs // 50
+                self._sign_ms += (time.perf_counter() - t0) * 1e3
+                self._sign_reqs += min(len(fuse_reqs), max(0, int(max_reqs)))
+                if self._sign_reqs // 50 > before:
+                    wall = (time.perf_counter() - self._sign_t0) * 1e3
+                    logger.info("BFF pull-v2 producer: piggyback signing %.1f ms over %d request(s) "
+                                "= %.2f ms/request, %.2f%% of wall time since the first signing "
+                                "(BFF_STEP_PROFILE).", self._sign_ms, self._sign_reqs,
+                                self._sign_ms / max(1, self._sign_reqs),
+                                100.0 * self._sign_ms / wall if wall > 0 else 0.0)
+
+        def _precompute_and_offer(self, fuse_reqs, max_reqs) -> int:
+            """:meth:`precompute_and_offer` without the timing wrapper."""
             n = 0
             cap = max(0, int(max_reqs))
             overflow = len(fuse_reqs) - cap

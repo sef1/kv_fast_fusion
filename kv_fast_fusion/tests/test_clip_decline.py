@@ -89,3 +89,39 @@ def test_a_clip_shows_in_the_ledger_and_an_unclipped_request_has_no_clip_key():
     st.note_request("clipped", 30, 40, True, clipped=10)
     assert "clipped" not in st.request_ledger["plain"]
     assert st.request_ledger["clipped"]["clipped"] == 10
+
+
+# ---- match potential: every planned block's best candidate, accepted or not --------------------
+def test_the_grid_cell_bins_cosine_by_lower_edge_and_error_by_upper_edge():
+    assert pd_lsh.potential_cell(0.99, 0.05) == "0.95|0.1"
+    assert pd_lsh.potential_cell(0.72, 0.55) == "0.7|0.6"
+    assert pd_lsh.potential_cell(0.2, 1.5) == "0|inf"
+    assert pd_lsh.potential_cell(0.5, None) == "0.5|?"
+
+
+def test_probe_reports_one_best_per_block_including_rejected_ones(monkeypatch):
+    monkeypatch.setattr(pd_lsh, "LSH_EXACT", True)       # every live row is a candidate
+    torch.manual_seed(0)
+    sig, hashes, norms = _sigs(torch.randn(4, 8))
+    idx = pd_lsh.LshIndex()
+    idx.register(sig, hashes, [(i, 40 + i, i, "rA") for i in range(4)], norms.tolist())
+    torch.manual_seed(3)
+    q_sig, q_hash, q_norms = _sigs(torch.randn(2, 8))
+    plain = idx.probe(q_sig, q_hash, ["rB", "rB"], 0.99, q_norms.tolist())
+    best: list = []
+    with_best = idx.probe(q_sig, q_hash, ["rB", "rB"], 0.99, q_norms.tolist(), best_out=best)
+
+    assert with_best == plain, "recording the best candidate must not change what matches"
+    assert plain[0] == [False, False], "random blocks clear no 0.99 bar"
+    assert len(best) == 2 and all(b is not None and b[0] < 0.99 for b in best), \
+        "the rejected best candidates are still recorded"
+
+
+def test_a_plan_records_every_block_in_the_potential_grid(planned, monkeypatch):
+    # stats_dict reads the per-group threshold through the connector package, which needs a vLLM
+    # with the p2p connector; this test is only about the grid.
+    monkeypatch.setattr(pd_dedup_v2, "threshold_for", lambda gi: 0.75)
+    engine, _ids = planned
+    pot = engine.stats.match_potential[1]
+    assert sum(pot.values()) + engine.stats.match_potential_none.get(1, 0) == 4
+    assert engine.stats.stats_dict()["match_potential"]["1"]["cells"] == dict(sorted(pot.items()))

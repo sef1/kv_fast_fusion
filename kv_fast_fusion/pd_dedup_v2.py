@@ -651,6 +651,10 @@ class DedupStats:
         self.request_decline_frac = dict.fromkeys(DECLINE_BUCKETS, 0)
         self.requests_capped = 0     # requests read whole because they exceeded MAX_REQ_DECLINE
         # BFF_V2_CLIP_FRAC: capped requests kept partially instead, and what that kept / fetched.
+        # Per group: {potential_cell: n} of every planned block's best candidate, and blocks with
+        # none (pd_lsh.POTENTIAL_COS_BINS). Says how much a looser bar would add, before trying it.
+        self.match_potential: dict[int, dict[str, int]] = {}
+        self.match_potential_none: dict[int, int] = {}
         self.requests_clipped = 0
         self.clip_aliases_kept = 0
         self.clip_aliases_dropped = 0
@@ -694,6 +698,11 @@ class DedupStats:
             err[i] += c
         for i, c in enumerate(getattr(plan, "reject_cos", ())):
             rej[i] += c
+        pot = self.match_potential.setdefault(gi, {})
+        for cell, n in getattr(plan, "potential", {}).items():
+            pot[cell] = pot.get(cell, 0) + n
+        self.match_potential_none[gi] = (self.match_potential_none.get(gi, 0)
+                                         + getattr(plan, "potential_none", 0))
         self.rejected_by_rel_err[gi] = (self.rejected_by_rel_err.get(gi, 0)
                                         + plan.rejected_by_rel_err)
 
@@ -814,6 +823,9 @@ class DedupStats:
             # the distinction the run-level wire saving cannot make.
             "request_decline_frac": dict(self.request_decline_frac),
             "requests_capped": self.requests_capped,
+            "match_potential": {str(g): {"cells": dict(sorted(c.items())),
+                                         "no_candidate": self.match_potential_none.get(g, 0)}
+                                for g, c in sorted(self.match_potential.items())},
             "requests_clipped": self.requests_clipped,
             "clip_aliases_kept": self.clip_aliases_kept,
             "clip_aliases_dropped": self.clip_aliases_dropped,

@@ -58,6 +58,10 @@ class DedupPlan:
     # Same keys as ``alias``: the accepted match's relative substitution error (None when the norms
     # were unknown). Read only by BFF_V2_CLIP_FRAC, which keeps a capped request's best aliases.
     alias_err: dict[tuple[str, int], dict[int, float | None]] = field(default_factory=dict)
+    # Match potential: per planned block, the BEST candidate's (cos, rel_err) cell — accepted or
+    # not — as pd_lsh.potential_cell keys, plus blocks that had no candidate at all.
+    potential: dict[str, int] = field(default_factory=dict)
+    potential_none: int = 0
     n_resident: int = 0      # satisfied by a block already on D
     n_batch: int = 0         # satisfied by another block in this same pull
     # Cleared the cosine bar, rejected by the substitution-error budget: the merges the norm
@@ -158,10 +162,13 @@ class DedupPlanner:
             cur = sigs[row:row + 1]
             hit = None
             err = None
+            best = None          # (cos, rel_err) of the best candidate, for the potential grid
 
             if idx is not None and idx.size():
+                best_out: list = []
                 matched, hits = idx.probe(cur, [hashes[row]], [blk.block_id], threshold,
-                                          [norms[row]], return_err=True)
+                                          [norms[row]], return_err=True, best_out=best_out)
+                best = best_out[0] if best_out else None
                 if matched[0] and hits:
                     hit = (int(hits[0][1]), True)
                     err = hits[0][4]
@@ -177,6 +184,8 @@ class DedupPlanner:
                         for k, c in enumerate(sims)]
                 j = min(range(len(errs)), key=errs.__getitem__)
                 v, e = sims[j], errs[j]
+                if best is None or best[1] is None or e < best[1]:
+                    best = (v, e)
                 if v > threshold and e <= pd_lsh.MAX_REL_ERR:
                     hit = (batch_ids[j], False)
                     err = e
@@ -184,6 +193,12 @@ class DedupPlanner:
                 elif v > threshold:
                     plan.rejected_by_rel_err += 1
                     plan.reject_cos[pd_lsh._bin(v, pd_lsh.ACCEPT_COS_BINS)] += 1
+
+            if best is None:
+                plan.potential_none += 1
+            else:
+                cell = pd_lsh.potential_cell(*best)
+                plan.potential[cell] = plan.potential.get(cell, 0) + 1
 
             if hit is None:
                 keep.append(blk.slot)

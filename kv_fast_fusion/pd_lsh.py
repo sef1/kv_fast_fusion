@@ -158,6 +158,26 @@ def min_cos_for_budget(budget: float) -> float:
     return float(max(0.0, 1.0 - b * b)) ** 0.5
 
 
+# Match potential (BFF_V2_MATCH_POTENTIAL): every planned block's BEST candidate, accepted or not, on a
+# (cosine, rel_err) grid. The accept histograms only see what cleared both bars, so they cannot say
+# how much more a looser bar would take. Magicoder >=4096 has ~28% same-position token-level
+# near-duplicates against ~5.6% actually aliased; this grid says where the rest sit.
+POTENTIAL_COS_BINS = (0.0, 0.3, 0.5, 0.6, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1.01)
+POTENTIAL_ERR_BINS = (0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 1.0, float("inf"))
+
+
+def potential_cell(cos: float, err) -> str:
+    """Grid cell ``"<cos lower edge>|<err upper edge>"`` for one best candidate; err None -> "?"."""
+    ci = max(0, min(len(POTENTIAL_COS_BINS) - 2,
+                    next((k for k in range(len(POTENTIAL_COS_BINS) - 1)
+                          if cos < POTENTIAL_COS_BINS[k + 1]), len(POTENTIAL_COS_BINS) - 2)))
+    if err is None:
+        return f"{POTENTIAL_COS_BINS[ci]:g}|?"
+    ei = next((k for k in range(len(POTENTIAL_ERR_BINS) - 1) if err < POTENTIAL_ERR_BINS[k + 1]),
+              len(POTENTIAL_ERR_BINS) - 2)
+    return f"{POTENTIAL_COS_BINS[ci]:g}|{POTENTIAL_ERR_BINS[ei + 1]:g}"
+
+
 def _bin(value: float, bins) -> int:
     """Index of the bin `value` falls in (clamped to the last)."""
     for j in range(len(bins) - 2, 0, -1):
@@ -262,10 +282,15 @@ class LshIndex:
         new[:self.n_rows] = self.mat[:self.n_rows]
         self.mat = new
 
-    def probe(self, cur, hashes, owners, threshold, norms=None, return_err=False):
+    def probe(self, cur, hashes, owners, threshold, norms=None, return_err=False, best_out=None):
         """Probe for each current block; return ``(matched: list[bool], hits: list[(i, rep_key,
         rep_slot)])``. With ``return_err`` each hit also carries ``(cosine, rel_err)`` of the
         accepted match (``rel_err`` None without norms) — the quality BFF_V2_CLIP_FRAC ranks by.
+
+        ``best_out``, when a list, gets one entry per block: ``(cosine, rel_err)`` of the candidate
+        the accept test judged — matched or REJECTED — or None without a candidate. It is what the
+        match-potential histogram is built from (see :data:`POTENTIAL_COS_BINS`); probing is
+        otherwise unchanged.
 
         A hit requires a bucket candidate from a DIFFERENT owner whose **exact cosine** with the
         current block is > ``threshold``; the best candidate wins. A raw bucket collision is never
@@ -307,6 +332,8 @@ class LshIndex:
                 # either, even while dead rows are waiting for a lazy compaction.
                 cand_rows = [r for r in cand if self.meta[r][2] != owner_i]
             if not cand_rows:
+                if best_out is not None:
+                    best_out.append(None)
                 continue
             rows = torch.tensor(cand_rows, dtype=torch.long, device=self.mat.device)
             sims = self.mat.index_select(0, rows) @ cur[i]              # [C]
@@ -322,6 +349,8 @@ class LshIndex:
                         for c, r in zip(cand_cos, cand_rows)]
                 best_j = min(range(len(errs)), key=errs.__getitem__)
                 v, e = cand_cos[best_j], errs[best_j]
+                if best_out is not None:
+                    best_out.append((v, e))
                 if v <= threshold or e > MAX_REL_ERR:
                     # Charge the rejection to whichever bar actually stopped it, so a run says how
                     # much the error budget removed BEYOND the cosine threshold.
@@ -333,6 +362,10 @@ class LshIndex:
             else:
                 best_val, best_j = sims.max(dim=0)
                 v = float(best_val.item())
+                if best_out is not None:
+                    r_best = cand_rows[int(best_j.item())]
+                    best_out.append((v, rel_err(v, float(self.row_norm.get(r_best, own or 1.0))
+                                                / (own or 1.0)) if own is not None else None))
                 if v <= cos_bar:
                     # Same accounting as the raw branch: a candidate that cleared the cosine
                     # THRESHOLD and was stopped by the raised bar was stopped by the error budget,

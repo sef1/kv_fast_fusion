@@ -1458,6 +1458,40 @@ if v2:
               f"{max(clip_ms or [0]):.1f} ms over {max((s.get('clip_calls') or 0) for s in v2)} "
               f"call(s) | landing copy {max(copy_ms or [0]):.1f} ms over {calls} call(s), {pairs} "
               f"block(s)" + (f" = {max(copy_ms) / calls:.2f} ms/call" if calls and copy_ms else ""))
+    # Where BFF's own time goes, worst rank. plan/sig_decode/landing copy run on the recv thread (off
+    # the forward path: they delay one request's load); hook/apply run on the decode's forward path,
+    # once per step. The producer's signing cost is logged by the prefill node itself.
+    if v2:
+        nreq = max(len(s.get("request_ledger") or {}) for s in v2) or 1
+        mx = lambda k: max((s.get(k) or 0) for s in v2)
+        print(f"    BFF time, worst rank: recv thread — plan {mx('plan_ms_total'):.0f} ms "
+              f"({mx('plan_ms_total') / nreq:.1f} ms/request), sig decode {mx('sig_decode_ms_total'):.0f} ms"
+              f" | forward path — hook {mx('hook_ms_total'):.0f} ms, apply {mx('apply_ms_total'):.0f} ms "
+              f"over {mx('apply_calls')} steps ({1e3 * mx('apply_ms_total') / max(1, mx('apply_calls')):.0f} us/step)")
+    # Match potential: every planned block's BEST candidate, accepted or not. Rank 0 only — every rank
+    # plans the same blocks. Read the current bar's row against "applied" above: the gap is what a
+    # looser bar could take, and the quality cost of taking it is measured separately (clip + garbage).
+    pot = (v2[0].get("match_potential") or {}) if v2 else {}
+    for g, pg in sorted(pot.items()):
+        cells = pg.get("cells") or {}
+        none = pg.get("no_candidate", 0)
+        tot = sum(cells.values()) + none
+        if not tot:
+            continue
+        def _within(cos_min, err_max):
+            n = 0
+            for key, c in cells.items():
+                lo, hi = key.split("|")
+                if hi == "?":
+                    continue
+                if float(lo) >= cos_min - 1e-9 and float(hi) <= err_max + 1e-9:
+                    n += c
+            return n
+        bars = ((0.75, 0.5, "current bar"), (0.7, 0.5, ""), (0.7, 0.6, ""), (0.6, 0.7, ""),
+                (0.5, 0.8, ""), (0.0, float("inf"), "any candidate"))
+        print(f"    match potential g{g} ({tot} blocks planned, {none} with no candidate): "
+              + " | ".join(f"cos>={c:g} err<={e:g}: {_within(c, e)} ({100.0 * _within(c, e) / tot:.1f}%)"
+                           f"{' [' + lbl + ']' if lbl else ''}" for c, e, lbl in bars))
     hot = sum(s.get("hot_block_aliases", 0) for s in v2)
     if hot:
         guarded = any(s.get("hot_block_guarded") for s in v2)
