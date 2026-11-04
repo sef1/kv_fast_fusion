@@ -46,6 +46,7 @@ case "$SCENARIO" in
        DEFAULT_LIMITS="16 18 22 ${MAX_CONCURRENCY}" ;;
   *) echo "Unknown SCENARIO=$SCENARIO (use 121 or 200)"; exit 1 ;;
 esac
+MAX_IN_TOKENS=${MAX_IN_TOKENS:-0}   # upper bound on input length, 0 = none
 
 # The largest "Running: N reqs" in a decode log, then that value minus one, plus no limit at all. The
 # largest Running is what the run reached, so a limit at it changes little: the one below it is the one
@@ -58,7 +59,7 @@ if [[ -n "${REF_DECODE_LOG:-}" && -z "${DECODE_LIMITS:-}" ]]; then
 fi
 DECODE_LIMITS=${DECODE_LIMITS:-$DEFAULT_LIMITS}
 
-COMMON=(MODEL="$MODEL" TP_SIZE="$TP_SIZE" MIN_TOKENS="$MIN_TOKENS" MAX_IN_TOKENS="${MAX_IN_TOKENS:-0}" MAX_TOKENS="$MAX_TOKENS"
+COMMON=(MODEL="$MODEL" TP_SIZE="$TP_SIZE" MIN_TOKENS="$MIN_TOKENS" MAX_IN_TOKENS="$MAX_IN_TOKENS" MAX_TOKENS="$MAX_TOKENS"
         NUM_PROMPTS="$NUM_PROMPTS" MAX_CONCURRENCY="$MAX_CONCURRENCY"
         CLIENT_MAX_CONCURRENCY="$MAX_CONCURRENCY" DECODE_MAX_NUM_BATCHED_TOKENS=64 USE_ASCEND_STORE=0)
 BFF_ARGS=(BASELINE=bff_pull_v2 BFF_LSH_EXACT=1 BFF_MAX_REL_ERR=0.5 BFF_THRESHOLD=0.75 BFF_EDGE_LAYERS=20
@@ -96,7 +97,7 @@ run_one() {   # run_one <folder name> <arm: baseline|bff> <decode limit> <stage:
 compare() { (cd "$REPO_ROOT" && PYTHONPATH="$REPO_ROOT:${PYTHONPATH:-}" python -m f1_benchmark.compare_runs "$SWEEP_DIR" "$@"); }
 
 n_limits=$(wc -w <<< "$DECODE_LIMITS")
-echo "Scenario $SCENARIO: $NUM_PROMPTS prompts >= $MIN_TOKENS tokens, $MAX_TOKENS out, client $MAX_CONCURRENCY"
+echo "Scenario $SCENARIO: $NUM_PROMPTS prompts >= $MIN_TOKENS tokens (max $MAX_IN_TOKENS, 0 = none), $MAX_TOKENS out, client $MAX_CONCURRENCY"
 echo "Decode limits: $DECODE_LIMITS | runs: $((2 * n_limits + 2 * CONFIRM_PAIRS)) | saved under $SWEEP_DIR"
 
 echo "--- Stage 1: both arms at each decode limit"
