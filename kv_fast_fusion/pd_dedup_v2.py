@@ -465,10 +465,8 @@ def signature_matrix_by_layer(kv_layers: list, block_ids: list[int], is_mla: boo
     summation order (measured max |1-cos| 2.4e-7 on GLM-5.1).
 
     The producer's default (BFF_V2_SIG_PROJECTION) because it never holds the ~400 MB of
-    temporaries the concat path does. It is NOT faster: 03i measured 40.5 ms per real signing
-    against the concat's 40.6, with 0 allocator retries — the 40 ms vs 3.5 ms gap between a real
-    signing and an immediate repeat is not allocation (see the cold-first test in
-    signature_rows_for)."""
+    temporaries the concat path does. Its speed is about the same: 2.9-5 ms against 3.5 ms per call
+    on GLM-5.1."""
     if not block_ids or not kv_layers:
         return None, None
     dt = SIG_COMPUTE_DTYPE if compute_dtype is None else compute_dtype

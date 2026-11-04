@@ -59,6 +59,15 @@ def test_cache_list_device_of_no_caches_is_none():
     assert v2.cache_list_device([]) is None
 
 
+def test_the_projection_is_warmed_on_a_group_that_is_really_signed():
+    """Group 0 is never signed; a matrix warmed on it (40 layers) is rebuilt by the first signing on
+    group 1 (39 layers): ~3.8 s on the prefill's forward thread on GLM-5.1."""
+    assert v2.warm_group({0: {"a"}, 1: {"b"}}) == 1
+    assert v2.warm_group({0: {"a"}, 1: set(), 2: {"c"}}) == 2
+    assert v2.warm_group({0: {"a"}, 1: {"b"}, 2: {"c"}}, skip=lambda g: g == 1) == 2
+    assert v2.warm_group({0: {"a"}}) is None, "nothing that will be signed: nothing to warm"
+
+
 # =====================================================================================
 # cache_parts — what the materialize copy copies. Under DSA (GLM-5.1) a layer's cache is
 # (latent KV, rope key, indexer key[, indexer key scale]); AscendAttentionBackend.copy_blocks copied

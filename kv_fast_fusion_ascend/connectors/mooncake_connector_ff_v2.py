@@ -1255,6 +1255,17 @@ def split_cached_blocks(block_ids: list, cache: dict, gi: int) -> tuple:
     return rows, missing
 
 
+def warm_group(group_layers: dict, skip=lambda gi: False):
+    """The group to build the signature projections on at startup, or None.
+
+    The first group that is really signed: group 0 is never signed (see
+    signature_request_and_plan_groups), and the JL matrix is sized by the group's layer count, so a
+    matrix warmed on it is discarded by the first real signing. On GLM-5.1 (40/39 layers) that
+    rebuild is ~3.8 s on the prefill node's forward thread, on top of the ~3.8 s the warm-up spent."""
+    return next((g for g in sorted(group_layers)
+                 if g > 0 and group_layers[g] and not skip(g)), None)
+
+
 def cache_list_device(kv_caches):
     """Device of a list of per-layer KV caches, tolerating both layouts BFF sees.
 
@@ -2831,27 +2842,27 @@ if _ASCEND_AVAILABLE:
             # Requests that completed prefill in a step but lost the piggyback to the per-step cap —
             # each one is an on-demand round trip the decode pays in front of its transfer.
             self._sig_precompute_overflow = 0
-            # BFF_STEP_PROFILE: piggyback signing time on the PRODUCER's forward thread. The prefill node
-            # is the bottleneck of a 1P1D run, so this is the one BFF cost that comes straight out of
-            # throughput. Logged every 50 signed requests with its share of wall time.
+            # BFF_STEP_PROFILE: piggyback signing time on the PRODUCER's forward thread, logged every 50
+            # signed requests. CUMULATIVE: read the slope between two lines, not one line's average.
+            # Until 2026-11-04a the first signing rebuilt the JL matrix (see warm_group), so one line
+            # read as "44 ms/request, 2% of wall time" when the truth was ~3.8 s once plus ~4.5
+            # ms/request (~0.2%).
             self._sign_ms = 0.0
             self._sign_reqs = 0
             self._sign_t0: float | None = None
             # The first .cpu() of a signing drains the NPU queue, i.e. waits for the prefill forward
-            # still in flight. Draining explicitly first splits the 44 ms/request measured on GLM
-            # (2026-11-03) into that wait and the signing's own work; the total is unchanged.
+            # still in flight. Draining explicitly first separates that wait from the signing's own
+            # work; the total is unchanged.
             self._sign_drain_ms = 0.0
-            # Phase split of signature_rows_for (BFF_STEP_PROFILE): where the ~41 ms of real signing
-            # work per request goes, and the per-layer projection timed against the concat for the
-            # first _SIG_ALT_CHECKS calls (time and max |1 - cos| between the two signatures).
-            # project_launch = until the projection call returns (host dispatch); project_device = the
-            # wait after it (device execution). 03i: ~40 ms projection inside a real signing, 3.5-5 ms
-            # when repeated at once, whichever implementation, 0 allocator retries.
+            # Phase split of signature_rows_for (BFF_STEP_PROFILE), and the per-layer projection timed
+            # against the concat for the first _SIG_ALT_CHECKS calls (time and max |1 - cos| between
+            # the two signatures). project_launch = until the projection call returns (host dispatch,
+            # including a JL build); project_device = the wait after it (device execution).
             self._sig_phase_ms = {"project_launch": 0.0, "project_device": 0.0, "hash": 0.0,
                                   "d2h": 0.0, "encode": 0.0}
             # Cold-first test (calls _SIG_ALT_CHECKS.._SIG_ALT_CHECKS*2): the per-layer projection runs
-            # FIRST on the just-written KV, the real signing right after. If the first one is the slow
-            # one whatever it is, the cost is the first read after the forward, not the code.
+            # FIRST on the just-written KV, the real signing right after. Measured 3.9 vs 3.0 ms on
+            # GLM-5.1: a first read after the forward is not slow.
             self._sig_calls = 0
             self._sig_skip_phase = False
             self._sig_cold = {"calls": 0, "cold_ms": 0.0, "warm_after_ms": 0.0}
@@ -3012,7 +3023,7 @@ if _ASCEND_AVAILABLE:
             it on a side thread of a node that is by then busy with prefill, inside a bounded window
             — a slow first answer that costs compression for no reason. The result is discarded; only
             the cached projections in _jl/_proj are wanted."""
-            gi = next((g for g in sorted(self._group_layers) if self._group_layers[g]), None)
+            gi = warm_group(self._group_layers, self._skip_group)
             if gi is None or not getattr(self, "num_blocks", 0):
                 return
             try:
