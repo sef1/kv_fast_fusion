@@ -160,6 +160,16 @@ BFF_ALIAS_FUSED=${BFF_ALIAS_FUSED:-1}
 # 1: also merge and free for a request whose KV load finished but which still WAITs behind the
 # max_num_seqs cap. 0: only for RUNNING requests.
 BFF_FREE_PRERUNNING=${BFF_FREE_PRERUNNING:-1}
+# Best-run settings. All off by default, as in the code, so a command that omits one runs a different
+# pipeline without saying so. The best runs set all five to 1.
+BFF_V2_MATERIALIZE=${BFF_V2_MATERIALIZE:-0}             # copy each representative into the request's own block
+BFF_V2_SIG_PIGGYBACK=${BFF_V2_SIG_PIGGYBACK:-0}         # prefill signs and sends signatures with the transfer params
+BFF_V2_ALLOW_FULL_GRAPH=${BFF_V2_ALLOW_FULL_GRAPH:-0}   # let the decode run full graph with dedup on
+BFF_V2_FREE_AT_PROMOTION=${BFF_V2_FREE_AT_PROMOTION:-0} # turn landing copies into real frees at promotion
+BFF_LSH_EXACT=${BFF_LSH_EXACT:-0}                       # exact candidate search instead of LSH
+# Makes the producer drain its writes before the decode can read. The log warns on every run that
+# piggyback without this may race. Untested on GLM, and a device-wide sync, so off until it is.
+BFF_PD_SAVE_BARRIER=${BFF_PD_SAVE_BARRIER:-0}
 # Admission back-pressure (Update 27). vLLM allocates a request's KV blocks and THEN parks it waiting
 # for its remote-KV pull, uncapped — so BFF's slow, exchange-gated admission leaves the pool jammed by
 # requests that cannot decode (measured: ~20k of 34.5k blocks; KV saturated at Running=97 vs the
@@ -532,6 +542,9 @@ export_bff_env() {
   # v2 knobs. Exported for every BFF arm, not just bff_v2: BFF_MAX_REL_ERR also gates v1's merges
   # (both go through pd_lsh.probe), so an A/B at the same error budget is one variable apart.
   export BFF_FREE_FLUSH=$BFF_FREE_FLUSH BFF_ALIAS_FUSED=$BFF_ALIAS_FUSED BFF_FREE_PRERUNNING=$BFF_FREE_PRERUNNING
+  export BFF_V2_MATERIALIZE=$BFF_V2_MATERIALIZE BFF_V2_SIG_PIGGYBACK=$BFF_V2_SIG_PIGGYBACK \
+         BFF_V2_ALLOW_FULL_GRAPH=$BFF_V2_ALLOW_FULL_GRAPH BFF_V2_FREE_AT_PROMOTION=$BFF_V2_FREE_AT_PROMOTION \
+         BFF_LSH_EXACT=$BFF_LSH_EXACT BFF_PD_SAVE_BARRIER=$BFF_PD_SAVE_BARRIER
   export BFF_MAX_INFLIGHT_LOADS=$BFF_MAX_INFLIGHT_LOADS \
          BFF_V2_SIG_PRECOMPUTE_PER_STEP=$BFF_V2_SIG_PRECOMPUTE_PER_STEP \
          BFF_STEP_PROFILE=$BFF_STEP_PROFILE
