@@ -1134,7 +1134,9 @@ def test_the_two_barriers_stay_distinct():
     from kv_fast_fusion_ascend.connectors import mooncake_connector_ff_v2 as v2
 
     ff_src = inspect.getsource(mc)
-    v2_src = inspect.getsource(v2)
+    from kv_fast_fusion_ascend import diagnostics
+
+    v2_src = inspect.getsource(v2) + inspect.getsource(diagnostics)
 
     assert "def _sync_producer_writes()" in ff_src
     assert "def _sync_device()" in v2_src

@@ -26,6 +26,20 @@ import pytest
 
 from kv_fast_fusion_ascend.connectors import mooncake_connector_ff_v2 as v2
 
+
+def _v2_source() -> str:
+    """The connector plus its diagnostics module, for the source checks below.
+
+    The diagnostics methods moved into mixins (one indent level shallower). They are re-indented here
+    so these checks read them as they read every other method of the connector's nested classes."""
+    import inspect
+
+    from kv_fast_fusion_ascend import diagnostics
+
+    head, mixins = inspect.getsource(diagnostics).split("class TransferDiagnostics:", 1)
+    mixins = "\n".join("    " + ln if ln.strip() else ln for ln in mixins.splitlines())
+    return f"{inspect.getsource(v2)}\n{head}\n    class TransferDiagnostics:{mixins}\n"
+
 SENT = -1
 
 
@@ -1307,7 +1321,7 @@ def _v2_injected_attributes() -> set:
     worker assigns through ``self.kv_recv_thread.<name> = ...``."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     names = set(re.findall(r"self\.kv_recv_thread\.(\w+)\s*=", src))
     tree = ast.parse(src)
     for node in ast.walk(tree):
@@ -1354,7 +1368,7 @@ def test_the_dedup_engine_is_reachable_under_its_new_name():
     error at all."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     assert "self.kv_recv_thread.dedup_engine = self._dedup_engine" in src
     assert "self.dedup_engine.plan(" in src, "the planner must read the injected attribute"
     assert "self.kv_recv_thread.engine = " not in src, "the fatal assignment must not come back"
@@ -1581,7 +1595,7 @@ def test_the_override_mirrors_that_contract():
     request — batching several requests into one iteration must not let one fault lose the rest."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     # Anchored on the docstring, not on "def run(self):" — _SigServer has one too, and it comes
     # first in the file, so the plain index() was slicing from the ZMQ listener and only passed by
     # luck. Adding a second _handle_request anywhere between them exposed it.
@@ -1603,7 +1617,7 @@ def test_the_override_mirrors_that_contract():
 def test_the_prefetch_asks_each_peer_once_and_caches_by_request_id():
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     fn = src[src.index("        def _prefetch_signatures(self, batch)"):]
     fn = fn[:fn.index("        def _take_prefetched(")]
 
@@ -1620,7 +1634,7 @@ def test_the_planner_no_longer_talks_to_the_producer_itself():
     would pay the 222 ms round trip again on top of the prefetched one."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     fn = src[src.index("        def _plan_aligned(self, req_meta, aligned):"):]
     fn = fn[:fn.index("        def _warn_on_runaway_groups(")]
 
@@ -1633,7 +1647,7 @@ def test_ask_many_answers_positionally_and_skips_empty_payloads():
     place, or the caller's indexing silently shifts onto another request's signatures."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     fn = src[src.index("        def ask_many(self, host, port, payloads: list)"):]
     fn = fn[:fn.index("        def ask(self, host, port, groups_to_ids: dict)")]
 
@@ -1648,7 +1662,7 @@ def test_the_dead_executor_claim_is_gone_from_the_comments():
     A wrong comment that explains a design is worse than no comment."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
 
     assert "executor runs 32 workers" not in src
     assert "recv thread runs 32 workers" not in src
@@ -1735,7 +1749,7 @@ def test_verification_never_plans_and_never_aliases():
     it would alias blocks and then measure its own substitution as if it were the transport's."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     fn = src[src.index("        def _plan_aligned(self, req_meta, aligned):"):]
     fn = fn[:fn.index("        def _warn_on_runaway_groups(")]
 
@@ -1751,7 +1765,7 @@ def test_the_fetch_is_gated_on_verification_but_the_plan_is_not():
     still be gated on V2_ENABLED alone, or 'dedup off' would stop meaning dedup off."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     gate = "pd_dedup_v2.V2_ENABLED or self._verify_ready()"
 
     def body(start, end):
@@ -1775,7 +1789,7 @@ def test_verification_happens_before_release():
     then cannot be told apart from a bad alias."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     fn = src[src.index("        def _after_transfer(self, req_meta) -> None:"):]
     fn = fn[:fn.index("        def _verify_transfer(")]
 
@@ -1788,7 +1802,7 @@ def test_the_verify_budget_is_shared_and_spread_across_the_run():
     sampled only the ramp."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
 
     assert '_verify_sampler: ClassVar = VerifySampler(VERIFY_TRANSFER, VERIFY_SPACING_S)' in src
     assert "KVCacheRecvingThreadFFv2._verify_sampler.take()" in src, \
@@ -1804,7 +1818,7 @@ def test_the_check_is_claimed_where_the_signatures_are_still_in_hand():
     requests happened to finish transferring, which is not a sample of anything."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     fn = src[src.index("        def _plan_aligned(self, req_meta, aligned):"):]
     fn = fn[:fn.index("        def _warn_on_runaway_groups(")]
 
@@ -1819,7 +1833,7 @@ def test_the_hot_block_audit_is_off_by_default():
     across 1,008,893 slot observations and every run since."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
 
     assert 'os.environ.get("BFF_V2_AUDIT_HOT_BLOCKS", "0")' in src
 
@@ -1974,7 +1988,7 @@ def test_the_decode_signature_is_taken_behind_a_barrier():
     check that raced."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     fn = src[src.index("        def _verify_transfer(self, req_meta) -> None:"):]
     fn = fn[:fn.index("            except Exception as e:")]
 
@@ -1988,7 +2002,7 @@ def test_the_verify_barrier_and_recompute_are_once_per_request():
     that changes the run it measures. The loop over groups must consume a result computed once."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     fn = src[src.index("        def _verify_transfer(self, req_meta) -> None:"):]
     fn = fn[:fn.index("            except Exception as e:")]
 
@@ -2004,7 +2018,7 @@ def test_the_barrier_is_verification_only():
     every request's KV read behind the whole device."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
 
     # The signing-phase profiler (BFF_STEP_PROFILE only) drains between phases by design; its two
     # helpers are reached only from behind the `prof` gate in signature_rows_for.
@@ -2035,7 +2049,7 @@ def test_the_barrier_is_verification_only():
     sign = sign[:sign.index("        def _precompute_and_offer(")]
     assert sign.index("if not _PROFILE_OVERHEAD:") < sign.index("_sync_device()")
     transfer = src[src.index("        def _after_transfer(self, req_meta) -> None:"):]
-    transfer = transfer[:transfer.index("        def _audit_self_consistency(")]
+    transfer = transfer[:transfer.index("    class MooncakeConnectorWorkerFFv2(")]
     assert "_sync_device()" not in transfer, "not on the request's own path"
 
 
@@ -2045,7 +2059,7 @@ def test_every_barrier_sits_behind_a_diagnostic_that_is_off_by_default():
     sync, not after."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     for name, gate in (("_verify_transfer(self, req_meta) -> None:", "entry is None"),
                        ("_audit_self_consistency(self, req_meta) -> None:", "XFER_AUDIT <= 0")):
         fn = src[src.index(f"        def {name}"):]
@@ -2062,7 +2076,7 @@ def test_the_producer_is_re_asked_only_when_a_check_fails():
     two rounds measuring."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     fn = src[src.index("        def _verify_transfer(self, req_meta) -> None:"):]
     fn = fn[:fn.index("            except Exception as e:")]
 
@@ -2076,7 +2090,7 @@ def test_the_re_ask_needs_the_producers_ids_so_the_stash_carries_them():
     defect that cost a whole run before."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
 
     assert 'self._verify_stash[req_meta.get("remote_request_id")] = (ask, plan_groups, sigs)' in src
     fn = src[src.index("        def _diagnose_mismatch("):]
@@ -2090,7 +2104,7 @@ def test_a_failed_re_ask_reports_unknown_rather_than_guessing():
     broken one."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     fn = src[src.index("        def _diagnose_mismatch("):]
     fn = fn[:fn.index("        def _verify_transfer(")]
 
@@ -2190,7 +2204,7 @@ def test_localisation_runs_only_for_a_confirmed_transfer_fault():
     would report a coincidence as a finding, and the search is O(rows^2)."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     fn = src[src.index("        def _verify_transfer(self, req_meta) -> None:"):]
     fn = fn[:fn.index("            except Exception as e:")]
 
@@ -2204,7 +2218,7 @@ def test_the_cross_group_search_is_the_fallback_not_the_first_answer():
     block that matches nothing in its own group."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     fn = src[src.index("        def _localise(self, gi, row, p_rows, rows_d, stats) -> str:"):]
     fn = fn[:fn.index("        def _verify_transfer(")]
 
@@ -2287,7 +2301,7 @@ def test_capture_is_tied_to_verification_being_on():
     and must not be paid by a normal run."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
 
     assert "capture_descriptors: bool = VERIFY_TRANSFER > 0" in src
 
@@ -2303,7 +2317,7 @@ def test_the_replay_fires_only_for_a_static_foreign_block():
     permuted, would be a round trip spent on a question already answered."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     fn = src[src.index("        def _stability(self, gi, row, rows_p, rows_d, stats) -> str:"):]
 
     assert fn.index("if cos >= VERIFY_MIN_COS:") < fn.index("self._replay("), \
@@ -2317,7 +2331,7 @@ def test_the_replay_uses_every_address_of_the_block():
     a slice of it and the re-check would still fail, for the wrong reason."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     fn = src[src.index("        def _replay(self, gi, block_id, rows_p, rows_d, row, stats) -> str:"):]
     fn = fn[:fn.index("        def _stability(")]
 
@@ -2332,7 +2346,7 @@ def test_the_replay_is_judged_against_the_producer_not_just_against_the_old_cont
     ends up overstating its own finding."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     fn = src[src.index("        def _replay(self, gi, block_id, rows_p, rows_d, row, stats) -> str:"):]
     fn = fn[:fn.index("        def _stability(")]
 
@@ -2348,7 +2362,7 @@ def test_all_three_replay_outcomes_are_distinguishable():
     Collapsing any pair loses the finding."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     fn = src[src.index("        def _replay(self, gi, block_id, rows_p, rows_d, row, stats) -> str:"):]
     fn = fn[:fn.index("        def _stability(")]
 
@@ -2363,7 +2377,7 @@ def test_the_descriptor_is_logged_even_when_the_replay_cannot_run():
     every early return."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     fn = src[src.index("        def _replay(self, gi, block_id, rows_p, rows_d, row, stats) -> str:"):]
     fn = fn[:fn.index("        def _stability(")]
 
@@ -2379,7 +2393,7 @@ def test_corruption_is_counted_per_request_not_per_block():
     with three bad blocks is one damaged answer, not three."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     fn = src[src.index("        def _verify_transfer(self, req_meta) -> None:"):]
 
     assert "stats.verify_requests += 1" in fn, "one increment per request, whatever the block count"
@@ -2424,7 +2438,7 @@ def _code_only(text):
 def _groups_split_src():
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     fn = src[src.index("        def signatures_for_groups_split(self, plan: dict):"):]
     return _code_only(fn[:fn.index("        def signatures_for_group_split(")])
 
@@ -2457,7 +2471,7 @@ def test_the_single_group_entry_point_delegates_rather_than_duplicating():
     construction — and the decode's _stability and _replay diagnostics still use the single form."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     fn = src[src.index("        def signatures_for_group_split(self, gi: int, block_ids, lengths):"):]
     # Slice to the END of this method (the next def), not to a far-off one — the producer precompute
     # methods that follow have their OWN legitimate signature_matrix call for the per-block cache.
@@ -2485,7 +2499,7 @@ def test_the_server_makes_one_cross_group_call_per_exchange():
     server, not merely made cheaper inside the worker."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     fn = src[src.index("        def _signatures_for(self, per_slot: dict) -> dict:"):]
     fn = _code_only(fn[:fn.index("    class _SigClient:")])
 
@@ -2502,7 +2516,7 @@ def test_the_exchange_is_charged_to_the_recv_thread_s_duty_cycle():
     waits behind it."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     fn = src[src.index("        def run(self):"):]
     fn = fn[:fn.index("        def _peer_of(self, req_meta):")]
 
@@ -2523,7 +2537,7 @@ def test_the_exchange_is_charged_to_the_recv_thread_s_duty_cycle():
 def _audit_src():
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     fn = src[src.index("        def _audit_self_consistency(self, req_meta) -> None:"):]
     return _code_only(fn[:fn.index("        def _score_audit(")])
 
@@ -2577,7 +2591,7 @@ def test_the_audit_runs_before_release_like_the_verification_does():
     ambiguous between a lost write and a legitimate alias."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     fn = src[src.index("        def _after_transfer(self, req_meta) -> None:"):]
     fn = fn[:fn.index("        def _audit_self_consistency(")]
 
@@ -2590,7 +2604,7 @@ def test_the_audit_counts_every_block_it_checks_not_only_the_bad_ones():
     offsets"."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     fn = src[src.index("        def _score_audit(self, by_group, first, second, stats)"):]
     fn = _code_only(fn[:fn.index("        def _audit_buckets(")])
 
@@ -2619,7 +2633,7 @@ def test_a_request_with_several_bad_blocks_counts_once():
     one damaged answer, and counting blocks understated the impact by two orders of magnitude."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     fn = src[src.index("        def _score_audit(self, by_group, first, second, stats)"):]
     fn = _code_only(fn[:fn.index("        def _audit_buckets(")])
 
@@ -2801,7 +2815,7 @@ def test_the_exchange_thread_never_touches_the_dedup_engine():
     its counters, which is why _take_prefetched does the counting."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     fn = src[src.index("        def _exchange_for(self, batch) -> None:"):]
     fn = _code_only(fn[:fn.index("        def _run_async(")])
 
@@ -2814,7 +2828,7 @@ def test_the_answer_rides_on_the_request_not_in_a_shared_cache():
     request is handed another's signatures. On the request, that is structurally impossible."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     fn = src[src.index("        def _take_prefetched(self, req_meta, ask) -> dict:"):]
     fn = _code_only(fn[:fn.index("        def _plan_aligned(")])
 
@@ -2830,7 +2844,7 @@ def test_a_deadline_skip_is_counted_from_the_pipeline_not_take_prefetched():
     all, so counting it there would silently undercount exactly the trade we are measuring."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     take = src[src.index("        def _take_prefetched(self, req_meta, ask) -> dict:"):]
     take = _code_only(take[:take.index("        def _plan_aligned(")])
     skip = take[take.index("if slot is None:"):]
@@ -2852,7 +2866,7 @@ def test_async_is_off_by_default_and_raises_the_batch_cap_when_on():
     queued requests at 8 per round trip is 25 trips, at 64 it is 4."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
 
     assert v2.ASYNC_SIG is False, "opt-in"
     assert 'os.environ.get("BFF_PULL_V2_ASYNC_SIG", "0") == "1"' in src
@@ -2865,7 +2879,7 @@ def test_the_synchronous_path_is_untouched_when_async_is_off():
     knob that rewrites it when off would make every earlier run incomparable."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     run = src[src.index('            """The vendored loop, taking the queue in DRAINED RUNS'):]
     run = run[:run.index("        def _peer_of(")]
 
@@ -2911,7 +2925,7 @@ def test_the_startup_line_states_the_mode_unconditionally():
     ever logged, never async-off. The mode must be line 1 whether on or off."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     run = src[src.index('            """The vendored loop, taking the queue in DRAINED RUNS'):]
     run = run[:run.index("        def _peer_of(")]
 
@@ -2925,7 +2939,7 @@ def test_plan_on_thread_a_is_off_by_default_and_requires_async_sig():
     exchange thread it plans on."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
 
     assert v2.ASYNC_PLAN is False, "off by default"
     assert 'os.environ.get("BFF_PULL_V2_ASYNC_PLAN", "0") == "1"' in src
@@ -2937,7 +2951,7 @@ def test_thread_b_does_no_exchange_and_no_plan_when_planning_moved():
     engine's plan path. _run_async must be pure transfer."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     # End-anchor on the recv-thread run() docstring, not "def run(self):" — _SigServer also has a
     # run() and it comes first in the file, so the plain index would slice to an empty string.
     fn = _code_only(src[src.index("        def _run_async(self):"):
@@ -2954,7 +2968,7 @@ def test_the_plan_travels_on_the_request_and_is_popped_once():
     blocks. Popped (not peeked) so a stale plan cannot outlive its request."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     exch = _code_only(src[src.index("        def _exchange_for(self, batch) -> None:"):
                           src.index("        def _plan_for(")])
     align = _code_only(src[src.index("        def _align_and_group(self, req_meta, local_groups"):
@@ -2971,11 +2985,11 @@ def test_every_engine_mutation_is_under_the_one_lock():
     can interleave, and the lock is the entire safety argument — so each must be inside it."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     plan = _code_only(src[src.index("        def _plan_aligned(self, req_meta, aligned):"):
                           src.index("        def _warn_on_runaway_groups(")])
     after = _code_only(src[src.index("        def _after_transfer(self, req_meta) -> None:"):
-                           src.index("        def _audit_self_consistency(")])
+                           src.index("    class MooncakeConnectorWorkerFFv2(")])
 
     # In _plan_aligned, the lock must open before the first engine mutation and every plan/forget
     # must sit after it.
@@ -2998,7 +3012,7 @@ def test_the_piggyback_overflow_is_counted_and_cannot_be_carried_to_a_later_step
     import inspect
 
     assert v2.SIG_PRECOMPUTE_PER_STEP >= 32, "the default must cover a real producer step"
-    src = inspect.getsource(v2)
+    src = _v2_source()
     body = src[src.index("def precompute_and_offer"):]
     body = body[:body.index("def serve_signatures_cached")]
     assert "_sig_precompute_overflow" in body, "an overflow is counted, not silently dropped"
@@ -3011,7 +3025,7 @@ def test_the_piggyback_cache_stores_the_PAYLOAD_shape_not_the_ask_shape():
     the disagreement surfaced deep inside DedupEngine._plan instead of at the guard."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     body = src[src.index("def _prefetch_signatures"):]
     body = body[:body.index("def _exchange_for")] if "def _exchange_for" in body else body[:6000]
     assert "fit_piggyback_to_ask(psig, ask)" in body
@@ -3026,7 +3040,7 @@ def test_the_sharing_snapshot_kept_in_bff_stats_is_the_BUSIEST_one_not_the_last(
     that says the opposite of the run, and the Hydragen decision rule is read off that field."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     body = src[src.index("sh = pd_dedup_v2.sharing_stats(per_req)"):]
     body = body[:body.index("except Exception")]
     assert 'sh["refs"] >= prev_sh.get("refs", 0)' in body, "keep the sample with the most refs"
@@ -3042,7 +3056,7 @@ def test_the_connector_worker_init_is_not_where_the_kv_pool_overhead_can_be(monk
     the profiling itself. Pin that they do not creep back."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     assert "connector-worker:before-init" not in src, "this probe cannot observe the KV budget"
     assert "connector-worker:after-init" not in src
     assert "initialize_from_config" in src, "and the reason stays recorded next to the call"
@@ -3059,7 +3073,7 @@ def _requires_piecewise_fn(allow_full_graph: bool, materialize: bool):
     import textwrap
     import types
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     tree = ast.parse(src)
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef) and node.name == "requires_piecewise_for_cudagraph":
@@ -3104,7 +3118,7 @@ def test_piggyback_signing_happens_only_where_its_result_is_used():
 def test_wait_for_save_asks_the_gate_before_it_signs():
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     fn = src[src.rindex("        def wait_for_save(self):"):]
     fn = fn[:fn.index("        def request_finished_all_groups")]
     assert "self._ff_piggyback_sign()" in fn
@@ -3131,7 +3145,7 @@ def test_sharded_stats_sign_before_draining_the_outbox():
     after request_finished has stapled an empty set (GLM-5.1 + MTP: piggyback_hits 0)."""
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     fn = src[src.index("        def get_kv_connector_stats(self):"):]
     fn = fn[:fn.index("        def save_kv_layer")]
     assert "self._ff_piggyback_sign()" in fn
@@ -3205,7 +3219,7 @@ def test_the_producer_scheduler_stashes_every_ranks_signatures_for_the_staple(mo
 def test_a_sharded_producer_routes_signatures_to_the_outbox_not_the_local_stash():
     import inspect
 
-    src = inspect.getsource(v2)
+    src = _v2_source()
     body = src[src.index("def precompute_and_offer"):]
     body = body[:body.index("def serve_signatures_cached")]
     assert "tp_group_if_sharded() is not None" in body and "self._sig_outbox[ext_id]" in body
