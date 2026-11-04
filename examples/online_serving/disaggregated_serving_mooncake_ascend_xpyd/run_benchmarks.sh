@@ -267,6 +267,9 @@ BURSTINESS=${BURSTINESS:-0.1}
 MIN_TOKENS=${MIN_TOKENS:-2048}
 # Upper bound on INPUT length, 0 = none. Prompts outside the range are skipped, not truncated.
 MAX_IN_TOKENS=${MAX_IN_TOKENS:-0}
+# 1: only prompts with a near-identical partner in that range, sent family by family. Real prompts, but
+# selected in dedup's favour. See f1_main.prompt_families.
+PROMPT_FAMILIES=${PROMPT_FAMILIES:-0}
 # Generation cap. NOT the same knob as MIN_TOKENS, which filters INPUT length. It decides which
 # regime the benchmark measures: the GPU comparison runs used 1024, where ~72% of requests hit the
 # cap, so generation length is pinned and the run measures pure token throughput. This default of
@@ -789,7 +792,7 @@ run_benchmark() {
     --input-key "${F1_INPUT_KEY}" --output-key "${F1_OUTPUT_KEY}" \
     --num-prompts ${NUM_PROMPTS} --request-rate ${REQUEST_RATE} --burstiness ${BURSTINESS} \
     --max-concurrency ${CLIENT_MAX_CONCURRENCY} --request-timeout ${REQUEST_TIMEOUT} \
-    --min-tokens ${MIN_TOKENS} --max-in-tokens ${MAX_IN_TOKENS} --max-tokens ${max_tok_flag} ${eval_flags} \
+    --min-tokens ${MIN_TOKENS} --max-in-tokens ${MAX_IN_TOKENS} $([[ "$PROMPT_FAMILIES" == "1" ]] && echo --prompt-families) --max-tokens ${max_tok_flag} ${eval_flags} \
     --model "${MODEL}" --host ${VLLM_HOST_IP} --port ${PROXY_PORT} \
     --result-dir "${results_root}" \
     > "${logs_root}/${BASELINE}-${NUM_PREFILL}Px${NUM_DECODE}D-con${DECODE_MAX_CONCURRENCY}-serving.txt" 2>&1

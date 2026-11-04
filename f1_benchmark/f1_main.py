@@ -299,13 +299,46 @@ def prompt_fingerprint(prompts) -> str:
     return hashlib.sha1("\n".join(prompts).encode()).hexdigest()[:8]
 
 
+def prompt_families(prompt_ids, min_match: float = 0.8) -> list:
+    """Groups of near-identical prompts, as lists of indices. Prompts with no partner are left out.
+
+    Two prompts are related when at least ``min_match`` of either one's tokens are identical at the
+    same position. That, rather than similar text, is what predicts a KV match: long Magicoder
+    prompts are one software project with a different file requested, differing from about token 75,
+    so prefix caching cannot share them. Families are ordered by first appearance, members by index."""
+    arrays = [np.asarray(ids, dtype=np.int64) for ids in prompt_ids]
+    parent = list(range(len(arrays)))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for i, a in enumerate(arrays):
+        for j in range(i + 1, len(arrays)):
+            b = arrays[j]
+            n = min(len(a), len(b))
+            same = int((a[:n] == b[:n]).sum())
+            if same >= min_match * len(a) or same >= min_match * len(b):
+                parent[max(find(i), find(j))] = min(find(i), find(j))
+    groups = {}
+    for i in range(len(arrays)):
+        groups.setdefault(find(i), []).append(i)
+    return [members for _root, members in sorted(groups.items()) if len(members) > 1]
+
+
 def load_dataset_simple(dataset_path: str, split: str, input_key: str, output_key: str,
                         num_samples: int, model: str = None, min_tokens: int = 0,
-                        max_in_tokens: int = 0):
+                        max_in_tokens: int = 0, group_families: bool = False):
     """Load dataset from Hugging Face or local JSONL file.
 
     Keeps prompts of at least ``min_tokens`` and, when ``max_in_tokens`` is above 0, at most
-    ``max_in_tokens`` input tokens. A filtered prompt is skipped, not truncated."""
+    ``max_in_tokens`` input tokens. A filtered prompt is skipped, not truncated.
+
+    ``group_families`` keeps only prompts with a near-identical partner in the length range, and sends
+    each family together. The prompts are unchanged, but the selection favours dedup, so any result
+    from it describes workloads with shared context and not the dataset as a whole."""
     from datasets import load_dataset
 
     if dataset_path.endswith(".jsonl") or os.path.isfile(dataset_path):
@@ -314,16 +347,18 @@ def load_dataset_simple(dataset_path: str, split: str, input_key: str, output_ke
         dataset = load_dataset(dataset_path, split=split)
 
     tokenizer = None
-    if min_tokens > 0 or max_in_tokens > 0:
+    if min_tokens > 0 or max_in_tokens > 0 or group_families:
         from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
 
     prompts = []
     references = {}
     n_skipped = 0
+    prompt_ids = []
 
     for item in dataset:
-        if len(prompts) >= num_samples:
+        # A family's members can be far apart, so grouping has to see the whole range first.
+        if len(prompts) >= num_samples and not group_families:
             break
         prompt = item[input_key]
         reference = item[output_key]
@@ -333,6 +368,8 @@ def load_dataset_simple(dataset_path: str, split: str, input_key: str, output_ke
             if n_tok < min_tokens or (max_in_tokens > 0 and n_tok > max_in_tokens):
                 n_skipped += 1
                 continue
+            if group_families:
+                prompt_ids.append(tokenizer(prompt, add_special_tokens=False).input_ids)
 
         references[str(len(prompts))] = reference
         prompts.append(prompt)
@@ -341,6 +378,13 @@ def load_dataset_simple(dataset_path: str, split: str, input_key: str, output_ke
         upper = f" and <= {max_in_tokens}" if max_in_tokens > 0 else ""
         print(f"  token filter: kept {len(prompts)} samples with >= {min_tokens}{upper} input "
               f"tokens (skipped {n_skipped})")
+    if group_families:
+        families = prompt_families(prompt_ids)
+        order = [i for members in families for i in members][:num_samples]
+        print(f"  prompt families: {len(families)} families, {sum(map(len, families))} prompts in them, "
+              f"using {len(order)}, grouped so each family runs together")
+        references = {str(k): references[str(i)] for k, i in enumerate(order)}
+        prompts = [prompts[i] for i in order]
     print(f"  prompt fingerprint: {prompt_fingerprint(prompts)} ({len(prompts)} prompts)")
 
     return prompts, references
@@ -374,6 +418,8 @@ async def main():
     parser.add_argument("--min-tokens", type=int, default=0)
     parser.add_argument("--max-in-tokens", type=int, default=0,
                         help="Skip prompts longer than this many input tokens. 0 means no limit.")
+    parser.add_argument("--prompt-families", action="store_true",
+                        help="Use only prompts with a near-identical partner, sent family by family.")
     parser.add_argument("--disable-tqdm", action="store_true")
     parser.add_argument("--no-stream", dest="stream", action="store_false")
     parser.add_argument("--max-tokens", type=int, default=6000)
@@ -398,6 +444,7 @@ async def main():
     prompts, references = load_dataset_simple(
         args.dataset_path, args.hf_split, args.input_key, args.output_key, args.num_prompts,
         model=args.model, min_tokens=args.min_tokens, max_in_tokens=args.max_in_tokens,
+        group_families=args.prompt_families,
     )
 
     # Run inference
