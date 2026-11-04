@@ -1,6 +1,8 @@
 #!/bin/bash
 # =============================================================================
-# Same scenario, mooncake against BFF, with the best settings found so far.
+# Same scenario, mooncake against BFF, with the best settings found so far. The one way to run tests.
+#
+# With RUNS set, it does exactly those runs and nothing else. Without it, it runs the full sweep:
 #
 #   1. Baseline (mooncakev1) and BFF at each decode limit in DECODE_LIMITS, alternating.
 #   2. Each arm's best limit, chosen separately: if BFF evicts less, its best limit can be higher
@@ -16,6 +18,8 @@
 # The client always keeps MAX_CONCURRENCY requests in flight (CLIENT_MAX_CONCURRENCY); only decode
 # admission is limited, so a queue still builds behind the limit.
 #
+#   RUNS="bff:48 baseline:8" ./run_best_compare.sh      # just these: arm:decode limit[:folder name]
+#   RUNS="bff:48" BFF_ALIAS_FUSED=0 ./run_best_compare.sh   # any setting can be changed the same way
 #   DRY_RUN=1 ./run_best_compare.sh                     # print the plan, run nothing
 #   ./run_best_compare.sh                               # 121 prompts >= 4096 tokens, 1024 out
 #   SCENARIO=200 ./run_best_compare.sh                  # 200 prompts >= 1000 tokens, 2000 out
@@ -23,6 +27,9 @@
 #                                                       # limits from that log's max running
 #   DECODE_LIMITS="7 8 9 48" ./run_best_compare.sh      # or name them yourself
 #   SWEEP_DIR=<folder> ./run_best_compare.sh            # resume
+#
+# Stops after a run whose prompts are not the scenario's usual ones, since nothing could be compared
+# with it. Set EXPECT_FINGERPRINT= (empty) when changing the prompts on purpose.
 # =============================================================================
 set -u
 
@@ -41,12 +48,16 @@ MAX_CONCURRENCY=${MAX_CONCURRENCY:-48}
 SCENARIO=${SCENARIO:-121}
 case "$SCENARIO" in
   121) MIN_TOKENS=${MIN_TOKENS:-4096}; MAX_IN_TOKENS=${MAX_IN_TOKENS:-6000}; MAX_TOKENS=${MAX_TOKENS:-1024}; NUM_PROMPTS=${NUM_PROMPTS:-121}
+       USUAL_PROMPTS="4096 6000 121"; USUAL_FINGERPRINT=9f5e27b8
        DEFAULT_LIMITS="8 9 ${MAX_CONCURRENCY}" ;;
   200) MIN_TOKENS=${MIN_TOKENS:-1000}; MAX_IN_TOKENS=${MAX_IN_TOKENS:-2000}; MAX_TOKENS=${MAX_TOKENS:-2000}; NUM_PROMPTS=${NUM_PROMPTS:-200}
+       USUAL_PROMPTS="1000 2000 200"; USUAL_FINGERPRINT=4da4b383
        DEFAULT_LIMITS="16 18 22 ${MAX_CONCURRENCY}" ;;
   *) echo "Unknown SCENARIO=$SCENARIO (use 121 or 200)"; exit 1 ;;
 esac
 MAX_IN_TOKENS=${MAX_IN_TOKENS:-0}   # upper bound on input length, 0 = none
+if [[ "$MIN_TOKENS $MAX_IN_TOKENS $NUM_PROMPTS" != "$USUAL_PROMPTS" ]]; then USUAL_FINGERPRINT=""; fi
+EXPECT_FINGERPRINT=${EXPECT_FINGERPRINT-$USUAL_FINGERPRINT}
 
 # The largest "Running: N reqs" in a decode log, then that value minus one, plus no limit at all. The
 # largest Running is what the run reached, so a limit at it changes little: the one below it is the one
@@ -61,11 +72,16 @@ DECODE_LIMITS=${DECODE_LIMITS:-$DEFAULT_LIMITS}
 
 COMMON=(MODEL="$MODEL" TP_SIZE="$TP_SIZE" MIN_TOKENS="$MIN_TOKENS" MAX_IN_TOKENS="$MAX_IN_TOKENS" MAX_TOKENS="$MAX_TOKENS"
         NUM_PROMPTS="$NUM_PROMPTS" MAX_CONCURRENCY="$MAX_CONCURRENCY"
-        CLIENT_MAX_CONCURRENCY="$MAX_CONCURRENCY" DECODE_MAX_NUM_BATCHED_TOKENS=64 USE_ASCEND_STORE=0)
-BFF_ARGS=(BASELINE=bff_pull_v2 BFF_LSH_EXACT=1 BFF_MAX_REL_ERR=0.5 BFF_THRESHOLD=0.75 BFF_EDGE_LAYERS=20
-          BFF_V2_MATERIALIZE=1 BFF_FREE_FLUSH=recv BFF_V2_ALLOW_FULL_GRAPH=1 BFF_V2_DEDUP=1
-          BFF_V2_SIG_PIGGYBACK=1 BFF_V2_FREE_AT_PROMOTION=1 BFF_ALIAS_FUSED=1
-          BFF_V2_CLIP_FRAC=${BFF_V2_CLIP_FRAC:-0.4} BFF_STEP_PROFILE=0)
+        CLIENT_MAX_CONCURRENCY="${CLIENT_MAX_CONCURRENCY:-$MAX_CONCURRENCY}"
+        DECODE_MAX_NUM_BATCHED_TOKENS="${DECODE_MAX_NUM_BATCHED_TOKENS:-64}" USE_ASCEND_STORE="${USE_ASCEND_STORE:-0}")
+# The best settings. Each can be overridden from the command line.
+BFF_ARGS=(BASELINE=bff_pull_v2 BFF_LSH_EXACT="${BFF_LSH_EXACT:-1}" BFF_MAX_REL_ERR="${BFF_MAX_REL_ERR:-0.5}"
+          BFF_THRESHOLD="${BFF_THRESHOLD:-0.75}" BFF_EDGE_LAYERS="${BFF_EDGE_LAYERS:-20}"
+          BFF_V2_MATERIALIZE="${BFF_V2_MATERIALIZE:-1}" BFF_FREE_FLUSH="${BFF_FREE_FLUSH:-recv}"
+          BFF_V2_ALLOW_FULL_GRAPH="${BFF_V2_ALLOW_FULL_GRAPH:-1}" BFF_V2_DEDUP="${BFF_V2_DEDUP:-1}"
+          BFF_V2_SIG_PIGGYBACK="${BFF_V2_SIG_PIGGYBACK:-1}" BFF_V2_FREE_AT_PROMOTION="${BFF_V2_FREE_AT_PROMOTION:-1}"
+          BFF_ALIAS_FUSED="${BFF_ALIAS_FUSED:-1}" BFF_V2_CLIP_FRAC="${BFF_V2_CLIP_FRAC:-0.4}"
+          BFF_STEP_PROFILE="${BFF_STEP_PROFILE:-0}")
 BASE_ARGS=(BASELINE=mooncakev1)
 
 run_one() {   # run_one <folder name> <arm: baseline|bff> <decode limit> <stage: sweep|confirm>
@@ -77,7 +93,9 @@ run_one() {   # run_one <folder name> <arm: baseline|bff> <decode limit> <stage:
   fi
   if [[ -f "${dest}/DONE" ]]; then echo "=== $name: already done, skipping"; return 0; fi
   mkdir -p "$dest"
-  { echo "arm=$arm"; echo "decode_limit=$limit"; echo "stage=$stage"; echo "scenario=$SCENARIO"; printf '%s\n' "${COMMON[@]}" "${args[@]}"
+  # The inherited BFF_ settings first, so the ones this run really sets win when config.txt is read.
+  { env | grep '^BFF_' | sort; echo "arm=$arm"; echo "decode_limit=$limit"; echo "stage=$stage"; echo "scenario=$SCENARIO"
+    printf '%s\n' "${COMMON[@]}" "${args[@]}"
     echo "git=$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null)"; } > "${dest}/config.txt"
   echo "=== $name: $arm, decode limit $limit, started $(date '+%H:%M:%S')"
   env "${COMMON[@]}" "${args[@]}" DECODE_MAX_CONCURRENCY="$limit" "$RUN_SCRIPT" > "${dest}/console.txt" 2>&1
@@ -90,14 +108,49 @@ run_one() {   # run_one <folder name> <arm: baseline|bff> <decode limit> <stage:
     echo "=== $name FAILED (exit $rc). What it wrote is in $dest; see console.txt. Stopping."
     exit 1
   fi
+  local got
+  got=$(grep -rhoE 'prompt fingerprint: [0-9a-f]+' "${dest}/logs_latest" 2>/dev/null | head -1 | awk '{print $3}')
+  if [[ -n "$EXPECT_FINGERPRINT" && -z "$got" ]]; then
+    echo "=== $name: WARNING: no prompt fingerprint in its logs, so its prompts are unchecked."
+  elif [[ -n "$EXPECT_FINGERPRINT" && "$got" != "$EXPECT_FINGERPRINT" ]]; then
+    echo "=== $name used different prompts: fingerprint $got, expected $EXPECT_FINGERPRINT. Stopping, since it"
+    echo "    cannot be compared with earlier runs. Saved in $dest. To allow this: EXPECT_FINGERPRINT="
+    exit 1
+  fi
   touch "${dest}/DONE"
   echo "=== $name: finished $(date '+%H:%M:%S'), saved to $dest"
 }
 
 compare() { (cd "$REPO_ROOT" && PYTHONPATH="$REPO_ROOT:${PYTHONPATH:-}" python -m f1_benchmark.compare_runs "$SWEEP_DIR" "$@"); }
 
-n_limits=$(wc -w <<< "$DECODE_LIMITS")
 echo "Scenario $SCENARIO: $NUM_PROMPTS prompts >= $MIN_TOKENS tokens (max $MAX_IN_TOKENS, 0 = none), $MAX_TOKENS out, client $MAX_CONCURRENCY"
+
+if [[ -n "${RUNS:-}" ]]; then
+  # Checked before anything runs, so a typo in the last one does not surface after the first has finished.
+  for spec in $RUNS; do
+    IFS=: read -r arm limit name <<< "$spec"
+    if [[ ! "$arm" =~ ^(baseline|bff)$ || ! "$limit" =~ ^[0-9]+$ ]]; then
+      echo "Bad entry in RUNS: '$spec'. Use arm:decode_limit or arm:decode_limit:name, with arm baseline or bff."
+      exit 1
+    fi
+  done
+  echo "Runs: $RUNS | saved under $SWEEP_DIR"
+  declare -A used=()
+  for spec in $RUNS; do
+    IFS=: read -r arm limit name <<< "$spec"
+    name=${name:-${arm}_limit${limit}}
+    used[$name]=$(( ${used[$name]:-0} + 1 ))
+    if [[ "${used[$name]}" -gt 1 ]]; then name="${name}_${used[$name]}"; fi
+    run_one "$name" "$arm" "$limit" sweep
+  done
+  if [[ "$DRY_RUN" != "1" ]]; then
+    echo; echo "=== Comparison"; compare | tee "${SWEEP_DIR}/summary.txt"
+    echo "Saved: ${SWEEP_DIR} (summary.txt, one folder per run)"
+  fi
+  exit 0
+fi
+
+n_limits=$(wc -w <<< "$DECODE_LIMITS")
 echo "Decode limits: $DECODE_LIMITS | runs: $((2 * n_limits + 2 * CONFIRM_PAIRS)) | saved under $SWEEP_DIR"
 
 echo "--- Stage 1: both arms at each decode limit"

@@ -55,7 +55,11 @@ fix moves across with `git cherry-pick`.
 ### Golden run
 
 Same settings as the 03j run (alias on), on the 121 prompts (`MIN_TOKENS=4096 MAX_IN_TOKENS=6000`),
-fingerprint `9f5e27b8`.
+fingerprint `9f5e27b8`:
+
+```
+RUNS="bff:48:golden_<build>" BFF_STEP_PROFILE=1 ./run_best_compare.sh
+```
 
 | Check | Pass |
 |---|---|

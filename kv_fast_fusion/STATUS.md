@@ -434,7 +434,9 @@ evidence than a run on the box. Before 04b, on vLLM 0.31.0, 9 tests failed and 4
 **Running and reading a run.**
 - `run_benchmarks.sh`: launches everything for one run. 1,750 lines, 577 of them an inline stats
   report. `results_latest` and `logs_latest` are wiped at each start.
-- `run_best_compare.sh`: sweep with every run saved to its own folder.
+- `run_best_compare.sh`: **the way to run tests.** `RUNS="bff:48 baseline:8"` does just those runs; without
+  it, the full sweep. Holds the best settings, saves every run to its own folder, and stops if the prompts
+  are not the scenario's usual ones.
 - `python -m f1_benchmark.compare_runs <folder>`: the table and verdict.
 - `python -m f1_benchmark.degenerate_outputs <results> <decode log>`: garbage and attribution.
 
