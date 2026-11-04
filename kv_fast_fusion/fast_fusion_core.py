@@ -239,7 +239,7 @@ def _initialize_kv_caches(
         num_gpu_blocks = scheduler_kv_cache_config.num_blocks
         num_cpu_blocks = 0
 
-        # v0.19.1 contract: _initialize_kv_caches returns the scheduler
+        # vLLM 0.18.0 contract: _initialize_kv_caches returns the scheduler
         # KVCacheConfig and is itself responsible for syncing num_gpu_blocks /
         # block_size onto cache_config (the caller no longer unpacks a tuple).
         # Mirror stock EngineCore._initialize_kv_caches.

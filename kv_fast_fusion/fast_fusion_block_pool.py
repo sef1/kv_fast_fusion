@@ -463,8 +463,7 @@ def patched_cache_full_blocks(
     `num_full_blocks` regardless, so accounting stays consistent.
 
     We delegate to the STOCK implementation rather than carrying a copy of its body: this file
-    is shared by the CUDA and Ascend patches, which run against different vLLM versions (0.18.0
-    locally, 0.19.1 on the NPU node), and a stale body copy would silently revert upstream
+    is shared by the CUDA and Ascend patches, which can run against different vLLM versions, and a stale body copy would silently revert upstream
     changes. When no block in the range is pre-hashed — the overwhelmingly common case — this is
     exactly one passthrough call, byte-identical to stock. Otherwise we call stock once per
     maximal run of unhashed blocks, passing absolute indices (stock slices both `blocks` and

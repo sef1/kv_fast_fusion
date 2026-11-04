@@ -148,7 +148,7 @@ def test_evicting_the_rep_drops_its_aliases_and_says_so(trace, monkeypatch):
 
 
 def _stock_evict(pool, block):
-    """vLLM 0.19.1 BlockPool._maybe_evict_cached_block: reset the hash only if the pop finds it."""
+    """vLLM 0.18.0 BlockPool._maybe_evict_cached_block: reset the hash only if the pop finds it."""
     if block.block_hash is None:
         return False
     if pool.cached_block_hash_to_block.pop(block.block_hash, block.block_id) is None:
