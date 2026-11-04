@@ -154,6 +154,12 @@ FIXED_OUTPUT_LEN=${FIXED_OUTPUT_LEN:-1024}
 # drain on the recv thread before each remote-KV load; 1 = drain on every block free (stalls the
 # scheduler ~5 ms/step); 0 = no barrier (throughput-only runs).
 BFF_FREE_FLUSH=${BFF_FREE_FLUSH:-recv}
+# Register a representative under the swapped request's prefix key as well as its own, so a resumed
+# request could hit it. Decode prefix hits have been 0% in the GLM runs, so this has bought nothing yet.
+BFF_ALIAS_FUSED=${BFF_ALIAS_FUSED:-1}
+# 1: also merge and free for a request whose KV load finished but which still WAITs behind the
+# max_num_seqs cap. 0: only for RUNNING requests.
+BFF_FREE_PRERUNNING=${BFF_FREE_PRERUNNING:-1}
 # Admission back-pressure (Update 27). vLLM allocates a request's KV blocks and THEN parks it waiting
 # for its remote-KV pull, uncapped — so BFF's slow, exchange-gated admission leaves the pool jammed by
 # requests that cannot decode (measured: ~20k of 34.5k blocks; KV saturated at Running=97 vs the
@@ -525,7 +531,7 @@ export_bff_env() {
   fi
   # v2 knobs. Exported for every BFF arm, not just bff_v2: BFF_MAX_REL_ERR also gates v1's merges
   # (both go through pd_lsh.probe), so an A/B at the same error budget is one variable apart.
-  export BFF_FREE_FLUSH=$BFF_FREE_FLUSH
+  export BFF_FREE_FLUSH=$BFF_FREE_FLUSH BFF_ALIAS_FUSED=$BFF_ALIAS_FUSED BFF_FREE_PRERUNNING=$BFF_FREE_PRERUNNING
   export BFF_MAX_INFLIGHT_LOADS=$BFF_MAX_INFLIGHT_LOADS \
          BFF_V2_SIG_PRECOMPUTE_PER_STEP=$BFF_V2_SIG_PRECOMPUTE_PER_STEP \
          BFF_STEP_PROFILE=$BFF_STEP_PROFILE
