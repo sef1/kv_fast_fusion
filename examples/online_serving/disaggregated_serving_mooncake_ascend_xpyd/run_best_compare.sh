@@ -2,10 +2,12 @@
 # =============================================================================
 # Same scenario, mooncake against BFF, with the best settings found so far.
 #
-#   1. Baseline (mooncakev1) at each decode limit in DECODE_LIMITS.
-#   2. BFF at the limit where the baseline was fastest.
-#   3. CONFIRM_PAIRS more baseline/BFF pairs at that limit, alternating, because a single run
-#      cannot resolve a gap of a few percent.
+#   1. Baseline (mooncakev1) and BFF at each decode limit in DECODE_LIMITS, alternating.
+#   2. Each arm's best limit, chosen separately: if BFF evicts less, its best limit can be higher
+#      than the baseline's, and forcing one limit on both would hide exactly that.
+#   3. CONFIRM_PAIRS fresh baseline/BFF pairs, each arm at its own best limit, alternating. The
+#      verdict comes from these: the fastest of several noisy runs flatters whichever got lucky, so
+#      the runs that chose the limit are not used to judge it.
 #
 # Every run is copied to its own folder under SWEEP_DIR as soon as it ends (run_benchmarks.sh wipes
 # logs_latest and results_latest when the next one starts), with its console output and settings.
@@ -30,7 +32,7 @@ RUN_SCRIPT=${RUN_SCRIPT:-${SCRIPT_DIR}/run_benchmarks.sh}
 LOGS_LATEST=${LOGS_LATEST:-${SCRIPT_DIR}/logs_latest}
 RESULTS_LATEST=${RESULTS_LATEST:-${SCRIPT_DIR}/results_latest}
 DRY_RUN=${DRY_RUN:-0}
-CONFIRM_PAIRS=${CONFIRM_PAIRS:-1}
+CONFIRM_PAIRS=${CONFIRM_PAIRS:-2}
 SWEEP_DIR=${SWEEP_DIR:-${SCRIPT_DIR}/sweeps/$(date +%Y%m%d_%H%M%S)}
 
 MODEL=${MODEL:-/models/glm/glm/GLM-5.1-W4A8-nq8}
@@ -65,8 +67,8 @@ BFF_ARGS=(BASELINE=bff_pull_v2 BFF_LSH_EXACT=1 BFF_MAX_REL_ERR=0.5 BFF_THRESHOLD
           BFF_V2_CLIP_FRAC=${BFF_V2_CLIP_FRAC:-0.4} BFF_STEP_PROFILE=0)
 BASE_ARGS=(BASELINE=mooncakev1)
 
-run_one() {   # run_one <folder name> <arm: baseline|bff> <decode limit>
-  local name=$1 arm=$2 limit=$3 dest="${SWEEP_DIR}/$1" args
+run_one() {   # run_one <folder name> <arm: baseline|bff> <decode limit> <stage: sweep|confirm>
+  local name=$1 arm=$2 limit=$3 stage=$4 dest="${SWEEP_DIR}/$1" args
   if [[ "$arm" == "bff" ]]; then args=("${BFF_ARGS[@]}"); else args=("${BASE_ARGS[@]}"); fi
   if [[ "$DRY_RUN" == "1" ]]; then
     echo "  [$name] env ${COMMON[*]} ${args[*]} DECODE_MAX_CONCURRENCY=$limit $RUN_SCRIPT"
@@ -74,7 +76,7 @@ run_one() {   # run_one <folder name> <arm: baseline|bff> <decode limit>
   fi
   if [[ -f "${dest}/DONE" ]]; then echo "=== $name: already done, skipping"; return 0; fi
   mkdir -p "$dest"
-  { echo "arm=$arm"; echo "decode_limit=$limit"; echo "scenario=$SCENARIO"; printf '%s\n' "${COMMON[@]}" "${args[@]}"
+  { echo "arm=$arm"; echo "decode_limit=$limit"; echo "stage=$stage"; echo "scenario=$SCENARIO"; printf '%s\n' "${COMMON[@]}" "${args[@]}"
     echo "git=$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null)"; } > "${dest}/config.txt"
   echo "=== $name: $arm, decode limit $limit, started $(date '+%H:%M:%S')"
   env "${COMMON[@]}" "${args[@]}" DECODE_MAX_CONCURRENCY="$limit" "$RUN_SCRIPT" > "${dest}/console.txt" 2>&1
@@ -95,27 +97,31 @@ compare() { (cd "$REPO_ROOT" && PYTHONPATH="$REPO_ROOT:${PYTHONPATH:-}" python -
 
 n_limits=$(wc -w <<< "$DECODE_LIMITS")
 echo "Scenario $SCENARIO: $NUM_PROMPTS prompts >= $MIN_TOKENS tokens, $MAX_TOKENS out, client $MAX_CONCURRENCY"
-echo "Decode limits: $DECODE_LIMITS | runs: $((n_limits + 1 + 2 * CONFIRM_PAIRS)) | saved under $SWEEP_DIR"
+echo "Decode limits: $DECODE_LIMITS | runs: $((2 * n_limits + 2 * CONFIRM_PAIRS)) | saved under $SWEEP_DIR"
 
-echo "--- Stage 1: baseline at each decode limit"
-for limit in $DECODE_LIMITS; do run_one "baseline_limit${limit}" baseline "$limit"; done
+echo "--- Stage 1: both arms at each decode limit"
+for limit in $DECODE_LIMITS; do
+  run_one "sweep_baseline_limit${limit}" baseline "$limit" sweep
+  run_one "sweep_bff_limit${limit}" bff "$limit" sweep
+done
 
 if [[ "$DRY_RUN" == "1" ]]; then
-  BEST="<best baseline limit>"
+  BEST_BASE="<baseline best>"; BEST_BFF="<BFF best>"
 else
-  BEST=$(compare --best baseline)
-  if [[ -z "$BEST" ]]; then echo "No baseline run finished without garbage; stopping."; exit 1; fi
-  echo "--- Best baseline limit: $BEST"
+  BEST_BASE=$(compare --best baseline); BEST_BFF=$(compare --best bff)
+  if [[ -z "$BEST_BASE" || -z "$BEST_BFF" ]]; then
+    echo "An arm has no run without garbage output; stopping before the confirmation runs."
+    compare
+    exit 1
+  fi
+  echo "--- Best limits: baseline $BEST_BASE, BFF $BEST_BFF"
   compare
 fi
 
-echo "--- Stage 2: BFF at that limit"
-run_one "bff_limit${BEST}" bff "$BEST"
-
-echo "--- Stage 3: $CONFIRM_PAIRS more pair(s), BFF and baseline alternating"
+echo "--- Stage 2: $CONFIRM_PAIRS fresh pair(s), each arm at its own best limit"
 for i in $(seq 1 "$CONFIRM_PAIRS"); do
-  run_one "confirm${i}_bff_limit${BEST}" bff "$BEST"
-  run_one "confirm${i}_baseline_limit${BEST}" baseline "$BEST"
+  run_one "confirm${i}_bff_limit${BEST_BFF}" bff "$BEST_BFF" confirm
+  run_one "confirm${i}_baseline_limit${BEST_BASE}" baseline "$BEST_BASE" confirm
 done
 
 if [[ "$DRY_RUN" != "1" ]]; then

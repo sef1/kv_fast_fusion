@@ -81,7 +81,7 @@ def read_run(run_dir: str) -> dict:
     build = re.search(r"build (\d{4}-\d\d-\d\d[a-z])", decode)
     return {
         "name": os.path.basename(run_dir.rstrip("/")), "arm": cfg.get("arm", "?"),
-        "limit": cfg.get("decode_limit", "?"), "n": len(outs),
+        "limit": cfg.get("decode_limit", "?"), "stage": cfg.get("stage", "sweep"), "n": len(outs),
         "fingerprint": hashlib.sha1("\n".join(o.get("prompt", "") for o in outs).encode()).hexdigest()[:8],
         "garbage": sum(is_degenerate(o.get("generated_text") or "") for o in outs),
         "tok_s": _num(r"throughput: ([\d.]+) output tok/s", serving),
@@ -106,8 +106,12 @@ def read_sweep(sweep_dir: str) -> list:
 
 
 def best_of(runs: list, arm: str):
-    """The arm's highest-throughput run with no garbage output; a broken run cannot win on speed."""
-    cand = [r for r in runs if r["arm"] == arm and r["tok_s"] is not None and not r["garbage"]]
+    """The arm's fastest SWEEP run with no garbage output; a broken run cannot win on speed.
+
+    Confirmation runs are excluded so that they cannot change the limit they are confirming, which
+    would also move a resumed sweep onto a different limit."""
+    cand = [r for r in runs if r["arm"] == arm and r["stage"] == "sweep"
+            and r["tok_s"] is not None and not r["garbage"]]
     return max(cand, key=lambda r: r["tok_s"]) if cand else None
 
 
@@ -131,13 +135,18 @@ def table(runs: list) -> list:
     return lines
 
 
-def compare_arms(runs: list, limit: str) -> list:
-    """Baseline against BFF at one decode limit: means, and how far apart they are against run noise."""
-    a = [r for r in runs if r["arm"] == "baseline" and r["limit"] == limit]
-    b = [r for r in runs if r["arm"] == "bff" and r["limit"] == limit]
+def compare_arms(runs: list, base_limit: str, bff_limit: str, stage=None) -> list:
+    """Baseline against BFF, each at its own limit: means, and how far apart they are against noise.
+
+    ``stage="confirm"`` is the verdict: runs that did not take part in choosing the limits."""
+    a = [r for r in runs if r["arm"] == "baseline" and r["limit"] == base_limit
+         and (stage is None or r["stage"] == stage)]
+    b = [r for r in runs if r["arm"] == "bff" and r["limit"] == bff_limit
+         and (stage is None or r["stage"] == stage)]
     if not a or not b:
         return []
-    lines = [f"baseline ({len(a)} run(s)) vs BFF ({len(b)} run(s)) at decode limit {limit}:"]
+    lines = [f"baseline at limit {base_limit} ({len(a)} run(s)) vs BFF at limit {bff_limit} "
+             f"({len(b)} run(s)){', ' + stage + ' runs only' if stage else ''}:"]
     if {r["fingerprint"] for r in a + b} != {a[0]["fingerprint"]}:
         lines.append("  WARNING: these runs did NOT use the same prompts, so they are not comparable.")
     for key, label, higher in (("tok_s", "throughput tok/s", True), ("req_s", "requests/s", True),
@@ -149,7 +158,7 @@ def compare_arms(runs: list, limit: str) -> list:
         ma, mb = statistics.mean(va), statistics.mean(vb)
         pct = 100.0 * (mb / ma - 1) if ma else 0.0
         better = (mb > ma) == higher
-        lines.append(f"  {label:18s} {ma:9.2f} -> {mb:9.2f}  {pct:+6.1f}%  {'BFF ahead' if better else 'baseline ahead'}")
+        lines.append(f"  {label:18s} {ma:9.2f} -> {mb:9.2f}  {pct:+6.1f}%  {'level' if abs(pct) < 0.05 else 'BFF ahead' if better else 'baseline ahead'}")
     lines.append(f"  garbage outputs    {sum(r['garbage'] for r in a)} vs {sum(r['garbage'] for r in b)}"
                  f" | BFF blocks freed per run: {statistics.mean(r['freed'] for r in b):.0f}")
     lines.append("  Noise: identical BFF runs differ by about +-2.7% in wall time and +-1 point of CodeBLEU, "
@@ -170,12 +179,18 @@ def main(argv=None) -> int:
         print(best["limit"])
         return 0
     print("\n".join(table(runs)))
-    best = best_of(runs, "baseline")
-    if best is not None:
-        lines = compare_arms(runs, best["limit"])
-        if lines:
-            print()
-            print("\n".join(lines))
+    best_a, best_b = best_of(runs, "baseline"), best_of(runs, "bff")
+    if best_a is None or best_b is None:
+        return 0
+    print(f"\nBest limit from the sweep: baseline {best_a['limit']}, BFF {best_b['limit']}")
+    confirm = compare_arms(runs, best_a["limit"], best_b["limit"], stage="confirm")
+    if confirm:
+        print("\nVERDICT (fresh runs that did not choose the limits)")
+        print("\n".join(confirm))
+    else:
+        print("\nNo confirmation runs yet. These are the runs that chose the limits, so they flatter "
+              "both arms:")
+        print("\n".join(compare_arms(runs, best_a["limit"], best_b["limit"])))
     return 0
 
 

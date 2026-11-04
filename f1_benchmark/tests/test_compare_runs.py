@@ -13,12 +13,12 @@ SERVING = ("Inference completed in {wall} s | 2/2 ok | achieved 0.36 req/s\n"
 CODE = "\n".join(f"def handler_{i}(request, user_{i}):\n    return render(request, {i})" for i in range(60))
 
 
-def _save(root, name, arm, limit, tok, garbage=False, prompts=("a", "b")):
+def _save(root, name, arm, limit, tok, garbage=False, prompts=("a", "b"), stage="sweep"):
     run = root / name
     (run / "logs_latest").mkdir(parents=True)
     (run / "results_latest").mkdir()
     (run / "DONE").write_text("")
-    (run / "config.txt").write_text(f"arm={arm}\ndecode_limit={limit}\nMODEL=x\n")
+    (run / "config.txt").write_text(f"arm={arm}\ndecode_limit={limit}\nstage={stage}\nMODEL=x\n")
     (run / "logs_latest" / "x-serving.txt").write_text(SERVING.format(wall=300.0, tok=tok))
     (run / "logs_latest" / "prefill-0.txt").write_text(ENGINE.format(p=2000.0, g=0, r=2, w=30, k=40) * 3)
     (run / "logs_latest" / "decode-0.txt").write_text(ENGINE.format(p=0, g=200, r=8, w=1, k=90) * 3)
@@ -52,11 +52,37 @@ def test_an_unfinished_run_is_ignored(tmp_path):
 def test_different_prompts_are_called_out(tmp_path):
     _save(tmp_path, "a", "baseline", "9", 199.0)
     _save(tmp_path, "b", "bff", "9", 201.0, prompts=("a", "other"))
-    assert any("NOT use the same prompts" in ln for ln in cr.compare_arms(cr.read_sweep(str(tmp_path)), "9"))
+    assert any("NOT use the same prompts" in ln for ln in cr.compare_arms(cr.read_sweep(str(tmp_path)), "9", "9"))
 
 
 def test_the_comparison_names_who_is_ahead_on_each_measure(tmp_path):
     _save(tmp_path, "a", "baseline", "9", 190.0)
     _save(tmp_path, "b", "bff", "9", 200.0)
-    lines = cr.compare_arms(cr.read_sweep(str(tmp_path)), "9")
+    lines = cr.compare_arms(cr.read_sweep(str(tmp_path)), "9", "9")
+    assert "BFF ahead" in next(ln for ln in lines if "throughput" in ln)
+
+
+def test_each_arm_gets_its_own_best_limit(tmp_path):
+    _save(tmp_path, "a", "baseline", "8", 199.0)
+    _save(tmp_path, "b", "baseline", "9", 190.0)
+    _save(tmp_path, "c", "bff", "8", 190.0)
+    _save(tmp_path, "d", "bff", "9", 205.0)
+    runs = cr.read_sweep(str(tmp_path))
+    assert (cr.best_of(runs, "baseline")["limit"], cr.best_of(runs, "bff")["limit"]) == ("8", "9")
+
+
+def test_a_confirmation_run_cannot_change_the_limit_it_confirms(tmp_path):
+    _save(tmp_path, "a", "baseline", "8", 199.0)
+    _save(tmp_path, "b", "baseline", "9", 190.0)
+    _save(tmp_path, "c", "baseline", "9", 400.0, stage="confirm")
+    assert cr.best_of(cr.read_sweep(str(tmp_path)), "baseline")["limit"] == "8"
+
+
+def test_the_verdict_uses_only_fresh_runs_at_each_arms_limit(tmp_path):
+    _save(tmp_path, "a", "baseline", "8", 500.0)
+    _save(tmp_path, "b", "bff", "9", 100.0)
+    _save(tmp_path, "c", "baseline", "8", 190.0, stage="confirm")
+    _save(tmp_path, "d", "bff", "9", 200.0, stage="confirm")
+    lines = cr.compare_arms(cr.read_sweep(str(tmp_path)), "8", "9", stage="confirm")
+    assert "baseline at limit 8 (1 run(s)) vs BFF at limit 9 (1 run(s))" in lines[0]
     assert "BFF ahead" in next(ln for ln in lines if "throughput" in ln)
