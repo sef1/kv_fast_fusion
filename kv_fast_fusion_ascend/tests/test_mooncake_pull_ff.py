@@ -153,6 +153,48 @@ def test_each_group_is_tail_aligned_independently():
     assert out[1] == ([20, 21, 22], [80, 81, 82]), "group 1 was already aligned"
 
 
+def test_a_block_past_the_prompt_would_shift_every_block():
+    """The bug itself. 36 prompt blocks, one lookahead block: tail-aligning D's 36 onto P's 37 gives D
+    block i the content of P block i+1, which is garbage from the first token, with no error."""
+    local, held = list(range(500, 536)), list(range(100, 137))
+    (bad, _l), = mc.align_per_group([local], [held])
+    assert bad[0] == 101, "unfixed: D's first block receives P's second"
+
+    (good, ll), = mc.align_per_group([local], mc.prompt_blocks_only([held], 36 * 128, 128))
+    assert good == list(range(100, 136)) and ll == local
+
+
+def test_a_prompt_ending_mid_block_keeps_that_block():
+    assert mc.prompt_blocks_only([[1, 2, 3]], 2 * 128 + 1, 128) == [[1, 2, 3]]
+    assert mc.prompt_blocks_only([[1, 2, 3]], 2 * 128, 128) == [[1, 2]]
+    assert mc.prompt_blocks_only([[1, 2], [3, 4]], 128, 128) == [[1], [3]], "every group"
+
+
+def test_an_exact_list_is_unchanged():
+    held = [[1, 2, 3], [4, 5, 6]]
+    assert mc.prompt_blocks_only(held, 3 * 128, 128) == held
+
+
+def test_a_decode_prefix_hit_still_pairs_correctly_after_the_trim():
+    """Tail alignment stays right for the case it exists for: D's hit covers the front."""
+    offered = mc.prompt_blocks_only([list(range(100, 137))], 36 * 128, 128)
+    (r, ll), = mc.align_per_group([[500, 501, 502]], offered)
+    assert r == [133, 134, 135], "the last prompt blocks, not the block past the prompt"
+    assert ll == [500, 501, 502]
+
+
+def test_the_transfer_and_the_signatures_both_get_the_trimmed_list():
+    """Trimming one alone would pair signature rows with the wrong blocks, so aliases would point at
+    the wrong KV. Every list leaving the prefill has to go through the same trim."""
+    import inspect
+
+    src = inspect.getsource(mc)
+    fuse = src[src.index("def _collect_fuse_reqs"):src.index("def request_finished_all_groups")]
+    assert fuse.count("self._offered_blocks(") == 2, "both fuse_reqs sites"
+    finished = src[src.index("def request_finished_all_groups"):src.index("class KVCacheRecvingThreadFF(")]
+    assert "remote_block_ids=self._offered_blocks(" in finished
+
+
 def test_alignment_never_moves_a_surviving_pair():
     """Stated as the invariant rather than an example: whatever the trim, position i on D must
     still be fed by the block P intended for it."""

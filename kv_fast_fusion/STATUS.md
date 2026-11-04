@@ -76,7 +76,19 @@ The limit 10 gap is within noise: paired per prompt, BFF minus baseline is -0.00
 baseline 10, with no BFF at all, is -0.011. Generation at equal running count is about 1% lower for the BFF
 connector, with dedup on or off.
 
-**Scenario `families` (not yet run).** `SCENARIO=families` or `PROMPT_FAMILIES=1`: 219 prompts of 2,000-4,096
+**Families, first pair, both at decode limit 10, one run each**
+
+| Run | tok/s | wall s | F1 | CodeBLEU | Evictions | TPOT p99 ms | KV pulled | Freed |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| baseline | 235.6 | 553 | 0.628 | 38.97 | 9 | 226 | all | 0 |
+| BFF, clip 0.4 | 235.5 | 548 | 0.635 | 39.29 | 2 | 71 | -12.3% | 1103 |
+
+Running sat at exactly 10 in 94-98% of samples in both arms, so the limit set the speed and freed memory could not
+be used. Generation at equal running was 1.9% lower for BFF. The report's `capacity:` line claimed 6.58% of the pool
+free at any moment; about 4.4% is the better estimate, because a swap only saves while the owner is alive. Prefill
+tokens integrated from the log are not accurate to better than a few percent: BFF's 646k is below the prompts' own total.
+
+**Scenario `families`.** `SCENARIO=families` or `PROMPT_FAMILIES=1`: 219 prompts of 2,000-4,096
 tokens in 84 families, fingerprint `872781bc`, sent family by family. Long Magicoder prompts are one software project
 with a different file requested, differing from about token 75, so prefix caching cannot share them. A live partner
 matching at least 80% of tokens at the same positions gives 50-64% of KV matched, everything else about 3%, and
@@ -447,6 +459,8 @@ rows below. `BFF_V2_SHARED_WRITE_CHECK` stays on by default.
 | 5 | Warm-up built the projection matrix on the wrong group | Fixed in 04a. **Not yet seen on the box:** expect `signature path warmed on group 1`. |
 | 6 | The recompute path pastes the partial answer into the user message | **Open, upstream proxy.** Caused one garbage output (`#141`). Affects baseline and BFF alike. |
 | 7 | Over-admission at the decode leads to evictions | **Open.** A scheduling policy, separate from dedup. |
+| 13 | **Prompts ending exactly on a block boundary and taking more than one chunk are garbage from the first token, in every BFF run including dedup off, and fine in baseline.** MTP's lookahead makes P hold one block past the prompt (37 for 36); `align_per_group` keeps P's last ids, so every block on D gets P's next block. Stock takes the first `num_prompt_blocks`. Seen on 121-set #54 and families #49 | **Fix written, build 04c, not yet run on the box.** `is_degenerate` reported 0 throughout, so every earlier "0 garbage" figure is wrong: one prompt in 121 was always bad. Hybrid models keep the bug. |
+| 12 | A decode limit of 7, 9, 11, 13, 15, 17, 19 or 21-23 runs about 4x slower when full, in both arms: 2 x limit tokens is not in the graph list, so the batch falls back to eager. Limit 9: 985 s and 925 s against about 330 s | **Open.** `run_best_compare.sh` still lists 9 and 22 as default limits. |
 | 11 | Prefill sometimes hangs at startup after several runs in one container (`No available shared memory broadcast block`), after graph warm-up and before any BFF connector code | **Open, cause unknown.** Seen on run 5 of sweep `20261104_123438`, stopped by hand once hung. |
 | 8 | Piggyback signatures may race the KV write without `BFF_PD_SAVE_BARRIER` | **Open question.** The log warns on every run. No damage seen, but never tested with the barrier on GLM. |
 | 9 | The input-length cap in `f1_main.py` existed only on the box | **Committed in 04b** as `--max-in-tokens` / `MAX_IN_TOKENS`. `f1_main` now prints the prompt fingerprint. Check on the box that `MAX_IN_TOKENS=6000` reproduces `9f5e27b8` and `MAX_IN_TOKENS=2000` reproduces `4da4b383`. |

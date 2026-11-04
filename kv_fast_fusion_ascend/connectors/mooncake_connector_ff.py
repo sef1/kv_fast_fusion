@@ -425,6 +425,21 @@ def align_per_group(local_groups, remote_groups) -> list[tuple[list[int], list[i
     return out
 
 
+def prompt_blocks_only(groups, num_prompt_tokens: int, block_size: int) -> list[list[int]]:
+    """Each group's blocks that hold the prompt, without any block allocated past it.
+
+    A prefill can hold one block more than its prompt fills. MTP allocates a lookahead token on every
+    allocation but a request's first, so a prompt filling its last block exactly and taking more than
+    one chunk spills into a new, empty block: 37 blocks for a 36-block prompt, seen on 2 of 338
+    prompts. :func:`align_per_group` keeps P's LAST ``len(local)`` ids, which is right for a decode
+    prefix-cache hit and wrong here: every block on D then receives P's next block, and the answer is
+    garbage from its first token. Stock avoids this by taking the first ``num_prompt_blocks`` ids.
+
+    Done on the prefill, so the transfer and the piggybacked signatures cannot disagree."""
+    n = math.ceil(int(num_prompt_tokens) / int(block_size))
+    return [list(g)[:n] for g in groups]
+
+
 def admission_deferred(inflight: int, cap: int, params) -> bool:
     """Should this request be handed back to the waiting queue instead of allocated for?
 
@@ -1006,9 +1021,23 @@ if _ASCEND_AVAILABLE:
             self._inflight_loads: set[str] = set()
             self._freed_log = FreedBlockLog()
             self._freed_log.install()
+            # A Mamba group finds its state relative to the lookahead blocks (mamba_state_index), and
+            # nothing here can tell which group is which, so hybrid models keep the full lists.
+            self._has_mamba = model_declares_mamba(vllm_config)
             if _MAX_INFLIGHT_LOADS > 0:
                 logger.info("MooncakeConnectorFF: admitting at most %d concurrent remote-KV load(s); "
                             "over-quota requests wait WITHOUT holding blocks.", _MAX_INFLIGHT_LOADS)
+
+        def _offered_blocks(self, req_id, groups, num_prompt_tokens):
+            """What the decode may pull and what gets signed: see :func:`prompt_blocks_only`."""
+            if self._has_mamba:
+                return groups
+            kept = prompt_blocks_only(groups, num_prompt_tokens, self.block_size)
+            if any(len(a) != len(b) for a, b in zip(kept, groups)):
+                logger.info("BFF past-prompt block not offered | req=%s prompt_tokens=%d held=%s "
+                            "offered=%s", req_id, num_prompt_tokens, [len(g) for g in groups],
+                            [len(g) for g in kept])
+            return kept
 
         def get_num_new_matched_tokens(self, request, num_computed_tokens):
             """Back-pressure on admission: defer rather than allocate when the load queue is full.
@@ -1118,7 +1147,8 @@ if _ASCEND_AVAILABLE:
                     if n < len(prompt):
                         self._ff_chunked[new_req.req_id] = (groups, prompt)
                         continue
-                    meta.fuse_reqs.append((new_req.req_id, _ext_of(new_req.req_id), groups))
+                    meta.fuse_reqs.append((new_req.req_id, _ext_of(new_req.req_id),
+                                           self._offered_blocks(new_req.req_id, groups, len(prompt))))
 
                 cached = scheduler_output.scheduled_cached_reqs
                 for i, req_id in enumerate(cached.req_ids):
@@ -1139,7 +1169,8 @@ if _ASCEND_AVAILABLE:
                         self._ff_chunked[req_id] = (blocks, prompt)
                         continue
                     self._ff_chunked.pop(req_id, None)
-                    meta.fuse_reqs.append((req_id, _ext_of(req_id), blocks))
+                    meta.fuse_reqs.append((req_id, _ext_of(req_id),
+                                           self._offered_blocks(req_id, blocks, len(prompt))))
             except Exception as e:  # pragma: no cover - defensive (never break scheduling)
                 logger.warning("MooncakeConnectorFF: could not collect fuse reqs: %s", e)
 
@@ -1187,7 +1218,8 @@ if _ASCEND_AVAILABLE:
                 do_remote_decode=False,
                 ff_redirects=ff_redirects or {},
                 ff_sigs=ff_sigs or {},
-                remote_block_ids=groups,
+                remote_block_ids=self._offered_blocks(request.request_id, groups,
+                                                      len(request.prompt_token_ids)),
                 remote_engine_id=self.engine_id,
                 remote_request_id=request.request_id,
                 remote_host=self.side_channel_host,
