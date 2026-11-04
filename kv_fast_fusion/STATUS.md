@@ -88,6 +88,19 @@ be used. Generation at equal running was 1.9% lower for BFF. The report's `capac
 free at any moment; about 4.4% is the better estimate, because a swap only saves while the owner is alive. Prefill
 tokens integrated from the log are not accurate to better than a few percent: BFF's 646k is below the prompts' own total.
 
+**Families at decode limit 24, build 04c, one run each.** The limit is never reached (peak 16 running), so KV decides.
+
+| Run | tok/s | wall s | F1 | CodeBLEU | Bad | Right file | Running | Evictions | Mean output | KV not pulled | Freed |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| baseline | 277.7 | 471 | 0.625 | 39.10 | 0 | 195/195 | 13.55 | 44 | 597 | 0 | 0 |
+| BFF, clip 0.4 | 292.2 | 431 | 0.632 | 39.16 | 0 | 195/195 | 14.08 | 38 | 576 | 10.4% | 1055 |
+
+The first throughput win: +5.2%, with paired F1 +0.007 (CI -0.008 to +0.021). The mechanism shows directly: 3.9% more
+running gives 3.9% more generation, at the same rate per running request. BFF's answers were also about 4% shorter
+(paired, CI excludes 0), which inflates its req/s and wall-time gains, so tok/s is the fair figure. Tail results are
+mixed: TPOT p99 616 ms against 379, TTFT p99 68 s against 80, end-to-end p99 182 s against 198. Unconfirmed: one pair,
+and neither arm has been tried between limits 10 and 24.
+
 **Scenario `families`.** `SCENARIO=families` or `PROMPT_FAMILIES=1`: 219 prompts of 2,000-4,096
 tokens in 84 families, fingerprint `872781bc`, sent family by family. Long Magicoder prompts are one software project
 with a different file requested, differing from about token 75, so prefix caching cannot share them. A live partner
@@ -459,7 +472,7 @@ rows below. `BFF_V2_SHARED_WRITE_CHECK` stays on by default.
 | 5 | Warm-up built the projection matrix on the wrong group | Fixed in 04a. **Not yet seen on the box:** expect `signature path warmed on group 1`. |
 | 6 | The recompute path pastes the partial answer into the user message | **Open, upstream proxy.** Caused one garbage output (`#141`). Affects baseline and BFF alike. |
 | 7 | Over-admission at the decode leads to evictions | **Open.** A scheduling policy, separate from dedup. |
-| 13 | **Prompts ending exactly on a block boundary and taking more than one chunk are garbage from the first token, in every BFF run including dedup off, and fine in baseline.** MTP's lookahead makes P hold one block past the prompt (37 for 36); `align_per_group` keeps P's last ids, so every block on D gets P's next block. Stock takes the first `num_prompt_blocks`. Seen on 121-set #54 and families #49 | **Fix written, build 04c, not yet run on the box.** `is_degenerate` reported 0 throughout, so every earlier "0 garbage" figure is wrong: one prompt in 121 was always bad. `is_garbled` now reads the opening: all 19 known-bad answers caught, 0 of 1,153 baseline answers flagged, and from build 03e on it flags no other prompt on the 121-prompt or families runs (one 200-prompt run, 03h, has one output flagged by the tail check). It cannot see garbage that opens normally. Hybrid models keep the bug. |
+| 13 | **Prompts ending exactly on a block boundary and taking more than one chunk are garbage from the first token, in every BFF run including dedup off, and fine in baseline.** MTP's lookahead makes P hold one block past the prompt (37 for 36); `align_per_group` keeps P's last ids, so every block on D gets P's next block. Stock takes the first `num_prompt_blocks`. Seen on 121-set #54 and families #49 | **Fixed in 04c, confirmed on the box:** 0 of 121 bad, prompt 54 correct, tok/s 198.5, F1 0.656, CodeBLEU 47.24. `is_degenerate` reported 0 throughout, so every earlier "0 garbage" figure is wrong: one prompt in 121 was always bad. `is_garbled` now reads the opening: all 19 known-bad answers caught, 0 of 1,153 baseline answers flagged, and from build 03e on it flags no other prompt on the 121-prompt or families runs (one 200-prompt run, 03h, has one output flagged by the tail check). It cannot see garbage that opens normally. Hybrid models keep the bug. |
 | 12 | A decode limit of 7, 9, 11, 13, 15, 17, 19 or 21-23 runs about 4x slower when full, in both arms: 2 x limit tokens is not in the graph list, so the batch falls back to eager. Limit 9: 985 s and 925 s against about 330 s | **Open.** `run_best_compare.sh` still lists 9 and 22 as default limits. |
 | 11 | Prefill sometimes hangs at startup after several runs in one container (`No available shared memory broadcast block`), after graph warm-up and before any BFF connector code | **Open, cause unknown.** Seen on run 5 of sweep `20261104_123438`, stopped by hand once hung. |
 | 8 | Piggyback signatures may race the KV write without `BFF_PD_SAVE_BARRIER` | **Open question.** The log warns on every run. No damage seen, but never tested with the barrier on GLM. |
