@@ -12,8 +12,10 @@ Removal work is in [PLAN.md](PLAN.md). This file says what exists and what is tr
 
 - **Correctness is solved for the current path.** BFF runs at baseline quality with 0 garbage
   outputs, with dedup, the clip and free-at-promotion all on.
-- **In the same scenario, BFF already wins on prefill work and network.** About 30% less re-prefill
-  work, about 2.8% less KV pulled, about 214 decode blocks freed per run.
+- **BFF has no visible win over mooncake yet.** It frees about 180-230 decode blocks per run and pulls about
+  2.8% less KV, but neither reaches throughput or quality. The "30% less re-prefill work" reported earlier does
+  not hold: it compared against two no-limit baselines, and with a decode limit the two match (limit 10: 638k
+  against 643k prefill tokens; limit 8: 623k against 618k).
 - **BFF has not beaten mooncake on throughput.** On the 121-prompt set it is level, within noise. It
   frees about 2.3% of a prompt's KV; the queue simulator says a visible win (+5%) needs about 10%.
 - **No public dataset scanned so far reaches that.** Magicoder's long prompts are still the best
@@ -60,6 +62,31 @@ differ by about 2.7% in wall time and about 1 point of CodeBLEU.
 The cap runs also limited the client, so nothing queued at the decode. This prompt set has almost no
 similar KV, so BFF has nothing to free there. Evictions are counted differently for the two
 connectors, so compare them with care.
+
+**Same 121 prompts, decode limits 8 and 10, build 04b** (sweep `20261104_123438`, one run each)
+
+| Run | tok/s | wall s | F1 | CodeBLEU | Garbage | Prefill tokens | Evictions | Decode waiting | Freed |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| baseline, limit 10 | 201.7 | 321 | 0.658 | 46.66 | 0 | 638k | 12 | 0.9 | 0 |
+| BFF, limit 10 | 196.4 | 336 | 0.651 | 44.70 | 0 | 643k | 13 | 2.7 | 191 |
+| baseline, limit 8 | 198.6 | 332 | 0.647 | 45.96 | 0 | 623k | 8 | 2.9 | 0 |
+| BFF, limit 8 | 197.3 | 326 | 0.666 | 45.81 | 0 | 618k | 7 | 2.3 | 176 |
+
+The limit 10 gap is within noise: paired per prompt, BFF minus baseline is -0.007 F1, while baseline 8 minus
+baseline 10, with no BFF at all, is -0.011. Generation at equal running count is about 1% lower for the BFF
+connector, with dedup on or off.
+
+**Scenario `families` (not yet run).** `SCENARIO=families` or `PROMPT_FAMILIES=1`: 219 prompts of 2,000-4,096
+tokens in 84 families, fingerprint `872781bc`, sent family by family. Long Magicoder prompts are one software project
+with a different file requested, differing from about token 75, so prefix caching cannot share them. A live partner
+matching at least 80% of tokens at the same positions gives 50-64% of KV matched, everything else about 3%, and
+dataset order keeps most partners apart. The prompts are real and unchanged but selected in dedup's favour, so a
+result describes workloads with shared context, not the dataset as a whole.
+
+**Output length and clip, on the 121 prompts.** No run compares output lengths on the same prompts. Output is 2-3
+blocks against about 38 of prompt, so the freed share barely moves with it (estimated 1.83% at 256 to 1.75% at
+2,000). The clip acts only on capped requests, 7 per run: clip 0.25, 0.4 and 0.5 freed 215, 214-275 and 229 blocks,
+so run-to-run variation hides it. Keeping every match would reach about 2.6% of KV from 1.9%.
 
 ## 3. What limits throughput
 
@@ -420,6 +447,7 @@ rows below. `BFF_V2_SHARED_WRITE_CHECK` stays on by default.
 | 5 | Warm-up built the projection matrix on the wrong group | Fixed in 04a. **Not yet seen on the box:** expect `signature path warmed on group 1`. |
 | 6 | The recompute path pastes the partial answer into the user message | **Open, upstream proxy.** Caused one garbage output (`#141`). Affects baseline and BFF alike. |
 | 7 | Over-admission at the decode leads to evictions | **Open.** A scheduling policy, separate from dedup. |
+| 11 | Prefill sometimes hangs at startup after several runs in one container (`No available shared memory broadcast block`), after graph warm-up and before any BFF connector code | **Open, cause unknown.** Seen on run 5 of sweep `20261104_123438`, stopped by hand once hung. |
 | 8 | Piggyback signatures may race the KV write without `BFF_PD_SAVE_BARRIER` | **Open question.** The log warns on every run. No damage seen, but never tested with the barrier on GLM. |
 | 9 | The input-length cap in `f1_main.py` existed only on the box | **Committed in 04b** as `--max-in-tokens` / `MAX_IN_TOKENS`. `f1_main` now prints the prompt fingerprint. Check on the box that `MAX_IN_TOKENS=6000` reproduces `9f5e27b8` and `MAX_IN_TOKENS=2000` reproduces `4da4b383`. |
 | 10 | `pd_dedup_v2.threshold_for` imported the GPU connector package | **Fixed in 04b.** It caused the 9 local test failures. Needs one box run to confirm. |
@@ -436,7 +464,7 @@ evidence than a run on the box. Before 04b, on vLLM 0.31.0, 9 tests failed and 4
   report. `results_latest` and `logs_latest` are wiped at each start.
 - `run_best_compare.sh`: **the way to run tests.** `RUNS="bff:48 baseline:8"` does just those runs; without
   it, the full sweep. Holds the best settings, saves every run to its own folder, and stops if the prompts
-  are not the scenario's usual ones.
+  are not the scenario's usual ones. Scenarios: `121`, `200`, `families`.
 - `python -m f1_benchmark.compare_runs <folder>`: the table and verdict.
 - `python -m f1_benchmark.degenerate_outputs <results> <decode log>`: garbage and attribution.
 
