@@ -240,3 +240,14 @@ results/
 
 # graft's local graph cache — regenerable, not committed (run `graft build`).
 /graft/
+
+# Profiler output, run logs and dependency checkouts kept beside the repo.
+/nsys_report.*
+/report1.*
+/logs_for_Claude/
+/GLM logs for claude/
+sweeps/
+/vllm/
+/vllm-ascend/
+/Mooncake/
+.venv-*/

@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import time
@@ -291,9 +292,20 @@ async def run_api_inference(
     return results
 
 
+def prompt_fingerprint(prompts) -> str:
+    """Short hash of the prompt list, so two runs can be checked as using the same prompts.
+
+    Same formula as ``compare_runs``, which computes it from a run's saved outputs."""
+    return hashlib.sha1("\n".join(prompts).encode()).hexdigest()[:8]
+
+
 def load_dataset_simple(dataset_path: str, split: str, input_key: str, output_key: str,
-                        num_samples: int, model: str = None, min_tokens: int = 0):
-    """Load dataset from Hugging Face or local JSONL file."""
+                        num_samples: int, model: str = None, min_tokens: int = 0,
+                        max_in_tokens: int = 0):
+    """Load dataset from Hugging Face or local JSONL file.
+
+    Keeps prompts of at least ``min_tokens`` and, when ``max_in_tokens`` is above 0, at most
+    ``max_in_tokens`` input tokens. A filtered prompt is skipped, not truncated."""
     from datasets import load_dataset
 
     if dataset_path.endswith(".jsonl") or os.path.isfile(dataset_path):
@@ -302,7 +314,7 @@ def load_dataset_simple(dataset_path: str, split: str, input_key: str, output_ke
         dataset = load_dataset(dataset_path, split=split)
 
     tokenizer = None
-    if min_tokens > 0:
+    if min_tokens > 0 or max_in_tokens > 0:
         from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
 
@@ -318,7 +330,7 @@ def load_dataset_simple(dataset_path: str, split: str, input_key: str, output_ke
 
         if tokenizer is not None:
             n_tok = len(tokenizer(prompt, add_special_tokens=False).input_ids)
-            if n_tok < min_tokens:
+            if n_tok < min_tokens or (max_in_tokens > 0 and n_tok > max_in_tokens):
                 n_skipped += 1
                 continue
 
@@ -326,8 +338,10 @@ def load_dataset_simple(dataset_path: str, split: str, input_key: str, output_ke
         prompts.append(prompt)
 
     if tokenizer is not None:
-        print(f"  token filter: kept {len(prompts)} samples with >= {min_tokens} input "
-              f"tokens (skipped {n_skipped} shorter ones)")
+        upper = f" and <= {max_in_tokens}" if max_in_tokens > 0 else ""
+        print(f"  token filter: kept {len(prompts)} samples with >= {min_tokens}{upper} input "
+              f"tokens (skipped {n_skipped})")
+    print(f"  prompt fingerprint: {prompt_fingerprint(prompts)} ({len(prompts)} prompts)")
 
     return prompts, references
 
@@ -358,6 +372,8 @@ async def main():
     parser.add_argument("--max-concurrency", type=int, default=None)
     parser.add_argument("--request-timeout", type=float, default=600.0)
     parser.add_argument("--min-tokens", type=int, default=0)
+    parser.add_argument("--max-in-tokens", type=int, default=0,
+                        help="Skip prompts longer than this many input tokens. 0 means no limit.")
     parser.add_argument("--disable-tqdm", action="store_true")
     parser.add_argument("--no-stream", dest="stream", action="store_false")
     parser.add_argument("--max-tokens", type=int, default=6000)
@@ -381,7 +397,7 @@ async def main():
     print(f"Loading dataset from {args.dataset_path}...")
     prompts, references = load_dataset_simple(
         args.dataset_path, args.hf_split, args.input_key, args.output_key, args.num_prompts,
-        model=args.model, min_tokens=args.min_tokens,
+        model=args.model, min_tokens=args.min_tokens, max_in_tokens=args.max_in_tokens,
     )
 
     # Run inference
