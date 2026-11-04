@@ -24,6 +24,7 @@ from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.engine.core import EngineCore
 
+from kv_fast_fusion.connector_selection import _selected_connector_names
 from kv_fast_fusion.fast_fusion_core import _initialize_kv_caches
 from kv_fast_fusion.fast_fusion_block_pool import patched_free_blocks
 from kv_fast_fusion.fast_fusion_scheduler import (
@@ -38,47 +39,6 @@ logger = init_logger("vllm.fast_fusion_pd_patch")
 # infra. In ratio, the producer ships per-redirect K/V norm ratios and D re-enables the minimal
 # subset (norm buffers + slots + BFF Triton kernel) so the shared rep block is scaled per request.
 _PD_SCALE_MODE = os.environ.get("BFF_SCALE_MODE", "raw").lower()
-
-
-def _selected_connector_names() -> set:
-    """Connector names this process was actually launched with, from ``--kv-transfer-config``.
-
-    Read from ``sys.argv`` because the patch runs at import, long before a ``VllmConfig`` exists.
-    Includes connectors nested under MultiConnector's ``kv_connector_extra_config.connectors``.
-    Returns an empty set when the flag is absent or unparseable — callers must treat that as
-    "unknown", never as "not selected"."""
-    import json
-    import sys
-
-    argv = sys.argv
-    raw = None
-    for i, a in enumerate(argv):
-        if a == "--kv-transfer-config" and i + 1 < len(argv):
-            raw = argv[i + 1]
-        elif a.startswith("--kv-transfer-config="):
-            raw = a.split("=", 1)[1]
-    if not raw:
-        return set()
-    try:
-        cfg = json.loads(raw)
-    except Exception:
-        return set()
-
-    names = set()
-
-    def _walk(node):
-        if not isinstance(node, dict):
-            return
-        name = node.get("kv_connector")
-        if isinstance(name, str):
-            names.add(name)
-        extra = node.get("kv_connector_extra_config")
-        if isinstance(extra, dict):
-            for child in extra.get("connectors") or ():
-                _walk(child)
-
-    _walk(cfg)
-    return names
 
 
 def _registration_failed(name: str, exc: Exception) -> None:

@@ -1317,14 +1317,12 @@ try:
         project_signatures,
         signature_matrix,
         signature_matrix_by_layer,
+        signatures_for_group,
     )
     from kv_fast_fusion_ascend.connectors import mooncake_connector_ff as v1
     from kv_fast_fusion_ascend.connectors.merge_stats import (
         BFFMergeStats,
         tp_group_if_sharded,
-    )
-    from kv_fast_fusion_ascend.connectors.mooncake_layerwise_connector_ff_v2 import (
-        signatures_for_group,
     )
     from kv_fast_fusion_ascend.hybrid_layout import build_hybrid_layout, model_declares_mamba
 

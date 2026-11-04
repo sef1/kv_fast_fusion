@@ -23,6 +23,8 @@ import time
 from vllm.logger import init_logger
 from vllm.v1.request import RequestStatus
 
+from kv_fast_fusion_ascend.request_ids import _ext_of
+
 logger = init_logger("vllm.fast_fusion_ascend_patch")
 
 # Per-step block-merge diagnostics (ready/pending/dropped, running vs waiting) are noisy once we free
@@ -209,19 +211,6 @@ def _bff_apply_block_merge(scheduler, model_runner_output) -> None:
         except Exception as e:
             logger.error("BFF Ascend block merging failed — skipping this step: %s", e,
                          exc_info=True)
-
-
-def _ext_of(rid: str) -> str:
-    """External (cross-P/D stable) id of a request id. Uses vllm_ascend's canonical helper on the
-    NPU stack; falls back to stripping the per-server random ``-<8hex>`` suffix (the same transform)
-    off-NPU so the promotion apply is unit-testable."""
-    try:
-        from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
-            get_external_request_id,
-        )
-        return get_external_request_id(rid)
-    except ImportError:
-        return rid.rsplit("-", 1)[0]
 
 
 def _bff_promotion_apply(scheduler, request) -> None:
@@ -703,17 +692,14 @@ def _patch_attn_metadata_forward_order() -> None:
 def _registration_failed(name: str, exc: Exception) -> None:
     """A connector failed to register. Fatal iff this run actually selected it.
 
-    Ascend mirror of ``kv_fast_fusion.fast_fusion_pd_patch._registration_failed``, reusing its argv
+    Ascend mirror of ``kv_fast_fusion.fast_fusion_pd_patch._registration_failed``, using the same argv
     parser. Registration stays in try/except so a box without mooncake can still run the other
     transports, but swallowing the failure for the connector the run REQUIRES turns an ImportError
     into ``Unsupported connector type`` raised much later inside config validation, naming neither
     the module nor the cause. When the selected set cannot be determined (no --kv-transfer-config on
     this process) we warn rather than raise."""
-    try:
-        from kv_fast_fusion.fast_fusion_pd_patch import _selected_connector_names
-        selected = _selected_connector_names()
-    except Exception:  # pragma: no cover - GPU module unimportable on this box
-        selected = set()
+    from kv_fast_fusion.connector_selection import _selected_connector_names
+    selected = _selected_connector_names()
     if name in selected:
         raise RuntimeError(
             f"{name} is selected by --kv-transfer-config but failed to register: {exc!r}. "

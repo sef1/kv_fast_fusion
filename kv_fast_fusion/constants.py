@@ -1,3 +1,4 @@
+import logging
 import os
 
 # Shared BFF constants used by both P/D and (legacy) single-instance paths.
@@ -7,6 +8,32 @@ import os
 # at runtime so it always matches the --block-size CLI argument.
 
 THRESHOLD = float(os.environ.get("BFF_THRESHOLD", "0.75"))
+
+
+def parse_thresholds(raw: str | None) -> dict[int, float]:
+    """Parse ``BFF_THRESHOLD_G`` ("1:0.97,2:0.90") into ``{group: threshold}``.
+
+    One bar for every group is a guess, and the wrong one: a group's blocks have a natural
+    similarity FLOOR (early layers share a large common component, so arbitrary blocks already sit
+    near cosine 0.9), and a threshold under that floor merges everything indiscriminately. Groups
+    not listed fall back to ``BFF_THRESHOLD``. Run with ``BFF_PD_AUDIT=1`` to measure the floor
+    instead of guessing it."""
+    out: dict[int, float] = {}
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            gi, thr = part.split(":")
+            out[int(gi)] = float(thr)
+        except ValueError:
+            logging.getLogger(__name__).warning("BFF: ignoring malformed BFF_THRESHOLD_G entry %r", part)
+    return out
+
+
+# Per-group merge thresholds, overriding the global BFF_THRESHOLD.
+THRESHOLD_G = parse_thresholds(os.environ.get("BFF_THRESHOLD_G"))
+
 BFF_GROUP_SIZE = int(os.environ.get("BFF_GROUP_SIZE", "4"))
 
 # Balanced-groups layout (dedup=0). Default 0 = the warmup(4)+uniform-chunk split above.

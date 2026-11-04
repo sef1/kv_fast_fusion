@@ -63,6 +63,7 @@ from kv_fast_fusion.pd_dedup_v2 import (
     SignatureCodec,
     signature_matrix,
 )
+from kv_fast_fusion.pd_dedup_v2 import signatures_for_group
 from kv_fast_fusion_ascend.hybrid_layout import (
     HybridLayout,
     HybridLayoutError,
@@ -127,37 +128,6 @@ def to_external_request_id(request_id: str) -> str:
     Kept in lockstep with ``vllm_ascend...mooncake_layerwise_connector.get_external_request_id``;
     the NPU-only section below asserts the two agree at import time."""
     return request_id[:-9]
-
-
-def signatures_for_group(kv_caches: dict, layer_names, block_ids, is_mla, jl_holder,
-                         num_blocks=None, proj_holder=None, scale: int = 1):
-    """Producer-side signature payload for one group's blocks.
-
-    ``layer_names`` is however much of the group has been written when the transport wants to send
-    it — one layer under ``BFF_SIG_LAYERS=first``, all of them under ``group``. Returns ``None``
-    when there is nothing to describe; raises :class:`~kv_fast_fusion.pd_dedup_v2.KVLayoutError` if
-    the cache cannot be indexed by connector block ids, which the caller must count rather than
-    swallow.
-
-    ``proj_holder`` caches the SimHash projection ACROSS calls and a real caller must pass one that
-    outlives them: the fixed-seed matrix is identical every time, so rebuilding it per group per
-    request is pure waste on the producer's critical path. It defaults to a throwaway only so the
-    pure-function tests stay callable without one.
-
-    ``block_ids`` are POOL blocks and ``scale`` is this group's rows-per-pool-block; ``num_blocks``
-    is the tensor's row count, i.e. the pool's count times ``scale``. See
-    :func:`~kv_fast_fusion.pd_dedup_v2.signature_matrix` for why the pool is the id space."""
-    layers = [kv_caches[ln] for ln in layer_names if ln in kv_caches]
-    if not layers or not block_ids:
-        return None
-    sig, norms = signature_matrix(layers, block_ids, is_mla, jl_holder, num_blocks=num_blocks,
-                                  scale=scale)
-    if sig is None:
-        return None
-    proj = pd_lsh.get_proj(proj_holder if proj_holder is not None else [None],
-                           sig.shape[1], sig.device)
-    hashes = pd_lsh.sub_hashes_device(sig, proj).cpu().tolist()
-    return SignatureCodec.encode(sig, norms, hashes)
 
 
 # ---------------------------------------------------------------------------------------------

@@ -60,6 +60,7 @@ import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
 
+from kv_fast_fusion.constants import THRESHOLD_G, parse_thresholds as _parse_thresholds
 from kv_fast_fusion import pd_lsh
 
 if TYPE_CHECKING:
@@ -134,27 +135,6 @@ _FF_DONE_TID_MAX = int(os.environ.get("BFF_FF_DONE_TID_MAX", "4096"))
 _FF_HOLD_LOG_S = float(os.environ.get("BFF_HOLD_LOG_S", "10"))
 
 
-def _parse_thresholds(raw: str | None) -> dict[int, float]:
-    """Parse ``BFF_THRESHOLD_G`` ("1:0.97,2:0.90") into ``{group: threshold}``.
-
-    One bar for every group is a guess, and the wrong one: a group's blocks have a natural
-    similarity FLOOR (early layers share a large common component, so arbitrary blocks already sit
-    near cosine 0.9), and a threshold under that floor merges everything indiscriminately. Groups
-    not listed fall back to ``BFF_THRESHOLD``. Run with ``BFF_PD_AUDIT=1`` to measure the floor
-    instead of guessing it."""
-    out: dict[int, float] = {}
-    for part in (raw or "").split(","):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            gi, thr = part.split(":")
-            out[int(gi)] = float(thr)
-        except ValueError:
-            logger.warning("BFF: ignoring malformed BFF_THRESHOLD_G entry %r", part)
-    return out
-
-
 def _global_threshold() -> float | None:
     """``BFF_THRESHOLD`` as the run actually resolved it, recorded in the stats so the collector can
     state the substitution-error budget it implies (see ``pd_lsh.rel_err``)."""
@@ -204,7 +184,7 @@ def _parse_groups(raw: str | None):
 # clustering/hash/probe/register entirely; its blocks still transfer normally, so the only cost is
 # the forgone compression. PRODUCER only — the consumer applies whatever it receives.
 _FF_GROUPS = _parse_groups(os.environ.get("BFF_FF_GROUPS"))
-_THRESHOLD_G = _parse_thresholds(os.environ.get("BFF_THRESHOLD_G"))
+_THRESHOLD_G = THRESHOLD_G
 
 
 def _tid_hash(transfer_id: str) -> int:

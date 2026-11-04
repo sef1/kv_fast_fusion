@@ -22,6 +22,8 @@ import os
 
 from vllm.logger import init_logger
 
+from kv_fast_fusion_ascend.request_ids import _ext_of
+
 logger = init_logger("vllm.bff_shared_write_check")
 
 # On by default: one dict lookup per scheduled request per group per step, a scan only on a hit.
@@ -70,7 +72,6 @@ def holders_of(managers, gi: int, block_id: int, exclude: str) -> list:
 
 
 def _roles(scheduler, rid: str) -> str:
-    from kv_fast_fusion_ascend.fast_fusion_ascend_patch import _ext_of
     got = scheduler.__dict__.get("_bff_swap_roles", {}).get(_ext_of(rid))
     return ",".join(sorted(got)) if got else "none"
 
@@ -111,7 +112,6 @@ def check_step(scheduler, scheduler_output) -> int:
             logger.info("BFF recompute | req=%s roles=%s", rid, _roles(scheduler, rid))
             # Its next prefix lookup is a re-arrival; fast_fusion_block_pool logs that lookup.
             from kv_fast_fusion import fast_fusion_block_pool as _bp
-            from kv_fast_fusion_ascend.fast_fusion_ascend_patch import _ext_of
             _bp._RECOMPUTED_EXT.add(_ext_of(rid))
     return n
 
