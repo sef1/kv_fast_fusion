@@ -6,6 +6,10 @@ median per-prompt change was 0 — 13 of 121 outputs had collapsed into whitespa
 had 10. A degenerate tail is cheap to detect: it compresses far better than code or prose, or it is
 mostly punctuation.
 
+That misses garbage that varies. KV shifted by one block gives ``pythonpython`` or `` or or or)``, and
+such answers can even recover into plausible code, so the tail looks fine: prompt 54 of the 121-prompt
+set was wrong in every BFF run while this reported 0. :func:`is_garbled` reads the opening instead.
+
 With a decode log, each garbage request is joined with the scheduler's free-at-promotion trace:
 
 * ``swapped`` — its own victim was swapped to a representative at promotion;
@@ -27,6 +31,10 @@ TAIL_CHARS = 1500
 MIN_CHARS = 300
 MAX_ZLIB_RATIO = 0.12
 MIN_ALNUM_SHARE = 0.2
+GARBLE_HEAD_CHARS = 80
+GARBLE_SHORT_CHARS = 32
+GARBLE_MIN_LETTER_SHARE = 0.5
+_NORMAL_OPENING = ("```", "#", "<", "{", "[", "*", '"', "'", "-", "/", "(")
 
 _SWAP = re.compile(r"BFF swap \| req=(\S+) .* owner=(\S+)")
 _REUSE = re.compile(r"BFF victim reuse \| req=(\S+) .* freed by (\S+)")
@@ -56,6 +64,39 @@ def is_degenerate(text: str) -> bool:
     if len(zlib.compress(raw)) / len(raw) < MAX_ZLIB_RATIO:
         return True
     return sum(c.isalnum() for c in tail) / len(tail) < MIN_ALNUM_SHARE
+
+
+def is_garbled(text: str) -> bool:
+    """True if the answer is broken from its first token: an abnormal opening and bad text after it.
+
+    An answer normally opens with a capital, a digit or markup. An abnormal opening alone is not
+    enough, because a dropped first token leaves `` Code: models.py`` or ``python\\n## user.py`` with
+    good text behind it. Those are told apart by what follows: a very short answer, stray punctuation
+    first, a doubled word (``or or or``), a doubled fragment (``pythonpython``), a repeating fragment
+    (``::::``, ``ZOZOZO``), or an opening that is mostly not letters. Thresholds come from every saved
+    run: all 19 known-bad answers caught, none of 1,153 baseline answers flagged. It cannot see garbage
+    that opens normally. Empty answers are failed requests rather than garbage, so they are not counted."""
+    text = text or ""
+    if not text.strip() or text[0].isupper() or text[0].isdigit() or text.startswith(_NORMAL_OPENING):
+        return False
+    if len(text.strip()) < GARBLE_SHORT_CHARS:
+        return True
+    head = text[:GARBLE_HEAD_CHARS]
+    first = text.lstrip()[0]
+    if not first.isalnum() and first not in "_`#":
+        return True
+    if re.search(r"(\S{1,3})\1{3,}", head):
+        return True
+    words = head.split()[:12]
+    if any(a == b for a, b in zip(words, words[1:])):
+        return True
+    if re.match(r"\s*(\w{3,})\1", head):
+        return True
+    return sum(c.isalpha() for c in head) / len(head) < GARBLE_MIN_LETTER_SHARE
+
+
+def is_garbage(text: str) -> bool:
+    return is_degenerate(text) or is_garbled(text)
 
 
 def parse_trace(log_text: str) -> dict:
@@ -115,8 +156,11 @@ def roles_of(key, roles: dict) -> list:
 def report(outputs, ledger=None, log_text=None) -> list:
     """Printable lines: the count, then one line per degenerate output."""
     ledger = ledger or {}
-    bad = [(i, o) for i, o in enumerate(outputs) if is_degenerate(o.get("generated_text") or "")]
-    lines = [f"degenerate outputs: {len(bad)}/{len(outputs)}"]
+    bad = [(i, o) for i, o in enumerate(outputs) if is_garbage(o.get("generated_text") or "")]
+    # Only those the tail check would have missed, so an old run's report keeps its meaning.
+    garbled = sum(not is_degenerate(o.get("generated_text") or "") for _i, o in bad)
+    lines = [f"degenerate outputs: {len(bad)}/{len(outputs)}"
+             + (f" ({garbled} garbled from the first token)" if garbled else "")]
     roles = parse_trace(log_text) if log_text else None
     if roles is not None and not any(roles.values()):
         # No swap line at all: free-at-promotion was off, or the build predates the trace. Calling

@@ -21,7 +21,7 @@ import re
 import statistics
 import sys
 
-from f1_benchmark.degenerate_outputs import is_degenerate
+from f1_benchmark.degenerate_outputs import is_garbage
 
 LOG_INTERVAL_S = 10          # vLLM's loggers.py reports throughput on this period
 _ENGINE = re.compile(r"prompt throughput: ([\d.]+).*generation throughput: ([\d.]+).*"
@@ -83,7 +83,7 @@ def read_run(run_dir: str) -> dict:
         "name": os.path.basename(run_dir.rstrip("/")), "arm": cfg.get("arm", "?"),
         "limit": cfg.get("decode_limit", "?"), "stage": cfg.get("stage", "sweep"), "n": len(outs),
         "fingerprint": hashlib.sha1("\n".join(o.get("prompt", "") for o in outs).encode()).hexdigest()[:8],
-        "garbage": sum(is_degenerate(o.get("generated_text") or "") for o in outs),
+        "garbage": sum(is_garbage(o.get("generated_text") or "") for o in outs),
         "tok_s": _num(r"throughput: ([\d.]+) output tok/s", serving),
         "req_s": _num(r"\| ([\d.]+) req/s", serving),
         "wall": _num(r"completed in ([\d.]+) s", serving),

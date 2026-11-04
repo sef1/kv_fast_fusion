@@ -1,5 +1,7 @@
 """The garbage detector and its join with the free-at-promotion trace. CPU only."""
 
+import pytest
+
 from f1_benchmark import degenerate_outputs as dg
 
 U1 = "0a1b2c3d-0000-4000-8000-000000000001"
@@ -24,6 +26,57 @@ def test_a_punctuation_tail_is_degenerate():
 
 def test_a_short_answer_is_never_called_degenerate():
     assert not dg.is_degenerate("   ]]  " * 10)
+
+
+@pytest.mark.parametrize("opening", [
+    "pythonpython``\n`\n with already wayq,`` with other",
+    "pythonpythonó``\nq11`` other\n with with`` with way",
+    " or or or or)\n```python\n## pins/views.py\nfrom rest_framework",
+    " TO:: DO DO DO Z Z  \n\n    DOZE   \n```python\n## pins/views.py",
+    " TO:::: ZZOZOZOZOZOZEZEZEZEZEZEZEZEZE\nZEZEZE and so on for a while",
+    " right    CT        or or or or or TO TO## Code: pins/views.py",
+    ",,  ,,,,, [ (,,,  (   \n\n, ' ' ' : :  \n\n\n\n\n\n\n and more text",
+    ':\n ## ` " ##^;  explanation <,ooo code q s #^ ## ## s logoolu lines',
+])
+def test_answers_broken_from_the_first_token_are_garbled(opening):
+    """All from BFF runs where the KV was shifted by one block. Several recover into real code, which
+    is why the tail check reported 0."""
+    assert dg.is_garbled(opening + "\n" + CODE)
+    assert dg.is_garbage(opening + "\n" + CODE)
+
+
+@pytest.mark.parametrize("opening", [
+    "```python\n## pins/views.py\n",
+    "## Code: users/models.py\n```python\n",
+    "Here is a much funkier version of your SVG",
+    "This SVG appears to be an emoji of a",
+    " Code: models.py\n```python\n## models.py\nfrom flask import Flask",
+    "python\n## user.py\nfrom __future__ import annotations\nimport os",
+    "sql\nSELECT `number of caps` FROM table_11585 WHERE name = 'x'",
+    " give this SVG an underwater feel, we need to add a filter and",
+    " are two main ways to add a reflection to an SVG on the web",
+])
+def test_good_answers_are_not_garbled_even_with_a_dropped_first_token(opening):
+    """The lower ones lost their first token and are otherwise fine, in a baseline run."""
+    assert not dg.is_garbled(opening + CODE)
+
+
+def test_an_opening_that_is_mostly_not_letters_is_garbled():
+    assert dg.is_garbled(' an-[\n \nITYT \n\n\nS\n\n,\nss,sm � funcals\nelt �\n,s left\n\nss �ss ), �, �, �,,,\n) assumption,, note assumption assumption codin')
+
+
+def test_a_few_stray_characters_are_garbled():
+    assert dg.is_garbled(" not")
+
+
+def test_an_empty_answer_is_a_failed_request_not_garbage():
+    assert not dg.is_garbled("") and not dg.is_garbled("   \n ")
+
+
+def test_the_report_counts_garbled_answers():
+    good = {"generated_text": CODE, "response_id": "chatcmpl-a"}
+    bad = {"generated_text": "pythonpython``\n`\n with" + CODE, "response_id": "chatcmpl-b"}
+    assert "1/2 (1 garbled from the first token)" in dg.report([good, bad])[0]
 
 
 def test_the_trace_names_each_role():
