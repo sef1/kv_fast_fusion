@@ -161,7 +161,10 @@ hybrid and the alias stay on both. Diagnostics move to one module.
 | `kv_fast_fusion_ascend/step_profile.py` | 545 | DIAG (off by default) | Per-step timing and memory probes. | keep; move memory probes out in P5 |
 | `kv_fast_fusion_ascend/connectors/merge_stats.py` | 76 | LIVE | Carries landed aliases and signatures between worker and scheduler at TP>1. | keep |
 | `kv_fast_fusion_ascend/connectors/mooncake_connector_ff.py` | 2,170 | LIVE (base class) | Group-aware pull transport; v2 subclasses it. Also holds v1 fusion that v2 switches off. | keep; drop fusion in P4 |
-| `kv_fast_fusion_ascend/connectors/mooncake_connector_ff_v2.py` | 4,124 | LIVE (core) | The connector your runs use: signing, planning, landing copy, diagnostics, unused async paths. | keep; shrink in P5 |
+| `kv_fast_fusion_ascend/connectors/mooncake_connector_ff_v2.py` | 3,281 | LIVE (core) | The connector your runs use: signing, planning, landing copy, unused async paths. | keep; shrink in P5 |
+| `kv_fast_fusion_ascend/diagnostics.py` | 904 | DIAG (off by default) | Transfer checks and slot traces, moved out of the connector in 04b. `_sync_device` here is also used by the signing profile. | keep |
+| `kv_fast_fusion_ascend/request_ids.py` | 14 | LIVE | `_ext_of`, shared by the patch and its write check. | keep |
+| `kv_fast_fusion/connector_selection.py` | 42 | LIVE | `_selected_connector_names`, shared by the GPU and Ascend patches. | keep |
 | `kv_fast_fusion_ascend/connectors/mooncake_layerwise_connector_ff.py` | 2,081 | NOT USED + 4 helpers | Layerwise v1 (`bff`). The live path imports 4 symbols from it. | P4 |
 | `kv_fast_fusion_ascend/connectors/mooncake_layerwise_connector_ff_v2.py` | 652 | NOT USED + 1 helper | Layerwise v2 (`bff_v2`). The live path imports `signatures_for_group`. | P4 |
 | `f1_benchmark/f1_main.py` | 594 | LIVE | The benchmark client and scoring. Your box has an uncommitted input-length cap. | keep; commit the cap |
@@ -187,7 +190,7 @@ Untracked in the working copy: `vllm/` (a 2.5 GB checkout from 2025, not what th
 
 ## 6. Functions in the live files
 
-**`kv_fast_fusion_ascend/connectors/mooncake_connector_ff_v2.py`** (4,124 lines)
+**`kv_fast_fusion_ascend/connectors/mooncake_connector_ff_v2.py`** (3,281 lines; the two DIAG transfer and trace groups below now live in `diagnostics.py`)
 
 | Mark | Functions |
 |---|---|
@@ -423,10 +426,10 @@ rows below. `BFF_V2_SHARED_WRITE_CHECK` stays on by default.
 
 ## 10. Tests and tooling
 
-**Tests.** About 716 pass locally, 3 skipped, 9 fail, and 4 more files do not load. All 13 share one cause:
-this machine's vLLM 0.31.0 has no `p2p` module, and bug 10 imports it. They are not code defects.
-The local vLLM is not the box's 0.18.0, so a test passing here is weaker evidence than a test passing
-there.
+**Tests.** On vLLM 0.18.0, the box's version: 851 pass, 84 skip, 0 fail (2026-11-04, build 04b). The 84
+need Mooncake or an Ascend checkout, which this machine lacks. Build the environment with
+`bash kv_fast_fusion/tools/make_test_env.sh`. NPU-only code does not run here, so passing here is weaker
+evidence than a run on the box. Before 04b, on vLLM 0.31.0, 9 tests failed and 4 files did not load.
 
 **Running and reading a run.**
 - `run_benchmarks.sh`: launches everything for one run. 1,750 lines, 577 of them an inline stats

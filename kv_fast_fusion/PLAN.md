@@ -121,7 +121,7 @@ mixin. `hot_block_collisions` was checked: its only caller is the off-by-default
 and the base connector's audit helpers can join later if the first move goes well.
 `BFF_V2_SHARED_WRITE_CHECK` stays on by default, since the alias stays.
 
-**Done when:** the 13 local test problems are gone, and one golden run passes. Then tag `pre-core` and
+**Done when:** one golden run passes. The 13 local test problems are gone: on vLLM 0.18.0, 851 tests pass, 84 skip and none fail. Then tag `pre-core` and
 create the branch.
 
 ### P1, P3, P2. On `bff-core`: everything the live path doesn't load
