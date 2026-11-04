@@ -242,6 +242,10 @@ NUM_PROMPTS=${NUM_PROMPTS:-512}
 MAX_CONCURRENCY=${MAX_CONCURRENCY:-530}
 PREFILL_MAX_CONCURRENCY=${PREFILL_MAX_CONCURRENCY:-${MAX_CONCURRENCY}}
 DECODE_MAX_CONCURRENCY=${DECODE_MAX_CONCURRENCY:-${MAX_CONCURRENCY}}
+# Requests the benchmark client keeps in flight. Defaults to the decode's limit, which is what it always
+# was; set it above DECODE_MAX_CONCURRENCY to cap decode admission while a queue still builds behind it.
+# Without that, a low decode limit also starves the run: 14 in flight in total left decode KV ~70% full.
+CLIENT_MAX_CONCURRENCY=${CLIENT_MAX_CONCURRENCY:-${DECODE_MAX_CONCURRENCY}}
 REQUEST_RATE=${REQUEST_RATE:-64}
 BURSTINESS=${BURSTINESS:-0.1}
 MIN_TOKENS=${MIN_TOKENS:-2048}
@@ -758,12 +762,12 @@ run_benchmark() {
     max_tok_flag="${MAX_TOKENS}"
     mode="F1 benchmark"
   fi
-  echo "Running ${mode} (prefill_concurrency=${PREFILL_MAX_CONCURRENCY}, decode_concurrency=${DECODE_MAX_CONCURRENCY}, prompts=${NUM_PROMPTS}) against proxy ${PROXY_PORT}..."
+  echo "Running ${mode} (prefill_concurrency=${PREFILL_MAX_CONCURRENCY}, decode_concurrency=${DECODE_MAX_CONCURRENCY}, client_concurrency=${CLIENT_MAX_CONCURRENCY}, prompts=${NUM_PROMPTS}) against proxy ${PROXY_PORT}..."
   python -m f1_benchmark.f1_main \
     --dataset-path "${F1_DATASET}" --hf-split "${F1_SPLIT}" \
     --input-key "${F1_INPUT_KEY}" --output-key "${F1_OUTPUT_KEY}" \
     --num-prompts ${NUM_PROMPTS} --request-rate ${REQUEST_RATE} --burstiness ${BURSTINESS} \
-    --max-concurrency ${DECODE_MAX_CONCURRENCY} --request-timeout ${REQUEST_TIMEOUT} \
+    --max-concurrency ${CLIENT_MAX_CONCURRENCY} --request-timeout ${REQUEST_TIMEOUT} \
     --min-tokens ${MIN_TOKENS} --max-tokens ${max_tok_flag} ${eval_flags} \
     --model "${MODEL}" --host ${VLLM_HOST_IP} --port ${PROXY_PORT} \
     --result-dir "${results_root}" \
