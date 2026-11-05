@@ -317,6 +317,8 @@ MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT=${MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT:-120000000
 # ---- Paths / infra ----
 REPO_ROOT=${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}
 VLLM_ASCEND_ROOT=${VLLM_ASCEND_ROOT:-/vllm-workspace/vllm-ascend}
+# 1: an evicted answer is continued instead of restarted. See proxy_continue_answer.py.
+PROXY_CONTINUE_ANSWER=${PROXY_CONTINUE_ANSWER:-0}
 PROXY_DIR=${PROXY_DIR:-${VLLM_ASCEND_ROOT}/examples/disaggregated_prefill_v1}
 # If the user set MOONCAKE_CONFIG_PATH, respect it; otherwise write_mooncake_config() generates one.
 MOONCAKE_CONFIG_PATH=${MOONCAKE_CONFIG_PATH:-}
@@ -745,7 +747,14 @@ launch_proxy() {
   else
     proxy_script="${PROXY_DIR}/load_balance_proxy_server_example.py"
   fi
-  nohup python "$proxy_script" \
+  local proxy_cmd=(python "$proxy_script")
+  if [[ "$PROXY_CONTINUE_ANSWER" == "1" ]]; then
+    if [[ "$LAYER_WISE" == "true" ]]; then
+      echo "PROXY_CONTINUE_ANSWER=1 supports the pull proxy only, not the layerwise one."; exit 1
+    fi
+    proxy_cmd=(python "${SCRIPT_DIR}/proxy_continue_answer.py" "$proxy_script")
+  fi
+  nohup "${proxy_cmd[@]}" \
     --prefiller-hosts ${prefill_hosts} \
     --prefiller-ports ${prefill_ports} \
     --decoder-hosts ${VLLM_HOST_IP} \

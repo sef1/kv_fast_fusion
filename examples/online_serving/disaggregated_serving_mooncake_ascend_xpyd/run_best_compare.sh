@@ -101,7 +101,7 @@ run_one() {   # run_one <folder name> <arm: baseline|bff> <decode limit> <stage:
   if [[ -f "${dest}/DONE" ]]; then echo "=== $name: already done, skipping"; return 0; fi
   mkdir -p "$dest"
   # The inherited BFF_ settings first, so the ones this run really sets win when config.txt is read.
-  { env | grep '^BFF_' | sort; echo "arm=$arm"; echo "decode_limit=$limit"; echo "stage=$stage"; echo "scenario=$SCENARIO"
+  { env | grep -E '^(BFF_|PROXY_CONTINUE_ANSWER=|THROUGHPUT_ONLY=|FIXED_OUTPUT_LEN=)' | sort; echo "arm=$arm"; echo "decode_limit=$limit"; echo "stage=$stage"; echo "scenario=$SCENARIO"
     printf '%s\n' "${COMMON[@]}" "${args[@]}"
     echo "git=$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null)"; } > "${dest}/config.txt"
   echo "=== $name: $arm, decode limit $limit, started $(date '+%H:%M:%S')"

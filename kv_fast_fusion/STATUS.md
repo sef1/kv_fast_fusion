@@ -96,10 +96,33 @@ tokens integrated from the log are not accurate to better than a few percent: BF
 | BFF, clip 0.4 | 292.2 | 431 | 0.632 | 39.16 | 0 | 195/195 | 14.08 | 38 | 576 | 10.4% | 1055 |
 
 The first throughput win: +5.2%, with paired F1 +0.007 (CI -0.008 to +0.021). The mechanism shows directly: 3.9% more
-running gives 3.9% more generation, at the same rate per running request. BFF's answers were also about 4% shorter
-(paired, CI excludes 0), which inflates its req/s and wall-time gains, so tok/s is the fair figure. Tail results are
+running gives 3.9% more generation, at the same rate per running request. BFF's answers were also about 4% shorter,
+which inflates its req/s and wall-time gains, so tok/s is the fair figure. Over both families pairs the gap is -2.9%
+(-17 tokens, CI -30 to -5). The shorter answers are complete: 99% end in a closed code fence in both arms, each still
+opens with the requested file, and where only baseline hit the 1,024 cap, F1 goes 0.441 to 0.550 and valid syntax 1 to
+11 of 12. The cause is unknown. It does not concentrate on substituted prompts, and the 121 prompts show no gap (544.6
+tokens over 11 BFF runs, 543.1 over 4 baseline). Tail results are
 mixed: TPOT p99 616 ms against 379, TTFT p99 68 s against 80, end-to-end p99 182 s against 198. Unconfirmed: one pair,
 and neither arm has been tried between limits 10 and 24.
+
+**Families at limit 24, all modes, build 04c, one run each**
+
+| Run | tok/s | vs base | Running | KV not pulled | Freed | F1 | CodeBLEU | Restarted answers | Evictions |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| baseline | 277.7 | - | 13.55 | 0 | 0 | 0.625 | 39.10 | 26 | 44 |
+| dedup off | 275.6 | -0.8% | 13.32 | 0 | 0 | 0.619 | 39.07 | 24 | 38 |
+| BFF clip 0.4 | 292.2 | +5.2% | 14.08 | 10.4% | 1055 | 0.632 | 39.16 | 25 | 38 |
+| BFF clip 0.7 | 301.8 | +8.7% | 15.06 | 17.3% | 1858 | 0.633 | 39.50 | 23 | 39 |
+| BFF clip 0.95 | 304.7 | +9.7% | 15.40 | 20.1% | 2135 | 0.631 | 38.39 | 16 | 26 |
+| fixed 600, baseline | 289.5 | - | 13.97 | 0 | 0 | - | - | - | 49 |
+| fixed 600, BFF 0.4 | 300.6 | +3.8% | 14.86 | 10.9% | 1132 | - | - | - | 37 |
+| fixed 600, BFF 0.7 | 315.6 | +9.0% | 15.59 | 17.2% | 1909 | - | - | - | 40 |
+
+Fixed-length runs confirm the gain is not an effect of answer length. Dedup off costs 0.8%: running falls 1.7% with the 1.3%
+smaller pool, and speed per running request is unchanged. Answers are shorter only with dedup on (-109 characters against
+dedup off, CI -187 to -34; dedup off against baseline +8), and the gap does not grow with the clip. Checks at every clip: 0
+garbled, right file, no drift toward a sibling's reference, F1 of clean answers 0.640, 0.639, 0.639, 0.638. In fixed runs the
+tail check flags text forced past the natural end, baseline included, so `bad` there is not meaningful.
 
 **Scenario `families`.** `SCENARIO=families` or `PROMPT_FAMILIES=1`: 219 prompts of 2,000-4,096
 tokens in 84 families, fingerprint `872781bc`, sent family by family. Long Magicoder prompts are one software project
@@ -472,6 +495,7 @@ rows below. `BFF_V2_SHARED_WRITE_CHECK` stays on by default.
 | 5 | Warm-up built the projection matrix on the wrong group | Fixed in 04a. **Not yet seen on the box:** expect `signature path warmed on group 1`. |
 | 6 | The recompute path pastes the partial answer into the user message | **Open, upstream proxy.** Caused one garbage output (`#141`). Affects baseline and BFF alike. |
 | 7 | Over-admission at the decode leads to evictions | **Open.** A scheduling policy, separate from dedup. |
+| 14 | **About 12% of answers are damaged by eviction restarts, in both arms** (baseline 26 of 219, F1 0.512 against 0.640 for clean answers). The proxy's recompute path pastes the partial answer into the user message and resends, so the model starts over and the client receives both pieces glued together. Upstream, in vllm-ascend's `load_balance_proxy_server_example.py`. BFF has fewer at clip 0.95 (16) and at limit 10 (2 against 7) | **Fix written, not yet run on the box:** `PROXY_CONTINUE_ANSWER=1` continues the answer as an unfinished assistant message (`proxy_continue_answer.py`), tested end to end against the real v0.18.0 proxy with fake servers. Off by default. Reports now count restarts (`rst`). |
 | 13 | **Prompts ending exactly on a block boundary and taking more than one chunk are garbage from the first token, in every BFF run including dedup off, and fine in baseline.** MTP's lookahead makes P hold one block past the prompt (37 for 36); `align_per_group` keeps P's last ids, so every block on D gets P's next block. Stock takes the first `num_prompt_blocks`. Seen on 121-set #54 and families #49 | **Fixed in 04c, confirmed on the box:** 0 of 121 bad, prompt 54 correct, tok/s 198.5, F1 0.656, CodeBLEU 47.24. `is_degenerate` reported 0 throughout, so every earlier "0 garbage" figure is wrong: one prompt in 121 was always bad. `is_garbled` now reads the opening: all 19 known-bad answers caught, 0 of 1,153 baseline answers flagged, and from build 03e on it flags no other prompt on the 121-prompt or families runs (one 200-prompt run, 03h, has one output flagged by the tail check). It cannot see garbage that opens normally. Hybrid models keep the bug. |
 | 12 | A decode limit of 7, 9, 11, 13, 15, 17, 19 or 21-23 runs about 4x slower when full, in both arms: 2 x limit tokens is not in the graph list, so the batch falls back to eager. Limit 9: 985 s and 925 s against about 330 s | **Open.** `run_best_compare.sh` still lists 9 and 22 as default limits. |
 | 11 | Prefill sometimes hangs at startup after several runs in one container (`No available shared memory broadcast block`), after graph warm-up and before any BFF connector code | **Open, cause unknown.** Seen on run 5 of sweep `20261104_123438`, stopped by hand once hung. |

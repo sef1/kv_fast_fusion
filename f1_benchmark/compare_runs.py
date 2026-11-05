@@ -21,7 +21,7 @@ import re
 import statistics
 import sys
 
-from f1_benchmark.degenerate_outputs import is_garbage
+from f1_benchmark.degenerate_outputs import has_restart, is_garbage
 
 LOG_INTERVAL_S = 10          # vLLM's loggers.py reports throughput on this period
 _ENGINE = re.compile(r"prompt throughput: ([\d.]+).*generation throughput: ([\d.]+).*"
@@ -84,6 +84,7 @@ def read_run(run_dir: str) -> dict:
         "limit": cfg.get("decode_limit", "?"), "stage": cfg.get("stage", "sweep"), "n": len(outs),
         "fingerprint": hashlib.sha1("\n".join(o.get("prompt", "") for o in outs).encode()).hexdigest()[:8],
         "garbage": sum(is_garbage(o.get("generated_text") or "") for o in outs),
+        "restarted": sum(has_restart(o.get("generated_text") or "") for o in outs),
         "tok_s": _num(r"throughput: ([\d.]+) output tok/s", serving),
         "req_s": _num(r"\| ([\d.]+) req/s", serving),
         "wall": _num(r"completed in ([\d.]+) s", serving),
@@ -121,7 +122,7 @@ def _f(v, spec=".1f"):
 
 def table(runs: list) -> list:
     head = (f"{'run':28s} {'limit':>5s} {'tok/s':>6s} {'req/s':>5s} {'wall':>6s} {'TTFT':>5s} {'TPOT':>5s} "
-            f"{'F1':>6s} {'CBLEU':>6s} {'AST':>5s} {'bad':>3s} {'prefill':>7s} {'evict':>5s} "
+            f"{'F1':>6s} {'CBLEU':>6s} {'AST':>5s} {'bad':>3s} {'rst':>3s} {'prefill':>7s} {'evict':>5s} "
             f"{'run':>4s} {'max':>3s} {'wait':>4s} {'KV%':>4s} {'freed':>5s}  prompts/build")
     lines = [head]
     for r in runs:
@@ -129,7 +130,7 @@ def table(runs: list) -> list:
         lines.append(
             f"{r['name'][:28]:28s} {r['limit']:>5s} {_f(r['tok_s']):>6s} {_f(r['req_s'], '.2f'):>5s} "
             f"{_f(r['wall'], '.0f'):>6s} {_f(r['ttft_s'], '.0f'):>5s} {_f(r['tpot']):>5s} {_f(r['f1'], '.3f'):>6s} "
-            f"{_f(r['codebleu'], '.2f'):>6s} {_f(r['ast']):>5s} {r['garbage']:>3d} {r['prefill_k']:>6.0f}k "
+            f"{_f(r['codebleu'], '.2f'):>6s} {_f(r['ast']):>5s} {r['garbage']:>3d} {r['restarted']:>3d} {r['prefill_k']:>6.0f}k "
             f"{evict:>5d} {r['running']:>4.1f} {r['max_running']:>3.0f} {r['waiting']:>4.1f} {r['kv']:>4.0f} "
             f"{r['freed']:>5d}  {r['fingerprint']} {r['build']}")
     return lines

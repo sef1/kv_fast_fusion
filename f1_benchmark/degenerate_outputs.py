@@ -34,6 +34,8 @@ MIN_ALNUM_SHARE = 0.2
 GARBLE_HEAD_CHARS = 80
 GARBLE_SHORT_CHARS = 32
 GARBLE_MIN_LETTER_SHARE = 0.5
+_RESTART = re.compile(r"[^\n]```(?:python|html|sql|css|javascript|js|bash|json|yaml|xml|java|cpp|go|typescript|ts)?\n"
+                      r"|[^\n]## Code: ")
 _NORMAL_OPENING = ("```", "#", "<", "{", "[", "*", '"', "'", "-", "/", "(")
 
 _SWAP = re.compile(r"BFF swap \| req=(\S+) .* owner=(\S+)")
@@ -93,6 +95,15 @@ def is_garbled(text: str) -> bool:
     if re.match(r"\s*(\w{3,})\1", head):
         return True
     return sum(c.isalpha() for c in head) / len(head) < GARBLE_MIN_LETTER_SHARE
+
+
+def has_restart(text: str) -> bool:
+    """True if the answer was cut off and begins again, the mark of an eviction under the stock proxy.
+
+    ``__tablename__ =```python``: a code fence or a ``## Code:`` heading glued onto unfinished text. Not
+    garbage in the sense above, and it hits baseline too, but such answers score lower (F1 0.51 against
+    0.64 on families at limit 24). Fixed-output runs also trip it on text forced past the answer's end."""
+    return _RESTART.search(text or "") is not None
 
 
 def is_garbage(text: str) -> bool:
@@ -161,6 +172,9 @@ def report(outputs, ledger=None, log_text=None) -> list:
     garbled = sum(not is_degenerate(o.get("generated_text") or "") for _i, o in bad)
     lines = [f"degenerate outputs: {len(bad)}/{len(outputs)}"
              + (f" ({garbled} garbled from the first token)" if garbled else "")]
+    restarted = sum(has_restart(o.get("generated_text") or "") for o in outputs)
+    if restarted:
+        lines[0] += f" | restarted by an eviction: {restarted}"
     roles = parse_trace(log_text) if log_text else None
     if roles is not None and not any(roles.values()):
         # No swap line at all: free-at-promotion was off, or the build predates the trace. Calling
