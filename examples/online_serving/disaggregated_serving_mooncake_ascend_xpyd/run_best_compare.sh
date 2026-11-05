@@ -51,10 +51,10 @@ SCENARIO=${SCENARIO:-121}
 case "$SCENARIO" in
   121) MIN_TOKENS=${MIN_TOKENS:-4096}; MAX_IN_TOKENS=${MAX_IN_TOKENS:-6000}; MAX_TOKENS=${MAX_TOKENS:-1024}; NUM_PROMPTS=${NUM_PROMPTS:-121}
        USUAL_PROMPTS="4096 6000 121 0"; USUAL_FINGERPRINT=9f5e27b8
-       DEFAULT_LIMITS="8 9 ${MAX_CONCURRENCY}" ;;
+       DEFAULT_LIMITS="8 10 ${MAX_CONCURRENCY}" ;;
   200) MIN_TOKENS=${MIN_TOKENS:-1000}; MAX_IN_TOKENS=${MAX_IN_TOKENS:-2000}; MAX_TOKENS=${MAX_TOKENS:-2000}; NUM_PROMPTS=${NUM_PROMPTS:-200}
        USUAL_PROMPTS="1000 2000 200 0"; USUAL_FINGERPRINT=4da4b383
-       DEFAULT_LIMITS="16 18 22 ${MAX_CONCURRENCY}" ;;
+       DEFAULT_LIMITS="16 18 24 ${MAX_CONCURRENCY}" ;;
   families) MIN_TOKENS=${MIN_TOKENS:-2000}; MAX_IN_TOKENS=${MAX_IN_TOKENS:-4096}; MAX_TOKENS=${MAX_TOKENS:-1024}; NUM_PROMPTS=${NUM_PROMPTS:-219}
        PROMPT_FAMILIES=${PROMPT_FAMILIES:-1}
        DEFAULT_LIMITS="12 16 ${MAX_CONCURRENCY}"
@@ -77,7 +77,24 @@ if [[ -n "${REF_DECODE_LOG:-}" && -z "${DECODE_LIMITS:-}" ]]; then
 fi
 DECODE_LIMITS=${DECODE_LIMITS:-$DEFAULT_LIMITS}
 
+# Graphs are captured up to 2 x limit tokens (MTP uses 2 per request) from this list. A limit whose double is
+# not in it falls back to eager once full: limit 9 ran about 4x slower in both arms, 985 s against about 330 s.
+check_limit() {
+  local limit=$1 size
+  [[ "${ALLOW_SLOW_LIMIT:-0}" == "1" || "$limit" -gt 32 ]] && return 0
+  for size in 2 4 8 12 16 20 24 28 32 36 40 48 56 64; do
+    [[ $((2 * limit)) -eq $size ]] && return 0
+  done
+  echo "Decode limit $limit runs about 4x slower when full: no graph for $((2 * limit)) tokens. Use 6, 8, 10, 12, 14, 16, 18,"
+  echo "20, 24, 28, 32 or above 32, or set ALLOW_SLOW_LIMIT=1 to run it anyway."
+  exit 1
+}
+
+# 1: an evicted answer is continued instead of restarted. Confirmed on the box; see proxy_continue_answer.py.
+PROXY_CONTINUE_ANSWER=${PROXY_CONTINUE_ANSWER:-1}
+
 COMMON=(MODEL="$MODEL" TP_SIZE="$TP_SIZE" MIN_TOKENS="$MIN_TOKENS" MAX_IN_TOKENS="$MAX_IN_TOKENS" PROMPT_FAMILIES="$PROMPT_FAMILIES" MAX_TOKENS="$MAX_TOKENS"
+        PROXY_CONTINUE_ANSWER="$PROXY_CONTINUE_ANSWER"
         NUM_PROMPTS="$NUM_PROMPTS" MAX_CONCURRENCY="$MAX_CONCURRENCY"
         CLIENT_MAX_CONCURRENCY="${CLIENT_MAX_CONCURRENCY:-$MAX_CONCURRENCY}"
         DECODE_MAX_NUM_BATCHED_TOKENS="${DECODE_MAX_NUM_BATCHED_TOKENS:-64}" USE_ASCEND_STORE="${USE_ASCEND_STORE:-0}")
@@ -140,6 +157,7 @@ if [[ -n "${RUNS:-}" ]]; then
       echo "Bad entry in RUNS: '$spec'. Use arm:decode_limit or arm:decode_limit:name, with arm baseline or bff."
       exit 1
     fi
+    check_limit "$limit"
   done
   echo "Runs: $RUNS | saved under $SWEEP_DIR"
   declare -A used=()
@@ -157,6 +175,7 @@ if [[ -n "${RUNS:-}" ]]; then
   exit 0
 fi
 
+for limit in $DECODE_LIMITS; do check_limit "$limit"; done
 n_limits=$(wc -w <<< "$DECODE_LIMITS")
 echo "Decode limits: $DECODE_LIMITS | runs: $((2 * n_limits + 2 * CONFIRM_PAIRS)) | saved under $SWEEP_DIR"
 

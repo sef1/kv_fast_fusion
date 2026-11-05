@@ -124,6 +124,18 @@ dedup off, CI -187 to -34; dedup off against baseline +8), and the gap does not 
 garbled, right file, no drift toward a sibling's reference, F1 of clean answers 0.640, 0.639, 0.639, 0.638. In fixed runs the
 tail check flags text forced past the natural end, baseline included, so `bad` there is not meaningful.
 
+**Families at limit 24 with `PROXY_CONTINUE_ANSWER=1`, one run each.** Evictions here are the proxy's own count, the same in every arm.
+
+| Run | tok/s | vs base | Running | Evictions | Prefill tokens | KV not pulled | Freed | F1 | CodeBLEU | Valid syntax | `rst` | TPOT p99 | E2E p99 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| baseline | 282.7 | - | 13.46 | 55 | 785k | 0 | 0 | 0.628 | 39.22 | 149 | 0 | 2171 | 206 |
+| BFF clip 0.4 (folder named 0.7) | 292.2 | +3.4% | 14.29 | 26 | 719k | 11.2% | 1115 | 0.638 | 39.11 | 152 | 1 | 1350 | 152 |
+| BFF no cap | 305.2 | +8.0% | 15.79 | 19 | 697k | 22.2% | 2267 | 0.635 | 39.21 | 156 | 0 | 177 | 151 |
+
+The restart fix works on the box: `rst` 27 to 0, 0 refused, 219/219, joins read seamless. It adds little F1 overall (+0.004, not significant) but valid syntax goes 137 to 149. So the earlier F1 0.51 against 0.64 was partly selection: long answers are both evicted more and score lower.
+
+**Overhead, fixed 600.** Flag on in both, but the fixed baseline (289.5) was run without it, so this is not yet exact: dedup off 280.6 (-3.1%), dedup with no freeing at clip 0.7 283.4 (-2.1%). Dedup's own work shows no measurable cost, and speed per running request is the same in all three (21.85, 21.98, 21.94).
+
 **Scenario `families`.** `SCENARIO=families` or `PROMPT_FAMILIES=1`: 219 prompts of 2,000-4,096
 tokens in 84 families, fingerprint `872781bc`, sent family by family. Long Magicoder prompts are one software project
 with a different file requested, differing from about token 75, so prefix caching cannot share them. A live partner
@@ -495,9 +507,9 @@ rows below. `BFF_V2_SHARED_WRITE_CHECK` stays on by default.
 | 5 | Warm-up built the projection matrix on the wrong group | Fixed in 04a. **Not yet seen on the box:** expect `signature path warmed on group 1`. |
 | 6 | The recompute path pastes the partial answer into the user message | **Open, upstream proxy.** Caused one garbage output (`#141`). Affects baseline and BFF alike. |
 | 7 | Over-admission at the decode leads to evictions | **Open.** A scheduling policy, separate from dedup. |
-| 14 | **About 12% of answers are damaged by eviction restarts, in both arms** (baseline 26 of 219, F1 0.512 against 0.640 for clean answers). The proxy's recompute path pastes the partial answer into the user message and resends, so the model starts over and the client receives both pieces glued together. Upstream, in vllm-ascend's `load_balance_proxy_server_example.py`. BFF has fewer at clip 0.95 (16) and at limit 10 (2 against 7) | **Fix written, not yet run on the box:** `PROXY_CONTINUE_ANSWER=1` continues the answer as an unfinished assistant message (`proxy_continue_answer.py`), tested end to end against the real v0.18.0 proxy with fake servers. Off by default. Reports now count restarts (`rst`). |
+| 14 | **About 12% of answers are damaged by eviction restarts, in both arms** (baseline 26 of 219, F1 0.512 against 0.640 for clean answers). The proxy's recompute path pastes the partial answer into the user message and resends, so the model starts over and the client receives both pieces glued together. Upstream, in vllm-ascend's `load_balance_proxy_server_example.py`. BFF has fewer at clip 0.95 (16) and at limit 10 (2 against 7) | **Fix confirmed on the box:** `PROXY_CONTINUE_ANSWER=1` continues the answer as an unfinished assistant message (`proxy_continue_answer.py`), tested end to end against the real v0.18.0 proxy with fake servers. On by default in `run_best_compare.sh`, off in `run_benchmarks.sh`. Reports now count restarts (`rst`). |
 | 13 | **Prompts ending exactly on a block boundary and taking more than one chunk are garbage from the first token, in every BFF run including dedup off, and fine in baseline.** MTP's lookahead makes P hold one block past the prompt (37 for 36); `align_per_group` keeps P's last ids, so every block on D gets P's next block. Stock takes the first `num_prompt_blocks`. Seen on 121-set #54 and families #49 | **Fixed in 04c, confirmed on the box:** 0 of 121 bad, prompt 54 correct, tok/s 198.5, F1 0.656, CodeBLEU 47.24. `is_degenerate` reported 0 throughout, so every earlier "0 garbage" figure is wrong: one prompt in 121 was always bad. `is_garbled` now reads the opening: all 19 known-bad answers caught, 0 of 1,153 baseline answers flagged, and from build 03e on it flags no other prompt on the 121-prompt or families runs (one 200-prompt run, 03h, has one output flagged by the tail check). It cannot see garbage that opens normally. Hybrid models keep the bug. |
-| 12 | A decode limit of 7, 9, 11, 13, 15, 17, 19 or 21-23 runs about 4x slower when full, in both arms: 2 x limit tokens is not in the graph list, so the batch falls back to eager. Limit 9: 985 s and 925 s against about 330 s | **Open.** `run_best_compare.sh` still lists 9 and 22 as default limits. |
+| 12 | A decode limit of 7, 9, 11, 13, 15, 17, 19 or 21-23 runs about 4x slower when full, in both arms: 2 x limit tokens is not in the graph list, so the batch falls back to eager. Limit 9: 985 s and 925 s against about 330 s | **Open.** `run_best_compare.sh` now refuses these limits unless `ALLOW_SLOW_LIMIT=1`. |
 | 11 | Prefill sometimes hangs at startup after several runs in one container (`No available shared memory broadcast block`), after graph warm-up and before any BFF connector code | **Open, cause unknown.** Seen on run 5 of sweep `20261104_123438`, stopped by hand once hung. |
 | 8 | Piggyback signatures may race the KV write without `BFF_PD_SAVE_BARRIER` | **Open question.** The log warns on every run. No damage seen, but never tested with the barrier on GLM. |
 | 9 | The input-length cap in `f1_main.py` existed only on the box | **Committed in 04b** as `--max-in-tokens` / `MAX_IN_TOKENS`. `f1_main` now prints the prompt fingerprint. Check on the box that `MAX_IN_TOKENS=6000` reproduces `9f5e27b8` and `MAX_IN_TOKENS=2000` reproduces `4da4b383`. |
@@ -513,6 +525,8 @@ evidence than a run on the box. Before 04b, on vLLM 0.31.0, 9 tests failed and 4
 **Running and reading a run.**
 - `run_benchmarks.sh`: launches everything for one run. 1,750 lines, 577 of them an inline stats
   report. `results_latest` and `logs_latest` are wiped at each start.
+- `run_client_table.sh`: collects all 30 runs for the client table in batches of 4, resumes after a stop, then runs
+  `python -m f1_benchmark.client_table <folder>`, which writes `client_table.md` and `client_runs.csv`.
 - `run_best_compare.sh`: **the way to run tests.** `RUNS="bff:48 baseline:8"` does just those runs; without
   it, the full sweep. Holds the best settings, saves every run to its own folder, and stops if the prompts
   are not the scenario's usual ones. Scenarios: `121`, `200`, `families`.
