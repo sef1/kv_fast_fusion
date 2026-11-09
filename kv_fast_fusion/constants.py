@@ -51,3 +51,12 @@ BFF_BALANCED_GROUPS = int(os.environ.get("BFF_BALANCED_GROUPS", "0"))
 # 28-layer model gives 14+14, i.e. max_layers×num_groups at its floor. 0 = off; takes precedence over
 # BFF_BALANCED_GROUPS.
 BFF_EDGE_LAYERS = int(os.environ.get("BFF_EDGE_LAYERS", "0"))
+# With BFF_EDGE_LAYERS: cut the middle into this many contiguous, near-equal groups (sizes differ by
+# <= 1), each dedup-eligible and matched on its own. 1 = the two-group layout above, unchanged.
+#
+# Why: the pool is sized by the fattest group, so fewer edge layers alone (e.g. 10 on GLM-5.1's 79:
+# groups 20 + 59) waste ~33% of KV memory. Splitting the middle keeps every group the same size
+# (10 + split 3 -> 20/20/20/19: the same ~1.3% waste as edge 20) while 59 of 79 layers become
+# shareable instead of 39, and each group can free its block independently. Balanced when
+# 2 * edge_layers ~= (layers - 2 * edge_layers) / split.
+BFF_EDGE_SPLIT = int(os.environ.get("BFF_EDGE_SPLIT", "1"))

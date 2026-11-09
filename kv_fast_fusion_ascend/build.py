@@ -5,4 +5,4 @@ so a box that pulled only part of a change (2026-11-01: an "exact search" run us
 build) is visible on line 1 of decode-0.txt instead of after the run is analysed.
 """
 
-BFF_BUILD = "2026-11-04c"
+BFF_BUILD = "2026-11-09a"   # BFF_EDGE_SPLIT: balanced edge + split-middle layout

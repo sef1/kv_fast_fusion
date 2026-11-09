@@ -98,6 +98,41 @@ def test_edge_layout_takes_precedence_and_always_leaves_a_middle():
     assert len(middle) >= 1 and len(edges) + len(middle) == 6
 
 
+def test_edge_split_one_is_todays_two_group_layout_exactly():
+    for edge in (7, 20):
+        layers = _layers(79)
+        assert (bff_group_layout(layers, 0, 4, edge_layers=edge, edge_split=1)
+                == bff_group_layout(layers, 0, 4, edge_layers=edge))
+
+
+def test_edge_split_on_glm51_is_balanced_with_three_quarters_shareable():
+    """GLM-5.1: 79 layers. Edge 10 + split 3 gives 20/20/20/19 — the same ~1.3% pool waste as edge 20
+    (40/39) — while 59 of 79 layers become shareable instead of 39."""
+    layers = _layers(79)
+    layout = bff_group_layout(layers, 0, 4, edge_layers=10, edge_split=3)
+    sizes = [len(n) for n, _ in layout]
+    assert sizes == [20, 20, 20, 19]
+    assert layout[0][0] == layers[:10] + layers[69:], "group 0 still holds both ends"
+    assert sorted(_flat(layout)) == sorted(layers), "every layer exactly once"
+    assert max(sizes) * len(sizes) == 80, "same reserved size as edge 20 (40 x 2)"
+    assert sum(sizes[1:]) == 59
+
+
+def test_edge_split_groups_are_contiguous_in_forward_order_and_share_the_middle_spec():
+    """Contiguous middle groups keep forward order (what full-graph replay pairs metadata by), and
+    one spec for all of them — same-spec groups stay separate groups, as the legacy layout relies on."""
+    layers = _layers(79)
+    layout = bff_group_layout(layers, 0, 4, edge_layers=10, edge_split=3)
+    middle = [n for names, _ in layout[1:] for n in names]
+    assert middle == layers[10:69]
+    assert {sid for _, sid in layout[1:]} == {0} and layout[0][1] == 1
+
+
+def test_edge_split_is_clamped_to_the_middle():
+    layout = bff_group_layout(_layers(6), 0, 4, edge_layers=2, edge_split=9)
+    assert [len(n) for n, _ in layout] == [4, 1, 1]
+
+
 def test_edge_layers_zero_leaves_the_other_layouts_untouched():
     for bal in (0, 2, 4):
         assert (bff_group_layout(_layers(28), bal, 4, edge_layers=0)

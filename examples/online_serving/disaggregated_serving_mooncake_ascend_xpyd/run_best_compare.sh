@@ -25,6 +25,8 @@
 #   SCENARIO=200 ./run_best_compare.sh                  # 200 prompts >= 1000 tokens, 2000 out
 #   SCENARIO=families RUNS="bff:48" ./run_best_compare.sh   # one project, many files: real prompts,
 #                                                       # selected in dedup's favour, sent family by family
+#   SCENARIO=longbench_e RUNS="bff:48" ./run_best_compare.sh   # LongBench-E 2K-4K, dataset order; build the
+#                                                       # file first with f1_benchmark/make_longbench_e.py
 #   REF_DECODE_LOG=<a BFF run>/logs_latest/decode-0.txt ./run_best_compare.sh
 #                                                       # limits from that log's max running
 #   DECODE_LIMITS="7 8 9 48" ./run_best_compare.sh      # or name them yourself
@@ -48,6 +50,7 @@ MODEL=${MODEL:-/models/glm/glm/GLM-5.1-W4A8-nq8}
 TP_SIZE=${TP_SIZE:-8}
 MAX_CONCURRENCY=${MAX_CONCURRENCY:-48}
 SCENARIO=${SCENARIO:-121}
+DATASET_ARGS=()   # empty: run_benchmarks.sh's own dataset (Magicoder)
 case "$SCENARIO" in
   121) MIN_TOKENS=${MIN_TOKENS:-4096}; MAX_IN_TOKENS=${MAX_IN_TOKENS:-6000}; MAX_TOKENS=${MAX_TOKENS:-1024}; NUM_PROMPTS=${NUM_PROMPTS:-121}
        USUAL_PROMPTS="4096 6000 121 0"; USUAL_FINGERPRINT=9f5e27b8
@@ -59,7 +62,18 @@ case "$SCENARIO" in
        PROMPT_FAMILIES=${PROMPT_FAMILIES:-1}
        DEFAULT_LIMITS="12 16 ${MAX_CONCURRENCY}"
        USUAL_PROMPTS="2000 4096 219 1"; USUAL_FINGERPRINT=872781bc ;;
-  *) echo "Unknown SCENARIO=$SCENARIO (use 121, 200 or families)"; exit 1 ;;
+  # LongBench-E, 2K-4K tokens, in the dataset's order: a candidate for ordinary traffic. Built once with
+  # f1_benchmark/make_longbench_e.py, which already filtered the lengths, so no filter here. Its first
+  # use is the BFF run's "match potential" lines, which measure the real signature match.
+  longbench_e) MIN_TOKENS=${MIN_TOKENS:-0}; MAX_IN_TOKENS=${MAX_IN_TOKENS:-0}; MAX_TOKENS=${MAX_TOKENS:-1024}; NUM_PROMPTS=${NUM_PROMPTS:-289}
+       F1_DATASET=${F1_DATASET:-${SCRIPT_DIR}/longbench_e_2k4k.jsonl}
+       DATASET_ARGS=(F1_DATASET="$F1_DATASET" F1_INPUT_KEY=prompt F1_OUTPUT_KEY=reference F1_SPLIT=train)
+       if [[ "${DRY_RUN:-0}" != "1" && ! -f "$F1_DATASET" ]]; then
+         echo "No prompt file at $F1_DATASET. Build it with f1_benchmark/make_longbench_e.py, or set F1_DATASET."; exit 1
+       fi
+       DEFAULT_LIMITS="24 ${MAX_CONCURRENCY}"
+       USUAL_PROMPTS="0 0 289 0"; USUAL_FINGERPRINT=aabe1d84 ;;   # the file as built 2026-11-08 (11 tasks)
+  *) echo "Unknown SCENARIO=$SCENARIO (use 121, 200, families or longbench_e)"; exit 1 ;;
 esac
 MAX_IN_TOKENS=${MAX_IN_TOKENS:-0}   # upper bound on input length, 0 = none
 PROMPT_FAMILIES=${PROMPT_FAMILIES:-0}
@@ -93,7 +107,7 @@ check_limit() {
 # 1: an evicted answer is continued instead of restarted. Confirmed on the box; see proxy_continue_answer.py.
 PROXY_CONTINUE_ANSWER=${PROXY_CONTINUE_ANSWER:-1}
 
-COMMON=(MODEL="$MODEL" TP_SIZE="$TP_SIZE" MIN_TOKENS="$MIN_TOKENS" MAX_IN_TOKENS="$MAX_IN_TOKENS" PROMPT_FAMILIES="$PROMPT_FAMILIES" MAX_TOKENS="$MAX_TOKENS"
+COMMON=(${DATASET_ARGS[@]+"${DATASET_ARGS[@]}"} MODEL="$MODEL" TP_SIZE="$TP_SIZE" MIN_TOKENS="$MIN_TOKENS" MAX_IN_TOKENS="$MAX_IN_TOKENS" PROMPT_FAMILIES="$PROMPT_FAMILIES" MAX_TOKENS="$MAX_TOKENS"
         PROXY_CONTINUE_ANSWER="$PROXY_CONTINUE_ANSWER"
         NUM_PROMPTS="$NUM_PROMPTS" MAX_CONCURRENCY="$MAX_CONCURRENCY"
         CLIENT_MAX_CONCURRENCY="${CLIENT_MAX_CONCURRENCY:-$MAX_CONCURRENCY}"
@@ -101,6 +115,7 @@ COMMON=(MODEL="$MODEL" TP_SIZE="$TP_SIZE" MIN_TOKENS="$MIN_TOKENS" MAX_IN_TOKENS
 # The best settings. Each can be overridden from the command line.
 BFF_ARGS=(BASELINE=bff_pull_v2 BFF_LSH_EXACT="${BFF_LSH_EXACT:-1}" BFF_MAX_REL_ERR="${BFF_MAX_REL_ERR:-0.5}"
           BFF_THRESHOLD="${BFF_THRESHOLD:-0.75}" BFF_EDGE_LAYERS="${BFF_EDGE_LAYERS:-20}"
+          BFF_EDGE_SPLIT="${BFF_EDGE_SPLIT:-1}"
           BFF_V2_MATERIALIZE="${BFF_V2_MATERIALIZE:-1}" BFF_FREE_FLUSH="${BFF_FREE_FLUSH:-recv}"
           BFF_V2_ALLOW_FULL_GRAPH="${BFF_V2_ALLOW_FULL_GRAPH:-1}" BFF_V2_DEDUP="${BFF_V2_DEDUP:-1}"
           BFF_V2_SIG_PIGGYBACK="${BFF_V2_SIG_PIGGYBACK:-1}" BFF_V2_FREE_AT_PROMOTION="${BFF_V2_FREE_AT_PROMOTION:-1}"

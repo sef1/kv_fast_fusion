@@ -13,7 +13,7 @@ from vllm.v1.core.kv_cache_utils import (
     init_none_hash,
 )
 
-def bff_group_layout(original_layers, balanced_groups, group_size, edge_layers=0):
+def bff_group_layout(original_layers, balanced_groups, group_size, edge_layers=0, edge_split=1):
     """Pure partition of the model's layer names into BFF storage groups.
 
     Returns ``list[(layer_names, spec_id)]``. ``spec_id`` selects one of the two page-identical
@@ -30,13 +30,23 @@ def bff_group_layout(original_layers, balanced_groups, group_size, edge_layers=0
       ``edge_layers`` layers (alt spec, group 0), then the middle (group 1). Group 0 is never
       dedup-eligible, so the uniform layers at both ends are quarantined with the fewest groups.
       Clamped so the middle keeps at least one layer; balanced when ``4 × edge_layers == n``.
+      ``edge_split >= 2`` cuts the middle into that many contiguous near-equal groups (groups 1..S,
+      all dedup-eligible), so fewer edge layers stay balanced: see constants.BFF_EDGE_SPLIT.
     * otherwise: today's layout — warmup group (first 2 + last 2 layers, alt spec) + the middle
       layers chunked by ``group_size`` (per_layer_spec). Byte-for-byte the prior behaviour.
     """
     n = len(original_layers)
     if edge_layers and edge_layers >= 1 and n >= 3:
         k = min(edge_layers, (n - 1) // 2)
-        return [(original_layers[:k] + original_layers[n - k:], 1), (original_layers[k:n - k], 0)]
+        middle = original_layers[k:n - k]
+        s = max(1, min(int(edge_split or 1), len(middle)))
+        base, extra = divmod(len(middle), s)
+        groups, start = [], 0
+        for i in range(s):
+            size = base + (1 if i < extra else 0)
+            groups.append((middle[start:start + size], 0))
+            start += size
+        return [(original_layers[:k] + original_layers[n - k:], 1)] + groups
     if balanced_groups and balanced_groups >= 2:
         g = max(2, min(balanced_groups, n))
         base, extra = divmod(n, g)
@@ -117,7 +127,7 @@ def _initialize_kv_caches(
                 get_kv_cache_config_from_groups, _report_kv_cache_config,
             )
             from kv_fast_fusion.constants import (
-                BFF_GROUP_SIZE, BFF_BALANCED_GROUPS, BFF_EDGE_LAYERS,
+                BFF_GROUP_SIZE, BFF_BALANCED_GROUPS, BFF_EDGE_LAYERS, BFF_EDGE_SPLIT,
             )
 
             # Reference (global) layer ordering + a concrete per-layer spec.
@@ -167,7 +177,8 @@ def _initialize_kv_caches(
             global_groups = [
                 KVCacheGroupSpec(layer_names, _specs[spec_id])
                 for layer_names, spec_id in bff_group_layout(
-                    original_layers, BFF_BALANCED_GROUPS, BFF_GROUP_SIZE, BFF_EDGE_LAYERS
+                    original_layers, BFF_BALANCED_GROUPS, BFF_GROUP_SIZE, BFF_EDGE_LAYERS,
+                    BFF_EDGE_SPLIT,
                 )
             ]
             # Attention groups first so group 0 stays the warmup group every downstream consumer
@@ -182,13 +193,20 @@ def _initialize_kv_caches(
                     for i, g in enumerate(global_groups)))
             if BFF_EDGE_LAYERS >= 1:
                 sizes = [len(g.layer_names) for g in global_groups]
-                logger.info("BFF_EDGE_LAYERS=%d: edge+middle layout, group sizes %s (group 0 = "
-                            "edges, never dedup-eligible).", BFF_EDGE_LAYERS, sizes)
-                if len(set(sizes)) > 1:
+                n_att = len(original_layers)
+                # Share of KV memory reserved but unused: every group's block is as big as the fattest.
+                bff_sizes = sizes[:1 + max(1, BFF_EDGE_SPLIT)]
+                waste = 100.0 * (1 - n_att / (max(bff_sizes) * len(bff_sizes)))
+                logger.info("BFF_EDGE_LAYERS=%d BFF_EDGE_SPLIT=%d: edge+middle layout, group sizes %s "
+                            "(group 0 = edges, never dedup-eligible; %d of %d layers shareable; "
+                            "pool waste %.1f%%).", BFF_EDGE_LAYERS, BFF_EDGE_SPLIT, sizes,
+                            n_att - len(global_groups[0].layer_names), n_att, waste)
+                if waste > 3.0:
                     logger.warning(
-                        "BFF_EDGE_LAYERS=%d gives unequal groups %s: the pool is sized by the "
-                        "fattest group, so the thinner one strands KV. Balanced needs "
-                        "4 x edge_layers == %d layers.", BFF_EDGE_LAYERS, sizes, len(original_layers))
+                        "BFF_EDGE_LAYERS=%d BFF_EDGE_SPLIT=%d gives unequal groups %s: the pool is "
+                        "sized by the fattest group, so %.1f%% of KV memory is stranded. Balanced "
+                        "needs 2 x edge_layers ~= (%d - 2 x edge_layers) / split.", BFF_EDGE_LAYERS,
+                        BFF_EDGE_SPLIT, sizes, waste, n_att)
             elif BFF_BALANCED_GROUPS >= 2 and os.environ.get("BFF_V2_DEDUP") == "1":
                 logger.warning(
                     "BFF_BALANCED_GROUPS=%d with BFF_V2_DEDUP=1: balanced groups fuse boundary "
