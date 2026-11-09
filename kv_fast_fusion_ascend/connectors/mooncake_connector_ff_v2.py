@@ -999,6 +999,21 @@ def warm_group(group_layers: dict, skip=lambda gi: False):
                  if g > 0 and group_layers[g] and not skip(g)), None)
 
 
+def warm_groups(group_layers: dict, skip=lambda gi: False) -> list:
+    """One signed group per distinct layer count: the groups whose JL matrices the warm-up builds.
+
+    The JL matrix is cached per width (pd_dedup_v2.jl_projection), so the split layout (signed
+    groups of 20, 20 and 19 layers) needs two matrices; warming only :func:`warm_group` left the
+    19-layer build (~1.9 s) to the first real request."""
+    seen, out = set(), []
+    for g in sorted(group_layers):
+        n = len(group_layers[g] or ())
+        if g > 0 and n and not skip(g) and n not in seen:
+            seen.add(n)
+            out.append(g)
+    return out
+
+
 def cache_list_device(kv_caches):
     """Device of a list of per-layer KV caches, tolerating both layouts BFF sees.
 
@@ -2298,14 +2313,16 @@ if _ASCEND_AVAILABLE:
             it on a side thread of a node that is by then busy with prefill, inside a bounded window
             — a slow first answer that costs compression for no reason. The result is discarded; only
             the cached projections in _jl/_proj are wanted."""
-            gi = warm_group(self._group_layers, self._skip_group)
-            if gi is None or not getattr(self, "num_blocks", 0):
+            gis = warm_groups(self._group_layers, self._skip_group)
+            if not gis or not getattr(self, "num_blocks", 0):
                 return
             try:
-                _t0 = time.perf_counter()
-                self.signatures_for_group(gi, [0])
-                logger.info("BFF pull-v2: signature path warmed on group %d in %.0f ms.",
-                            gi, (time.perf_counter() - _t0) * 1e3)
+                for gi in gis:
+                    _t0 = time.perf_counter()
+                    self.signatures_for_group(gi, [0])
+                    logger.info("BFF pull-v2: signature path warmed on group %d (%d layers) in "
+                                "%.0f ms.", gi, len(self._group_layers[gi]),
+                                (time.perf_counter() - _t0) * 1e3)
             except Exception as e:
                 # Never fatal: a producer that cannot warm up can still try per request, and if it
                 # cannot do that either the decode degrades to full reads.

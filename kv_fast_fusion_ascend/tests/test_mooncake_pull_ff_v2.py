@@ -82,6 +82,17 @@ def test_the_projection_is_warmed_on_a_group_that_is_really_signed():
     assert v2.warm_group({0: {"a"}}) is None, "nothing that will be signed: nothing to warm"
 
 
+def test_warm_groups_covers_every_signed_width_once():
+    """Split layout 20/20/20/19: g1 and g2 share a width, g3 needs its own matrix. Warming only g1
+    left the 19-layer build to the first real request."""
+    layers = lambda n, tag: {f"{tag}{i}" for i in range(n)}
+    split = {0: layers(20, "e"), 1: layers(20, "a"), 2: layers(20, "b"), 3: layers(19, "c")}
+    assert v2.warm_groups(split) == [1, 3]
+    assert v2.warm_groups({0: layers(40, "e"), 1: layers(39, "a")}) == [1]
+    assert v2.warm_groups(split, skip=lambda g: g == 1) == [2, 3]
+    assert v2.warm_groups({0: layers(5, "e")}) == []
+
+
 # =====================================================================================
 # cache_parts — what the materialize copy copies. Under DSA (GLM-5.1) a layer's cache is
 # (latent KV, rope key, indexer key[, indexer key scale]); AscendAttentionBackend.copy_blocks copied

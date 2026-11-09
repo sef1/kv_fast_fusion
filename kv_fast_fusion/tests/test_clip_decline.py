@@ -147,3 +147,36 @@ def test_the_per_layer_projection_refuses_a_layout_it_cannot_index():
 
 def test_the_producer_signs_per_layer_by_default():
     assert pd_dedup_v2.SIG_PROJECTION == "by_layer"
+
+
+def test_alternating_group_widths_build_each_projection_once(monkeypatch):
+    """Split layout (signed groups of 20, 20, 19 layers): the single-slot cache rebuilt the JL matrix
+    twice per request (~1.9 s host randn each), dropping the prefill from ~2,080 to ~740 tok/s."""
+    torch.manual_seed(6)
+    wide = [(torch.randn(10, 4, 1, 6), torch.randn(10, 4, 1, 6)) for _ in range(3)]
+    narrow = wide[:2]
+    holder = [None]
+    fresh_wide, _ = pd_dedup_v2.signature_matrix_by_layer(wide, [1, 2], False, [None],
+                                                          compute_dtype=torch.float32)
+    fresh_narrow, _ = pd_dedup_v2.signature_matrix_by_layer(narrow, [1, 2], False, [None],
+                                                            compute_dtype=torch.float32)
+    builds = []
+    real = torch.randn
+    monkeypatch.setattr(pd_dedup_v2.torch, "randn",
+                        lambda *a, **k: builds.append(a) or real(*a, **k))
+    for _ in range(3):   # three "requests": g1, g2 (same width), g3 (narrower)
+        for layers, fresh in ((wide, fresh_wide), (wide, fresh_wide), (narrow, fresh_narrow)):
+            s, _ = pd_dedup_v2.signature_matrix_by_layer(layers, [1, 2], False, holder,
+                                                         compute_dtype=torch.float32)
+            assert torch.equal(s, fresh), "a cached projection must sign exactly as a fresh one"
+    assert len(builds) == 2, "one build per width, none per request"
+    # The concat path shares the cache: same width, no new build.
+    pd_dedup_v2.signature_matrix(wide, [1, 2], False, holder, compute_dtype=torch.float32)
+    assert len(builds) == 2
+
+
+def test_the_projection_cache_is_bounded():
+    holder = [None]
+    for w in range(1, pd_dedup_v2.JL_CACHE_WIDTHS + 3):
+        pd_dedup_v2.jl_projection(holder, w, "cpu", torch.float32)
+    assert len(holder[0]) == pd_dedup_v2.JL_CACHE_WIDTHS

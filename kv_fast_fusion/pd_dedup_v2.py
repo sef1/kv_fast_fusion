@@ -386,6 +386,36 @@ def _check_layout(first, probe, is_mla: bool, num_blocks, scale: int) -> None:
             "and this tensor disagree")
 
 
+# At most this many JL matrices are kept per holder: one per distinct signed-group width. Today's
+# layouts have 1 (edge 20: groups 40/39, only 39 signed) or 2 (edge 10 + split 3: 20/20/20/19).
+JL_CACHE_WIDTHS = 4
+
+
+def jl_projection(jl_holder: list, width: int, device, dt) -> torch.Tensor:
+    """The fixed-seed ``[width, SIG_DIM]`` JL matrix, cached in ``jl_holder`` per (width, dtype).
+
+    Until 2026-11-09b the holder kept ONE matrix and rebuilt it on any width change. With the split
+    layout (BFF_EDGE_SPLIT=3: signed groups of 20, 20 and 19 layers) every request then rebuilt it
+    twice (20 -> 19 -> 20), ~1.9 s of host randn each, on the prefill's forward thread: the first
+    box run's prefill fell from ~2,080 to ~740 prompt tok/s. Each width now builds once. The values
+    are exactly what the single-slot cache built (same seed, same shape), so signatures are
+    unchanged and P and D still agree without negotiating."""
+    cache = jl_holder[0]
+    if not isinstance(cache, dict):
+        cache = {}
+        jl_holder[0] = cache
+    key = (int(width), dt)
+    m = cache.get(key)
+    if m is None:
+        while len(cache) >= JL_CACHE_WIDTHS:
+            cache.pop(next(iter(cache)))
+        g = torch.Generator(device="cpu")
+        g.manual_seed(20240517)
+        m = torch.randn(int(width), SIG_DIM, generator=g, dtype=torch.float32).to(device).to(dt)
+        cache[key] = m
+    return m
+
+
 def signature_matrix(kv_layers: list, block_ids: list[int], is_mla: bool, jl_holder: list,
                      num_blocks: int | None = None, compute_dtype=None, scale: int = 1):
     """Concatenate the given layers' per-block K and project to :data:`SIG_DIM`.
@@ -438,17 +468,11 @@ def signature_matrix(kv_layers: list, block_ids: list[int], is_mla: bool, jl_hol
         parts.append(blk.reshape(n, -1))
     full = torch.cat(parts, dim=1)
     # The projection is seeded in fp32 on the host (so P and D derive the same one), then cast to the
-    # compute dtype and cached at that dtype; the shape guard rebuilds only on a feature-width change,
-    # and the compute dtype is fixed for the process, so a cached projection is always the right one.
-    if (jl_holder[0] is None or jl_holder[0].shape[0] != full.shape[1]
-            or jl_holder[0].dtype != dt):
-        g = torch.Generator(device="cpu")
-        g.manual_seed(20240517)
-        jl_holder[0] = torch.randn(full.shape[1], SIG_DIM, generator=g,
-                                   dtype=torch.float32).to(full.device).to(dt)
+    # compute dtype and cached per (width, dtype); see jl_projection.
+    jl = jl_projection(jl_holder, full.shape[1], full.device, dt)
     # Heavy matmul in `dt` (cube path in bf16); upcast the small [N, SIG_DIM] result to fp32 so the
     # norm/normalize — and thus every consumer — stay bit-for-bit what the fp32 path produced.
-    sig = (full @ jl_holder[0]).float()
+    sig = (full @ jl).float()
     norms = sig.norm(dim=1).clamp(min=1e-6)
     return sig / norms.unsqueeze(1), norms
 
@@ -479,12 +503,7 @@ def signature_matrix_by_layer(kv_layers: list, block_ids: list[int], is_mla: boo
     first = key_blocks(kv_layers[0], idx, is_mla).to(dt).reshape(n, -1)
     w = first.shape[1]
     full_w = w * len(kv_layers)
-    if (jl_holder[0] is None or jl_holder[0].shape[0] != full_w or jl_holder[0].dtype != dt):
-        g = torch.Generator(device="cpu")
-        g.manual_seed(20240517)
-        jl_holder[0] = torch.randn(full_w, SIG_DIM, generator=g,
-                                   dtype=torch.float32).to(first.device).to(dt)
-    jl = jl_holder[0]
+    jl = jl_projection(jl_holder, full_w, first.device, dt)
     acc = (first @ jl[:w]).float()
     for li, kv in enumerate(kv_layers[1:], start=1):
         blk = key_blocks(kv, idx, is_mla).to(dt).reshape(n, -1)
