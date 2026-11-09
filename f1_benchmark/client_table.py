@@ -21,6 +21,7 @@ import re
 import statistics as st
 import sys
 
+from f1_benchmark import sibling_drift
 from f1_benchmark.compare_runs import _read, read_config, read_run
 from f1_benchmark.degenerate_outputs import is_garbled
 
@@ -34,6 +35,9 @@ NOTES = (
     "use dataset order.",
     "Fixed-length runs give the same number of tokens per request, so they show throughput alone. They do not "
     "measure quality.",
+    "`Sibling` counts answers that read like a near-identical sibling prompt's answer instead of their own (closer "
+    "to the sibling's baseline answer than to their own). F1 and the right-file check cannot see this. A baseline "
+    "row is each baseline repeat judged against the others: the rate at which the model does it on its own.",
 )
 
 
@@ -101,6 +105,7 @@ def read_table(table_dir: str) -> list:
         run.update(cell=os.path.basename(os.path.dirname(run_dir)), setting=setting_of(cfg),
                    folder=os.path.basename(run_dir), scenario=cfg.get("scenario", "?"))
         runs.append(run)
+    sibling_drift.mark(runs, key=lambda r: (r["cell"], r["fingerprint"], r["fixed"]))
     return runs
 
 
@@ -158,9 +163,9 @@ def unlike(inside: list) -> list:
 
 def table(runs: list) -> list:
     head = ("| Scenario | Mode | Setting | Runs | Fix | tok/s (range) | vs baseline | Running | Evictions | KV not pulled | "
-            "Freed | F1 | CodeBLEU | Valid syntax | Bad | Restarted | Right file | Tokens | Capped | TTFT p50 s | "
+            "Freed | F1 | CodeBLEU | Valid syntax | Bad | Restarted | Sibling | Right file | Tokens | Capped | TTFT p50 s | "
             "TPOT p50 ms | TPOT p99 ms | E2E p99 s |")
-    lines = [head, "|" + "---|" * 3 + "---:|" * 2 + "---|" + "---|" + "---:|" * 16]
+    lines = [head, "|" + "---|" * 3 + "---:|" * 2 + "---|" + "---|" + "---:|" * 17]
     warnings = []
     order = {"baseline": 0}
     for cell in sorted({r["cell"] for r in runs}):
@@ -180,12 +185,14 @@ def table(runs: list) -> list:
             ms = lambda k: _fmt(_mean(rows, k), ".0f")
             secs = lambda k: _fmt(_mean(rows, k) / 1000.0 if _mean(rows, k) is not None else None, ".0f")
             q = (lambda k, spec=".3f": "-" if fixed else _fmt(_mean(rows, k), spec))
+            judged = [r["sibling"] for r in rows if r.get("sibling") is not None]
+            sib = str(sum(judged)) if judged and not fixed else "-"
             lines.append(
                 f"| {rows[0]['scenario']} | {'fixed' if fixed else 'normal'} | {setting} | {len(rows)} | "
                 f"{'on' if rows[0]['fix'] else 'off'} | {rng} | {_verdict(rows, base) or '-'} | {_fmt(_mean(rows, 'running'), '.2f')} | "
                 f"{_fmt(_mean(rows, 'evictions'), '.0f')} | {_fmt(_mean(rows, 'kv_not_pulled'))}% | {_fmt(_mean(rows, 'freed'), '.0f')} | "
                 f"{q('f1')} | {q('codebleu', '.2f')} | {q('ast', '.1f')}{'' if fixed else '%'} | {bad} | "
-                f"{'-' if fixed else sum(r['restarted'] for r in rows)} | {'-' if fixed or not right[1] else f'{right[0]}/{right[1]}'} | "
+                f"{'-' if fixed else sum(r['restarted'] for r in rows)} | {sib} | {'-' if fixed or not right[1] else f'{right[0]}/{right[1]}'} | "
                 f"{_fmt(_mean(rows, 'mean_tokens'), '.0f')} | {_fmt(_mean(rows, 'capped'), '.0f')}% | {secs('ttft_p50')} | "
                 f"{ms('tpot_p50')} | {ms('tpot_p99')} | {secs('e2e_p99')} |")
     return lines, warnings
@@ -193,7 +200,7 @@ def table(runs: list) -> list:
 
 CSV_FIELDS = ("cell", "folder", "setting", "scenario", "fixed", "fix", "limit", "build", "fingerprint", "n", "completed", "tok_s",
               "req_s", "wall", "running", "max_running", "waiting", "kv", "evictions", "prefill_k", "kv_not_pulled", "freed",
-              "f1", "codebleu", "ast", "garbage", "garbled", "restarted", "right_file", "refused", "mean_tokens", "capped",
+              "f1", "codebleu", "ast", "garbage", "garbled", "restarted", "sibling", "right_file", "refused", "mean_tokens", "capped",
               "ttft_p50", "ttft_p99", "tpot_p50", "tpot_p99", "e2e_p50", "e2e_p99")
 
 
@@ -210,6 +217,10 @@ def main(argv=None) -> int:
     text = ["# BFF against baseline", ""] + lines + [""]
     if warnings:
         text += ["**Check before using:**", ""] + [f"- {w}" for w in warnings] + [""]
+    hits = [f"{r['cell']}/{sibling_drift.describe(r, h)}" for r in runs for h in r.get("sibling_hits") or []]
+    if hits:
+        text += ["**Answers that read like a sibling's (read them before quoting quality):**", ""] + \
+                [f"- {h}" for h in hits] + [""]
     text += [f"- {n}" for n in NOTES]
     print("\n".join(text))
     with open(os.path.join(argv[0], "client_table.md"), "w") as f:

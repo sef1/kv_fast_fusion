@@ -21,6 +21,7 @@ import re
 import statistics
 import sys
 
+from f1_benchmark import sibling_drift
 from f1_benchmark.degenerate_outputs import has_restart, is_garbage
 
 LOG_INTERVAL_S = 10          # vLLM's loggers.py reports throughput on this period
@@ -98,12 +99,17 @@ def read_run(run_dir: str) -> dict:
         "recompute": len(re.findall(r"BFF recompute \|", decode)),
         "running": d["running"], "max_running": d["max_running"], "waiting": d["waiting"], "kv": d["kv"],
         "freed": int(freed[-1]) if freed else 0, "build": build.group(1) if build else "-",
+        # For the sibling-content check, which needs the baseline runs too (see read_sweep).
+        "outputs": outs, "dir": run_dir, "fixed": cfg.get("THROUGHPUT_ONLY") == "1",
+        "sibling": None, "sibling_hits": [],
     }
 
 
 def read_sweep(sweep_dir: str) -> list:
     dirs = sorted(d for d in glob.glob(os.path.join(sweep_dir, "*")) if os.path.isfile(os.path.join(d, "DONE")))
-    return [read_run(d) for d in dirs]
+    runs = [read_run(d) for d in dirs]
+    sibling_drift.mark(runs)
+    return runs
 
 
 def best_of(runs: list, arm: str):
@@ -120,9 +126,23 @@ def _f(v, spec=".1f"):
     return "-" if v is None else format(v, spec)
 
 
+def _sib(r) -> str:
+    return "-" if r.get("sibling") is None else str(r["sibling"])
+
+
+def sibling_lines(runs: list) -> list:
+    """Each answer the sibling-content check flagged, to be read by a person, and what the column means."""
+    hits = [sibling_drift.describe(r, h) for r in runs for h in r.get("sibling_hits") or []]
+    if not any(r.get("sibling") is not None for r in runs):
+        return []
+    lines = ["sib: answers closer to a sibling prompt's baseline answer than to their own (a baseline run is "
+             "judged against the other baseline repeats; '-' = no baseline of the same prompts, or fixed length)."]
+    return lines + [f"  {h}" for h in hits]
+
+
 def table(runs: list) -> list:
     head = (f"{'run':28s} {'limit':>5s} {'tok/s':>6s} {'req/s':>5s} {'wall':>6s} {'TTFT':>5s} {'TPOT':>5s} "
-            f"{'F1':>6s} {'CBLEU':>6s} {'AST':>5s} {'bad':>3s} {'rst':>3s} {'prefill':>7s} {'evict':>5s} "
+            f"{'F1':>6s} {'CBLEU':>6s} {'AST':>5s} {'bad':>3s} {'rst':>3s} {'sib':>3s} {'prefill':>7s} {'evict':>5s} "
             f"{'run':>4s} {'max':>3s} {'wait':>4s} {'KV%':>4s} {'freed':>5s}  prompts/build")
     lines = [head]
     for r in runs:
@@ -130,7 +150,7 @@ def table(runs: list) -> list:
         lines.append(
             f"{r['name'][:28]:28s} {r['limit']:>5s} {_f(r['tok_s']):>6s} {_f(r['req_s'], '.2f'):>5s} "
             f"{_f(r['wall'], '.0f'):>6s} {_f(r['ttft_s'], '.0f'):>5s} {_f(r['tpot']):>5s} {_f(r['f1'], '.3f'):>6s} "
-            f"{_f(r['codebleu'], '.2f'):>6s} {_f(r['ast']):>5s} {r['garbage']:>3d} {r['restarted']:>3d} {r['prefill_k']:>6.0f}k "
+            f"{_f(r['codebleu'], '.2f'):>6s} {_f(r['ast']):>5s} {r['garbage']:>3d} {r['restarted']:>3d} {_sib(r):>3s} {r['prefill_k']:>6.0f}k "
             f"{evict:>5d} {r['running']:>4.1f} {r['max_running']:>3.0f} {r['waiting']:>4.1f} {r['kv']:>4.0f} "
             f"{r['freed']:>5d}  {r['fingerprint']} {r['build']}")
     return lines
@@ -162,6 +182,9 @@ def compare_arms(runs: list, base_limit: str, bff_limit: str, stage=None) -> lis
         lines.append(f"  {label:18s} {ma:9.2f} -> {mb:9.2f}  {pct:+6.1f}%  {'level' if abs(pct) < 0.05 else 'BFF ahead' if better else 'baseline ahead'}")
     lines.append(f"  garbage outputs    {sum(r['garbage'] for r in a)} vs {sum(r['garbage'] for r in b)}"
                  f" | BFF blocks freed per run: {statistics.mean(r['freed'] for r in b):.0f}")
+    if any(r.get("sibling") is not None for r in b):
+        sib = lambda rs: "-" if all(r.get("sibling") is None for r in rs) else str(sum(r.get("sibling") or 0 for r in rs))
+        lines.append(f"  sibling content    {sib(a)} vs {sib(b)} (answers that read like a sibling prompt's)")
     lines.append("  Noise: identical BFF runs differ by about +-2.7% in wall time and +-1 point of CodeBLEU, "
                  "so a smaller gap from a few runs is not yet a result.")
     return lines
@@ -180,6 +203,9 @@ def main(argv=None) -> int:
         print(best["limit"])
         return 0
     print("\n".join(table(runs)))
+    sib = sibling_lines(runs)
+    if sib:
+        print("\n" + "\n".join(sib))
     best_a, best_b = best_of(runs, "baseline"), best_of(runs, "bff")
     if best_a is None or best_b is None:
         return 0
