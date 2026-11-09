@@ -52,6 +52,21 @@ def test_settings_are_named_from_what_ran():
     assert ct.setting_of({"arm": "bff", "BFF_V2_MAX_REQ_DECLINE": "1"}) == "no cap"
     assert ct.setting_of({"arm": "bff", "BFF_V2_DEDUP": "0"}) == "dedup off"
     assert ct.setting_of({"arm": "bff", "BFF_V2_CLIP_FRAC": "0.7", "BFF_V2_FREE_AT_PROMOTION": "0"}) == "clip 0.7, no freeing"
+    assert ct.setting_of({"arm": "bff", "BFF_V2_MAX_REQ_DECLINE": "1", "BFF_EDGE_LAYERS": "20",
+                          "BFF_EDGE_SPLIT": "1"}) == "no cap"
+    assert ct.setting_of({"arm": "bff", "BFF_V2_MAX_REQ_DECLINE": "1", "BFF_EDGE_LAYERS": "10",
+                          "BFF_EDGE_SPLIT": "3"}) == "no cap, edge 10 split 3"
+
+
+def test_kv_not_pulled_counts_every_signed_group(tmp_path):
+    """Split layout: the saving covers g1-g3 (59 of 79 layers), not just the last group (19)."""
+    save(tmp_path, "c", "split", arm="bff")
+    run = tmp_path / "c" / "split"
+    (run / "logs_latest" / "decode-0.txt").write_text(
+        ENGINE + "BFF KV sizing | num_gpu_blocks=1503 | groups=4 [20, 20, 20, 19] | x\n")
+    (run / "console.txt").write_text("bff v2 wire saving: 8.1% of blocks\n")
+    out = ct.extras(str(run), {"arm": "bff"})
+    assert abs(out["kv_not_pulled"] - 8.1 * 59 / 79) < 1e-6
 
 
 def test_a_gain_needs_every_repeat_ahead(tmp_path):

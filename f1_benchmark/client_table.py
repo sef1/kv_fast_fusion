@@ -48,7 +48,13 @@ def setting_of(cfg: dict) -> str:
     if cfg.get("BFF_V2_DEDUP") == "0":
         return "dedup off"
     label = "no cap" if cfg.get("BFF_V2_MAX_REQ_DECLINE") == "1" else f"clip {cfg.get('BFF_V2_CLIP_FRAC', '?')}"
-    return label + (", no freeing" if cfg.get("BFF_V2_FREE_AT_PROMOTION") == "0" else "")
+    label += ", no freeing" if cfg.get("BFF_V2_FREE_AT_PROMOTION") == "0" else ""
+    # The layout is part of the setting: edge 20 (the default) and edge 10 + split 3 are different
+    # experiments and must not be averaged into one row.
+    edge, split = cfg.get("BFF_EDGE_LAYERS", "20"), cfg.get("BFF_EDGE_SPLIT", "1")
+    if edge != "20" or split != "1":
+        label += f", edge {edge}" + (f" split {split}" if split != "1" else "")
+    return label
 
 
 def extras(run_dir: str, cfg: dict) -> dict:
@@ -89,7 +95,10 @@ def extras(run_dir: str, cfg: dict) -> dict:
     layout = re.search(r"BFF KV sizing .*?groups=\d+ \[([\d, ]+)\]", decode)
     if saving and layout:
         sizes = [int(x) for x in layout.group(1).split(",")]
-        out["kv_not_pulled"] = float(saving[-1]) * sizes[-1] / sum(sizes)
+        # The saving is a share of the SIGNED blocks: every group but group 0 (the edges). Weighting
+        # by the last group alone was right only for the two-group layout [40, 39]; on edge 10 +
+        # split 3 ([20, 20, 20, 19]) it showed 1.9% where 6.0% of all KV was not pulled.
+        out["kv_not_pulled"] = float(saving[-1]) * sum(sizes[1:]) / sum(sizes)
     else:
         out["kv_not_pulled"] = 0.0
     return out
