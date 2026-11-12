@@ -49,6 +49,24 @@ def middle_layers(n_layers: int, edge_frac: float = GLM_EDGE / GLM_LAYERS) -> li
     return list(range(edge, n_layers - edge))
 
 
+def layout_groups(spec: str, n_proxy: int) -> list:
+    """The shared groups of a box layout, as proxy layers.
+
+    ``spec`` is ``both:EDGE:SPLIT`` (today's BFF_EDGE_LAYERS/BFF_EDGE_SPLIT) or ``end:EDGE:SPLIT``
+    (the same with BFF_EDGE_AT_END=1). Each shared GLM-5.1 group maps to the proxy layers at the same
+    relative depth. Returns ``[(glm_layer_count, [proxy layers])]``: the box signs and frees every
+    group on its own, so the replay must too."""
+    from kv_fast_fusion.fast_fusion_core import bff_group_layout
+    where, edge, split = spec.split(":")
+    names = list(range(GLM_LAYERS))
+    shared = bff_group_layout(names, 0, 4, int(edge), int(split), edge_at_end=where == "end")[1:]
+    out = []
+    for glm, _ in shared:
+        proxy = sorted({li * n_proxy // GLM_LAYERS for li in glm})
+        out.append((len(glm), proxy))
+    return out
+
+
 def load_prompts(args) -> tuple:
     if args.prompts:
         import json
@@ -82,11 +100,15 @@ def extract(args) -> int:
     # One signature set per BFF_EDGE_LAYERS value (GLM-5.1 counts, scaled to the proxy's depth);
     # the forward pass is shared, so extra settings cost almost nothing.
     by_edge = {e: middle_layers(len(layers), e / GLM_LAYERS) for e in args.edge_layers}
-    mids = sorted({li for m in by_edge.values() for li in m})
+    by_layout = {s: layout_groups(s, len(layers)) for s in (args.layouts or [])}
+    mids = sorted({li for m in by_edge.values() for li in m}
+                  | {li for groups in by_layout.values() for _, m in groups for li in m})
     # Nothing after the last signed layer is needed: cut the stack there.
     model.model.layers = layers[:mids[-1] + 1]
     for e, m in by_edge.items():
         print(f"proxy {args.model}: {len(layers)} layers; edge {e} (GLM) signs {m[0]}..{m[-1]} ({len(m)})")
+    for s, groups in by_layout.items():
+        print(f"layout {s}: " + ", ".join(f"{g[0]}..{g[-1]} ({n} GLM layers)" for n, g in groups))
 
     captured = {}
 
@@ -104,8 +126,12 @@ def extract(args) -> int:
     jl = [None]
     out = {"model": f"{args.model} ({name})", "layers": mids, "block": BLOCK, "tags": tags, "ids": [], "sigs": [],
            "norms": [], "by_edge": {e: {"layers": m, "sigs": [], "norms": []} for e, m in by_edge.items()},
-           "n_layers": len(layers)}
+           "n_layers": len(layers),
+           "by_layout": {s: [{"glm_layers": n, "layers": m, "sigs": [], "norms": []} for n, m in groups]
+                         for s, groups in by_layout.items()}}
     jls = {e: [None] for e in by_edge}
+    # One JL cache per signed width: groups of different layer counts must not share one.
+    jl_width = {}
     for i, prompt in enumerate(prompts):
         text = tok.apply_chat_template([{"role": "user", "content": prompt}], tokenize=False,
                                        add_generation_prompt=True)
@@ -118,6 +144,10 @@ def extract(args) -> int:
             for d in out["by_edge"].values():
                 d["sigs"].append(None)
                 d["norms"].append(None)
+            for groups in out["by_layout"].values():
+                for d in groups:
+                    d["sigs"].append(None)
+                    d["norms"].append(None)
             continue
         captured.clear()
         with torch.no_grad():
@@ -132,6 +162,12 @@ def extract(args) -> int:
             if k == 0:          # the first setting doubles as the default set
                 out["sigs"].append(sig.float().cpu())
                 out["norms"].append(norms.float().cpu())
+        for groups in out["by_layout"].values():
+            for d in groups:
+                kv = [captured[li][0, :nb * BLOCK].reshape(nb, BLOCK, -1) for li in d["layers"]]
+                sig, norms = signature_matrix(kv, list(range(nb)), True, jl_width.setdefault(len(kv), [None]))
+                d["sigs"].append(sig.float().cpu())
+                d["norms"].append(norms.float().cpu())
         if i % 20 == 0:
             print(f"  {i + 1}/{len(prompts)}: {ids.shape[1]} tokens, {nb} blocks", flush=True)
     for h in handles:
@@ -332,6 +368,21 @@ def simulate(args) -> int:
             variants = {e: {"ids": data["ids"], "sigs": d["sigs"], "norms": d["norms"], "layers": d["layers"]}
                         for e, d in data["by_edge"].items()}
         print(f"{path}: {len(data['ids'])} prompts, proxy {data['model']}")
+        if data.get("by_layout") and args.layouts_only:
+            variants = {}
+        for spec, groups in (data.get("by_layout") or {}).items():
+            print(f" layout {spec} (each shared group signed and freed on its own, as on the box)")
+            for live in args.live:
+                parts, blocks, kv = [], 0, 0.0
+                for d in groups:
+                    t = simulate_one({"ids": data["ids"], "sigs": d["sigs"], "norms": d["norms"]},
+                                     live, args.cache)
+                    blocks = t["blocks"]
+                    kv += t["dropped"] * d["glm_layers"]
+                    parts.append(f"proxy {d['layers'][0]}-{d['layers'][-1]}: {t['dropped']} "
+                                 f"({100 * t['dropped'] / max(1, t['planned']):.1f}%)")
+                print(f"  live {live:2d}: KV not pulled {100 * kv / max(1, blocks * GLM_LAYERS):.2f}% of all | "
+                      + " | ".join(parts))
         for e, v in variants.items():
             share = ""
             if e is not None:
@@ -363,6 +414,9 @@ def main(argv=None) -> int:
     e.add_argument("--device", default="cuda:0")
     e.add_argument("--edge-layers", type=int, nargs="+", default=[GLM_EDGE],
                    help="BFF_EDGE_LAYERS values to sign for, in GLM-5.1 layers (scaled to the proxy)")
+    e.add_argument("--layouts", nargs="+", default=[],
+                   help="box layouts to sign group by group: both:EDGE:SPLIT or end:EDGE:SPLIT "
+                        "(BFF_EDGE_AT_END=1), e.g. both:10:3 end:10:3")
     e.add_argument("--out", required=True)
     h = sub.add_parser("shift", help="upper bound with matches at shifted positions allowed (GPU)")
     hsrc = h.add_mutually_exclusive_group(required=True)
@@ -378,6 +432,7 @@ def main(argv=None) -> int:
     s.add_argument("--live", type=int, nargs="+", default=[8, 16, 24],
                    help="requests the decode holds at once (the box's Running)")
     s.add_argument("--cache", type=int, default=64, help="recent prompts the prefix cache still holds")
+    s.add_argument("--layouts-only", action="store_true", help="skip the single-group edge settings")
     args = ap.parse_args(argv)
     return {"extract": extract, "simulate": simulate, "shift": shift}[args.cmd](args)
 
