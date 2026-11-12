@@ -330,7 +330,8 @@ def prompt_families(prompt_ids, min_match: float = 0.8) -> list:
 
 def load_dataset_simple(dataset_path: str, split: str, input_key: str, output_key: str,
                         num_samples: int, model: str = None, min_tokens: int = 0,
-                        max_in_tokens: int = 0, group_families: bool = False):
+                        max_in_tokens: int = 0, group_families: bool = False,
+                        families_order: str = "grouped"):
     """Load dataset from Hugging Face or local JSONL file.
 
     Keeps prompts of at least ``min_tokens`` and, when ``max_in_tokens`` is above 0, at most
@@ -338,7 +339,11 @@ def load_dataset_simple(dataset_path: str, split: str, input_key: str, output_ke
 
     ``group_families`` keeps only prompts with a near-identical partner in the length range, and sends
     each family together. The prompts are unchanged, but the selection favours dedup, so any result
-    from it describes workloads with shared context and not the dataset as a whole."""
+    from it describes workloads with shared context and not the dataset as a whole.
+
+    ``families_order="dataset"`` keeps the same selection but sends it in the dataset's own order, so
+    family members arrive wherever they fall instead of together: the grouping, the most artificial
+    part of the families test, is taken out."""
     from datasets import load_dataset
 
     if dataset_path.endswith(".jsonl") or os.path.isfile(dataset_path):
@@ -381,8 +386,14 @@ def load_dataset_simple(dataset_path: str, split: str, input_key: str, output_ke
     if group_families:
         families = prompt_families(prompt_ids)
         order = [i for members in families for i in members][:num_samples]
+        if families_order == "dataset":
+            order = sorted(order)
+        elif families_order != "grouped":
+            raise ValueError(f"families_order must be 'grouped' or 'dataset', not {families_order!r}")
+        how = ("grouped so each family runs together" if families_order == "grouped"
+               else "in dataset order, families not grouped")
         print(f"  prompt families: {len(families)} families, {sum(map(len, families))} prompts in them, "
-              f"using {len(order)}, grouped so each family runs together")
+              f"using {len(order)}, {how}")
         references = {str(k): references[str(i)] for k, i in enumerate(order)}
         prompts = [prompts[i] for i in order]
     print(f"  prompt fingerprint: {prompt_fingerprint(prompts)} ({len(prompts)} prompts)")
@@ -420,6 +431,9 @@ async def main():
                         help="Skip prompts longer than this many input tokens. 0 means no limit.")
     parser.add_argument("--prompt-families", action="store_true",
                         help="Use only prompts with a near-identical partner, sent family by family.")
+    parser.add_argument("--families-order", choices=("grouped", "dataset"), default="grouped",
+                        help="With --prompt-families: send each family together (grouped) or the same "
+                             "prompts in the dataset's own order (dataset).")
     parser.add_argument("--disable-tqdm", action="store_true")
     parser.add_argument("--no-stream", dest="stream", action="store_false")
     parser.add_argument("--max-tokens", type=int, default=6000)
@@ -444,7 +458,7 @@ async def main():
     prompts, references = load_dataset_simple(
         args.dataset_path, args.hf_split, args.input_key, args.output_key, args.num_prompts,
         model=args.model, min_tokens=args.min_tokens, max_in_tokens=args.max_in_tokens,
-        group_families=args.prompt_families,
+        group_families=args.prompt_families, families_order=args.families_order,
     )
 
     # Run inference

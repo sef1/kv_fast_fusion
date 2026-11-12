@@ -62,6 +62,12 @@ case "$SCENARIO" in
        PROMPT_FAMILIES=${PROMPT_FAMILIES:-1}
        DEFAULT_LIMITS="12 16 ${MAX_CONCURRENCY}"
        USUAL_PROMPTS="2000 4096 219 1"; USUAL_FINGERPRINT=872781bc ;;
+  # The same 219 families prompts in the dataset's own order: family members are not sent together.
+  # Takes out the grouping, the most artificial part of the families test; the selection stays.
+  families_unsorted) MIN_TOKENS=${MIN_TOKENS:-2000}; MAX_IN_TOKENS=${MAX_IN_TOKENS:-4096}; MAX_TOKENS=${MAX_TOKENS:-1024}; NUM_PROMPTS=${NUM_PROMPTS:-219}
+       PROMPT_FAMILIES=${PROMPT_FAMILIES:-1}; FAMILIES_ORDER=dataset
+       DEFAULT_LIMITS="16 24 ${MAX_CONCURRENCY}"
+       USUAL_PROMPTS="2000 4096 219 1"; USUAL_FINGERPRINT=a9b0c3c7 ;;
   # LongBench-E, 2K-4K tokens, in the dataset's order: a candidate for ordinary traffic. Built once with
   # f1_benchmark/make_longbench_e.py, which already filtered the lengths, so no filter here. Its first
   # use is the BFF run's "match potential" lines, which measure the real signature match.
@@ -73,8 +79,9 @@ case "$SCENARIO" in
        fi
        DEFAULT_LIMITS="24 ${MAX_CONCURRENCY}"
        USUAL_PROMPTS="0 0 289 0"; USUAL_FINGERPRINT=aabe1d84 ;;   # the file as built 2026-11-08 (11 tasks)
-  *) echo "Unknown SCENARIO=$SCENARIO (use 121, 200, families or longbench_e)"; exit 1 ;;
+  *) echo "Unknown SCENARIO=$SCENARIO (use 121, 200, families, families_unsorted or longbench_e)"; exit 1 ;;
 esac
+FAMILIES_ORDER=${FAMILIES_ORDER:-grouped}
 MAX_IN_TOKENS=${MAX_IN_TOKENS:-0}   # upper bound on input length, 0 = none
 PROMPT_FAMILIES=${PROMPT_FAMILIES:-0}
 if [[ "$MIN_TOKENS $MAX_IN_TOKENS $NUM_PROMPTS $PROMPT_FAMILIES" != "$USUAL_PROMPTS" ]]; then USUAL_FINGERPRINT=""; fi
@@ -107,7 +114,7 @@ check_limit() {
 # 1: an evicted answer is continued instead of restarted. Confirmed on the box; see proxy_continue_answer.py.
 PROXY_CONTINUE_ANSWER=${PROXY_CONTINUE_ANSWER:-1}
 
-COMMON=(${DATASET_ARGS[@]+"${DATASET_ARGS[@]}"} MODEL="$MODEL" TP_SIZE="$TP_SIZE" MIN_TOKENS="$MIN_TOKENS" MAX_IN_TOKENS="$MAX_IN_TOKENS" PROMPT_FAMILIES="$PROMPT_FAMILIES" MAX_TOKENS="$MAX_TOKENS"
+COMMON=(${DATASET_ARGS[@]+"${DATASET_ARGS[@]}"} MODEL="$MODEL" TP_SIZE="$TP_SIZE" MIN_TOKENS="$MIN_TOKENS" MAX_IN_TOKENS="$MAX_IN_TOKENS" PROMPT_FAMILIES="$PROMPT_FAMILIES" FAMILIES_ORDER="$FAMILIES_ORDER" MAX_TOKENS="$MAX_TOKENS"
         PROXY_CONTINUE_ANSWER="$PROXY_CONTINUE_ANSWER"
         NUM_PROMPTS="$NUM_PROMPTS" MAX_CONCURRENCY="$MAX_CONCURRENCY"
         CLIENT_MAX_CONCURRENCY="${CLIENT_MAX_CONCURRENCY:-$MAX_CONCURRENCY}"
@@ -162,7 +169,7 @@ run_one() {   # run_one <folder name> <arm: baseline|bff> <decode limit> <stage:
 
 compare() { (cd "$REPO_ROOT" && PYTHONPATH="$REPO_ROOT:${PYTHONPATH:-}" python -m f1_benchmark.compare_runs "$SWEEP_DIR" "$@"); }
 
-echo "Scenario $SCENARIO: $NUM_PROMPTS prompts >= $MIN_TOKENS tokens (max $MAX_IN_TOKENS, 0 = none)$([[ "$PROMPT_FAMILIES" == "1" ]] && echo ', families only, grouped'), $MAX_TOKENS out, client $MAX_CONCURRENCY"
+echo "Scenario $SCENARIO: $NUM_PROMPTS prompts >= $MIN_TOKENS tokens (max $MAX_IN_TOKENS, 0 = none)$([[ "$PROMPT_FAMILIES" == "1" ]] && echo ", families only, $FAMILIES_ORDER order"), $MAX_TOKENS out, client $MAX_CONCURRENCY"
 
 if [[ -n "${RUNS:-}" ]]; then
   # Checked before anything runs, so a typo in the last one does not surface after the first has finished.
