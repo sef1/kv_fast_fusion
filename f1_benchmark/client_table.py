@@ -54,6 +54,8 @@ def setting_of(cfg: dict) -> str:
     edge, split = cfg.get("BFF_EDGE_LAYERS", "20"), cfg.get("BFF_EDGE_SPLIT", "1")
     if edge != "20" or split != "1":
         label += f", edge {edge}" + (f" split {split}" if split != "1" else "")
+    if cfg.get("BFF_EDGE_AT_END") == "1":
+        label += ", unshared at end"
     return label
 
 

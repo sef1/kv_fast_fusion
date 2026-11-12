@@ -128,6 +128,28 @@ def test_edge_split_groups_are_contiguous_in_forward_order_and_share_the_middle_
     assert {sid for _, sid in layout[1:]} == {0} and layout[0][1] == 1
 
 
+def test_edge_at_end_puts_every_unshared_layer_last_with_the_same_sizes():
+    """GLM-5.1, edge 10 split 3, unshared at the end: group 0 = layers 59-78, shared 0-19 / 20-39 /
+    40-58. Same sizes as today's layout, so the same pool waste."""
+    layers = _layers(79)
+    layout = bff_group_layout(layers, 0, 4, edge_layers=10, edge_split=3, edge_at_end=True)
+    assert [len(n) for n, _ in layout] == [20, 20, 20, 19]
+    assert layout[0][0] == layers[59:]
+    assert [n for names, _ in layout[1:] for n in names] == layers[:59]
+    assert [layout[i][0][0] for i in (1, 2, 3)] == ["l0", "l20", "l40"]
+    assert layout[0][1] == 1 and {sid for _, sid in layout[1:]} == {0}
+    assert sorted(_flat(layout)) == sorted(layers)
+
+
+def test_edge_at_end_off_is_todays_layout_and_clamps_the_same():
+    layers = _layers(79)
+    assert (bff_group_layout(layers, 0, 4, 10, 3, edge_at_end=False)
+            == bff_group_layout(layers, 0, 4, 10, 3))
+    edges, middle = (n for n, _ in bff_group_layout(_layers(6), 0, 4, edge_layers=99,
+                                                    edge_at_end=True))
+    assert edges == ["l2", "l3", "l4", "l5"] and middle == ["l0", "l1"]
+
+
 def test_edge_split_is_clamped_to_the_middle():
     layout = bff_group_layout(_layers(6), 0, 4, edge_layers=2, edge_split=9)
     assert [len(n) for n, _ in layout] == [4, 1, 1]

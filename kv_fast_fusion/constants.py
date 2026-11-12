@@ -60,3 +60,13 @@ BFF_EDGE_LAYERS = int(os.environ.get("BFF_EDGE_LAYERS", "0"))
 # shareable instead of 39, and each group can free its block independently. Balanced when
 # 2 * edge_layers ~= (layers - 2 * edge_layers) / split.
 BFF_EDGE_SPLIT = int(os.environ.get("BFF_EDGE_SPLIT", "1"))
+# With BFF_EDGE_LAYERS: put all 2 x BFF_EDGE_LAYERS unshared layers at the END of the model instead of
+# half at each end, so sharing starts at layer 0. Group sizes and pool waste are unchanged
+# (GLM-5.1, edge 10 split 3: unshared 59-78, shared 0-19 / 20-39 / 40-58).
+#
+# Why: matches fall with depth and are nested. On the edge 10 split 3 families run, layers 10-29 freed
+# 2477 blocks, 30-49 freed 2139 and 50-68 freed 1192, and 98-100% of a deeper group's frees were also
+# freed in every shallower group. Identical text at the same position gives near-identical KV in early
+# layers, and a divergent prefix leaks in through attention as depth grows. Layers 0-9 had never been
+# shared on GLM-5.1, so quality must be checked: their errors pass through every later layer.
+BFF_EDGE_AT_END = os.environ.get("BFF_EDGE_AT_END", "0") == "1"
