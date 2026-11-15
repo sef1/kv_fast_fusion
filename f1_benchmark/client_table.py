@@ -43,6 +43,10 @@ NOTES = (
 
 def setting_of(cfg: dict) -> str:
     """What this run really was, from its configuration."""
+    if cfg.get("PROXY_REORDER") == "1":
+        # Reordering changes both arms, so a reordered baseline is its own row too.
+        return setting_of({**cfg, "PROXY_REORDER": "0"}) + \
+            f", reorder (skip {cfg.get('PROXY_REORDER_MAX_SKIP', '?')})"
     if cfg.get("arm") != "bff":
         return "baseline"
     if cfg.get("BFF_V2_DEDUP") == "0":

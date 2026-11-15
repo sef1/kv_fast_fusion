@@ -326,6 +326,11 @@ REPO_ROOT=${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}
 VLLM_ASCEND_ROOT=${VLLM_ASCEND_ROOT:-/vllm-workspace/vllm-ascend}
 # 1: an evicted answer is continued instead of restarted. See proxy_continue_answer.py.
 PROXY_CONTINUE_ANSWER=${PROXY_CONTINUE_ANSWER:-0}
+# 1: the proxy holds requests before prefill and sends next the one sharing most with what is decoding.
+# Arm-neutral, so run the baseline with it too. Needs PROXY_CONTINUE_ANSWER=1. See bff_proxy_reorder.py.
+PROXY_REORDER=${PROXY_REORDER:-0}
+PROXY_REORDER_PREFILL_SLOTS=${PROXY_REORDER_PREFILL_SLOTS:-4}   # requests at the prefill at once
+PROXY_REORDER_MAX_SKIP=${PROXY_REORDER_MAX_SKIP:-20}            # a request passed over this often goes next
 PROXY_DIR=${PROXY_DIR:-${VLLM_ASCEND_ROOT}/examples/disaggregated_prefill_v1}
 # If the user set MOONCAKE_CONFIG_PATH, respect it; otherwise write_mooncake_config() generates one.
 MOONCAKE_CONFIG_PATH=${MOONCAKE_CONFIG_PATH:-}
@@ -761,8 +766,12 @@ launch_proxy() {
       echo "PROXY_CONTINUE_ANSWER=1 supports the pull proxy only, not the layerwise one."; exit 1
     fi
     proxy_cmd=(python "${SCRIPT_DIR}/proxy_continue_answer.py" "$proxy_script")
+  elif [[ "$PROXY_REORDER" == "1" ]]; then
+    echo "PROXY_REORDER=1 needs PROXY_CONTINUE_ANSWER=1 (it is installed by proxy_continue_answer.py)."; exit 1
   fi
-  nohup "${proxy_cmd[@]}" \
+  nohup env PROXY_REORDER="$PROXY_REORDER" PROXY_REORDER_PREFILL_SLOTS="$PROXY_REORDER_PREFILL_SLOTS" \
+    PROXY_REORDER_MAX_SKIP="$PROXY_REORDER_MAX_SKIP" PROXY_REORDER_TOKENIZER="${PROXY_REORDER_TOKENIZER:-$MODEL}" \
+    "${proxy_cmd[@]}" \
     --prefiller-hosts ${prefill_hosts} \
     --prefiller-ports ${prefill_ports} \
     --decoder-hosts ${VLLM_HOST_IP} \

@@ -18,6 +18,7 @@ expected line is missing this stops with an error instead of running an unpatche
     python proxy_continue_answer.py STOCK_PROXY.py [proxy args...]
 """
 
+import os
 import sys
 
 EDITS = [
@@ -76,9 +77,20 @@ EDITS = [
 ]
 
 
-def patched(source: str) -> str:
+# PROXY_REORDER=1: wrap the prefill call and the decode stream with bff_proxy_reorder before the server starts.
+REORDER_EDIT = (
+    'if __name__ == "__main__":\n',
+    'import bff_proxy_reorder as _bff_reorder\n'
+    '_handle_select_instance, stream_service_response_with_retry = _bff_reorder.install(\n'
+    '    _handle_select_instance, stream_service_response_with_retry)\n'
+    '\n'
+    'if __name__ == "__main__":\n',
+)
+
+
+def patched(source: str, reorder: bool = False) -> str:
     """The proxy's source with every edit applied. Raises if any anchor is not there exactly once."""
-    for old, new in EDITS:
+    for old, new in EDITS + ([REORDER_EDIT] if reorder else []):
         found = source.count(old)
         if found != 1:
             raise SystemExit(f"proxy_continue_answer: expected this line once, found {found}. The installed "
@@ -91,8 +103,11 @@ def main() -> None:
     if len(sys.argv) < 2:
         raise SystemExit(__doc__)
     path = sys.argv[1]
+    reorder = os.environ.get("PROXY_REORDER", "0") == "1"
+    if reorder:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     with open(path, encoding="utf-8") as f:
-        code = compile(patched(f.read()), path, "exec")
+        code = compile(patched(f.read(), reorder), path, "exec")
     sys.argv = [path] + sys.argv[2:]
     print("BFF proxy: evicted answers are continued, not restarted", flush=True)
     exec(code, {"__name__": "__main__", "__file__": path})
