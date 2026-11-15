@@ -331,7 +331,7 @@ def prompt_families(prompt_ids, min_match: float = 0.8) -> list:
 def load_dataset_simple(dataset_path: str, split: str, input_key: str, output_key: str,
                         num_samples: int, model: str = None, min_tokens: int = 0,
                         max_in_tokens: int = 0, group_families: bool = False,
-                        families_order: str = "grouped"):
+                        families_order: str = "grouped", mix_short: int = 0):
     """Load dataset from Hugging Face or local JSONL file.
 
     Keeps prompts of at least ``min_tokens`` and, when ``max_in_tokens`` is above 0, at most
@@ -343,7 +343,12 @@ def load_dataset_simple(dataset_path: str, split: str, input_key: str, output_ke
 
     ``families_order="dataset"`` keeps the same selection but sends it in the dataset's own order, so
     family members arrive wherever they fall instead of together: the grouping, the most artificial
-    part of the families test, is taken out."""
+    part of the families test, is taken out.
+
+    ``mix_short=N`` adds N ordinary short requests per family prompt: prompts under ``min_tokens``
+    (the ones the filter drops), taken evenly across the dataset. Grouped order puts N of them after
+    each family prompt, like other users' traffic arriving while an orchestrator fans out; dataset
+    order sorts everything by dataset position."""
     from datasets import load_dataset
 
     if dataset_path.endswith(".jsonl") or os.path.isfile(dataset_path):
@@ -360,8 +365,10 @@ def load_dataset_simple(dataset_path: str, split: str, input_key: str, output_ke
     references = {}
     n_skipped = 0
     prompt_ids = []
+    dataset_index = []    # each kept prompt's position in the dataset
+    short_pool = []       # (dataset position, prompt, reference) of prompts under min_tokens, for mix_short
 
-    for item in dataset:
+    for ds_i, item in enumerate(dataset):
         # A family's members can be far apart, so grouping has to see the whole range first.
         if len(prompts) >= num_samples and not group_families:
             break
@@ -372,12 +379,15 @@ def load_dataset_simple(dataset_path: str, split: str, input_key: str, output_ke
             n_tok = len(tokenizer(prompt, add_special_tokens=False).input_ids)
             if n_tok < min_tokens or (max_in_tokens > 0 and n_tok > max_in_tokens):
                 n_skipped += 1
+                if mix_short and 0 < n_tok < min_tokens:
+                    short_pool.append((ds_i, prompt, reference))
                 continue
             if group_families:
                 prompt_ids.append(tokenizer(prompt, add_special_tokens=False).input_ids)
 
         references[str(len(prompts))] = reference
         prompts.append(prompt)
+        dataset_index.append(ds_i)
 
     if tokenizer is not None:
         upper = f" and <= {max_in_tokens}" if max_in_tokens > 0 else ""
@@ -394,8 +404,24 @@ def load_dataset_simple(dataset_path: str, split: str, input_key: str, output_ke
                else "in dataset order, families not grouped")
         print(f"  prompt families: {len(families)} families, {sum(map(len, families))} prompts in them, "
               f"using {len(order)}, {how}")
-        references = {str(k): references[str(i)] for k, i in enumerate(order)}
-        prompts = [prompts[i] for i in order]
+        items = [(dataset_index[i], prompts[i], references[str(i)]) for i in order]
+        if mix_short:
+            n = mix_short * len(items)
+            if len(short_pool) < n:
+                raise ValueError(f"mix_short={mix_short} needs {n} short prompts, found {len(short_pool)}")
+            short = short_pool[::len(short_pool) // n][:n]
+            if families_order == "grouped":
+                mixed = []
+                for k, it in enumerate(items):
+                    mixed.append(it)
+                    mixed += short[k * mix_short:(k + 1) * mix_short]
+                items = mixed
+            else:
+                items = sorted(items + short, key=lambda it: it[0])
+            print(f"  mixed in {n} short requests (< {min_tokens} tokens, {mix_short} per family prompt): "
+                  f"{len(items)} requests")
+        prompts = [it[1] for it in items]
+        references = {str(k): it[2] for k, it in enumerate(items)}
     print(f"  prompt fingerprint: {prompt_fingerprint(prompts)} ({len(prompts)} prompts)")
 
     return prompts, references
@@ -434,6 +460,9 @@ async def main():
     parser.add_argument("--families-order", choices=("grouped", "dataset"), default="grouped",
                         help="With --prompt-families: send each family together (grouped) or the same "
                              "prompts in the dataset's own order (dataset).")
+    parser.add_argument("--families-mix-short", type=int, default=0,
+                        help="With --prompt-families: add this many short ordinary requests (under "
+                             "--min-tokens) per family prompt.")
     parser.add_argument("--disable-tqdm", action="store_true")
     parser.add_argument("--no-stream", dest="stream", action="store_false")
     parser.add_argument("--max-tokens", type=int, default=6000)
@@ -459,6 +488,7 @@ async def main():
         args.dataset_path, args.hf_split, args.input_key, args.output_key, args.num_prompts,
         model=args.model, min_tokens=args.min_tokens, max_in_tokens=args.max_in_tokens,
         group_families=args.prompt_families, families_order=args.families_order,
+        mix_short=args.families_mix_short,
     )
 
     # Run inference
