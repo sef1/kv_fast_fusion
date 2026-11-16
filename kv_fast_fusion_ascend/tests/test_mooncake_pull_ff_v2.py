@@ -27,6 +27,15 @@ import pytest
 from kv_fast_fusion_ascend.connectors import mooncake_connector_ff_v2 as v2
 
 
+@pytest.fixture(autouse=True)
+def _share_last_block(monkeypatch):
+    """These tests are about the transport (in-place declines, round trips, block-table writes) on
+    requests of one to three blocks, where the duplicate is often the last block. Whether a last block
+    may be shared at all is pd_dedup_v2.SHARE_LAST_BLOCK's question, tested in test_last_block_kept."""
+    from kv_fast_fusion import pd_dedup_v2 as _d
+    monkeypatch.setattr(_d, "SHARE_LAST_BLOCK", True)
+
+
 def _v2_source() -> str:
     """The connector plus its diagnostics module, for the source checks below.
 

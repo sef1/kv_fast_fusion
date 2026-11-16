@@ -105,6 +105,21 @@ FAIL_REASONS = ("owner_never_batched", "rep_not_resident", "victim_not_in_table"
 # correctness bug. Set to 0 to reproduce the old behaviour — the counter still fires either way.
 PROTECT_HOT_BLOCKS = os.environ.get("BFF_V2_PROTECT_HOT_BLOCKS", "1") == "1"
 
+# Never plan a request's LAST block in a group: it is always read from the producer, and never offered
+# to later requests as a representative.
+#
+# The last block is almost always partly filled. The producer signs all 128 slots, and the slots past
+# the prompt still hold whatever the block's previous tenant left there, so the signature describes
+# that tenant as much as this prompt. Under landing-time materialize a match is then COPIED into the
+# block, real prompt slots included, and the swap guard (`victim_hot`) only stops the later pointer
+# share, not that copy. Box, 2026-11-15 (mixed runs, short prompts under one block): every short request
+# whose block was declined, 8 of 8, answered someone else's prompt from the first token
+# ("Because11DocumentQuery query DocumentDocument..."); none whose block was read did. Long prompts lose
+# their tail, which holds the instructions (9-31 copied last blocks per run, families included).
+#
+# The cost is one block per request and group out of thousands. Set to 1 to reproduce the old behaviour.
+SHARE_LAST_BLOCK = os.environ.get("BFF_V2_SHARE_LAST_BLOCK", "0") == "1"
+
 # Variant A (see plan Update 4). When set, an alias is realised by COPYING the representative's KV
 # into the request's OWN physical block, instead of redirecting the block-table slot at the shared
 # representative and freeing the orphan. Wire saving is identical (the victim block was still not
@@ -731,6 +746,8 @@ class DedupStats:
         self.match_potential: dict[int, dict[str, int]] = {}
         self.match_potential_none: dict[int, int] = {}
         self.requests_clipped = 0
+        # Last blocks read in full rather than planned (SHARE_LAST_BLOCK off).
+        self.last_block_kept = 0
         self.clip_aliases_kept = 0
         self.clip_aliases_dropped = 0
         # BFF_STEP_PROFILE=1 only (None otherwise, so a run without it reports nothing): what the
@@ -902,6 +919,8 @@ class DedupStats:
                                          "no_candidate": self.match_potential_none.get(g, 0)}
                                 for g, c in sorted(self.match_potential.items())},
             "requests_clipped": self.requests_clipped,
+            "last_block_kept": self.last_block_kept,
+            "last_block_shared": SHARE_LAST_BLOCK,
             "clip_aliases_kept": self.clip_aliases_kept,
             "clip_aliases_dropped": self.clip_aliases_dropped,
             "clip_ms_total": None if self.clip_ms is None else round(self.clip_ms, 2),
@@ -1105,6 +1124,12 @@ class DedupEngine:
                 norms.extend(nrm)
                 hashes.extend(hsh)
                 for slot, bid in enumerate(ids):
+                    if not SHARE_LAST_BLOCK and slot == len(ids) - 1:
+                        # Read in full and kept out of the index: see SHARE_LAST_BLOCK. Its row is
+                        # still consumed, so the rows after it stay paired with their slots.
+                        self.stats.last_block_kept += 1
+                        row += 1
+                        continue
                     if pk is not None:
                         kvn_rows[row] = (pk[0][slot], pk[1][slot])
                     incoming.append(IncomingBlock(rid, gi, slot, int(bid), row))

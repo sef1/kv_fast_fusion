@@ -123,7 +123,9 @@ def test_a_plan_records_every_block_in_the_potential_grid(planned, monkeypatch):
     monkeypatch.setattr(pd_dedup_v2, "threshold_for", lambda gi: 0.75)
     engine, _ids = planned
     pot = engine.stats.match_potential[1]
-    assert sum(pot.values()) + engine.stats.match_potential_none.get(1, 0) == 4
+    # Every planned block: rB has 4, and its last is read without planning (SHARE_LAST_BLOCK off).
+    assert sum(pot.values()) + engine.stats.match_potential_none.get(1, 0) == 3
+    assert engine.stats.last_block_kept == 1
     assert engine.stats.stats_dict()["match_potential"]["1"]["cells"] == dict(sorted(pot.items()))
 
 

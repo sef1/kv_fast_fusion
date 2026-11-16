@@ -316,6 +316,8 @@ def test_a_pull_plans_declines_and_lands_a_scaled_alias(monkeypatch):
     recording the ratio — and every one of them degrades to a correct-but-unscaled substitution,
     which no counter reports and only accuracy would reveal."""
     monkeypatch.setattr(pd_dedup_v2, "SCALE_MODE", "ratio")
+    # One-block requests keep the chain short; the last-block rule has its own tests.
+    monkeypatch.setattr(pd_dedup_v2, "SHARE_LAST_BLOCK", True)
     engine = pd_dedup_v2.DedupEngine()
 
     # Two blocks of one 2-layer group, same direction, victim 2x the representative's magnitude.
@@ -355,6 +357,8 @@ def test_a_raw_producer_costs_the_alias_rather_than_the_scale(monkeypatch):
     """Same chain, but the representative was registered without norms. Ratio mode must decline —
     substituting here would be a raw-mode merge inside a run reporting itself as ratio."""
     monkeypatch.setattr(pd_dedup_v2, "SCALE_MODE", "ratio")
+    # One-block requests keep the chain short; the last-block rule has its own tests.
+    monkeypatch.setattr(pd_dedup_v2, "SHARE_LAST_BLOCK", True)
     engine = pd_dedup_v2.DedupEngine()
 
     direction = torch.tensor([[1.0, 0.0, 0.5, 0.25]])
