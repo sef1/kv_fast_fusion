@@ -114,14 +114,24 @@ def install(handle_select_instance, stream_service_response_with_retry, *, token
                         int(os.environ.get("PROXY_REORDER_MAX_SKIP", "20")),
                         log=lambda m: print(m, flush=True))
     known = {}      # id(req_data) -> (req_data, keys); req_data kept alive so its id is not reused
-    print(f"BFF proxy: prefill reordering on (slots={gate.slots}, max_skip={gate.max_skip}, tokenizer={path})",
-          flush=True)
 
     def tokens(req_data):
+        # Render the template to text, then tokenize: apply_chat_template(tokenize=True) returns a list in
+        # transformers 4 but a BatchEncoding in 5, whose len() is its 2 keys (every request had 0 blocks).
         if "messages" in req_data:
             kw = req_data.get("chat_template_kwargs") or {}
-            return tok.apply_chat_template(req_data["messages"], tokenize=True, add_generation_prompt=True, **kw)
-        return tok(req_data.get("prompt") or "", add_special_tokens=False).input_ids
+            text = tok.apply_chat_template(req_data["messages"], tokenize=False, add_generation_prompt=True, **kw)
+        else:
+            text = req_data.get("prompt") or ""
+        return list(tok(text, add_special_tokens=False)["input_ids"])
+
+    # Refuse to run blind: a long prompt must give blocks, or every score would be 0 and the order FIFO.
+    probe = block_keys(tokens({"messages": [{"role": "user", "content": "check " * 600}]}))
+    if len(probe) < 2:
+        raise SystemExit(f"bff_proxy_reorder: a 600-word prompt gave {len(probe)} blocks with tokenizer {path}; "
+                         "reordering would see nothing, so the proxy was not started.")
+    print(f"BFF proxy: prefill reordering on (slots={gate.slots}, max_skip={gate.max_skip}, tokenizer={path}, "
+          f"probe {len(probe)} blocks)", flush=True)
 
     # Presence is counted: every select adds the request's blocks once (at release, or on a retry), and every
     # decode stream that ends removes them once. The stock proxy breaks out of a stream on an eviction and

@@ -100,15 +100,14 @@ def test_a_request_passed_over_max_skip_times_goes_next_whatever_matches():
 
 
 class FakeTok:
-    """Token ids are the words of the message; enough to give blocks real positions."""
+    """One token per word. Like the real one: the template renders text, calling it returns a mapping."""
 
     def apply_chat_template(self, messages, tokenize, add_generation_prompt, **kw):
-        return [hash(w) % 50000 for w in " ".join(m["content"] for m in messages).split()]
+        assert tokenize is False
+        return " ".join(m["content"] for m in messages)
 
     def __call__(self, text, add_special_tokens=False):
-        class R:
-            input_ids = [hash(w) % 50000 for w in text.split()]
-        return R()
+        return {"input_ids": [hash(w) % 50000 for w in text.split()]}
 
 
 def body(words):
@@ -173,6 +172,63 @@ def test_a_failed_prefill_does_not_leave_its_blocks_present():
     run(go())
 
 
+class EmptyTok(FakeTok):
+    def __call__(self, text, add_special_tokens=False):
+        return {"input_ids": []}
+
+
+def test_a_tokenizer_that_finds_no_blocks_stops_the_proxy_instead_of_running_fifo():
+    async def nop(*a, **k):
+        return None
+
+    with pytest.raises(SystemExit, match="gave 0 blocks"):
+        pr.install(nop, nop, tokenizer=EmptyTok(), gate=pr.Gate(log=lambda m: None))
+
+
+GLM = sorted(glob.glob(os.path.expanduser("~/.cache/huggingface/hub/models--zai-org--GLM-5.1/snapshots/*")))
+
+
+@pytest.mark.skipif(not GLM, reason="no cached GLM-5.1 tokenizer")
+def test_with_the_real_glm_tokenizer_a_sibling_prompt_scores_its_shared_blocks():
+    """The box bug: transformers 5 returns a BatchEncoding from apply_chat_template(tokenize=True), so every
+    request had 0 blocks and every score was 0. Two prompts of one project, different file named early."""
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(GLM[-1])
+    project = " ".join(f"line {i}: the service stores user profiles and sessions in table t{i}." for i in range(150))
+
+    async def go():
+        g = pr.Gate(slots=1, log=lambda m: None)
+        released = asyncio.Event()
+
+        async def select(api, req_data, n):
+            await released.wait()
+
+        async def stream(client, api, req_data, **kw):
+            yield b""
+
+        sel, _ = pr.install(select, stream, tokenizer=tok, gate=g)
+        a = {"messages": [{"role": "user", "content": "## Code: models.py\n" + project}]}
+        other = {"messages": [{"role": "user", "content": " ".join(f"unrelated {i} text" for i in range(600))}]}
+        b = {"messages": [{"role": "user", "content": "## Code: forms.py\n" + project}]}
+        ta = asyncio.create_task(sel("/v1", a, 0))
+        await asyncio.sleep(0.3)
+        to = asyncio.create_task(sel("/v1", other, 0))
+        await asyncio.sleep(0.3)
+        tb = asyncio.create_task(sel("/v1", b, 0))
+        await asyncio.sleep(0.3)
+        assert len(g.waiting) == 2
+        scores = sorted(g._score(e["keys"]) for e in g.waiting)
+        assert scores[0] == 0 and scores[1] >= 5, f"the sibling shares most of its blocks: {scores}"
+        best, score = g._pick()
+        assert best["keys"] == pr.block_keys(list(tok(tok.apply_chat_template(
+            b["messages"], tokenize=False, add_generation_prompt=True), add_special_tokens=False)["input_ids"]))
+        released.set()
+        g.waiting.clear()
+        for t in (ta, to, tb):
+            t.cancel()
+    run(go())
+
+
 # ------------------------------------------------------------------------------ the real stock proxy
 TOK = sorted(glob.glob(os.path.expanduser("~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/*")))
 
@@ -195,7 +251,7 @@ def test_the_stock_proxy_runs_with_reordering_and_still_continues_evicted_answer
         port = start(backend)
         assert t._ask(port) == "aaa bbb"
         log = (tmp_path / "proxy.txt").read_text()
-        assert "prefill reordering on" in log
+        assert "prefill reordering on" in log and "probe" in log
         assert log.count("BFF proxy reorder | released") == 1, "the evicted request is not held a second time"
         assert len(backend.prefill_bodies) == 2, "the evicted request went back to prefill once"
         assert backend.prefill_bodies[1]["messages"][-1] == {"role": "assistant", "content": "aaa "}
