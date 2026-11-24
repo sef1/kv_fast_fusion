@@ -359,6 +359,65 @@ def patched_maybe_evict_cached_block(self, block) -> bool:
     return _ORIG_MAYBE_EVICT(self, block)
 
 
+def install_hold_hits_across_groups(coordinator_cls) -> bool:
+    """Claim EVERY group's prefix hits before any group takes new blocks. Returns True if it wrapped.
+
+    vLLM 0.18.0 (and up to 0.22 at least; fixed upstream as issue #33775) does this one group at a time:
+    ``for manager in single_type_managers: touch(its hits); get_new_blocks(external)``. A hit block nobody
+    holds sits in the free queue until touched, so an earlier group's ``get_new_blocks`` can pop a LATER
+    group's hit. Its hash is then reset, the later group touches it anyway, and one physical block sits in
+    two groups' tables of the same request: both write it, the pull sees it as unhashed, and that group's
+    tail-align is off. One group cannot do this, so the stock baseline never does; BFF's split can.
+
+    Needs prefix hits AND an external load AND a nearly empty free queue, i.e. a request resumed after an
+    eviction, whose own freed blocks are both its hits and the head of the queue. Box, 2026-11-16
+    (mixed_grouped_fix/end): 10 blocks in 2 resumes of one prompt, g3 positions 3-11 being g0-g2's new
+    blocks in reverse order; the answer was garbage from the resume on. 1 of 67 decode logs.
+
+    Holding is a plain extra reference around the original call, so it changes nothing when no group
+    would have stolen a block. The capacity check already counts these hits as needed."""
+    orig = getattr(coordinator_cls, "allocate_new_computed_blocks", None)
+    if orig is None or getattr(orig, "_bff_holds_hits", False):
+        return False
+    if _is_two_phase(coordinator_cls):
+        return False
+
+    def allocate_new_computed_blocks(self, request_id, new_computed_blocks, *args, **kwargs):
+        held = []
+        if len(getattr(self, "single_type_managers", ())) > 1:
+            held = [b for row in new_computed_blocks for b in row if not b.is_null]
+        if not held:
+            return orig(self, request_id, new_computed_blocks, *args, **kwargs)
+        pool = self.block_pool
+        pool.touch(held)
+        try:
+            return orig(self, request_id, new_computed_blocks, *args, **kwargs)
+        finally:
+            # The call took its own references. Drop ours without a free while another remains.
+            last = []
+            for b in held:
+                if b.ref_cnt > 1:
+                    b.ref_cnt -= 1
+                else:
+                    last.append(b)
+            if last:
+                pool.free_blocks(last)
+
+    allocate_new_computed_blocks._bff_holds_hits = True
+    coordinator_cls.allocate_new_computed_blocks = allocate_new_computed_blocks
+    return True
+
+
+def _is_two_phase(coordinator_cls) -> bool:
+    """Does this vLLM already claim all hits first (``add_local_computed_blocks``, issue #33775)?"""
+    import inspect
+    try:
+        return "add_local_computed_blocks" in inspect.getsource(
+            coordinator_cls.allocate_new_computed_blocks)
+    except (OSError, TypeError):
+        return False
+
+
 def patched_free_blocks(self, ordered_blocks):
     """Free a list of blocks with deduplication by block_id."""
     # `self` IS the BlockPool here — capture it so the recv thread can read KV usage for the dedup

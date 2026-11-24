@@ -151,6 +151,12 @@ def apply_fast_fusion_pd_patch():
     # --- 4. Dedup-before-decrement free (LSH evict is guarded → no-op here) ---
     BlockPool.free_blocks = patched_free_blocks
 
+    # Multi-group only: no group may take another group's unclaimed prefix hit as a new block.
+    from vllm.v1.core.kv_cache_coordinator import KVCacheCoordinator
+    from kv_fast_fusion.fast_fusion_block_pool import install_hold_hits_across_groups
+    logger.info("Fast fusion: hold prefix hits across groups %s.",
+                "installed" if install_hold_hits_across_groups(KVCacheCoordinator) else "not needed")
+
     # ROUND 39: wrap _maybe_evict_cached_block so a recycled/evicted block drops any
     # lever-3 fusion aliases pointing at it (staleness guard). Idempotent.
     import kv_fast_fusion.fast_fusion_block_pool as _ffbp2

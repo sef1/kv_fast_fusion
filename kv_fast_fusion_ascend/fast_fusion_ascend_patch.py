@@ -832,6 +832,11 @@ def apply_fast_fusion_ascend_patch() -> None:
     from vllm.v1.core.kv_cache_manager import KVCacheManager
     import kv_fast_fusion.fast_fusion_block_pool as _ffbp
     BlockPool.free_blocks = _ffbp.patched_free_blocks
+    # Multi-group only: no group may take another group's unclaimed prefix hit as a new block.
+    from vllm.v1.core.kv_cache_coordinator import KVCacheCoordinator
+    logger.info("BFF Ascend: hold prefix hits across groups %s.",
+                "installed" if _ffbp.install_hold_hits_across_groups(KVCacheCoordinator)
+                else "not needed")
     if _ffbp._ORIG_MAYBE_EVICT is None:
         _ffbp._ORIG_MAYBE_EVICT = BlockPool._maybe_evict_cached_block
         BlockPool._maybe_evict_cached_block = _ffbp.patched_maybe_evict_cached_block

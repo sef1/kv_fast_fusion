@@ -112,10 +112,11 @@ PROTECT_HOT_BLOCKS = os.environ.get("BFF_V2_PROTECT_HOT_BLOCKS", "1") == "1"
 # the prompt still hold whatever the block's previous tenant left there, so the signature describes
 # that tenant as much as this prompt. Under landing-time materialize a match is then COPIED into the
 # block, real prompt slots included, and the swap guard (`victim_hot`) only stops the later pointer
-# share, not that copy. Box, 2026-11-15 (mixed runs, short prompts under one block): every short request
-# whose block was declined, 8 of 8, answered someone else's prompt from the first token
-# ("Because11DocumentQuery query DocumentDocument..."); none whose block was read did. Long prompts lose
-# their tail, which holds the instructions (9-31 copied last blocks per run, families included).
+# share, not that copy. Box, 2026-11-15 (mixed runs, short prompts under one block): all 8 answers
+# whose first attempt had its block declined were damaged ("Because11DocumentQuery query ...").
+# Of 516 whose first attempt was read, 1 was flagged: it had been evicted, and its resume (a new
+# ledger id) is probably the declined one. With the fix: 0 declined, all 304 short answers open
+# normally (2 runs). Long prompts' tails were copied too (9-31 last blocks per run).
 #
 # The cost is one block per request and group out of thousands. Set to 1 to reproduce the old behaviour.
 SHARE_LAST_BLOCK = os.environ.get("BFF_V2_SHARE_LAST_BLOCK", "0") == "1"
