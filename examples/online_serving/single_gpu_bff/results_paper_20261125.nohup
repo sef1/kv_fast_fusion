@@ -1,0 +1,78 @@
+15:47:01 suite paper_20261125: 41 jobs, gpus [1, 2, 3, 4, 5, 6, 7], root /data/users/sefi/from_git/vllm_013/vllm_ff/examples/online_serving/single_gpu_bff/results/paper_20261125
+15:47:01 start repeats/rep1_vanilla_c128 gpu1 (40 queued)
+15:47:21 start repeats/rep1_online085_c128 gpu2 (39 queued)
+15:47:41 start repeats/rep1_online080_c128 gpu3 (38 queued)
+15:48:01 start repeats/rep2_vanilla_c128 gpu4 (37 queued)
+15:48:21 start repeats/rep2_online085_c128 gpu5 (36 queued)
+15:48:42 start repeats/rep2_online080_c128 gpu6 (35 queued)
+15:53:48 done  repeats/rep1_vanilla_c128 gpu1 6.8min
+15:53:49 start repeats/rep3_vanilla_c128 gpu1 (34 queued)
+15:54:24 done  repeats/rep1_online085_c128 gpu2 7.0min
+15:54:24 done  repeats/rep1_online080_c128 gpu3 6.7min
+15:54:24 start repeats/rep3_online085_c128 gpu2 (33 queued)
+15:54:44 start repeats/rep3_online080_c128 gpu3 (32 queued)
+15:55:19 done  repeats/rep2_vanilla_c128 gpu4 7.3min
+15:55:19 done  repeats/rep2_online085_c128 gpu5 7.0min
+15:55:19 done  repeats/rep2_online080_c128 gpu6 6.6min
+15:55:19 start conc_sweep/sweep_vanilla_c64 gpu4 (31 queued)
+15:55:39 start conc_sweep/sweep_fuse0_c64 gpu5 (30 queued)
+15:55:59 start conc_sweep/sweep_fuse1_c64 gpu6 (29 queued)
+16:00:36 done  repeats/rep3_vanilla_c128 gpu1 6.8min
+16:00:36 start conc_sweep/sweep_online085_c64 gpu1 (28 queued)
+16:01:11 done  repeats/rep3_online085_c128 gpu2 6.8min
+16:01:11 done  repeats/rep3_online080_c128 gpu3 6.5min
+16:01:11 start conc_sweep/sweep_online080_c64 gpu2 (27 queued)
+16:01:31 start conc_sweep/sweep_vanilla_c96 gpu3 (26 queued)
+16:07:24 done  conc_sweep/sweep_vanilla_c64 gpu4 12.1min
+16:07:24 start conc_sweep/sweep_fuse0_c96 gpu4 (25 queued)
+16:08:14 done  conc_sweep/sweep_fuse0_c64 gpu5 12.6min
+16:08:14 done  conc_sweep/sweep_fuse1_c64 gpu6 12.2min
+16:08:14 start conc_sweep/sweep_fuse1_c96 gpu5 (24 queued)
+16:08:34 start conc_sweep/sweep_online085_c96 gpu6 (23 queued)
+16:12:11 done  conc_sweep/sweep_online085_c64 gpu1 11.6min
+16:12:11 start conc_sweep/sweep_online080_c96 gpu1 (22 queued)
+16:12:46 done  conc_sweep/sweep_online080_c64 gpu2 11.6min
+16:12:46 start conc_sweep/sweep_vanilla_c128 gpu2 (21 queued)
+16:13:51 done  conc_sweep/sweep_vanilla_c96 gpu3 12.3min
+16:13:51 start conc_sweep/sweep_fuse0_c128 gpu3 (20 queued)
+16:19:59 done  conc_sweep/sweep_fuse0_c96 gpu4 12.6min
+16:19:59 start conc_sweep/sweep_fuse1_c128 gpu4 (19 queued)
+16:20:34 done  conc_sweep/sweep_fuse1_c96 gpu5 12.3min
+16:20:34 done  conc_sweep/sweep_online085_c96 gpu6 12.0min
+16:20:34 start conc_sweep/sweep_online085_c128 gpu5 (18 queued)
+16:20:54 start conc_sweep/sweep_online080_c128 gpu6 (17 queued)
+16:23:30 done  conc_sweep/sweep_online080_c96 gpu1 11.3min
+16:23:30 start conc_sweep/sweep_vanilla_c160 gpu1 (16 queued)
+16:24:51 done  conc_sweep/sweep_vanilla_c128 gpu2 12.1min
+16:24:51 start conc_sweep/sweep_fuse0_c160 gpu2 (15 queued)
+16:26:26 done  conc_sweep/sweep_fuse0_c128 gpu3 12.6min
+16:26:26 start conc_sweep/sweep_fuse1_c160 gpu3 (14 queued)
+16:32:19 done  conc_sweep/sweep_fuse1_c128 gpu4 12.3min
+16:32:19 done  conc_sweep/sweep_online085_c128 gpu5 11.7min
+16:32:19 done  conc_sweep/sweep_online080_c128 gpu6 11.4min
+16:32:19 start conc_sweep/sweep_online085_c160 gpu4 (13 queued)
+16:32:39 start conc_sweep/sweep_online080_c160 gpu5 (12 queued)
+16:32:59 start conc_sweep/sweep_vanilla_c224 gpu6 (11 queued)
+16:35:50 done  conc_sweep/sweep_vanilla_c160 gpu1 12.3min
+16:35:50 start conc_sweep/sweep_fuse0_c224 gpu1 (10 queued)
+16:37:26 done  conc_sweep/sweep_fuse0_c160 gpu2 12.6min
+16:37:26 start conc_sweep/sweep_fuse1_c224 gpu2 (9 queued)
+16:38:46 done  conc_sweep/sweep_fuse1_c160 gpu3 12.3min
+16:38:46 start conc_sweep/sweep_online085_c224 gpu3 (8 queued)
+16:43:53 done  conc_sweep/sweep_online080_c160 gpu5 11.2min
+16:43:53 start conc_sweep/sweep_online080_c224 gpu5 (7 queued)
+16:44:28 done  conc_sweep/sweep_online085_c160 gpu4 12.2min
+16:44:29 start conc_sweep/sweep_vanilla_c256 gpu4 (6 queued)
+16:45:19 done  conc_sweep/sweep_vanilla_c224 gpu6 12.3min
+16:45:19 start conc_sweep/sweep_fuse0_c256 gpu6 (5 queued)
+16:48:25 done  conc_sweep/sweep_fuse0_c224 gpu1 12.6min
+16:48:25 start conc_sweep/sweep_fuse1_c256 gpu1 (4 queued)
+16:50:01 done  conc_sweep/sweep_fuse1_c224 gpu2 12.6min
+16:50:01 start conc_sweep/sweep_online085_c256 gpu2 (3 queued)
+16:50:36 done  conc_sweep/sweep_online085_c224 gpu3 11.8min
+16:50:36 start conc_sweep/sweep_online080_c256 gpu3 (2 queued)
+16:55:13 done  conc_sweep/sweep_online080_c224 gpu5 11.3min
+16:55:13 start ablation/ablate_fuse1_c128 gpu5 (1 queued)
+16:56:33 done  conc_sweep/sweep_vanilla_c256 gpu4 12.1min
+16:56:33 start ablation/ablate_b13norm_c128 gpu4 (0 queued)
+16:57:53 done  conc_sweep/sweep_fuse0_c256 gpu6 12.6min
