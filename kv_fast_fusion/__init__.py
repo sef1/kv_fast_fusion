@@ -26,6 +26,16 @@ if _ascend_stack_available():
     except Exception as e:  # pragma: no cover - defensive
         print(f"Fast fusion Ascend patch failed: {e}")
         apply_fast_fusion_ascend_patch = None  # type: ignore
+elif __import__("os").environ.get("BFF_SINGLE", "0") == "1":
+    # Single-instance (no P/D, no connector) BFF: the legacy graph runner fuses co-finishing
+    # prefills post-forward and frees duplicates. BFF_SINGLE_FUSE=0 keeps the layout, skips merges.
+    from kv_fast_fusion.legacy.kv_fast_fusion_graph_patch import apply_fast_fusion_graph_patch
+    apply_fast_fusion_graph_patch()
+    from kv_fast_fusion.bff_online_fuse import ONLINE_ENABLED as _online, install_scheduler_hooks
+    if _online:
+        install_scheduler_hooks()
+    print("Fast fusion single-instance (graph) patch applied successfully."
+          + (" [online fusion]" if _online else ""))
 else:
     try:
         from kv_fast_fusion.fast_fusion_pd_patch import apply_fast_fusion_pd_patch

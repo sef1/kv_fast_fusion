@@ -1,0 +1,102 @@
+{
+  "label": "smoke_vanilla_eager",
+  "config": {
+    "model": "NousResearch/Meta-Llama-3.1-8B-Instruct",
+    "dataset_path": "/data/users/sefi/from_git/vllm_013/vllm_ff/examples/online_serving/single_gpu_bff/data/openmath2_4k.jsonl",
+    "num_prompts": 32,
+    "max_concurrency": 32,
+    "request_rate": "inf",
+    "burstiness": 1.0,
+    "max_tokens": 512,
+    "stream": true,
+    "enable_thinking": false
+  },
+  "completed": 32,
+  "thinking_only": 0,
+  "errors": 0,
+  "elapsed_s": 10.039141840767115,
+  "request_throughput_rps": 3.187523446481637,
+  "finish_length_pct": 40.625,
+  "evaluation": {
+    "mean_f1": 0.7255840177543249,
+    "per_sample_f1": [
+      0.3883388338833883,
+      0.8031203566121843,
+      0.7522071806945261,
+      0.6289248334919125,
+      0.7132258889741623,
+      0.8935361216730038,
+      0.7574396406513196,
+      0.5785609397944199,
+      0.7716359575656058,
+      0.5953693495038589,
+      0.8721461187214611,
+      0.8450860632981677,
+      0.8818297331639136,
+      0.43243243243243246,
+      0.8442776735459662,
+      0.8290972830850132,
+      0.6705020920502093,
+      0.6847457627118644,
+      0.6636916835699798,
+      0.782492184010719,
+      0.6951484431571325,
+      0.8839506172839507,
+      0.5035587188612101,
+      0.5536967080410146,
+      0.8238053356786866,
+      0.6850015989766549,
+      0.6312217194570137,
+      0.9006085192697769,
+      0.8202169397645973,
+      0.7538363171355498,
+      0.7799442896935932,
+      0.7990392313851081
+    ],
+    "mean_f1_all_prompts": 0.7255840177543249
+  },
+  "ttft_ms": {
+    "mean": 466.24672642792575,
+    "median": 475.14142584986985,
+    "p99": 477.7496939478442
+  },
+  "tpot_ms": {
+    "mean": 19.46346333945496,
+    "median": 19.17880482655376,
+    "p99": 21.634531159349297
+  },
+  "itl_ms": {
+    "mean": 19.15613080958969,
+    "median": 18.296483904123306,
+    "p99": 25.84643034264454
+  },
+  "e2e_latency_ms": {
+    "mean": 7914.145529590314,
+    "median": 8644.681946374476,
+    "p99": 10032.973368777893
+  },
+  "total_output_tokens": 12474,
+  "output_throughput_toks_s": 1242.536483481623,
+  "bff_single": {
+    "arm": "vanilla",
+    "fusion_calls": 0,
+    "reqs_fused": 0,
+    "mean_reqs_per_call": 0,
+    "fusion_layer_valid_blocks": 0,
+    "fusion_layer_unique_blocks": 0,
+    "fusion_layer_cr": 1.0,
+    "sched_blocks_freed": 0,
+    "running_mean": null,
+    "running_max": null,
+    "block_usage_mean": null,
+    "preempt_cum": 0
+  },
+  "run_env": {
+    "MAX_CONCURRENCY": "32",
+    "ARM": "vanilla",
+    "NUM_PROMPTS": "32",
+    "ENFORCE_EAGER": "1",
+    "GPU": "2",
+    "MAX_TOKENS": "512"
+  }
+}

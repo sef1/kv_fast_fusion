@@ -1,0 +1,36 @@
+== single-GPU BFF | ARM=vanilla | tag=s2_vanilla_eager1
+   env: CUDA_VISIBLE_DEVICES=2 PYTHONPATH=/data/users/sefi/from_git/vllm_013/vllm_ff:
+   serve: --host 0.0.0.0 --port 8312 --seed 1024 --trust-remote-code --block-size 16 --max-model-len 16384 --max-num-batched-tokens 16384 --max-num-seqs 64 --gpu-memory-utilization 0.90 --attention-backend FLASH_ATTN --enable-prefix-caching --enforce-eager --no-async-scheduling
+   waiting for server......................................... up (42s)
+Loading dataset from /data/users/sefi/from_git/vllm_013/vllm_ff/examples/online_serving/single_gpu_bff/data/openmath2_4k.jsonl...
+  prompt fingerprint: d42d2a55 (128 prompts)
+
+Starting inference...
+  request_rate=inf  burstiness=1.0  max_concurrency=64  num_prompts=128  stream=True  thinking=off
+Inference completed in 22.35 s  |  128/128 ok  |  achieved 5.73 req/s
+  output: completion_tokens mean=399 median=453 max=512 | chars mean=1295 median=1360
+  finish_reason: length(=max_tokens)=57/128 (44.5%)  stop(=EOS)=71/128
+  latency ms: TTFT[mean=402.9 median=253.4 p99=711.1] TPOT[mean=21.9 median=22.2 p99=24.0] ITL[mean=21.8 median=21.3 p99=34.6] E2E[mean=9081.7 median=10022.5 p99=12308.2]
+  throughput: 2282.4 output tok/s (51017 toks) | 5.73 req/s
+
+Sample Output [0]:
+Prompt: Solve for $y$:
+
+$$\frac{y^2 - 3y + 2}{y - 2} = y + 1$$...
+Generated Text: ## Step 1: Write down the given equation
+The given equation is $\frac{y^2 - 3y + 2}{y - 2} = y + 1$.
+
+## Step 2: Factor the numerator of the left-hand side
+The numerator $y^2 - 3y + 2$ can be factored...
+
+Raw completions saved to /data/users/sefi/from_git/vllm_013/vllm_ff/examples/online_serving/single_gpu_bff/f1_results/raw/s2_vanilla_eager1/raw_outputs.json
+
+=== Evaluation Results ===
+  Mean F1 Score: 0.7188 (over 128 samples)
+  Mean F1, failed scored as 0: 0.7188 (over 128 prompts)
+
+Summary saved to /data/users/sefi/from_git/vllm_013/vllm_ff/examples/online_serving/single_gpu_bff/f1_results/raw/s2_vanilla_eager1/summary.json
+bff_single: {"arm": "vanilla", "fusion_calls": 0, "reqs_fused": 0, "mean_reqs_per_call": 0, "fusion_layer_valid_blocks": 0, "fusion_layer_unique_blocks": 0, "fusion_layer_cr": 1.0, "sched_blocks_freed": 0, "running_mean": null, "running_max": null, "block_usage_mean": null, "preempt_cum": 0}
+  output_throughput_toks_s: 2282.352196742992
+  request_throughput_rps: 5.726347711215928
+  finish_length_pct: 44.53125

@@ -1,0 +1,40 @@
+== single-GPU BFF | ARM=fuse1 | tag=s11_dump
+   env: CUDA_VISIBLE_DEVICES=2 PYTHONPATH=/data/users/sefi/from_git/vllm_013/vllm_ff: BFF_CASCADE=1 BFF_CASCADE_DUMP=/data/users/sefi/from_git/vllm_013/vllm_ff/examples/online_serving/single_gpu_bff/f1_results/dumps/step BFF_CASCADE_DUMP_STEP=300 BFF_SINGLE=1 BFF_PD_FUSE=0 BFF_MERGE=nr_tree BFF_SCALE_MODE=raw BFF_THRESHOLD=0.75 BFF_GROUP_SIZE=4 BFF_LSH_REPR=proj BFF_LSH_PROJ_DIM=512 BFF_SINGLE_FUSE=1
+   serve: --host 0.0.0.0 --port 8391 --seed 1024 --trust-remote-code --block-size 16 --max-model-len 16384 --max-num-batched-tokens 16384 --max-num-seqs 48 --gpu-memory-utilization 0.90 --attention-backend FLASH_ATTN --enable-prefix-caching --async-scheduling
+   waiting for server.................................................. up (51s)
+   BFF single patch engaged
+Using the latest cached version of the dataset since ise-uiuc/Magicoder-Evol-Instruct-110K couldn't be found on the Hugging Face Hub (offline mode is enabled).
+Found the latest cached dataset configuration 'default' at /data/models/huggingface/datasets/ise-uiuc___magicoder-evol-instruct-110_k/default/0.0.0/b0079beaa0361d82412520b873715bee59cc7dd4 (last modified on Sun Aug 16 17:58:56 2026).
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Loading dataset from ise-uiuc/Magicoder-Evol-Instruct-110K...
+  token filter: kept 48 samples with >= 1536 and <= 3000 input tokens (skipped 6253)
+  prompt fingerprint: 2843c563 (48 prompts)
+
+Starting inference...
+  request_rate=inf  burstiness=1.0  max_concurrency=48  num_prompts=48  stream=True  thinking=off
+Inference completed in 22.27 s  |  48/48 ok  |  achieved 2.16 req/s
+  output: completion_tokens mean=512 median=512 max=512 | chars mean=1723 median=1786
+  finish_reason: length(=max_tokens)=48/48 (100.0%)  stop(=EOS)=0/48
+  latency ms: TTFT[mean=6668.3 median=6515.0 p99=8968.1] TPOT[mean=30.4 median=30.7 p99=37.7] ITL[mean=30.5 median=26.1 p99=34.7] E2E[mean=22216.7 median=22213.8 p99=22262.0]
+  throughput: 1103.6 output tok/s (24576 toks) | 2.16 req/s
+
+Sample Output [0]:
+Prompt: I'd like to animate this SVG. Can you show me how?
+<svg width="32" height="32" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
+<path d="M14.9 30H17.03C17.27 30 17.45 29.77 17.39 29...
+Generated Text: To animate the SVG, we'll use the `<animate>` element. However, since you want to create a trail or motion effect, we'll use the `<animateMotion>` element instead.
+
+Here's an example of how you can an...
+
+Raw completions saved to /data/users/sefi/from_git/vllm_013/vllm_ff/examples/online_serving/single_gpu_bff/f1_results/raw/s11_dump/raw_outputs.json
+
+=== Evaluation Results ===
+  Mean F1 Score: 0.5647 (over 48 samples)
+  Mean F1, failed scored as 0: 0.5647 (over 48 prompts)
+
+Summary saved to /data/users/sefi/from_git/vllm_013/vllm_ff/examples/online_serving/single_gpu_bff/f1_results/raw/s11_dump/summary.json
+bff_single: {"arm": "fuse1", "fusion_calls": 6, "reqs_fused": 47, "mean_reqs_per_call": 7.833333333333333, "fusion_layer_valid_blocks": 39774, "fusion_layer_unique_blocks": 17673, "fusion_layer_cr": 2.250551689017145, "sched_blocks_freed": 21952, "running_mean": 48.0, "running_max": 48, "block_usage_mean": 40.160000000000004, "preempt_cum": 0}
+  mean_f1: 0.5647188420526464
+  output_throughput_toks_s: 1103.6032660845115
+  request_throughput_rps: 2.1554751290713114
+  finish_length_pct: 100.0

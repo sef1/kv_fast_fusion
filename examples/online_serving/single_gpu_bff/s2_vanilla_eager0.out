@@ -1,0 +1,36 @@
+== single-GPU BFF | ARM=vanilla | tag=s2_vanilla_eager0
+   env: CUDA_VISIBLE_DEVICES=5 PYTHONPATH=/data/users/sefi/from_git/vllm_013/vllm_ff:
+   serve: --host 0.0.0.0 --port 8315 --seed 1024 --trust-remote-code --block-size 16 --max-model-len 16384 --max-num-batched-tokens 16384 --max-num-seqs 64 --gpu-memory-utilization 0.90 --attention-backend FLASH_ATTN --enable-prefix-caching --no-async-scheduling
+   waiting for server........................................................................... up (76s)
+Loading dataset from /data/users/sefi/from_git/vllm_013/vllm_ff/examples/online_serving/single_gpu_bff/data/openmath2_4k.jsonl...
+  prompt fingerprint: d42d2a55 (128 prompts)
+
+Starting inference...
+  request_rate=inf  burstiness=1.0  max_concurrency=64  num_prompts=128  stream=True  thinking=off
+Inference completed in 20.56 s  |  128/128 ok  |  achieved 6.23 req/s
+  output: completion_tokens mean=402 median=464 max=512 | chars mean=1307 median=1356
+  finish_reason: length(=max_tokens)=57/128 (44.5%)  stop(=EOS)=71/128
+  latency ms: TTFT[mean=369.7 median=302.2 p99=722.2] TPOT[mean=20.2 median=20.8 p99=22.0] ITL[mean=20.1 median=19.8 p99=31.9] E2E[mean=8444.3 median=9132.2 p99=11414.4]
+  throughput: 2503.3 output tok/s (51465 toks) | 6.23 req/s
+
+Sample Output [0]:
+Prompt: Solve for $y$:
+
+$$\frac{y^2 - 3y + 2}{y - 2} = y + 1$$...
+Generated Text: ## Step 1: Write down the given equation
+The given equation is $\frac{y^2 - 3y + 2}{y - 2} = y + 1$.
+
+## Step 2: Factor the numerator of the fraction
+The numerator $y^2 - 3y + 2$ can be factored as $(...
+
+Raw completions saved to /data/users/sefi/from_git/vllm_013/vllm_ff/examples/online_serving/single_gpu_bff/f1_results/raw/s2_vanilla_eager0/raw_outputs.json
+
+=== Evaluation Results ===
+  Mean F1 Score: 0.7173 (over 128 samples)
+  Mean F1, failed scored as 0: 0.7173 (over 128 prompts)
+
+Summary saved to /data/users/sefi/from_git/vllm_013/vllm_ff/examples/online_serving/single_gpu_bff/f1_results/raw/s2_vanilla_eager0/summary.json
+bff_single: {"arm": "vanilla", "fusion_calls": 0, "reqs_fused": 0, "mean_reqs_per_call": 0, "fusion_layer_valid_blocks": 0, "fusion_layer_unique_blocks": 0, "fusion_layer_cr": 1.0, "sched_blocks_freed": 0, "running_mean": null, "running_max": null, "block_usage_mean": null, "preempt_cum": 0}
+  output_throughput_toks_s: 2503.342987280879
+  request_throughput_rps: 6.226132369026572
+  finish_length_pct: 44.53125

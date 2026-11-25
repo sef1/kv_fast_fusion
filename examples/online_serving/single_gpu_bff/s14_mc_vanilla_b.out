@@ -1,0 +1,39 @@
+== single-GPU BFF | ARM=vanilla | tag=s14_mc_vanilla_b
+   env: CUDA_VISIBLE_DEVICES=5 PYTHONPATH=/data/users/sefi/from_git/vllm_013/vllm_ff:
+   serve: --host 0.0.0.0 --port 8439 --seed 1024 --trust-remote-code --block-size 16 --max-model-len 16384 --max-num-batched-tokens 16384 --max-num-seqs 128 --gpu-memory-utilization 0.90 --attention-backend FLASH_ATTN --enable-prefix-caching --async-scheduling
+   waiting for server.................................................. up (51s)
+Using the latest cached version of the dataset since ise-uiuc/Magicoder-Evol-Instruct-110K couldn't be found on the Hugging Face Hub (offline mode is enabled).
+Found the latest cached dataset configuration 'default' at /data/models/huggingface/datasets/ise-uiuc___magicoder-evol-instruct-110_k/default/0.0.0/b0079beaa0361d82412520b873715bee59cc7dd4 (last modified on Sun Aug 16 17:58:56 2026).
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Loading dataset from ise-uiuc/Magicoder-Evol-Instruct-110K...
+  token filter: kept 512 samples with >= 1536 and <= 6000 input tokens (skipped 47583)
+  prompt fingerprint: 343632cd (512 prompts)
+
+Starting inference...
+  request_rate=inf  burstiness=1.0  max_concurrency=128  num_prompts=512  stream=True  thinking=off
+Inference completed in 307.85 s  |  512/512 ok  |  achieved 1.66 req/s
+  output: completion_tokens mean=638 median=619 max=1024 | chars mean=2022 median=1922
+  finish_reason: length(=max_tokens)=176/512 (34.4%)  stop(=EOS)=336/512
+  latency ms: TTFT[mean=36384.6 median=39778.1 p99=60952.6] TPOT[mean=53.5 median=53.6 p99=94.1] ITL[mean=52.1 median=33.7 p99=490.5] E2E[mean=69610.8 median=68106.2 p99=116263.6]
+  throughput: 1061.9 output tok/s (326912 toks) | 1.66 req/s
+
+Sample Output [0]:
+Prompt: I'd like to animate this SVG. Can you show me how?
+<svg width="32" height="32" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
+<path d="M14.9 30H17.03C17.27 30 17.45 29.77 17.39 29...
+Generated Text: To animate this SVG, we'll need to add some JavaScript code to manipulate the SVG elements. We'll use the `animate` element to create a simple animation.
+
+Here's an example of how you can animate the ...
+
+Raw completions saved to /data/users/sefi/from_git/vllm_013/vllm_ff/examples/online_serving/single_gpu_bff/f1_results/raw/s14_mc_vanilla_b/raw_outputs.json
+
+=== Evaluation Results ===
+  Mean F1 Score: 0.6345 (over 512 samples)
+  Mean F1, failed scored as 0: 0.6345 (over 512 prompts)
+
+Summary saved to /data/users/sefi/from_git/vllm_013/vllm_ff/examples/online_serving/single_gpu_bff/f1_results/raw/s14_mc_vanilla_b/summary.json
+bff_single: {"arm": "vanilla", "fusion_calls": 0, "reqs_fused": 0, "mean_reqs_per_call": 0, "fusion_layer_valid_blocks": 0, "fusion_layer_unique_blocks": 0, "fusion_layer_cr": 1.0, "sched_blocks_freed": 0, "running_mean": null, "running_max": null, "block_usage_mean": null, "preempt_cum": 0}
+  mean_f1: 0.6345109253419241
+  output_throughput_toks_s: 1061.923840738023
+  request_throughput_rps: 1.6631540183837479
+  finish_length_pct: 34.375

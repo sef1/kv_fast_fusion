@@ -53,6 +53,12 @@ _CC_ITERS = 32  # label-propagation iterations (cluster diameter cap; clusters a
 # overlaps the transfer), disable the post-forward BFF here so there's no double-fusion and the
 # connector-side overhead can be measured cleanly. See plan ROUND 21/22.
 BFF_PD_FUSE = os.environ.get("BFF_PD_FUSE", "0") == "1"
+# Single-instance ablation: BFF_SINGLE_FUSE=0 keeps the BFF group layout but never merges (FUSE=0 arm).
+BFF_SINGLE_FUSE = os.environ.get("BFF_SINGLE_FUSE", "1") == "1"
+# Synced per-phase fusion timing (diagnostic; adds syncs). Logs one line per fusion call.
+BFF_FUSE_TIMING = os.environ.get("BFF_FUSE_TIMING", "0") == "1"
+# Project block fingerprints in bf16 (fp32 accumulate) instead of fp32: ~10x cheaper, same cosine to ~1e-3.
+BFF_REPR_BF16 = os.environ.get("BFF_REPR_BF16", "1") == "1"
 
 # How a redirected (shared) block is scaled at decode. Both 'raw' and 'ratio' share the
 # registrant's RAW block (NO cache mutation → cannot corrupt the prefix cache), and differ
@@ -609,7 +615,7 @@ class BFFCompressor:
     """
 
     __slots__ = (
-        '_runner', '_req_to_compress', '_req_idx_to_compress', '_meta_dict',
+        '_runner', '_req_to_compress', '_req_idx_to_compress', '_meta_dict', '_timing',
         'B', '_b_idx', '_num_blocks_dim', '_device',
         '_nz_blocks', '_idx__', '_nz_mask', '_mask_split_list',
         '_splits_k', '_splits_v',
@@ -833,6 +839,19 @@ class BFFCompressor:
     # ------------------------------------------------------------------
     # Fusion-group iteration helper
     # ------------------------------------------------------------------
+
+    def _tick(self, key, t0):
+        """Accumulate synced phase time (ms) when BFF_FUSE_TIMING; returns a fresh t0."""
+        if not BFF_FUSE_TIMING:
+            return t0
+        import time as _t
+        torch.cuda.synchronize()
+        now = _t.perf_counter()
+        tm = getattr(self, '_timing', None)
+        if tm is None:
+            tm = self._timing = {}
+        tm[key] = tm.get(key, 0.0) + (now - t0) * 1e3
+        return now
 
     def _iter_fusion_groups(self):
         """Yield (layer_names, layer_idxs, layer_meta, kv_layers) per fusion group.
@@ -1093,6 +1112,15 @@ class BFFCompressor:
         cnt = counts.clamp(min=1).unsqueeze(1).float()
         ones_n = None
 
+        if BFF_SCALE_MODE == "raw":
+            # raw: share the representative block verbatim; no centroid, no scales. Only mark
+            # the requests as fused (each request is fused once). The old per-layer loop below
+            # gathered every [B, P] block of every layer just to compute unused norms.
+            for req_id in self._req_to_compress:
+                runner.fused_requests.setdefault(req_id, {})
+            layer_meta.block_table[self._req_idx_to_compress] = bt
+            return N, n_unique
+
         # ---- per layer: scatter-mean centroid, write reps, store per-block norms ----
         for li, layer_name, kv_layer in zip(layer_idxs, layer_names, kv_layers):
             self._splits_k.fill_(1.0)
@@ -1168,8 +1196,11 @@ class BFFCompressor:
         req_of_block = self._nz_mask[0]                                          # [N] in [0,B)
         valid_node   = flat_valid > 0                                            # skip null block 0
 
+        import time as _t
+        _t0 = self._tick('pre', _t.perf_counter())
         # unit-normalized G-layer concatenation repr → cosine(i,j) = Xn[i]·Xn[j]
         Xn = self._block_repr(kv_layers, flat_valid, N).float()                  # [N, D]
+        _t0 = self._tick('repr', _t0)
 
         # union-find over the N flat blocks; representative = root. A request's blocks always
         # travel together in one node, so paired (L,R) nodes never share a request → no
@@ -1205,10 +1236,13 @@ class BFFCompressor:
             if torch.equal(nl, labels):
                 break
             labels = nl
+        _t0 = self._tick('tree', _t0)
 
-        return self._finalize_labels(
+        res = self._finalize_labels(
             layer_names, layer_idxs, layer_meta, kv_layers,
             bt, bt_safe, flat_valid, labels, N)
+        self._tick('finalize', _t0)
+        return res
 
     # ------------------------------------------------------------------
     # LSH deduplication path (< 4 concurrent prefills)
@@ -1221,6 +1255,12 @@ class BFFCompressor:
         per-layer JL matrix; `mean` → [N, head_dim]."""
         if self._repr_mode == 'mean':
             return kv_layer[0, valid_bids].float().view(N, -1, self._head_dim).mean(dim=1)
+        if self._repr_mode == 'proj' and BFF_REPR_BF16:
+            jl = self._runner.__dict__.setdefault('_bff_jl_bf16', {})
+            key = id(self._lsh_jl)
+            if key not in jl:
+                jl[key] = self._lsh_jl.to(torch.bfloat16)
+            return (kv_layer[0, valid_bids].view(N, -1).to(torch.bfloat16) @ jl[key]).float()
         rep = kv_layer[0, valid_bids].float().view(N, -1)
         if self._repr_mode == 'proj':
             rep = rep @ self._lsh_jl.float()
@@ -1533,6 +1573,11 @@ class BFFCompressor:
                     n_valid / n_unique if n_unique else 1.0, n_freed,
                 )
 
+        if BFF_FUSE_TIMING:
+            tm = getattr(self, '_timing', None) or {}
+            logger.info("BFF fuse timing | reqs=%d | blocks=%d | %s | total=%.1fms", self.B,
+                        self._total_valid, " ".join(f"{k}={v:.1f}ms" for k, v in tm.items()),
+                        sum(tm.values()))
         total_freed  = self._total_valid - self._total_unique
         overall_ratio = (self._total_valid / self._total_unique
                          if self._total_unique else 1.0)
@@ -1774,6 +1819,8 @@ def _patched_build_attention_metadata(
         cascade_attn_prefix_lens: list[list[int]] | None = None,
         fused_reqs_idx: list[int] | None = None,
         fused_reqs: list[str] | None = None,
+        slot_mappings=None,  # vLLM 0.18 _dummy_run passes it; unused here
+        **_unused_kwargs,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -1966,7 +2013,14 @@ def _patched_build_attention_metadata(
                     attn_metadata_i.has_fused_reqs = (
                         True if for_cudagraph_capture else bool(fused_reqs))
 
-            
+            # BFF pair cascade: fused groups, uniform-decode batches (incl. FULL-graph capture so the
+            # captured graph records the cascade path; replay reads the per-step-refilled buffers).
+            from kv_fast_fusion import bff_cascade_runner as _bcr
+            if (_bcr.CASCADE_ENABLED and kv_cache_gid >= 1 and attn_gid == 0 and ubid is None
+                    and max_query_len == 1):
+                attn_metadata_i.bff_pair_cascade = _bcr.fill(
+                    self, kv_cache_gid, num_reqs, num_reqs_padded, for_cudagraph_capture)
+
             if ubid is None:
                 assert isinstance(attn_metadata, dict)
                 attn_metadata_dict = attn_metadata
@@ -2073,6 +2127,9 @@ def execute_model(
         ):
             # Update persistent batch states.
             self._update_states(scheduler_output)
+            from kv_fast_fusion import bff_online_fuse as _bof
+            if _bof.ONLINE_ENABLED:
+                _bof.get_fuser(self).begin_step(scheduler_output)
 
             if has_ec_transfer() and get_ec_transfer().is_producer:
                 with self.maybe_get_ec_connector_output(
@@ -2196,6 +2253,12 @@ def execute_model(
                     self.norms_k_buf[:, slot, :] = 1.0
                     self.norms_v_buf[:, slot, :] = 1.0
 
+            from kv_fast_fusion.share_audit import maybe_audit as _bff_share_audit
+            self._bff_audit_step = getattr(self, '_bff_audit_step', 0) + 1
+            _bff_share_audit(self, scheduler_output, self._bff_audit_step)
+            from kv_fast_fusion.bff_cascade_runner import gc_and_log as _bff_casc_gc
+            _bff_casc_gc(self)
+
             # Only compress requests that FINISH their prefill this step. Compressing
             # a mid-prefill chunk (chunked prefill) would redirect/free blocks that the
             # next chunk's cache_full_blocks still expects to be uncached → crash.
@@ -2300,11 +2363,22 @@ def execute_model(
         _n_fusion_layers = sum(
             1 for g in self.kv_cache_config.kv_cache_groups[1:] if g.layer_names
         )
-        if len(req_to_compress) > 1 and not BFF_PD_FUSE:
+        from kv_fast_fusion import bff_online_fuse as _bof
+        if _bof.ONLINE_ENABLED and BFF_SINGLE_FUSE and not BFF_PD_FUSE:
+            # online fusion: registry + sync-free nr_tree, results proposed on a later step
+            if req_to_compress:
+                _bof.get_fuser(self).launch(req_to_compress)
+        elif len(req_to_compress) > 1 and not BFF_PD_FUSE and BFF_SINGLE_FUSE:
             # Full BFF: recursive merge across concurrent prefills, then register blocks.
             # (Skipped when BFF_PD_FUSE — the P/D connector owns fusion; avoids double-fusion.)
             self._run_post_forward_bff(req_to_compress, req_idx_to_compress, attn_metadata)
+            if BFF_FUSE_TIMING:
+                torch.cuda.synchronize(); _tbt = _time.perf_counter()
             self._update_block_tables_after_compression(req_to_compress)
+            if BFF_FUSE_TIMING:
+                logger.info("BFF fuse timing | bt_sync=%.1fms", (_time.perf_counter() - _tbt) * 1e3)
+            from kv_fast_fusion.bff_cascade_runner import record_pairs as _bff_record_pairs
+            _bff_record_pairs(self, req_to_compress)
             # self._lsh_register_bff_blocks(req_to_compress, req_idx_to_compress, attn_metadata)
             logger.info(
                 "BFF post-forward: compressed %d requests across %d fusion layers",
@@ -2401,6 +2475,7 @@ def execute_model(
             aux_hidden_states,
             ec_connector_output,
             cudagraph_stats,
+            None,  # slot_mappings (vLLM 0.18); KV is written by fast_fusion_flash.patched_forward
         )
         self.kv_connector_output = kv_connector_output
         return None
@@ -2439,7 +2514,8 @@ def sample_tokens(
         sample_hidden_states,
         aux_hidden_states,
         ec_connector_output,
-        cudagraph_stats,        
+        cudagraph_stats,
+        _slot_mappings,
     ) = self.execute_model_state
     # Clear ephemeral state.
     self.execute_model_state = None
@@ -2559,6 +2635,10 @@ def sample_tokens(
         )
 
     output._updated_block_tables = updated_block_tables #sefi
+    _onl = self.__dict__.get("_bff_online")
+    if _onl is not None and _onl.proposals:
+        output._bff_proposals = _onl.proposals
+        _onl.proposals = None
     if not self.use_async_scheduling:
         return output
 

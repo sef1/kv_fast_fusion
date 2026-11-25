@@ -1,0 +1,40 @@
+== single-GPU BFF | ARM=fuse1 | tag=s14_mc_online_reg0.85
+   env: CUDA_VISIBLE_DEVICES=2 PYTHONPATH=/data/users/sefi/from_git/vllm_013/vllm_ff: BFF_ONLINE=1 BFF_REG_THRESHOLD=0.85 BFF_SINGLE=1 BFF_PD_FUSE=0 BFF_MERGE=nr_tree BFF_SCALE_MODE=raw BFF_THRESHOLD=0.75 BFF_GROUP_SIZE=4 BFF_LSH_REPR=proj BFF_LSH_PROJ_DIM=512 BFF_SINGLE_FUSE=1
+   serve: --host 0.0.0.0 --port 8432 --seed 1024 --trust-remote-code --block-size 16 --max-model-len 16384 --max-num-batched-tokens 16384 --max-num-seqs 128 --gpu-memory-utilization 0.90 --attention-backend FLASH_ATTN --enable-prefix-caching --async-scheduling
+   waiting for server.................................................. up (51s)
+   BFF single patch engaged
+Using the latest cached version of the dataset since ise-uiuc/Magicoder-Evol-Instruct-110K couldn't be found on the Hugging Face Hub (offline mode is enabled).
+Found the latest cached dataset configuration 'default' at /data/models/huggingface/datasets/ise-uiuc___magicoder-evol-instruct-110_k/default/0.0.0/b0079beaa0361d82412520b873715bee59cc7dd4 (last modified on Sun Aug 16 17:58:56 2026).
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Loading dataset from ise-uiuc/Magicoder-Evol-Instruct-110K...
+  token filter: kept 512 samples with >= 1536 and <= 6000 input tokens (skipped 47583)
+  prompt fingerprint: 343632cd (512 prompts)
+
+Starting inference...
+  request_rate=inf  burstiness=1.0  max_concurrency=128  num_prompts=512  stream=True  thinking=off
+Inference completed in 297.22 s  |  512/512 ok  |  achieved 1.72 req/s
+  output: completion_tokens mean=648 median=632 max=1024 | chars mean=2105 median=1966
+  finish_reason: length(=max_tokens)=173/512 (33.8%)  stop(=EOS)=339/512
+  latency ms: TTFT[mean=27303.1 median=29529.1 p99=51521.8] TPOT[mean=64.9 median=65.5 p99=119.8] ITL[mean=63.2 median=37.5 p99=509.5] E2E[mean=68206.7 median=66280.8 p99=112385.9]
+  throughput: 1116.5 output tok/s (331855 toks) | 1.72 req/s
+
+Sample Output [0]:
+Prompt: I'd like to animate this SVG. Can you show me how?
+<svg width="32" height="32" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
+<path d="M14.9 30H17.03C17.27 30 17.45 29.77 17.39 29...
+Generated Text: To animate the SVG, we'll need to add a `animate` element to the SVG. We'll use the `animate` element to create a simple animation that changes the `fill` attribute of the paths.
+
+Here's an example of...
+
+Raw completions saved to /data/users/sefi/from_git/vllm_013/vllm_ff/examples/online_serving/single_gpu_bff/f1_results/raw/s14_mc_online_reg0.85/raw_outputs.json
+
+=== Evaluation Results ===
+  Mean F1 Score: 0.6326 (over 512 samples)
+  Mean F1, failed scored as 0: 0.6326 (over 512 prompts)
+
+Summary saved to /data/users/sefi/from_git/vllm_013/vllm_ff/examples/online_serving/single_gpu_bff/f1_results/raw/s14_mc_online_reg0.85/summary.json
+bff_single: {"arm": "fuse1", "fusion_calls": 0, "reqs_fused": 0, "mean_reqs_per_call": 0, "fusion_layer_valid_blocks": 0, "fusion_layer_unique_blocks": 0, "fusion_layer_cr": 1.0, "sched_blocks_freed": 0, "running_mean": 66.85858585858585, "running_max": 101, "block_usage_mean": 86.72828282828283, "preempt_cum": 84, "online_calls": 350, "online_blocks": 609581, "online_matched_tree": 34680, "online_matched_registry": 151944, "online_match_frac": 0.3061512743999567, "online_cr": 1.4412363431743653, "online_applied": 183132, "online_confirm_ok": 183132, "online_rejected": 3200}
+  mean_f1: 0.6326326037170741
+  output_throughput_toks_s: 1116.5411872261438
+  request_throughput_rps: 1.722647203928781
+  finish_length_pct: 33.7890625

@@ -5,6 +5,8 @@ import torch
 # layers take the plain flash-attn path. Read directly from env to avoid importing the runner
 # module here (keeps this attention hot-path decoupled / import-cycle free).
 _BFF_SCALE_MODE = os.environ.get("BFF_SCALE_MODE", "raw").lower()
+_CASCADE_CHECK = os.environ.get("BFF_CASCADE_CHECK", "0") == "1"
+_CHECK_STATS = {"n": 0, "max": 0.0}
 
 # from vllm.forward_context import get_forward_context
 from vllm.v1.attention.backends.flash_attn import  (
@@ -139,6 +141,37 @@ def patched_forward(
             )
             key_cache = key_cache.view(dtype)
             value_cache = value_cache.view(dtype)
+
+        # BFF pair cascade (raw mode, uniform decode): shared blocks of a fused pair read once.
+        _casc = getattr(attn_metadata, "bff_pair_cascade", None)
+        if (_casc is not None and attn_metadata.max_query_len == 1
+                and not attn_metadata.use_cascade and self.dcp_world_size == 1
+                and self.alibi_slopes is None and self.sinks is None
+                and not self.kv_cache_dtype.startswith("fp8")
+                and (self.sliding_window is None or tuple(self.sliding_window) == (-1, -1))):
+            from kv_fast_fusion.bff_cascade import pair_cascade_decode
+            pair_cascade_decode(
+                output[:num_actual_tokens], query[:num_actual_tokens], key_cache, value_cache,
+                _casc, attn_metadata.query_start_loc, attn_metadata.max_seq_len, self.scale,
+                self.vllm_flash_attn_version, attn_metadata.max_num_splits)
+            if _CASCADE_CHECK and _casc.n_pairs and not torch.cuda.is_current_stream_capturing():
+                ref = torch.empty_like(output[:num_actual_tokens])
+                flash_attn_varlen_func(
+                    q=query[:num_actual_tokens], k=key_cache, v=value_cache, out=ref,
+                    cu_seqlens_q=attn_metadata.query_start_loc, max_seqlen_q=1,
+                    seqused_k=attn_metadata.seq_lens, max_seqlen_k=attn_metadata.max_seq_len,
+                    softmax_scale=self.scale, causal=True, block_table=attn_metadata.block_table,
+                    fa_version=self.vllm_flash_attn_version)
+                n_real = int((attn_metadata.seq_lens > 0).sum())
+                err = (ref[:n_real].float() - output[:n_real].float()).abs().max().item()
+                _CHECK_STATS["n"] += 1
+                _CHECK_STATS["max"] = max(_CHECK_STATS["max"], err)
+                if _CHECK_STATS["n"] % 2000 == 1 or err > 0.05:
+                    import logging
+                    logging.getLogger("vllm.bff_cascade").warning(
+                        "BFF cascade check | layer=%s pairs=%d err=%.3e max_so_far=%.3e n=%d",
+                        layer.layer_name, _casc.n_pairs, err, _CHECK_STATS["max"], _CHECK_STATS["n"])
+            return output
 
         if not attn_metadata.use_cascade:
             cu_seqlens_q = attn_metadata.query_start_loc

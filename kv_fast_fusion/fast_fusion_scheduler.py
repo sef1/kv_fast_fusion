@@ -293,9 +293,18 @@ def _handle_block_merging_with_counts(self, request_blocks: dict[str, dict[int, 
             if _BFF_FREE_PRERUNNING and req_id not in manager.num_cached_block:
                 continue
             req_blocks = manager.req_to_blocks.get(req_id, [])
-              
-            # Count old references and cache blocks  
-            for block in req_blocks:  
+            # Positional merge (async-scheduling safe): the worker's snapshot covers the blocks
+            # the request held when it was compressed. Under async scheduling the scheduler may
+            # already have appended blocks for the next step; keep that tail instead of dropping
+            # it. With sync scheduling the lengths match and this is the old full replacement.
+            if len(new_block_ids) <= len(req_blocks):
+                tail_blocks = req_blocks[len(new_block_ids):]
+                req_blocks = req_blocks[:len(new_block_ids)]
+            else:
+                tail_blocks = []
+
+            # Count old references and cache blocks
+            for block in req_blocks:
                 if not block.is_null and block.block_id != -1:  
                     old_ref_counts[block.block_id] += 1  
                     block_cache[block.block_id] = block  
@@ -310,13 +319,14 @@ def _handle_block_merging_with_counts(self, request_blocks: dict[str, dict[int, 
                 if not block.is_null and block.block_id != -1:
                     new_ref_counts[block.block_id] += 1
 
-            manager.req_to_blocks[req_id] = new_req_blocks
+            manager.req_to_blocks[req_id] = new_req_blocks + tail_blocks
             # After merge/dedup a block may already carry a hash (it now points at a
             # block another request cached). Mark the whole current block set as
             # cached so cache_full_blocks won't try to re-hash it and trip
             # `assert blk.block_hash is None`. New decode blocks (beyond this count)
-            # still get cached normally.
-            manager.num_cached_block[req_id] = len(new_req_blocks)
+            # still get cached normally. Never lower it (async: the tail may be cached already).
+            manager.num_cached_block[req_id] = max(
+                manager.num_cached_block.get(req_id, 0), len(new_req_blocks))
 
             # ROUND 39 (lever 3): for every REDIRECTED position, register the representative
             # block under THIS request's own prefix-cache key. On resume from preemption the

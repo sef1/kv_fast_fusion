@@ -1,0 +1,40 @@
+== single-GPU BFF | ARM=fuse1 | tag=s13_om_online_async
+   env: CUDA_VISIBLE_DEVICES=3 PYTHONPATH=/data/users/sefi/from_git/vllm_013/vllm_ff: BFF_ONLINE=1 BFF_SINGLE=1 BFF_PD_FUSE=0 BFF_MERGE=nr_tree BFF_SCALE_MODE=raw BFF_THRESHOLD=0.75 BFF_GROUP_SIZE=4 BFF_LSH_REPR=proj BFF_LSH_PROJ_DIM=512 BFF_SINGLE_FUSE=1
+   serve: --host 0.0.0.0 --port 8423 --seed 1024 --trust-remote-code --block-size 16 --max-model-len 16384 --max-num-batched-tokens 16384 --max-num-seqs 64 --gpu-memory-utilization 0.90 --attention-backend FLASH_ATTN --enable-prefix-caching --async-scheduling
+   waiting for server..................................................... up (54s)
+   BFF single patch engaged
+Loading dataset from /data/users/sefi/from_git/vllm_013/vllm_ff/examples/online_serving/single_gpu_bff/data/openmath2_4k.jsonl...
+  prompt fingerprint: 2da84e51 (256 prompts)
+
+Starting inference...
+  request_rate=inf  burstiness=1.0  max_concurrency=64  num_prompts=256  stream=True  thinking=off
+Inference completed in 37.90 s  |  256/256 ok  |  achieved 6.76 req/s
+  output: completion_tokens mean=410 median=493 max=512 | chars mean=1321 median=1362
+  finish_reason: length(=max_tokens)=123/256 (48.0%)  stop(=EOS)=133/256
+  latency ms: TTFT[mean=421.0 median=113.3 p99=1253.6] TPOT[mean=19.6 median=19.8 p99=21.4] ITL[mean=19.6 median=18.7 p99=49.4] E2E[mean=8445.0 median=9227.2 p99=11325.5]
+  throughput: 2771.3 output tok/s (105018 toks) | 6.76 req/s
+
+Sample Output [0]:
+Prompt: Solve for $y$:
+
+$$\frac{y^2 - 3y + 2}{y - 2} = y + 1$$...
+Generated Text: ## Step 1: Write down the given equation
+$\frac{y^2 - 3y + 2}{y - 2} = y + 1$
+
+## Step 2: Factor the numerator in the left-hand side of the equation
+$\frac{(y - 2)(y - 1)}{y - 2} = y + 1$
+
+## Step 3: ...
+
+Raw completions saved to /data/users/sefi/from_git/vllm_013/vllm_ff/examples/online_serving/single_gpu_bff/f1_results/raw/s13_om_online_async/raw_outputs.json
+
+=== Evaluation Results ===
+  Mean F1 Score: 0.6928 (over 256 samples)
+  Mean F1, failed scored as 0: 0.6928 (over 256 prompts)
+
+Summary saved to /data/users/sefi/from_git/vllm_013/vllm_ff/examples/online_serving/single_gpu_bff/f1_results/raw/s13_om_online_async/summary.json
+bff_single: {"arm": "fuse1", "fusion_calls": 0, "reqs_fused": 0, "mean_reqs_per_call": 0, "fusion_layer_valid_blocks": 0, "fusion_layer_unique_blocks": 0, "fusion_layer_cr": 1.0, "sched_blocks_freed": 0, "running_mean": 54.8421052631579, "running_max": 64, "block_usage_mean": 10.913157894736841, "preempt_cum": 0, "online_calls": 100, "online_blocks": 7539, "online_matched_tree": 490, "online_matched_registry": 2182, "online_match_frac": 0.3544236636158642, "online_cr": 1.5490034929114445, "online_applied": 2627, "online_confirm_ok": 2627, "online_rejected": 34}
+  mean_f1: 0.6928236384590518
+  output_throughput_toks_s: 2771.2654208021295
+  request_throughput_rps: 6.755450948650186
+  finish_length_pct: 48.046875
